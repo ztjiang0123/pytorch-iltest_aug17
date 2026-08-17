@@ -13,6 +13,10 @@ from typing import Callable, Iterable, List, Optional, Tuple
 import torch
 from tabulate import tabulate
 
+from benchmarks.prototype.blockwise_fp8_training.roofline_utils import (
+    lookup_roofline_specs,
+    peak_mem_bw_from_device_properties,
+)
 from benchmarks.utils import benchmark_cuda_function_in_microseconds
 from torchao.prototype.blockwise_fp8_training.kernels import (
     torch_blockwise_scale_act_quant_lhs,
@@ -24,7 +28,6 @@ from torchao.prototype.blockwise_fp8_training.kernels import (
     triton_fp8_blockwise_weight_quant_rhs,
     triton_fp8_blockwise_weight_quant_transposed_rhs,
 )
-from torchao.testing.training.roofline_utils import gpu_name_to_specs
 
 
 @dataclass(frozen=True)
@@ -142,19 +145,9 @@ KERNEL_SPECS = [
 ]
 
 
-def _lookup_roofline_specs(gpu_name: str) -> Optional[dict]:
-    specs = gpu_name_to_specs.get(gpu_name)
-    if specs is not None:
-        return specs
-    for known_name, candidate in gpu_name_to_specs.items():
-        if known_name in gpu_name or gpu_name in known_name:
-            return candidate
-    return None
-
-
 def _resolve_gpu_specs(use_roofline_utils: bool = False) -> GpuBandwidthSpec:
     gpu_name = torch.cuda.get_device_name(0)
-    specs = _lookup_roofline_specs(gpu_name)
+    specs = lookup_roofline_specs(gpu_name)
 
     if use_roofline_utils:
         if specs is None:
@@ -162,7 +155,7 @@ def _resolve_gpu_specs(use_roofline_utils: bool = False) -> GpuBandwidthSpec:
         peak_gbps = specs["peak_mem_bw_bytes_sec"] / 1e9
         peak_source = "roofline_utils"
     else:
-        peak_mem_bw_bytes_sec = _get_peak_mem_bw_from_device_properties()
+        peak_mem_bw_bytes_sec = peak_mem_bw_from_device_properties()
         if peak_mem_bw_bytes_sec is not None:
             peak_gbps = peak_mem_bw_bytes_sec / 1e9
             peak_source = "cuda_device_properties"
@@ -189,16 +182,6 @@ def _resolve_gpu_specs(use_roofline_utils: bool = False) -> GpuBandwidthSpec:
         achievable_pct_of_peak=achievable_pct_of_peak,
         achievable_source=achievable_source,
     )
-
-
-def _get_peak_mem_bw_from_device_properties() -> Optional[float]:
-    props = torch.cuda.get_device_properties(0)
-    memory_clock_khz = getattr(props, "memory_clock_rate", 0)
-    memory_bus_width_bits = getattr(props, "memory_bus_width", 0)
-    if memory_clock_khz <= 0 or memory_bus_width_bits <= 0:
-        return None
-
-    return (memory_bus_width_bits / 8.0) * (memory_clock_khz * 1e3) * 2.0
 
 
 def _benchmark_kernel(

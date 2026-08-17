@@ -6,16 +6,22 @@
 # this benchmarking script is a modified version of the original script from: https://github.com/drisspg/transformer_nuggets/blob/main/transformer_nuggets/utils/benchmark.py
 
 import argparse
-import itertools
 from dataclasses import dataclass
 from typing import List
 
 import torch
 from tabulate import tabulate
-from tqdm import tqdm
 from triton.testing import do_bench
 
-from benchmarks.utils import bench_fwd_bwd_microseconds, profile_fwd_bwd
+from benchmarks.prototype.blockwise_fp8_training.bench_gemm_utils import (
+    ExperimentConfig,
+    get_configs,
+)
+from benchmarks.utils import (
+    bench_fwd_bwd_microseconds,
+    profile_fwd_bwd,
+    run_experiments_and_print,
+)
 from torchao.prototype.blockwise_fp8_training.linear import Float8BlockwiseLinear
 
 device = torch.device("cuda")
@@ -30,14 +36,6 @@ torch._dynamo.config.cache_size_limit = 1000
 
 
 @dataclass(frozen=True)
-class ExperimentConfig:
-    out_dtype: torch.dtype
-    m: int
-    n: int
-    k: int
-
-
-@dataclass(frozen=True)
 class ExperimentResult:
     bf16_linear_us: float
     fp8_triton_linear_us: float
@@ -48,27 +46,6 @@ class ExperimentResult:
 class Experiment:
     config: ExperimentConfig
     result: ExperimentResult
-
-
-def get_configs() -> List[ExperimentConfig]:
-    mnk_list = [
-        # Llama4 shapes
-        (16640, 5120, 8192),
-        (16640, 8192, 5120),
-    ]
-    out_dtypes = [torch.bfloat16]
-    configs = []
-    for mnk, out_dtype in itertools.product(mnk_list, out_dtypes):
-        m, n, k = mnk
-        configs.append(
-            ExperimentConfig(
-                out_dtype=out_dtype,
-                m=m,
-                n=n,
-                k=k,
-            )
-        )
-    return configs
 
 
 def run_experiment(
@@ -177,15 +154,16 @@ def benchmark_cuda_function_in_microseconds(f, *args, **kwargs):
 
 
 def main(args: argparse.Namespace):
-    torch.random.manual_seed(123)
-    configs = get_configs()
-    results = []
-    for config in tqdm(configs):
-        result = run_experiment(config, profile=args.profile, use_compile=args.compile)
-        results.append(Experiment(config=config, result=result))
-
-    # Use Tabulate to print results
-    print_results(results)
+    run_experiments_and_print(
+        get_configs,
+        run_experiment,
+        print_results,
+        Experiment,
+        run_experiment_kwargs={
+            "profile": args.profile,
+            "use_compile": args.compile,
+        },
+    )
 
 
 if __name__ == "__main__":

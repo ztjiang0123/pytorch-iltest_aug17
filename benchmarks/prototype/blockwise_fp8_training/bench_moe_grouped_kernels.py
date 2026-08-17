@@ -35,12 +35,16 @@ Kernels timed, matching torchao.prototype.moe_training.blockwise_fp8.grouped_mm:
 
 import argparse
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 
 import torch
 from tabulate import tabulate
 from triton.testing import do_bench
 
+from benchmarks.prototype.blockwise_fp8_training.roofline_utils import (
+    lookup_roofline_specs,
+    peak_mem_bw_from_device_properties,
+)
 from torchao.float8.config import e4m3_dtype
 from torchao.prototype.blockwise_fp8_training.deepgemm_grouped_kernels import (
     _quantize_wgrad_lhs,
@@ -65,7 +69,6 @@ from torchao.prototype.blockwise_fp8_training.kernels import (
     triton_fp8_blockwise_act_quant_lhs,
 )
 from torchao.prototype.moe_training.utils import generate_jagged_offs
-from torchao.testing.training.roofline_utils import gpu_name_to_specs
 
 device = torch.device("cuda")
 
@@ -94,27 +97,6 @@ class Shape:
     N: int
     K: int
     E: int
-
-
-def _lookup_specs(gpu_name: str) -> Optional[dict]:
-    specs = gpu_name_to_specs.get(gpu_name)
-    if specs is not None:
-        return specs
-    for known, candidate in gpu_name_to_specs.items():
-        if known in gpu_name or gpu_name in known:
-            return candidate
-    return None
-
-
-def _peak_mem_bw_from_device_properties() -> Optional[float]:
-    # Matches benchmark_quant_kernel_bandwidth.py: prefer the real device HBM
-    # peak over the roofline_utils value (which is a Meta-specific H100 variant).
-    props = torch.cuda.get_device_properties(0)
-    memory_clock_khz = getattr(props, "memory_clock_rate", 0)
-    memory_bus_width_bits = getattr(props, "memory_bus_width", 0)
-    if memory_clock_khz <= 0 or memory_bus_width_bits <= 0:
-        return None
-    return (memory_bus_width_bits / 8.0) * (memory_clock_khz * 1e3) * 2.0
 
 
 def _io_bytes(*tensors: torch.Tensor) -> int:
@@ -372,11 +354,11 @@ def main():
         )
 
     gpu_name = torch.cuda.get_device_name(0)
-    specs = _lookup_specs(gpu_name)
+    specs = lookup_roofline_specs(gpu_name)
     if specs is None:
         raise RuntimeError(f"No roofline specs for GPU: {gpu_name}")
 
-    device_peak_bw = _peak_mem_bw_from_device_properties()
+    device_peak_bw = peak_mem_bw_from_device_properties()
     peak_bw = device_peak_bw or specs["peak_mem_bw_bytes_sec"]
     bw_source = "cuda_device_properties" if device_peak_bw else "roofline_utils"
     ach_bw = peak_bw * specs.get("pct_achievable_mem_bw", 1.0)

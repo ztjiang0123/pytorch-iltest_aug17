@@ -14,8 +14,8 @@ from tabulate import tabulate
 from torch import nn
 from torch._inductor.utils import do_bench_using_profiling
 from torch.nn import functional as F
-from tqdm import tqdm
 
+from benchmarks.utils import run_experiments_and_print
 from torchao.float8.float8_linear_utils import convert_to_float8_training
 from torchao.prototype.float8nocompile.float8nocompile_linear_utils import (
     convert_to_float8_nocompile_training,
@@ -177,15 +177,7 @@ def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> 
 
 
 def main():
-    torch.random.manual_seed(123)
-    configs = get_configs()
-    results = []
-    for config in tqdm(configs):
-        result = run_experiment(config)
-        results.append(Experiment(config=config, result=result))
-
-    # Use Tabulate to print results
-    print_results(results)
+    run_experiments_and_print(get_configs, run_experiment, print_results, Experiment)
 
 
 if __name__ == "__main__":

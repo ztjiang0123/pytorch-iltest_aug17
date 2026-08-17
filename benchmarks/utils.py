@@ -1,5 +1,12 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD 3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
+
 import torch
 from torch.nn import functional as F
+from tqdm import tqdm
 from triton.testing import do_bench
 
 
@@ -104,3 +111,30 @@ def profile_fn(fn, *args, profile_name="profile", distributed=False, **kwargs):
 
 def benchmark_cuda_function_in_microseconds(f, *args, **kwargs):
     return do_bench(lambda: f(*args, **kwargs), return_mode="median") * 1e3
+
+
+def run_experiments_and_print(
+    get_configs,
+    run_experiment,
+    print_results,
+    experiment_cls,
+    run_experiment_kwargs=None,
+):
+    """Shared driver for the ``main()`` of the config/experiment benchmark scripts.
+
+    Seeds the RNG (to the fixed 123 the benchmarks share), builds configs via
+    ``get_configs()``, runs ``run_experiment`` on each, wraps the
+    ``(config, result)`` pair in ``experiment_cls`` and hands the collected
+    experiments to ``print_results``. Every benchmark script that follows the
+    config -> run_experiment -> print_results pattern shares this driver instead
+    of copying it. ``run_experiment_kwargs`` forwards extra keyword arguments
+    (e.g. profiling flags) to ``run_experiment``.
+    """
+    run_experiment_kwargs = run_experiment_kwargs or {}
+    torch.random.manual_seed(123)
+    configs = get_configs()
+    results = []
+    for config in tqdm(configs):
+        result = run_experiment(config, **run_experiment_kwargs)
+        results.append(experiment_cls(config=config, result=result))
+    print_results(results)
