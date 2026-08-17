@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 # this benchmarking script is a modified version of the original script from: https://github.com/drisspg/transformer_nuggets/blob/main/transformer_nuggets/utils/benchmark.py
 
-import itertools
 from dataclasses import dataclass
 from typing import List
 
@@ -13,9 +12,12 @@ import torch
 from tabulate import tabulate
 from triton.testing import do_bench
 
+from benchmarks.prototype.moe_training.fp8_rowwise.bench_utils import (
+    ExperimentConfig,
+    build_configs,
+    reference_scale_and_cast,
+)
 from benchmarks.utils import run_experiments_and_print
-from torchao.float8.config import ScalingGranularity
-from torchao.float8.float8_utils import tensor_to_scale, to_fp8_saturated
 from torchao.prototype.moe_training.kernels import (
     triton_fp8_colwise_3d_scale_and_cast,
 )
@@ -24,15 +26,6 @@ device = torch.device("cuda")
 
 # Needed since changing args to function causes recompiles
 torch._dynamo.config.cache_size_limit = 1000
-
-
-@dataclass(frozen=True)
-class ExperimentConfig:
-    high_precision_dtype: torch.dtype
-    input_shape: (
-        tuple  # (E, N, K), allocated row-major then transposed to (E, K, N) col-major
-    )
-    round_scales_to_power_of_2: bool
 
 
 @dataclass(frozen=True)
@@ -66,22 +59,7 @@ def get_configs() -> List[ExperimentConfig]:
         (32, 4096, 7168),  # w1+w3 fused gate/up: 2*moe_inter_dim along N
         (32, 7168, 2048),  # w2 down proj
     ]
-    high_precision_dtypes = [torch.bfloat16]
-    power_of_2_scales = [True]
-    configs = []
-    for (
-        input_shape,
-        high_precision_dtype,
-        round_scales_to_power_of_2,
-    ) in itertools.product(input_shapes, high_precision_dtypes, power_of_2_scales):
-        configs.append(
-            ExperimentConfig(
-                input_shape=input_shape,
-                high_precision_dtype=high_precision_dtype,
-                round_scales_to_power_of_2=round_scales_to_power_of_2,
-            )
-        )
-    return configs
+    return build_configs(input_shapes)
 
 
 def benchmark_cuda_function_in_microseconds(f, *args, **kwargs):
@@ -103,16 +81,12 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
     # This is the best-case for the unfused path: the compiler sees the full sequence
     # and can fuse ops freely.
     def run_original(B_t: torch.Tensor):
-        B_t_scales = tensor_to_scale(
+        return reference_scale_and_cast(
             B_t,
             float8_dtype,
-            scaling_granularity=ScalingGranularity.AXISWISE,
             axiswise_dim=-2,
             round_scales_to_power_of_2=config.round_scales_to_power_of_2,
         )
-        B_t_scaled = B_t.to(torch.float32) * B_t_scales
-        B_t_data = to_fp8_saturated(B_t_scaled, float8_dtype)
-        return B_t_data, B_t_scales
 
     run_original_compiled = torch.compile(run_original)
 

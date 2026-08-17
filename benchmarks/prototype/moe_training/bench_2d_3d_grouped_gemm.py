@@ -12,9 +12,11 @@ from typing import List
 
 import torch
 from tabulate import tabulate
-from tqdm import tqdm
 
-from benchmarks.utils import benchmark_cuda_function_in_microseconds
+from benchmarks.utils import (
+    benchmark_cuda_function_in_microseconds,
+    run_experiments_and_print,
+)
 from torchao.float8.config import ScalingGranularity
 from torchao.float8.float8_utils import tensor_to_scale, to_fp8_saturated
 from torchao.prototype.moe_training.kernels.mxfp8 import (
@@ -72,9 +74,7 @@ def get_configs() -> List[ExperimentConfig]:
     return configs
 
 
-def run_experiment(
-    config: ExperimentConfig, args: argparse.Namespace
-) -> ExperimentResult:
+def run_experiment(config: ExperimentConfig) -> ExperimentResult:
     e, m, n, k = config.e, config.m, config.n, config.k
 
     # define test inputs
@@ -248,15 +248,7 @@ def bench_mxfp8_grouped_mm(A, B_t, offs, block_size=32) -> float:
 
 
 def main(args: argparse.Namespace):
-    torch.random.manual_seed(123)
-    configs = get_configs()
-    results = []
-    for config in tqdm(configs):
-        result = run_experiment(config, args)
-        results.append(Experiment(config=config, result=result))
-
-    # Use Tabulate to print results
-    print_results(results)
+    run_experiments_and_print(get_configs, run_experiment, print_results, Experiment)
 
 
 if __name__ == "__main__":

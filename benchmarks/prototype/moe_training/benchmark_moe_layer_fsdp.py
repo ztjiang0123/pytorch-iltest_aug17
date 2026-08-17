@@ -14,15 +14,17 @@
 import argparse
 import copy
 import logging
-import os
 
 import pytest
 import torch
 from torch import distributed as dist
-from torch import nn
 from torch.distributed._composable.fsdp import fully_shard
 from torch.nn import functional as F
 
+from benchmarks.prototype.moe_training.bench_utils import (
+    make_moe_module_filter_fn,
+    setup_distributed,
+)
 from benchmarks.utils import bench_fwd_bwd_microseconds, profile_fwd_bwd
 from torchao.prototype.moe_training.config import (
     Float8TrainingRecipe,
@@ -112,11 +114,7 @@ def bench_moe_training_fsdp(recipe_name: str, enable_profile: bool, use_compile:
         assert torch.equal(param1, param2)
 
     # convert MoE to float8 training
-    def moe_module_filter_fn(mod: nn.Module, cur_fqn: str) -> bool:
-        for target_fqn in target_fqns:
-            if target_fqn in cur_fqn:
-                return True
-        return False
+    moe_module_filter_fn = make_moe_module_filter_fn(target_fqns)
 
     # quantize test model
     config = MXFP8TrainingOpConfig.from_recipe(recipe)
@@ -169,13 +167,6 @@ def bench_moe_training_fsdp(recipe_name: str, enable_profile: bool, use_compile:
 
     print(f"Speedup: {bf16_us / scaled_us:.3f}x")
     dist.destroy_process_group()
-
-
-def setup_distributed():
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
 
 
 if __name__ == "__main__":

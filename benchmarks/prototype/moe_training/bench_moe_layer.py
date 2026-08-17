@@ -11,9 +11,9 @@ import logging
 import sys
 
 import torch
-from torch import nn
 from torch.nn import functional as F
 
+from benchmarks.prototype.moe_training.bench_utils import make_moe_module_filter_fn
 from benchmarks.utils import bench_fwd_bwd_microseconds, profile_fwd_bwd
 from torchao.prototype.moe_training.config import (
     Float8TrainingRecipe,
@@ -120,11 +120,7 @@ def bench_moe_training_fsdp(args: argparse.Namespace):
         assert torch.equal(param1, param2)
 
     # convert MoE to float8 training
-    def moe_module_filter_fn(mod: nn.Module, cur_fqn: str) -> bool:
-        for target_fqn in target_fqns:
-            if target_fqn in cur_fqn:
-                return True
-        return False
+    moe_module_filter_fn = make_moe_module_filter_fn(target_fqns)
 
     # quantize test model
     config = MXFP8TrainingOpConfig.from_recipe(recipe)

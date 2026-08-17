@@ -12,9 +12,12 @@ from typing import List
 
 import torch
 from tabulate import tabulate
-from tqdm import tqdm
 
-from benchmarks.utils import benchmark_cuda_function_in_microseconds, profile_fn
+from benchmarks.utils import (
+    benchmark_cuda_function_in_microseconds,
+    profile_fn,
+    run_experiments_and_print,
+)
 from torchao.prototype.moe_training.kernels.mxfp8 import (
     _mxfp8_cuda_kernels_available,
     fused_unpad_token_groups_cuda,
@@ -73,9 +76,7 @@ def get_configs() -> List[ExperimentConfig]:
     return configs
 
 
-def run_experiment(
-    config: ExperimentConfig, args: argparse.Namespace
-) -> ExperimentResult:
+def run_experiment(config: ExperimentConfig, profile=False) -> ExperimentResult:
     num_tokens, dim, num_groups, alignment_size = (
         config.num_tokens,
         config.dim,
@@ -112,7 +113,7 @@ def run_experiment(
     torch_eager_time_us = benchmark_cuda_function_in_microseconds(
         torch_eager_with_offsets
     )
-    if args.profile:
+    if profile:
         profile_fn(
             torch_unpad_token_groups,
             padded_inputs,
@@ -136,7 +137,7 @@ def run_experiment(
 
         warmup(cuda_with_offsets)
         cuda_time_us = benchmark_cuda_function_in_microseconds(cuda_with_offsets)
-        if args.profile:
+        if profile:
             profile_fn(
                 fused_unpad_token_groups_cuda,
                 padded_inputs,
@@ -220,15 +221,13 @@ def print_results(experiments: List[Experiment]):
 
 
 def main(args: argparse.Namespace):
-    torch.random.manual_seed(123)
-    configs = get_configs()
-    results = []
-    for config in tqdm(configs):
-        result = run_experiment(config, args)
-        results.append(Experiment(config=config, result=result))
-
-    # Use Tabulate to print results
-    print_results(results)
+    run_experiments_and_print(
+        get_configs,
+        run_experiment,
+        print_results,
+        Experiment,
+        run_experiment_kwargs={"profile": args.profile},
+    )
 
 
 if __name__ == "__main__":
