@@ -6,6 +6,7 @@
 # this benchmarking script is a modified version of the original script from: https://github.com/drisspg/transformer_nuggets/blob/main/transformer_nuggets/utils/benchmark.py
 
 from dataclasses import dataclass
+from functools import partial
 from typing import List
 
 import torch
@@ -42,24 +43,26 @@ class Experiment:
     result: ExperimentResult
 
 
-def get_configs() -> List[ExperimentConfig]:
-    # MoE expert weights are 3D (E, K, N) column-major in fp8_grouped_mm forward.
-    # Specified here as (E, N, K) row-major; the bench transposes to col-major
-    # (matches actual usage in _Float8GroupedMM.forward).
-    input_shapes = [
-        # Llama4 expert weight shapes (cross-reference with bench_triton_fp8_rowwise_3d_transpose_rhs.py)
-        (1, 8192, 5120),  # w1, w3
-        (1, 5120, 8192),  # w2
-        (16, 8192, 5120),  # w1, w3
-        (16, 5120, 8192),  # w2
-        (128, 8192, 5120),  # w1, w3
-        (128, 5120, 8192),  # w2
-        # DeepSeek-V3 671B with EP=8 (E_local = 256/8 = 32 experts/rank)
-        # hidden_size=7168, moe_inter_dim=2048
-        (32, 4096, 7168),  # w1+w3 fused gate/up: 2*moe_inter_dim along N
-        (32, 7168, 2048),  # w2 down proj
-    ]
-    return build_configs(input_shapes)
+# MoE expert weights are 3D (E, K, N) column-major in fp8_grouped_mm forward.
+# Specified here as (E, N, K) row-major; the bench transposes to col-major
+# (matches actual usage in _Float8GroupedMM.forward).
+INPUT_SHAPES = [
+    # Llama4 expert weight shapes (cross-reference with bench_triton_fp8_rowwise_3d_transpose_rhs.py)
+    (1, 8192, 5120),  # w1, w3
+    (1, 5120, 8192),  # w2
+    (16, 8192, 5120),  # w1, w3
+    (16, 5120, 8192),  # w2
+    (128, 8192, 5120),  # w1, w3
+    (128, 5120, 8192),  # w2
+    # DeepSeek-V3 671B with EP=8 (E_local = 256/8 = 32 experts/rank)
+    # hidden_size=7168, moe_inter_dim=2048
+    (32, 4096, 7168),  # w1+w3 fused gate/up: 2*moe_inter_dim along N
+    (32, 7168, 2048),  # w2 down proj
+]
+
+# Config factory bound to this benchmark's shapes; the enumeration lives in
+# build_configs() so it is shared with the 2D scale-and-cast benchmark.
+get_configs = partial(build_configs, INPUT_SHAPES)
 
 
 def benchmark_cuda_function_in_microseconds(f, *args, **kwargs):

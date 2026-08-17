@@ -6,6 +6,7 @@
 # this benchmarking script is a modified version of the original script from: https://github.com/drisspg/transformer_nuggets/blob/main/transformer_nuggets/utils/benchmark.py
 
 from dataclasses import dataclass
+from functools import partial
 from typing import List
 
 import torch
@@ -41,23 +42,25 @@ class Experiment:
     result: ExperimentResult
 
 
-def get_configs() -> List[ExperimentConfig]:
-    # MoE-relevant 2D shapes: (M, K) where M = total tokens routed to experts.
-    # In practice M depends on batch_size * seq_len * top_k / num_experts.
-    # K is model hidden dim or intermediate dim.
-    input_shapes = [
-        (128, 5120),
-        (128, 8192),
-        (1024, 5120),
-        (1024, 8192),
-        (4096, 5120),
-        (4096, 8192),
-        (8192, 5120),
-        (8192, 8192),
-        (16384, 5120),
-        (16384, 8192),
-    ]
-    return build_configs(input_shapes)
+# MoE-relevant 2D shapes: (M, K) where M = total tokens routed to experts.
+# In practice M depends on batch_size * seq_len * top_k / num_experts.
+# K is model hidden dim or intermediate dim.
+INPUT_SHAPES = [
+    (128, 5120),
+    (128, 8192),
+    (1024, 5120),
+    (1024, 8192),
+    (4096, 5120),
+    (4096, 8192),
+    (8192, 5120),
+    (8192, 8192),
+    (16384, 5120),
+    (16384, 8192),
+]
+
+# Config factory bound to this benchmark's shapes; the enumeration lives in
+# build_configs() so it is shared with the 3D scale-and-cast benchmark.
+get_configs = partial(build_configs, INPUT_SHAPES)
 
 
 def benchmark_cuda_function_in_microseconds(f, *args, **kwargs):
