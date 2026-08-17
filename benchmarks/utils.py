@@ -129,6 +129,9 @@ def run_experiments_and_print(
     config -> run_experiment -> print_results pattern shares this driver instead
     of copying it. ``run_experiment_kwargs`` forwards extra keyword arguments
     (e.g. profiling flags) to ``run_experiment``.
+
+    Benchmarks that want an explanatory banner printed before the results table
+    wrap their ``print_results`` with :func:`with_banner`.
     """
     run_experiment_kwargs = run_experiment_kwargs or {}
     torch.random.manual_seed(123)
@@ -138,3 +141,26 @@ def run_experiments_and_print(
         result = run_experiment(config, **run_experiment_kwargs)
         results.append(experiment_cls(config=config, result=result))
     print_results(results)
+
+
+def with_banner(print_results, banner_lines, banner_width):
+    """Wrap ``print_results`` so it first prints a banner.
+
+    Returns a ``print_results``-compatible callable that prints ``banner_lines``
+    bracketed by ``banner_width``-wide ``=`` separators, then delegates to the
+    original ``print_results``. Shared by the benchmarks whose ``main()`` prints
+    an explanatory banner ahead of the results table, so the seed/loop/print
+    driver stays in :func:`run_experiments_and_print`.
+    """
+
+    def print_results_with_banner(results):
+        separator = "=" * banner_width
+        print()
+        print(separator)
+        for line in banner_lines:
+            print(line)
+        print(separator)
+        print()
+        print_results(results)
+
+    return print_results_with_banner

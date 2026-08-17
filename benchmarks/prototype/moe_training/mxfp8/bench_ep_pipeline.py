@@ -83,39 +83,6 @@ def get_configs() -> List[ExperimentConfig]:
     return configs
 
 
-def generate_split_sizes(K: int, N: int, device: str = "cuda") -> torch.Tensor:
-    """
-    Generates a tensor of K random non-negative integers that sum to N.
-    """
-    if K <= 0:
-        raise ValueError("K must be a positive integer.")
-    if N < 0:
-        raise ValueError("N must be a non-negative integer.")
-
-    if K == 1:
-        return torch.tensor([N], dtype=torch.int32, device=device)
-
-    # Generate K-1 random "dividers" in the range [0, N].
-    dividers = torch.randint(0, N + 1, (K - 1,), device=device)
-
-    # Add 0 and N to the set of dividers to form the boundaries.
-    boundaries = torch.cat(
-        [
-            torch.tensor([0], device=device),
-            dividers,
-            torch.tensor([N], device=device),
-        ]
-    )
-
-    # Sort the boundaries to ensure they are in order
-    sorted_boundaries = torch.sort(boundaries).values
-
-    # The K integers are the differences between consecutive boundaries
-    result = sorted_boundaries[1:] - sorted_boundaries[:-1]
-
-    return result.to(dtype=torch.int32)
-
-
 def standard_pipeline(
     input_tensor: torch.Tensor,
     expert_weights_t: torch.Tensor,

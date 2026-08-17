@@ -14,9 +14,9 @@ from typing import List
 
 import torch
 from tabulate import tabulate
-from tqdm import tqdm
 from triton.testing import do_bench
 
+from benchmarks.utils import run_experiments_and_print, with_banner
 from torchao.prototype.moe_training.kernels.jagged_float8_scales import (
     triton_fp8_per_group_colwise_scales,
     triton_fp8_per_group_colwise_scales_dual,
@@ -161,24 +161,23 @@ def print_results(experiments: List[Experiment]):
 
 
 def main():
-    torch.random.manual_seed(123)
-    configs = get_configs()
-    results = []
-    for config in tqdm(configs):
-        result = run_experiment(config)
-        results.append(Experiment(config=config, result=result))
-
-    print()
-    print("=" * 70)
-    print("Dual Colwise FP8 Scales Kernel Benchmark")
-    print()
-    print("  two calls : triton_fp8_per_group_colwise_scales called twice")
-    print("              (baseline — backward pass before optimization)")
-    print("  dual      : triton_fp8_per_group_colwise_scales_dual — single launch")
-    print("              merges row loops for both tensors")
-    print("=" * 70)
-    print()
-    print_results(results)
+    run_experiments_and_print(
+        get_configs,
+        run_experiment,
+        with_banner(
+            print_results,
+            banner_lines=[
+                "Dual Colwise FP8 Scales Kernel Benchmark",
+                "",
+                "  two calls : triton_fp8_per_group_colwise_scales called twice",
+                "              (baseline — backward pass before optimization)",
+                "  dual      : triton_fp8_per_group_colwise_scales_dual — single launch",
+                "              merges row loops for both tensors",
+            ],
+            banner_width=70,
+        ),
+        Experiment,
+    )
 
 
 if __name__ == "__main__":

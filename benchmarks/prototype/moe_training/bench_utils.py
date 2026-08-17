@@ -39,3 +39,39 @@ def setup_distributed():
     world_size = int(os.environ["WORLD_SIZE"])
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
+
+
+def generate_split_sizes(K: int, N: int, device: str = "cuda") -> torch.Tensor:
+    """Generate a tensor of ``K`` random non-negative integers that sum to ``N``.
+
+    Shared by the MoE EP benchmarks so the split-size generation logic has a
+    single source of truth. Returns an ``int64`` tensor; callers that need a
+    different integer width (e.g. ``int32``) can ``.to()`` the result.
+    """
+    if K <= 0:
+        raise ValueError("K must be a positive integer.")
+    if N < 0:
+        raise ValueError("N must be a non-negative integer.")
+
+    if K == 1:
+        return torch.tensor([N], dtype=torch.int64, device=device)
+
+    # Generate K-1 random "dividers" in the range [0, N].
+    dividers = torch.randint(0, N + 1, (K - 1,), device=device)
+
+    # Add 0 and N to the set of dividers to form the boundaries.
+    boundaries = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            dividers,
+            torch.tensor([N], device=device),
+        ]
+    )
+
+    # Sort the boundaries to ensure they are in order
+    sorted_boundaries = torch.sort(boundaries).values
+
+    # The K integers are the differences between consecutive boundaries (sum to N)
+    result = sorted_boundaries[1:] - sorted_boundaries[:-1]
+
+    return result.to(dtype=torch.int64)
