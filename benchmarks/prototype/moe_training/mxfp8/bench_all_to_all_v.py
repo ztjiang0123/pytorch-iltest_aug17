@@ -11,7 +11,6 @@
 #
 #######################################################################
 import argparse
-import os
 import time
 from dataclasses import dataclass
 from typing import List
@@ -27,6 +26,7 @@ from torch.distributed._functional_collectives import (
 from torch.nn import functional as F
 from tqdm import tqdm
 
+from benchmarks.prototype.moe_training.bench_utils import setup_distributed
 from benchmarks.utils import profile_fn
 from torchao.prototype.moe_training.kernels.mxfp8.comms import (
     to_mxfp8_a2a_dequant,
@@ -334,13 +334,6 @@ def main(args: argparse.Namespace):
 
     # Clean up process group
     dist.destroy_process_group()
-
-
-def setup_distributed():
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
 
 
 if __name__ == "__main__":

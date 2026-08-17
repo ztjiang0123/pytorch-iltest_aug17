@@ -5,8 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 # this benchmarking script is a modified version of the original script from: https://github.com/drisspg/transformer_nuggets/blob/main/transformer_nuggets/utils/benchmark.py
 
-import itertools
 from dataclasses import dataclass
+from functools import partial
 from typing import List
 
 import torch
@@ -14,8 +14,11 @@ from tabulate import tabulate
 from tqdm import tqdm
 from triton.testing import do_bench
 
-from torchao.float8.config import ScalingGranularity
-from torchao.float8.float8_utils import tensor_to_scale, to_fp8_saturated
+from benchmarks.prototype.moe_training.fp8_rowwise.bench_utils import (
+    ExperimentConfig,
+    build_configs,
+    reference_scale_and_cast,
+)
 from torchao.prototype.moe_training.kernels import (
     triton_fp8_rowwise_2d_scale_and_cast,
 )
@@ -23,13 +26,6 @@ from torchao.prototype.moe_training.kernels import (
 device = torch.device("cuda")
 
 torch._dynamo.config.cache_size_limit = 1000
-
-
-@dataclass(frozen=True)
-class ExperimentConfig:
-    high_precision_dtype: torch.dtype
-    input_shape: tuple  # (M, K)
-    round_scales_to_power_of_2: bool
 
 
 @dataclass(frozen=True)
@@ -46,38 +42,25 @@ class Experiment:
     result: ExperimentResult
 
 
-def get_configs() -> List[ExperimentConfig]:
-    # MoE-relevant 2D shapes: (M, K) where M = total tokens routed to experts.
-    # In practice M depends on batch_size * seq_len * top_k / num_experts.
-    # K is model hidden dim or intermediate dim.
-    input_shapes = [
-        (128, 5120),
-        (128, 8192),
-        (1024, 5120),
-        (1024, 8192),
-        (4096, 5120),
-        (4096, 8192),
-        (8192, 5120),
-        (8192, 8192),
-        (16384, 5120),
-        (16384, 8192),
-    ]
-    high_precision_dtypes = [torch.bfloat16]
-    power_of_2_scales = [True]
-    configs = []
-    for (
-        input_shape,
-        high_precision_dtype,
-        round_scales_to_power_of_2,
-    ) in itertools.product(input_shapes, high_precision_dtypes, power_of_2_scales):
-        configs.append(
-            ExperimentConfig(
-                input_shape=input_shape,
-                high_precision_dtype=high_precision_dtype,
-                round_scales_to_power_of_2=round_scales_to_power_of_2,
-            )
-        )
-    return configs
+# MoE-relevant 2D shapes: (M, K) where M = total tokens routed to experts.
+# In practice M depends on batch_size * seq_len * top_k / num_experts.
+# K is model hidden dim or intermediate dim.
+INPUT_SHAPES = [
+    (128, 5120),
+    (128, 8192),
+    (1024, 5120),
+    (1024, 8192),
+    (4096, 5120),
+    (4096, 8192),
+    (8192, 5120),
+    (8192, 8192),
+    (16384, 5120),
+    (16384, 8192),
+]
+
+# Config factory bound to this benchmark's shapes; the enumeration lives in
+# build_configs() so it is shared with the 3D scale-and-cast benchmark.
+get_configs = partial(build_configs, INPUT_SHAPES)
 
 
 def benchmark_cuda_function_in_microseconds(f, *args, **kwargs):
@@ -97,16 +80,12 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
     # This is the best-case for the unfused path: the compiler sees the full sequence
     # and can fuse ops freely.
     def run_original(A: torch.Tensor):
-        A_scales = tensor_to_scale(
+        return reference_scale_and_cast(
             A,
             float8_dtype,
-            scaling_granularity=ScalingGranularity.AXISWISE,
             axiswise_dim=-1,
             round_scales_to_power_of_2=config.round_scales_to_power_of_2,
         )
-        A_scaled = A.to(torch.float32) * A_scales
-        A_data = to_fp8_saturated(A_scaled, float8_dtype)
-        return A_data, A_scales
 
     run_original_compiled = torch.compile(run_original)
 

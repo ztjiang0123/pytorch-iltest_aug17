@@ -11,7 +11,6 @@
 #
 #######################################################################
 import argparse
-import os
 import sys
 import time
 from dataclasses import dataclass
@@ -29,6 +28,7 @@ from tqdm import tqdm
 repo_root = Path(__file__).resolve().parent.parent.parent.parent.parent
 sys.path.insert(0, str(repo_root))
 
+from benchmarks.prototype.moe_training.bench_utils import setup_distributed
 from benchmarks.utils import profile_fn
 from torchao.prototype.moe_training.ep import (
     a2a_combine_hp_fwd_mxfp8_bwd,
@@ -573,14 +573,6 @@ def main(args: argparse.Namespace):
 
     # Clean up process group
     dist.destroy_process_group()
-
-
-def setup_distributed():
-    """Initialize distributed process group."""
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
 
 
 if __name__ == "__main__":
