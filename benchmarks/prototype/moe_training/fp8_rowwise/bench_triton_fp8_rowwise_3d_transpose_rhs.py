@@ -11,9 +11,9 @@ from typing import List
 
 import torch
 from tabulate import tabulate
-from tqdm import tqdm
 from triton.testing import do_bench
 
+from benchmarks.utils import run_experiments_and_print
 from torchao.prototype.moe_training.kernels.float8_rowwise import (
     triton_fp8_rowwise_3d_transpose_rhs,
     triton_fp8_rowwise_3d_transpose_rhs_fused_reduction,
@@ -204,15 +204,7 @@ def benchmark_cuda_function_in_microseconds(f, *args):
 
 
 def main():
-    torch.random.manual_seed(123)
-    configs = get_configs()
-    results = []
-    for config in tqdm(configs):
-        result = run_experiment(config)
-        results.append(Experiment(config=config, result=result))
-
-    # Use Tabulate to print results
-    print_results(results)
+    run_experiments_and_print(get_configs, run_experiment, print_results, Experiment)
 
 
 if __name__ == "__main__":

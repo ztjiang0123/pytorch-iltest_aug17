@@ -11,9 +11,11 @@ from typing import List
 
 import torch
 from tabulate import tabulate
-from tqdm import tqdm
 
-from benchmarks.utils import benchmark_cuda_function_in_microseconds
+from benchmarks.utils import (
+    benchmark_cuda_function_in_microseconds,
+    run_experiments_and_print,
+)
 from torchao.prototype.moe_training.kernels.mxfp8 import mxfp8_quantize_cuda_3d
 from torchao.prototype.moe_training.mxfp8_grouped_mm import (
     _to_mxfp8_dim1_3d,
@@ -264,15 +266,7 @@ def print_results(experiments: List[Experiment]):
 
 
 def main():
-    torch.random.manual_seed(123)
-    configs = get_configs()
-    results = []
-    for config in tqdm(configs):
-        result = run_experiment(config)
-        results.append(Experiment(config=config, result=result))
-
-    # Use Tabulate to print results
-    print_results(results)
+    run_experiments_and_print(get_configs, run_experiment, print_results, Experiment)
 
 
 if __name__ == "__main__":

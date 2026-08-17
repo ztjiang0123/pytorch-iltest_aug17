@@ -11,9 +11,9 @@ from typing import List
 
 import torch
 from tabulate import tabulate
-from tqdm import tqdm
 from triton.testing import do_bench
 
+from benchmarks.utils import run_experiments_and_print
 from torchao.float8.config import ScalingGranularity
 from torchao.float8.float8_utils import tensor_to_scale, to_fp8_saturated
 from torchao.prototype.moe_training.kernels import (
@@ -185,14 +185,7 @@ def print_results(experiments: List[Experiment]):
 
 
 def main():
-    torch.random.manual_seed(123)
-    configs = get_configs()
-    results = []
-    for config in tqdm(configs):
-        result = run_experiment(config)
-        results.append(Experiment(config=config, result=result))
-
-    print_results(results)
+    run_experiments_and_print(get_configs, run_experiment, print_results, Experiment)
 
 
 if __name__ == "__main__":
