@@ -41,18 +41,12 @@ def setup_distributed():
     torch.cuda.set_device(rank)
 
 
-def generate_split_sizes(
-    K: int,
-    N: int,
-    device: str = "cuda",
-    dtype: torch.dtype = torch.int64,
-) -> torch.Tensor:
+def generate_split_sizes(K: int, N: int, device: str = "cuda") -> torch.Tensor:
     """Generate a tensor of ``K`` random non-negative integers that sum to ``N``.
 
     Shared by the MoE EP benchmarks so the split-size generation logic has a
-    single source of truth. ``dtype`` selects the integer type of the returned
-    tensor (e.g. ``torch.int64`` for all-to-all-v, ``torch.int32`` for the EP
-    pipeline).
+    single source of truth. Returns an ``int64`` tensor; callers that need a
+    different integer width (e.g. ``int32``) can ``.to()`` the result.
     """
     if K <= 0:
         raise ValueError("K must be a positive integer.")
@@ -60,7 +54,7 @@ def generate_split_sizes(
         raise ValueError("N must be a non-negative integer.")
 
     if K == 1:
-        return torch.tensor([N], dtype=dtype, device=device)
+        return torch.tensor([N], dtype=torch.int64, device=device)
 
     # Generate K-1 random "dividers" in the range [0, N].
     dividers = torch.randint(0, N + 1, (K - 1,), device=device)
@@ -80,4 +74,4 @@ def generate_split_sizes(
     # The K integers are the differences between consecutive boundaries (sum to N)
     result = sorted_boundaries[1:] - sorted_boundaries[:-1]
 
-    return result.to(dtype=dtype)
+    return result.to(dtype=torch.int64)

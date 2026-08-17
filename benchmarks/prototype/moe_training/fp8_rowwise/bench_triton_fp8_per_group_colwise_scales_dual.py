@@ -16,7 +16,7 @@ import torch
 from tabulate import tabulate
 from triton.testing import do_bench
 
-from benchmarks.utils import run_experiments_and_print
+from benchmarks.utils import run_experiments_and_print, with_banner
 from torchao.prototype.moe_training.kernels.jagged_float8_scales import (
     triton_fp8_per_group_colwise_scales,
     triton_fp8_per_group_colwise_scales_dual,
@@ -164,17 +164,19 @@ def main():
     run_experiments_and_print(
         get_configs,
         run_experiment,
-        print_results,
+        with_banner(
+            print_results,
+            banner_lines=[
+                "Dual Colwise FP8 Scales Kernel Benchmark",
+                "",
+                "  two calls : triton_fp8_per_group_colwise_scales called twice",
+                "              (baseline — backward pass before optimization)",
+                "  dual      : triton_fp8_per_group_colwise_scales_dual — single launch",
+                "              merges row loops for both tensors",
+            ],
+            banner_width=70,
+        ),
         Experiment,
-        banner_lines=[
-            "Dual Colwise FP8 Scales Kernel Benchmark",
-            "",
-            "  two calls : triton_fp8_per_group_colwise_scales called twice",
-            "              (baseline — backward pass before optimization)",
-            "  dual      : triton_fp8_per_group_colwise_scales_dual — single launch",
-            "              merges row loops for both tensors",
-        ],
-        banner_width=70,
     )
 
 

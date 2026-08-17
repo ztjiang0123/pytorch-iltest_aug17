@@ -18,7 +18,7 @@ from benchmarks.prototype.moe_training.fp8_rowwise.bench_utils import (
     build_configs,
     reference_scale_and_cast,
 )
-from benchmarks.utils import run_experiments_and_print
+from benchmarks.utils import run_experiments_and_print, with_banner
 from torchao.prototype.moe_training.kernels import (
     triton_fp8_rowwise_2d_scale_and_cast,
 )
@@ -170,17 +170,19 @@ def main():
     run_experiments_and_print(
         get_configs,
         run_experiment,
-        print_results,
+        with_banner(
+            print_results,
+            banner_lines=[
+                "Fused 2D Scale+Cast Kernel Benchmark",
+                "",
+                "  torch.compile : torch.compile of the native 3-op sequence",
+                "                  (tensor_to_scale + multiply + to_fp8_saturated).",
+                "                  Best-case for the unfused path.",
+                "  triton        : triton_fp8_rowwise_2d_scale_and_cast() fused kernel.",
+            ],
+            banner_width=90,
+        ),
         Experiment,
-        banner_lines=[
-            "Fused 2D Scale+Cast Kernel Benchmark",
-            "",
-            "  torch.compile : torch.compile of the native 3-op sequence",
-            "                  (tensor_to_scale + multiply + to_fp8_saturated).",
-            "                  Best-case for the unfused path.",
-            "  triton        : triton_fp8_rowwise_2d_scale_and_cast() fused kernel.",
-        ],
-        banner_width=90,
     )
 
 

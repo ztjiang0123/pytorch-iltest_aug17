@@ -119,8 +119,6 @@ def run_experiments_and_print(
     print_results,
     experiment_cls,
     run_experiment_kwargs=None,
-    banner_lines=None,
-    banner_width=0,
 ):
     """Shared driver for the ``main()`` of the config/experiment benchmark scripts.
 
@@ -132,9 +130,8 @@ def run_experiments_and_print(
     of copying it. ``run_experiment_kwargs`` forwards extra keyword arguments
     (e.g. profiling flags) to ``run_experiment``.
 
-    ``banner_lines``/``banner_width`` optionally print an explanatory banner
-    (bracketed by ``banner_width`` ``=`` separators) before the results table,
-    for benchmarks that describe their columns up front.
+    Benchmarks that want an explanatory banner printed before the results table
+    wrap their ``print_results`` with :func:`with_banner`.
     """
     run_experiment_kwargs = run_experiment_kwargs or {}
     torch.random.manual_seed(123)
@@ -143,8 +140,20 @@ def run_experiments_and_print(
     for config in tqdm(configs):
         result = run_experiment(config, **run_experiment_kwargs)
         results.append(experiment_cls(config=config, result=result))
+    print_results(results)
 
-    if banner_lines:
+
+def with_banner(print_results, banner_lines, banner_width):
+    """Wrap ``print_results`` so it first prints a banner.
+
+    Returns a ``print_results``-compatible callable that prints ``banner_lines``
+    bracketed by ``banner_width``-wide ``=`` separators, then delegates to the
+    original ``print_results``. Shared by the benchmarks whose ``main()`` prints
+    an explanatory banner ahead of the results table, so the seed/loop/print
+    driver stays in :func:`run_experiments_and_print`.
+    """
+
+    def print_results_with_banner(results):
         separator = "=" * banner_width
         print()
         print(separator)
@@ -152,5 +161,6 @@ def run_experiments_and_print(
             print(line)
         print(separator)
         print()
+        print_results(results)
 
-    print_results(results)
+    return print_results_with_banner
