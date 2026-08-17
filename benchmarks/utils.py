@@ -118,20 +118,20 @@ def run_experiments_and_print(
     run_experiment,
     print_results,
     experiment_cls,
-    *,
-    seed=123,
     run_experiment_kwargs=None,
 ):
     """Shared driver for the ``main()`` of the config/experiment benchmark scripts.
 
-    Seeds the RNG, builds configs via ``get_configs()``, runs ``run_experiment``
-    on each, wraps the ``(config, result)`` pair in ``experiment_cls`` and hands
-    the collected experiments to ``print_results``. Every benchmark script that
-    follows the config -> run_experiment -> print_results pattern shares this
-    driver instead of copying it.
+    Seeds the RNG (to the fixed 123 the benchmarks share), builds configs via
+    ``get_configs()``, runs ``run_experiment`` on each, wraps the
+    ``(config, result)`` pair in ``experiment_cls`` and hands the collected
+    experiments to ``print_results``. Every benchmark script that follows the
+    config -> run_experiment -> print_results pattern shares this driver instead
+    of copying it. ``run_experiment_kwargs`` forwards extra keyword arguments
+    (e.g. profiling flags) to ``run_experiment``.
     """
     run_experiment_kwargs = run_experiment_kwargs or {}
-    torch.random.manual_seed(seed)
+    torch.random.manual_seed(123)
     configs = get_configs()
     results = []
     for config in tqdm(configs):
