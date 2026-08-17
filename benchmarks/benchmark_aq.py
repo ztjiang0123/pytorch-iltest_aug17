@@ -6,6 +6,7 @@
 """Benchmarks for affine quantized tensor, this includes int8 dynamic quant, int8 weight only quant and int4 weight only quant APIs"""
 
 import copy
+from dataclasses import dataclass, field
 
 import torch
 
@@ -18,17 +19,29 @@ from torchao.quantization.quant_api import (
 )
 
 
+@dataclass
+class ToyLinearModelConfig:
+    """Problem size and placement options for :class:`ToyLinearModel`."""
+
+    m: int = 64
+    n: int = 32
+    k: int = 64
+    has_bias: bool = False
+    dtype: torch.dtype = field(default_factory=lambda: torch.float)
+    device: str = "cuda"
+
+
 class ToyLinearModel(torch.nn.Module):
     """Single linear for m * k * n problem size"""
 
-    def __init__(
-        self, m=64, n=32, k=64, has_bias=False, dtype=torch.float, device="cuda"
-    ):
+    def __init__(self, config=None):
         super().__init__()
-        self.m = m
-        self.dtype = dtype
-        self.device = device
-        self.linear = torch.nn.Linear(k, n, bias=has_bias).to(
+        if config is None:
+            config = ToyLinearModelConfig()
+        self.m = config.m
+        self.dtype = config.dtype
+        self.device = config.device
+        self.linear = torch.nn.Linear(config.k, config.n, bias=config.has_bias).to(
             dtype=self.dtype, device=self.device
         )
 
@@ -71,7 +84,9 @@ torch._dynamo.config.cache_size_limit = 50000
 @torch.no_grad
 def _bench_quantized_tensor_subclass_perf(api, config, M, N, K):
     m = ToyLinearModel(
-        M, N, K, has_bias=True, dtype=torch.bfloat16, device="cuda"
+        ToyLinearModelConfig(
+            m=M, n=N, k=K, has_bias=True, dtype=torch.bfloat16, device="cuda"
+        )
     ).eval()
     m_bf16 = copy.deepcopy(m)
     example_inputs = m.example_inputs()
