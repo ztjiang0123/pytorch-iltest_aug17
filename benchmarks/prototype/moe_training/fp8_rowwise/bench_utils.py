@@ -7,9 +7,10 @@
 
 import itertools
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Callable, List, Sequence, Tuple
 
 import torch
+from tabulate import tabulate
 
 from torchao.float8.config import ScalingGranularity
 from torchao.float8.float8_utils import tensor_to_scale, to_fp8_saturated
@@ -50,6 +51,53 @@ def build_configs(
             )
         )
     return configs
+
+
+def build_per_group_configs(
+    experiment_config_cls: Callable[..., object],
+    input_shapes: List[Tuple[int, ...]],
+    n_groups_list: List[int] = None,
+    high_precision_dtypes: List[torch.dtype] = None,
+) -> List[object]:
+    """Build the cartesian product of shapes/groups/dtypes into per-group configs.
+
+    Shared by the per-group colwise and rowwise scale benchmarks, which build an
+    identical grid and differ only in their ``input_shapes``. Each benchmark
+    passes its own ``ExperimentConfig`` dataclass as ``experiment_config_cls``;
+    the dataclass fields (``input_shape``, ``n_groups``, ``high_precision_dtype``)
+    are identical across those benchmarks.
+    """
+    if n_groups_list is None:
+        n_groups_list = [1, 16, 64]
+    if high_precision_dtypes is None:
+        high_precision_dtypes = [torch.bfloat16]
+    configs = []
+    for input_shape, n_groups, high_precision_dtype in itertools.product(
+        input_shapes, n_groups_list, high_precision_dtypes
+    ):
+        configs.append(
+            experiment_config_cls(
+                input_shape=input_shape,
+                n_groups=n_groups,
+                high_precision_dtype=high_precision_dtype,
+            )
+        )
+    return configs
+
+
+def print_experiment_table(
+    experiments: Sequence[object],
+    headers: List[str],
+    row_fn: Callable[[object], List[object]],
+) -> None:
+    """Render a benchmark results table with ``tabulate``.
+
+    Shared by the per-group scale benchmarks whose ``print_results`` functions
+    only differ in their ``headers`` and the per-experiment row they build.
+    ``row_fn`` maps a single experiment to the list of cell values for its row.
+    """
+    rows = [row_fn(experiment) for experiment in experiments]
+    print(tabulate(rows, headers=headers))
 
 
 def reference_scale_and_cast(

@@ -10,9 +10,11 @@ from dataclasses import dataclass
 from typing import List
 
 import torch
-from tabulate import tabulate
 from triton.testing import do_bench
 
+from benchmarks.prototype.moe_training.fp8_rowwise.bench_utils import (
+    print_experiment_table,
+)
 from benchmarks.utils import run_experiments_and_print
 from torchao.prototype.moe_training.kernels.float8_rowwise import (
     triton_fp8_rowwise_3d_transpose_rhs,
@@ -89,29 +91,26 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
         for _ in range(10):
             func(*args, **kwargs)
 
-    def run_torch(input_tensor: torch.Tensor):
-        out = torch_to_3d_rowwise_float8_transpose_rhs(
-            input_tensor,
-            target_dtype=torch.float8_e4m3fn,
-            round_scales_to_power_of_2=config.power_of_2_scales,
-        )
-        return out
+    def make_runner(kernel_fn, dtype_kwarg: str):
+        """Wrap ``kernel_fn`` so it is called with the fp8 dtype and this
+        config's scale-rounding flag. ``dtype_kwarg`` names the dtype keyword
+        the kernel expects (``target_dtype`` for the torch reference,
+        ``output_dtype`` for the triton kernels)."""
 
-    def run_triton_atomic(input_tensor: torch.Tensor):
-        out = triton_fp8_rowwise_3d_transpose_rhs(
-            input_tensor,
-            output_dtype=torch.float8_e4m3fn,
-            round_scales_to_power_of_2=config.power_of_2_scales,
-        )
-        return out
+        def run(input_tensor: torch.Tensor):
+            return kernel_fn(
+                input_tensor,
+                round_scales_to_power_of_2=config.power_of_2_scales,
+                **{dtype_kwarg: torch.float8_e4m3fn},
+            )
 
-    def run_triton_reduction(input_tensor: torch.Tensor):
-        out = triton_fp8_rowwise_3d_transpose_rhs_fused_reduction(
-            input_tensor,
-            output_dtype=torch.float8_e4m3fn,
-            round_scales_to_power_of_2=config.power_of_2_scales,
-        )
-        return out
+        return run
+
+    run_torch = make_runner(torch_to_3d_rowwise_float8_transpose_rhs, "target_dtype")
+    run_triton_atomic = make_runner(triton_fp8_rowwise_3d_transpose_rhs, "output_dtype")
+    run_triton_reduction = make_runner(
+        triton_fp8_rowwise_3d_transpose_rhs_fused_reduction, "output_dtype"
+    )
 
     # bench torch
     compiled_run_torch = torch.compile(run_torch)
@@ -179,24 +178,23 @@ def print_results(experiments: List[Experiment]):
         "triton_atomic_speedup",
         "triton_reduction_speedup",
     ]
-    rows = []
-    for experiment in experiments:
+
+    def make_row(experiment):
         input_shape = f"({experiment.config.input_shape[0]}, {experiment.config.input_shape[1], experiment.config.input_shape[2]})"
-        rows.append(
-            [
-                input_shape,
-                experiment.config.power_of_2_scales,
-                experiment.result.torch_time_us,
-                experiment.result.triton_atomic_time_us,
-                experiment.result.triton_reduction_time_us,
-                round(experiment.result.torch_mem_bw_gbps, 3),
-                round(experiment.result.triton_atomic_mem_bw_gbps, 3),
-                round(experiment.result.triton_reduction_mem_bw_gbps, 3),
-                f"{experiment.result.torch_time_us / experiment.result.triton_atomic_time_us:.2f}x",
-                f"{experiment.result.torch_time_us / experiment.result.triton_reduction_time_us:.2f}x",
-            ]
-        )
-    print(tabulate(rows, headers=headers))
+        return [
+            input_shape,
+            experiment.config.power_of_2_scales,
+            experiment.result.torch_time_us,
+            experiment.result.triton_atomic_time_us,
+            experiment.result.triton_reduction_time_us,
+            round(experiment.result.torch_mem_bw_gbps, 3),
+            round(experiment.result.triton_atomic_mem_bw_gbps, 3),
+            round(experiment.result.triton_reduction_mem_bw_gbps, 3),
+            f"{experiment.result.torch_time_us / experiment.result.triton_atomic_time_us:.2f}x",
+            f"{experiment.result.torch_time_us / experiment.result.triton_reduction_time_us:.2f}x",
+        ]
+
+    print_experiment_table(experiments, headers, make_row)
 
 
 def benchmark_cuda_function_in_microseconds(f, *args):

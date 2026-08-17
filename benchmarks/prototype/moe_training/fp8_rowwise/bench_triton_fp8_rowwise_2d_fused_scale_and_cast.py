@@ -11,7 +11,6 @@ from typing import List
 
 import torch
 from tabulate import tabulate
-from tqdm import tqdm
 from triton.testing import do_bench
 
 from benchmarks.prototype.moe_training.fp8_rowwise.bench_utils import (
@@ -19,6 +18,7 @@ from benchmarks.prototype.moe_training.fp8_rowwise.bench_utils import (
     build_configs,
     reference_scale_and_cast,
 )
+from benchmarks.utils import run_experiments_and_print
 from torchao.prototype.moe_training.kernels import (
     triton_fp8_rowwise_2d_scale_and_cast,
 )
@@ -167,24 +167,21 @@ def print_results(experiments: List[Experiment]):
 
 
 def main():
-    torch.random.manual_seed(123)
-    configs = get_configs()
-    results = []
-    for config in tqdm(configs):
-        result = run_experiment(config)
-        results.append(Experiment(config=config, result=result))
-
-    print()
-    print("=" * 90)
-    print("Fused 2D Scale+Cast Kernel Benchmark")
-    print()
-    print("  torch.compile : torch.compile of the native 3-op sequence")
-    print("                  (tensor_to_scale + multiply + to_fp8_saturated).")
-    print("                  Best-case for the unfused path.")
-    print("  triton        : triton_fp8_rowwise_2d_scale_and_cast() fused kernel.")
-    print("=" * 90)
-    print()
-    print_results(results)
+    run_experiments_and_print(
+        get_configs,
+        run_experiment,
+        print_results,
+        Experiment,
+        banner_lines=[
+            "Fused 2D Scale+Cast Kernel Benchmark",
+            "",
+            "  torch.compile : torch.compile of the native 3-op sequence",
+            "                  (tensor_to_scale + multiply + to_fp8_saturated).",
+            "                  Best-case for the unfused path.",
+            "  triton        : triton_fp8_rowwise_2d_scale_and_cast() fused kernel.",
+        ],
+        banner_width=90,
+    )
 
 
 if __name__ == "__main__":

@@ -119,6 +119,8 @@ def run_experiments_and_print(
     print_results,
     experiment_cls,
     run_experiment_kwargs=None,
+    banner_lines=None,
+    banner_width=0,
 ):
     """Shared driver for the ``main()`` of the config/experiment benchmark scripts.
 
@@ -129,6 +131,10 @@ def run_experiments_and_print(
     config -> run_experiment -> print_results pattern shares this driver instead
     of copying it. ``run_experiment_kwargs`` forwards extra keyword arguments
     (e.g. profiling flags) to ``run_experiment``.
+
+    ``banner_lines``/``banner_width`` optionally print an explanatory banner
+    (bracketed by ``banner_width`` ``=`` separators) before the results table,
+    for benchmarks that describe their columns up front.
     """
     run_experiment_kwargs = run_experiment_kwargs or {}
     torch.random.manual_seed(123)
@@ -137,4 +143,14 @@ def run_experiments_and_print(
     for config in tqdm(configs):
         result = run_experiment(config, **run_experiment_kwargs)
         results.append(experiment_cls(config=config, result=result))
+
+    if banner_lines:
+        separator = "=" * banner_width
+        print()
+        print(separator)
+        for line in banner_lines:
+            print(line)
+        print(separator)
+        print()
+
     print_results(results)

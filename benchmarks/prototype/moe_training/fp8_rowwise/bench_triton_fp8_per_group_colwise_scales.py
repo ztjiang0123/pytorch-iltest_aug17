@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 # this benchmarking script is a modified version of the original script from: https://github.com/drisspg/transformer_nuggets/blob/main/transformer_nuggets/utils/benchmark.py
 
-import itertools
 from dataclasses import dataclass
 from typing import List
 
@@ -13,6 +12,9 @@ import torch
 from tabulate import tabulate
 from triton.testing import do_bench
 
+from benchmarks.prototype.moe_training.fp8_rowwise.bench_utils import (
+    build_per_group_configs,
+)
 from benchmarks.utils import run_experiments_and_print
 from torchao.prototype.moe_training.kernels.jagged_float8_scales import (
     triton_fp8_per_group_colwise_scales,
@@ -51,20 +53,7 @@ class Experiment:
 
 def get_configs() -> List[ExperimentConfig]:
     input_shapes = [(16640, 5120)]  # (Mg, K)
-    n_groups_list = [1, 16, 64]
-    high_precision_dtypes = [torch.bfloat16]
-    configs = []
-    for input_shape, n_groups, high_precision_dtype in itertools.product(
-        input_shapes, n_groups_list, high_precision_dtypes
-    ):
-        configs.append(
-            ExperimentConfig(
-                input_shape=input_shape,
-                n_groups=n_groups,
-                high_precision_dtype=high_precision_dtype,
-            )
-        )
-    return configs
+    return build_per_group_configs(ExperimentConfig, input_shapes)
 
 
 def run_experiment(config: ExperimentConfig) -> ExperimentResult:
