@@ -19,7 +19,7 @@ from torchao.quantization.quant_api import (
 # Allow importing the shared benchmark helpers regardless of the working
 # directory the script is launched from.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from utils import benchmark_fn_in_usec  # noqa: E402
+from utils import benchmark_fn_in_usec
 
 
 def run(torch_compile_mode: str = "default"):

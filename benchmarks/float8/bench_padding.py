@@ -24,7 +24,7 @@ from torchao.float8.float8_utils import pad_tensor_for_matmul
 # Allow importing the shared benchmark helpers regardless of the working
 # directory the script is launched from.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from utils import benchmark_fn_in_usec  # noqa: E402
+from utils import benchmark_fn_in_usec
 
 # estimating TOPs for matmuls in fp32, fp16, fp8
 # assuming A * B = C, with A being M * K, B being K * N, C being M * N
