@@ -1,6 +1,13 @@
 import torch
+from torch._inductor.utils import do_bench_using_profiling
 from torch.nn import functional as F
 from triton.testing import do_bench
+
+
+def benchmark_fn_in_usec(f, *args, **kwargs):
+    no_args = lambda: f(*args, **kwargs)
+    time = do_bench_using_profiling(no_args)
+    return time * 1e3
 
 
 def bench_fwd_bwd_microseconds(fn, *args, use_compile=False, fullgraph=True, **kwargs):
