@@ -10,7 +10,20 @@ import re
 from typing import Optional
 
 import torch.utils.benchmark as benchmark
+from torch._inductor.utils import do_bench_using_profiling
 from torch.profiler import ProfilerActivity, profile
+
+
+def benchmark_fn_in_usec(f, *args, **kwargs):
+    """Benchmark ``f(*args, **kwargs)`` with the inductor profiler, in microseconds.
+
+    Shared by the float8/inference benchmark scripts so the profiling-based
+    timing helper lives in one place instead of being copied per script.
+    """
+    no_args = lambda: f(*args, **kwargs)
+    time = do_bench_using_profiling(no_args)
+    return time * 1e3
+
 
 DSV3_16B_671B_SHAPE_GEN_NAME = "dsv3-16b-671b"
 DSV3_16B_671B_SEQ_LEN = 4096

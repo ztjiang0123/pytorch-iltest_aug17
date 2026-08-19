@@ -73,10 +73,13 @@ class Experiment:
     scaling_repr: str
 
     # 3 Times since we are calculating forward backward
+    def _tops_sec(self, time_sec):
+        M, K, N = self.shape
+        return float(3 * (2 * M * K * N)) / time_sec
+
     @property
     def ref_tops_sec(self):
-        M, K, N = self.shape
-        return float(3 * (2 * M * K * N)) / self.ref_time_sec
+        return self._tops_sec(self.ref_time_sec)
 
     @property
     def ref_pct_top_peak(self):
@@ -84,8 +87,7 @@ class Experiment:
 
     @property
     def float8_tops_sec(self):
-        M, K, N = self.shape
-        return float(3 * (2 * M * K * N)) / self.float8_time_sec
+        return self._tops_sec(self.float8_time_sec)
 
     @property
     def float8_pct_top_peak(self):

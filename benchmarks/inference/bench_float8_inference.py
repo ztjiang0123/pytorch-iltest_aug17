@@ -3,22 +3,23 @@
 #
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
+import sys
+from pathlib import Path
+
 import fire
 import torch
 import torch.nn as nn
-from torch._inductor.utils import do_bench_using_profiling
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from benchmarks.float8.utils import benchmark_fn_in_usec
 from torchao.quantization.quant_api import (
     Float8DynamicActivationFloat8WeightConfig,
     PerRow,
     quantize_,
 )
-
-
-def benchmark_fn_in_usec(f, *args, **kwargs):
-    no_args = lambda: f(*args, **kwargs)
-    time = do_bench_using_profiling(no_args)
-    return time * 1e3
 
 
 def run(torch_compile_mode: str = "default"):
