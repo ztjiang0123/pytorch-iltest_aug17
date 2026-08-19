@@ -13,6 +13,52 @@ namespace torchao::kernels::cpu::fallback::bitpacking {
 namespace internal {
 
 /**
+ * @brief Shared "pack" primitive for the wide 5-bit formats (count 64 and 128).
+ *
+ * The unpacked data is organized as `2 * groups` rows of `block` bytes. The rows
+ * pair up: for each group `g`, the "low" row (2*g) supplies all 5 bits of a
+ * value and the "high" row (2*g + 1) supplies its top 2 bits. Each group writes
+ * one packed row `packed[g * block + i] = low | (high_low5 << 5)`; the top 2
+ * bits of every high row are then bit-packed four-per-byte into a trailing
+ * region of `groups * block / 4` bytes.
+ *
+ * The count-64 loop (groups = 2) and count-128 loop (groups = 4) are otherwise
+ * identical, so the logic lives here once, parameterized by `groups` (with the
+ * row width fixed at `block = 16`, matching the NEON layout).
+ *
+ * @tparam groups Number of value/high-bit row pairs (2 for count 64, 4 for 128).
+ */
+template <int groups>
+TORCHAO_ALWAYS_INLINE inline void pack_wide_uint5_values(
+    uint8_t* packed,
+    const uint8_t* unpacked) {
+  constexpr int block = 16;
+  constexpr int tail_len = groups * block / 4;
+
+  // Pack each group's low+high row pair into one packed row.
+  for (int i = 0; i < block; ++i) {
+    for (int g = 0; g < groups; ++g) {
+      const uint8_t low = unpacked[2 * g * block + i];
+      const uint8_t high = unpacked[(2 * g + 1) * block + i] & 0x1F;
+      packed[g * block + i] = low | (high << 5);
+    }
+  }
+
+  // Pack the top 2 bits of the `groups` high rows, four per trailing byte.
+  for (int t = 0; t < tail_len; ++t) {
+    uint8_t out = 0;
+    for (int k = 0; k < 4; ++k) {
+      const int hi_flat = k * tail_len + t;
+      const int row = hi_flat / block;
+      const int col = hi_flat % block;
+      const uint8_t hi = unpacked[(2 * row + 1) * block + col] >> 3;
+      out |= hi << (2 * k);
+    }
+    packed[groups * block + t] = out;
+  }
+}
+
+/**
  * @brief Packs 8 bytes, each holding a 5-bit value (0-31), into 5 bytes.
  *
  * @param packed Pointer to the destination memory (5 bytes).
@@ -71,20 +117,7 @@ TORCHAO_ALWAYS_INLINE inline void unpack_8_uint5_values(
 TORCHAO_ALWAYS_INLINE inline void pack_64_uint5_values(
     uint8_t* packed,
     const uint8_t* unpacked) {
-  // Pack the first 32 bytes (p0, p1)
-  for (int i = 0; i < 16; ++i) {
-    packed[i] = unpacked[i] | ((unpacked[i + 16] & 0x1F) << 5);
-    packed[i + 16] = unpacked[i + 32] | ((unpacked[i + 48] & 0x1F) << 5);
-  }
-
-  // Pack the final 8 bytes (p2)
-  for (int i = 0; i < 8; ++i) {
-    uint8_t val1 = unpacked[16 + i] >> 3;
-    uint8_t val2 = unpacked[24 + i] >> 3;
-    uint8_t val3 = unpacked[48 + i] >> 3;
-    uint8_t val4 = unpacked[56 + i] >> 3;
-    packed[32 + i] = val1 | (val2 << 2) | (val3 << 4) | (val4 << 6);
-  }
+  pack_wide_uint5_values<2>(packed, unpacked);
 }
 
 /**
@@ -126,22 +159,7 @@ TORCHAO_ALWAYS_INLINE inline void unpack_64_uint5_values(
 TORCHAO_ALWAYS_INLINE inline void pack_128_uint5_values(
     uint8_t* packed,
     const uint8_t* unpacked) {
-  // Pack the first 64 bytes (p0, p1, p2, p3)
-  for (int i = 0; i < 16; ++i) {
-    packed[i] = unpacked[i] | ((unpacked[i + 16] & 0x1F) << 5);
-    packed[i + 16] = unpacked[i + 32] | ((unpacked[i + 48] & 0x1F) << 5);
-    packed[i + 32] = unpacked[i + 64] | ((unpacked[i + 80] & 0x1F) << 5);
-    packed[i + 48] = unpacked[i + 96] | ((unpacked[i + 112] & 0x1F) << 5);
-  }
-
-  // Pack the final 16 bytes (p4)
-  for (int i = 0; i < 16; ++i) {
-    uint8_t val1 = unpacked[16 + i] >> 3;
-    uint8_t val2 = unpacked[48 + i] >> 3;
-    uint8_t val3 = unpacked[80 + i] >> 3;
-    uint8_t val4 = unpacked[112 + i] >> 3;
-    packed[64 + i] = val1 | (val2 << 2) | (val3 << 4) | (val4 << 6);
-  }
+  pack_wide_uint5_values<4>(packed, unpacked);
 }
 
 /**

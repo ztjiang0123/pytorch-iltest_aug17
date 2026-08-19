@@ -14,6 +14,34 @@ namespace torchao::kernels::cpu::fallback::bitpacking {
 namespace internal {
 
 /**
+ * @brief Shared "unpack-and-transpose" primitive for the 6-bit format.
+ *
+ * The count-32 and count-64 unpack loops are byte-for-byte identical apart from
+ * the block size, so the loop lives here once, parameterized by `block` (the
+ * packed row stride). The packed data is three rows of `block` bytes; each byte
+ * carries a 6-bit value in its low bits plus a 2-bit slice of a fourth value in
+ * its high bits, reassembled into the fourth output row.
+ *
+ * @tparam block Number of columns (== packed row stride).
+ */
+template <int block>
+TORCHAO_ALWAYS_INLINE inline void unpack_transpose_uint6_values(
+    uint8_t* unpacked,
+    const uint8_t* packed) {
+  for (int i = 0; i < block; ++i) {
+    const uint8_t p0 = packed[i];
+    const uint8_t p1 = packed[i + block];
+    const uint8_t p2 = packed[i + 2 * block];
+
+    unpacked[i] = p0 & 0x3F;
+    unpacked[i + block] = p1 & 0x3F;
+    unpacked[i + 2 * block] = p2 & 0x3F;
+    unpacked[i + 3 * block] =
+        ((p0 & 0xC0) >> 6) | ((p1 & 0xC0) >> 4) | ((p2 & 0xC0) >> 2);
+  }
+}
+
+/**
  * @brief Packs 4 bytes, each holding a 6-bit value (0-63), into 3 bytes.
  *
  * @param packed Pointer to the destination memory (3 bytes).
@@ -65,17 +93,7 @@ TORCHAO_ALWAYS_INLINE inline void pack_32_uint6_values(
 TORCHAO_ALWAYS_INLINE inline void unpack_32_uint6_values(
     uint8_t* unpacked,
     const uint8_t* packed) {
-  for (int i = 0; i < 8; ++i) {
-    const uint8_t p0 = packed[i];
-    const uint8_t p1 = packed[i + 8];
-    const uint8_t p2 = packed[i + 16];
-
-    unpacked[i] = p0 & 0x3F;
-    unpacked[i + 8] = p1 & 0x3F;
-    unpacked[i + 16] = p2 & 0x3F;
-    unpacked[i + 24] =
-        ((p0 & 0xC0) >> 6) | ((p1 & 0xC0) >> 4) | ((p2 & 0xC0) >> 2);
-  }
+  unpack_transpose_uint6_values<8>(unpacked, packed);
 }
 
 /**
@@ -111,17 +129,7 @@ TORCHAO_ALWAYS_INLINE inline void pack_64_uint6_values(
 TORCHAO_ALWAYS_INLINE inline void unpack_64_uint6_values(
     uint8_t* unpacked,
     const uint8_t* packed) {
-  for (int i = 0; i < 16; ++i) {
-    const uint8_t p0 = packed[i];
-    const uint8_t p1 = packed[i + 16];
-    const uint8_t p2 = packed[i + 32];
-
-    unpacked[i] = p0 & 0x3F;
-    unpacked[i + 16] = p1 & 0x3F;
-    unpacked[i + 32] = p2 & 0x3F;
-    unpacked[i + 48] =
-        ((p0 & 0xC0) >> 6) | ((p1 & 0xC0) >> 4) | ((p2 & 0xC0) >> 2);
-  }
+  unpack_transpose_uint6_values<16>(unpacked, packed);
 }
 
 } // namespace internal
