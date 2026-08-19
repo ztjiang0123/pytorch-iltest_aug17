@@ -9,6 +9,7 @@
 #include <torchao/csrc/cpu/shared_kernels/internal/library.h>
 #include <torchao/csrc/cpu/shared_kernels/internal/memory.h>
 #include <torchao/csrc/cpu/shared_kernels/internal/parallel.h>
+#include <torchao/csrc/cpu/shared_kernels/internal/tiling.h>
 #include <algorithm>
 #include <cassert>
 #include <vector>
@@ -91,39 +92,12 @@ GroupwiseTilingParams GroupwiseTilingParams::from_target_tiles_per_thread(
     int n,
     int n_step,
     int target_tiles_per_thread) {
-  TORCHAO_CHECK(m >= 1, "m must be >= 1");
-  TORCHAO_CHECK(m_step >= 1, "m_step must be >= 1");
-
-  TORCHAO_CHECK(n >= 1, "n must be >= 1");
-  TORCHAO_CHECK(n_step >= 1, "n_step must be >= 1");
-  TORCHAO_CHECK(
-      target_tiles_per_thread >= 1, "target_tiles_per_thread must be >= 1");
-  auto num_threads = torchao::get_num_threads();
-  TORCHAO_CHECK(num_threads >= 1, "num_threads must be >= 1");
-
-  int mc = m_step;
-  int num_mc_panels = (m + mc - 1) / mc;
-
-  int numerator = n * num_mc_panels;
-  int denominator = num_threads * target_tiles_per_thread;
-
-  // Set nc = ceil(numerator / denominator)
-  int nc = (numerator + denominator - 1) / denominator;
-  assert(nc >= 1);
-
-  // Replace nc with next number n_step divides
-  nc = ((nc + n_step - 1) / n_step) * n_step;
-
-  // Clamp mc, nc to be no larger than m, n
-  mc = std::min(m, mc);
-  nc = std::min(n, nc);
-
-  assert((mc == m) || (mc % m_step == 0));
-  assert((nc == n) || (nc % n_step == 0));
+  auto tile_sizes = torchao::ops::internal::compute_tile_sizes_per_thread(
+      m, m_step, n, n_step, target_tiles_per_thread);
 
   GroupwiseTilingParams tiling_params;
-  tiling_params.mc = mc;
-  tiling_params.nc = nc;
+  tiling_params.mc = tile_sizes.mc;
+  tiling_params.nc = tile_sizes.nc;
   return tiling_params;
 }
 

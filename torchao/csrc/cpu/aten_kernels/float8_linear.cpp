@@ -576,8 +576,12 @@ at::Tensor float8_linear_impl(
 } // anonymous namespace
 
 TORCH_LIBRARY_IMPL(torchao, CPU, m) {
-  m.impl("torchao::float8_linear_prepack_cpu", &float8_linear_prepack_impl);
-  m.impl("torchao::float8_linear_cpu", &float8_linear_impl);
+  torchao_register_impls(
+      m,
+      "torchao::float8_linear_prepack_cpu",
+      &float8_linear_prepack_impl,
+      "torchao::float8_linear_cpu",
+      &float8_linear_impl);
 }
 
 } // namespace torchao

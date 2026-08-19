@@ -6,6 +6,7 @@
 
 #pragma once
 #include <torchao/csrc/cpu/shared_kernels/internal/library.h>
+#include <torchao/csrc/cpu/shared_kernels/internal/tiling.h>
 #include <torchao/csrc/cpu/shared_kernels/linear_8bit_act_xbit_weight/kernel_config.h>
 #include <array>
 #include <cassert>
@@ -176,6 +177,25 @@ struct UKernelConfig {
       pack_weights_with_lut_fn_type pack_weights_with_lut,
       std::array<linear_config_type, kMaxLinearConfigs> linear_configs);
 
+ private:
+  // Shared aggregate builder behind make() and make_with_lut(). Exactly one of
+  // pack_weights / pack_weights_with_lut is expected to be set.
+  static UKernelConfig make_impl(
+      size_t preferred_alignment,
+      int n_step,
+      int nr,
+      int kr,
+      int sr,
+      int weight_nbit,
+      bool has_weight_zeros,
+      bool has_bias,
+      packed_weights_size_fn_type packed_weights_size,
+      packed_weights_offset_fn_type packed_weights_offset,
+      pack_weights_fn_type pack_weights,
+      pack_weights_with_lut_fn_type pack_weights_with_lut,
+      std::array<linear_config_type, kMaxLinearConfigs> linear_configs);
+
+ public:
   inline void validate() const {
     TORCHAO_CHECK(preferred_alignment >= 1, "preferred_alignment must be >= 1");
     TORCHAO_CHECK(n_step >= 1, "n_step must be >= 1");
@@ -222,22 +242,39 @@ struct UKernelConfig {
   }
 
   inline int select_linear_config_idx(int m) const {
-    assert(m >= 1);
-    assert(linear_configs[0].m_step >= 1);
-
-    size_t i = 0;
-    while (i + 1 < linear_configs.size() && linear_configs[i + 1].m_step >= 1 &&
-           linear_configs[i + 1].m_step <= m) {
-      assert(linear_configs[i].m_step < linear_configs[i + 1].m_step);
-      i++;
-    }
-
-    assert(i < linear_configs.size());
-    assert(linear_configs[i].m_step >= 1);
-    assert(i == 0 || linear_configs[i].m_step <= m);
-    return static_cast<int>(i);
+    return torchao::ops::internal::select_config_idx(linear_configs, m);
   }
 };
+
+inline UKernelConfig UKernelConfig::make_impl(
+    size_t preferred_alignment,
+    int n_step,
+    int nr,
+    int kr,
+    int sr,
+    int weight_nbit,
+    bool has_weight_zeros,
+    bool has_bias,
+    packed_weights_size_fn_type packed_weights_size,
+    packed_weights_offset_fn_type packed_weights_offset,
+    pack_weights_fn_type pack_weights,
+    pack_weights_with_lut_fn_type pack_weights_with_lut,
+    std::array<linear_config_type, kMaxLinearConfigs> linear_configs) {
+  return UKernelConfig{
+      preferred_alignment,
+      n_step,
+      nr,
+      kr,
+      sr,
+      weight_nbit,
+      has_weight_zeros,
+      has_bias,
+      packed_weights_size,
+      packed_weights_offset,
+      pack_weights,
+      pack_weights_with_lut,
+      std::move(linear_configs)};
+}
 
 inline UKernelConfig UKernelConfig::make(
     size_t preferred_alignment,
@@ -252,7 +289,7 @@ inline UKernelConfig UKernelConfig::make(
     packed_weights_offset_fn_type packed_weights_offset,
     pack_weights_fn_type pack_weights,
     std::array<linear_config_type, kMaxLinearConfigs> linear_configs) {
-  return UKernelConfig{
+  return make_impl(
       preferred_alignment,
       n_step,
       nr,
@@ -264,8 +301,8 @@ inline UKernelConfig UKernelConfig::make(
       packed_weights_size,
       packed_weights_offset,
       pack_weights,
-      /*pack_weights_with_lut*/nullptr,
-      std::move(linear_configs)};
+      /*pack_weights_with_lut*/ nullptr,
+      std::move(linear_configs));
 }
 
 inline UKernelConfig UKernelConfig::make_with_lut(
@@ -281,7 +318,7 @@ inline UKernelConfig UKernelConfig::make_with_lut(
     packed_weights_offset_fn_type packed_weights_with_lut_offset,
     pack_weights_with_lut_fn_type pack_weights_with_lut,
     std::array<linear_config_type, kMaxLinearConfigs> linear_configs) {
-  return UKernelConfig{
+  return make_impl(
       preferred_alignment,
       n_step,
       nr,
@@ -292,9 +329,9 @@ inline UKernelConfig UKernelConfig::make_with_lut(
       has_bias,
       packed_weights_with_lut_size,
       packed_weights_with_lut_offset,
-      /*pack_weights*/nullptr,
-      /*pack_weights_with_lut*/pack_weights_with_lut,
-      std::move(linear_configs)};
+      /*pack_weights*/ nullptr,
+      pack_weights_with_lut,
+      std::move(linear_configs));
 }
 
 } // namespace torchao::ops::linear_8bit_act_xbit_weight

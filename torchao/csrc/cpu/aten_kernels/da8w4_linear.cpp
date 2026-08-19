@@ -2,6 +2,7 @@
 #include <ATen/cpu/vec/vec.h>
 #include <ATen/native/CPUBlas.h>
 #include <c10/util/Unroll.h>
+#include "utils.h"
 
 namespace torchao {
 
@@ -751,8 +752,12 @@ at::Tensor da8w4_linear_impl(
 } // anonymous namespace
 
 TORCH_LIBRARY_IMPL(torchao, CPU, m) {
-  m.impl("torchao::da8w4_linear_prepack_cpu", &da8w4_linear_prepack_impl);
-  m.impl("torchao::da8w4_linear_cpu", &da8w4_linear_impl);
+  torchao_register_impls(
+      m,
+      "torchao::da8w4_linear_prepack_cpu",
+      &da8w4_linear_prepack_impl,
+      "torchao::da8w4_linear_cpu",
+      &da8w4_linear_impl);
 }
 
 } // namespace torchao

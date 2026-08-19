@@ -23,6 +23,7 @@
 #endif
 #include <c10/util/ArrayRef.h>
 #include <torch/library.h>
+#include <utility>
 
 using at::Scalar;
 using at::Tensor;
@@ -920,8 +921,26 @@ swizzle_scaled_mm(const Tensor& mat_a, const Tensor& mat_b,
   return _scaled_mm_out(mat_a, mat_b, mat1_is_swizzled, mat2_is_swizzled, scale_a, scale_b, bias, scale_result, out_dtype, out);
 }
 
+// Registers a sequence of (schema name, implementation) pairs into a
+// torch::Library, collapsing the otherwise-repeated `m.impl(...)` block.
+template <typename Library, typename Fn, typename... Rest>
+static void register_swizzle_impls(
+    Library& m,
+    const char* name,
+    Fn&& fn,
+    Rest&&... rest) {
+  m.impl(name, std::forward<Fn>(fn));
+  if constexpr (sizeof...(rest) > 0) {
+    register_swizzle_impls(m, std::forward<Rest>(rest)...);
+  }
+}
+
 TORCH_LIBRARY_IMPL(torchao, CUDA, m) {
-  m.impl("torchao::swizzle_mm", &swizzle_mm);
-  m.impl("torchao::swizzle_scaled_mm", &swizzle_scaled_mm);
+  register_swizzle_impls(
+      m,
+      "torchao::swizzle_mm",
+      &swizzle_mm,
+      "torchao::swizzle_scaled_mm",
+      &swizzle_scaled_mm);
 }
 #endif // USE_ROCM

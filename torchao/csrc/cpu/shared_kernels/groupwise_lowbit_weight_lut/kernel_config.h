@@ -6,8 +6,10 @@
 
 #pragma once
 #include <torchao/csrc/cpu/shared_kernels/internal/library.h>
+#include <torchao/csrc/cpu/shared_kernels/internal/tiling.h>
 #include <array>
 #include <cassert>
+#include <cstdint>
 #include <vector>
 
 namespace torchao::ops::groupwise_lowbit_weight_lut {
@@ -187,20 +189,7 @@ struct UKernelConfig {
 
   // Selects the appropriate configuration based on m.
   inline int select_config_idx(int m) const {
-    assert(m >= 1);
-    assert(configs[0].m_step >= 1);
-
-    size_t i = 0;
-    while (i + 1 < configs.size() && configs[i + 1].m_step >= 1 &&
-           configs[i + 1].m_step <= m) {
-      assert(configs[i].m_step < configs[i + 1].m_step);
-      i++;
-    }
-
-    assert(i < configs.size());
-    assert(configs[i].m_step >= 1);
-    assert(i == 0 || configs[i].m_step <= m);
-    return static_cast<int>(i);
+    return torchao::ops::internal::select_config_idx(configs, m);
   }
 };
 
