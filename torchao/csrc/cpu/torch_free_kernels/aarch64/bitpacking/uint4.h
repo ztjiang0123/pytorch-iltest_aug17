@@ -9,6 +9,7 @@
 #if defined(__aarch64__) || defined(__ARM_NEON)
 
 #include <arm_neon.h>
+#include <torchao/csrc/cpu/torch_free_kernels/fallback/bitpacking/uint4.h>
 #include <torchao/csrc/cpu/torch_free_kernels/macro.h>
 
 // This file contains bitpacking and unpacking methods for uint4.
@@ -19,17 +20,21 @@ namespace torchao {
 namespace bitpacking {
 namespace internal {
 
+// The scalar (non-vectorized) pack/unpack routines are identical to the
+// portable fallback implementations, so forward to that single source of truth
+// instead of maintaining a byte-for-byte copy here.
 TORCHAO_ALWAYS_INLINE inline void pack_2_uint4_values(
     uint8_t* packed,
     const uint8_t* unpacked) {
-  packed[0] = (unpacked[0] << 4) | (unpacked[1] & 0xF);
+  torchao::kernels::cpu::fallback::bitpacking::internal::pack_2_uint4_values(
+      packed, unpacked);
 }
 
 TORCHAO_ALWAYS_INLINE inline void unpack_2_uint4_values(
     uint8_t* unpacked,
     const uint8_t* packed) {
-  unpacked[0] = packed[0] >> 4;
-  unpacked[1] = packed[0] & 0xF;
+  torchao::kernels::cpu::fallback::bitpacking::internal::unpack_2_uint4_values(
+      unpacked, packed);
 }
 
 TORCHAO_ALWAYS_INLINE inline void vec_pack_16_uint4_values(
