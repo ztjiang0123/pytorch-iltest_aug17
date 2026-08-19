@@ -26,10 +26,12 @@ from torchao.prototype.attention.quantization.triton_hadamard_utils import (
     _compute_num_chunks,
     _get_log2_d,
 )
+from torchao.prototype.attention.quantization.triton_qkv_quantization import (
+    single_phase2_kernel,
+    single_reduce_kernel,
+)
 from torchao.prototype.attention.quantization.triton_rope_qkv_quantization import (
     rope_single_phase1_kernel,
-    rope_single_phase2_kernel,
-    single_reduce_kernel,
 )
 
 
@@ -327,7 +329,7 @@ def _rope_hadamard_quantize_one(x, cos, sin, spec):
     single_reduce_kernel[(B, H_kv)](
         partial_max, scale, descale, H_kv, groups * num_chunks
     )
-    rope_single_phase2_kernel[grid](
+    single_phase2_kernel[grid](
         intermediate,
         x_fp8,
         scale,
@@ -389,7 +391,7 @@ def _hadamard_v_quantize(v, spec):
         USE_BFLOAT16=use_bfloat16,
     )
     single_reduce_kernel[(B, H_kv)](partial_max, scale, descale, H_kv, num_chunks)
-    rope_single_phase2_kernel[grid](
+    single_phase2_kernel[grid](
         intermediate,
         v_fp8,
         scale,

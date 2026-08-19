@@ -21,6 +21,10 @@ from torchao.prototype.attention.quantization.triton_hadamard_utils import (
     QuantizeSpec,
     _compute_num_chunks,
 )
+from torchao.prototype.attention.quantization.triton_qkv_quantization import (
+    single_phase2_kernel,
+    single_reduce_kernel,
+)
 
 
 @triton.autotune(
@@ -246,116 +250,6 @@ def v_phase1_kernel(
     tl.store(partial_max_ptr + chunk_idx, v_max)
 
 
-@triton.jit
-def single_reduce_kernel(
-    partial_max_ptr,  # [B * H * num_chunks]
-    scale_ptr,
-    descale_ptr,
-    H,
-    num_chunks,
-):
-    """
-    Reduce partial maxes and compute scale/descale for a single tensor.
-
-    Grid: (B, H)
-    """
-    pid_b = tl.program_id(axis=0)
-    pid_h = tl.program_id(axis=1)
-
-    # Reduce across chunks for this (batch, head)
-    x_max = 0.0
-
-    base_idx = (pid_b * H + pid_h) * num_chunks
-    for c in range(num_chunks):
-        x_max = tl.maximum(x_max, tl.load(partial_max_ptr + base_idx + c))
-
-    # Compute scale and descale
-    # FP8 E4M3 max value is 448.0
-    FP8_MAX = 448.0
-    eps = 1e-12
-    scale_idx = pid_b * H + pid_h
-
-    tl.store(scale_ptr + scale_idx, tl.where(x_max > eps, FP8_MAX / x_max, 1.0))
-    tl.store(descale_ptr + scale_idx, tl.where(x_max > eps, x_max / FP8_MAX, 1.0))
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE": 512}, num_warps=4),
-        triton.Config({"BLOCK_SIZE": 1024}, num_warps=4),
-        triton.Config({"BLOCK_SIZE": 2048}, num_warps=8),
-        triton.Config({"BLOCK_SIZE": 4096}, num_warps=8),
-    ],
-    key=["chunk_size", "D"],
-)
-@triton.jit
-def rope_single_phase2_kernel(
-    # Intermediate tensor [B, H, S, D] - already RoPE'd
-    x_rope_ptr,
-    # Output tensor [B, H, S, D] - FP8 quantized
-    x_out_ptr,
-    # Precomputed scale [B, H_scale]
-    scale_ptr,
-    # Strides (for [B, H, S, D] layout) - same for intermediate and output
-    stride_b,
-    stride_h,
-    stride_s,
-    stride_d,
-    # Dimensions
-    S,
-    D,
-    H,
-    chunk_size,
-    # Scale indexing for GQA: scale has H_scale entries per batch,
-    # and each group of `groups` heads shares one scale.
-    # For non-GQA: H_scale = H, groups = 1.
-    H_scale,
-    groups,
-    # Block size
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Phase 2 for a single tensor (Q or K): Quantize pre-computed RoPE'd values to FP8.
-
-    Grid: (B, H, num_chunks)
-    """
-    pid_b = tl.program_id(axis=0)
-    pid_h = tl.program_id(axis=1)
-    pid_chunk = tl.program_id(axis=2)
-
-    # Load scale for this head (or head group for GQA)
-    scale = tl.load(scale_ptr + pid_b * H_scale + pid_h // groups)
-
-    # Compute the S range for this chunk
-    s_start = pid_chunk * chunk_size
-    s_end = tl.minimum(s_start + chunk_size, S)
-    chunk_elements = (s_end - s_start) * D
-
-    # Base pointer
-    base_offset = pid_b * stride_b + pid_h * stride_h
-
-    # Linearized iteration over chunk_size * D elements
-    for block_start in range(0, chunk_elements, BLOCK_SIZE):
-        offs = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < chunk_elements
-
-        # Convert linear offset to (s, d) coordinates
-        local_s = offs // D
-        d_idx = offs % D
-        s_idx = s_start + local_s
-
-        ptr_offset = base_offset + s_idx * stride_s + d_idx * stride_d
-
-        # Load pre-computed RoPE'd value from intermediate buffer
-        x_val = tl.load(x_rope_ptr + ptr_offset, mask=mask, other=0.0).to(tl.float32)
-
-        # Quantize to FP8
-        x_fp8 = (x_val * scale).to(tl.float8e4nv)
-
-        # Store to output
-        tl.store(x_out_ptr + ptr_offset, x_fp8, mask=mask)
-
-
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_SIZE": 512}, num_warps=4),
@@ -479,7 +373,7 @@ def _rope_quantize_one(x, cos, sin, spec):
     single_reduce_kernel[(B, H_kv)](
         partial_max, scale, descale, H_kv, groups * num_chunks
     )
-    rope_single_phase2_kernel[grid](
+    single_phase2_kernel[grid](
         rope_intermediate,
         x_fp8,
         scale,

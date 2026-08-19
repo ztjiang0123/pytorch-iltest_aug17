@@ -8,6 +8,7 @@
 Shared FX graph pattern detection and fusion utilities for low-precision attention.
 """
 
+import functools
 import logging
 import operator
 from dataclasses import dataclass
@@ -711,40 +712,43 @@ def _parse_stride2_index(idx) -> Optional[int]:
     return last.start if last.start is not None else 0
 
 
-def _get_setitem_stride2_slice(node: Node) -> Optional[Tuple[int, Node]]:
-    """Check if node is ``operator.setitem(tensor, (..., slice(start, None, 2)), value)``.
+def _get_op_stride2_slice(
+    node: Node, target, min_args: int, node_arg: int
+) -> Optional[Tuple[int, Node]]:
+    """Match ``target(..., (..., slice(start, None, 2)), ...)`` on an FX node.
 
-    Returns ``(start, value_node)`` or None.
+    The stride-2 index is always ``node.args[1]``; ``node_arg`` selects which
+    positional arg carries the associated tensor Node (the value for setitem,
+    the source tensor for getitem).
+
+    Returns ``(start, node.args[node_arg])`` or None.
     """
-    if not _is_op(node, operator.setitem):
+    if not _is_op(node, target):
         return None
-    if len(node.args) < 3:
+    if len(node.args) < min_args:
         return None
-    value = node.args[2]
-    if not isinstance(value, Node):
+    tensor_node = node.args[node_arg]
+    if not isinstance(tensor_node, Node):
         return None
     start = _parse_stride2_index(node.args[1])
     if start is None:
         return None
-    return start, value
+    return start, tensor_node
 
 
-def _get_getitem_stride2_slice(node: Node) -> Optional[Tuple[int, Node]]:
-    """Check if node is ``operator.getitem(tensor, (..., slice(start, None, 2)))``.
+# ``_get_setitem_stride2_slice(node)`` -> match
+# ``operator.setitem(tensor, (..., slice(start, None, 2)), value)`` and return
+# ``(start, value_node)`` or None.
+_get_setitem_stride2_slice = functools.partial(
+    _get_op_stride2_slice, target=operator.setitem, min_args=3, node_arg=2
+)
 
-    Returns ``(start, source_tensor_node)`` or None.
-    """
-    if not _is_op(node, operator.getitem):
-        return None
-    if len(node.args) < 2:
-        return None
-    source = node.args[0]
-    if not isinstance(source, Node):
-        return None
-    start = _parse_stride2_index(node.args[1])
-    if start is None:
-        return None
-    return start, source
+# ``_get_getitem_stride2_slice(node)`` -> match
+# ``operator.getitem(tensor, (..., slice(start, None, 2)))`` and return
+# ``(start, source_tensor_node)`` or None.
+_get_getitem_stride2_slice = functools.partial(
+    _get_op_stride2_slice, target=operator.getitem, min_args=2, node_arg=0
+)
 
 
 def _find_freq_slice_arg(mul_node: Node) -> Optional[Tuple[Node, Node]]:
