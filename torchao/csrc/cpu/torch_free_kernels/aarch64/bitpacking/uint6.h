@@ -10,6 +10,7 @@
 
 #include <arm_neon.h>
 #include <torchao/csrc/cpu/torch_free_kernels/macro.h>
+#include <torchao/csrc/cpu/torch_free_kernels/shared/uint6_scalar.h>
 
 // This file contains bitpacking and unpacking methods for uint5.
 // These are not inteded to be used outside of bitpacking directory.
@@ -19,40 +20,19 @@ namespace torchao {
 namespace bitpacking {
 namespace internal {
 
-TORCHAO_ALWAYS_INLINE inline void pack_4_uint6_values(
-    uint8_t* packed,
-    const uint8_t* unpacked) {
-  //    Given 4 unpacked uint6 values: abcdef, ghijkl, mnopqr, 123456
-  //    this function packs them as:
-  //    packed[0]: 56 | abcdef
-  //    packed[1]: 34 | ghijkl
-  //    packed[2]: 12 | mnopqr
-  //
-  // Input is 4 bytes
-  // Output is 6 * 4 bits/8 = 3 bytes
-  packed[0] = unpacked[0];
-  packed[1] = unpacked[1];
-  packed[2] = unpacked[2];
-  // Last value is packed in the upper 2 bits of the three bytes
-  packed[0] |= ((unpacked[3] & 0b00'0011u) << 6);
-  packed[1] |= ((unpacked[3] & 0b00'1100u) << 4);
-  packed[2] |= ((unpacked[3] & 0b11'0000u) << 2);
-}
+//    Given 4 unpacked uint6 values: abcdef, ghijkl, mnopqr, 123456
+//    this function packs them as:
+//    packed[0]: 56 | abcdef
+//    packed[1]: 34 | ghijkl
+//    packed[2]: 12 | mnopqr
+//
+// Input is 4 bytes, output is 6 * 4 bits/8 = 3 bytes. The scalar logic is
+// backend-independent and shared with the fallback backend.
+using torchao::uint6_scalar::pack_4_uint6_values;
 
-TORCHAO_ALWAYS_INLINE inline void unpack_4_uint6_values(
-    uint8_t* unpacked,
-    const uint8_t* packed) {
-  // Unpacks data packed by pack_4_uint6_values_v2
-  //
-  // Input is 24 bits = 3 bytes
-  // Output is 4 bytes
-  unpacked[0] = packed[0] & 0b111111u;
-  unpacked[1] = packed[1] & 0b111111u;
-  unpacked[2] = packed[2] & 0b111111u;
-  // Last value is packed in the upper 2 bits of the three bytes
-  unpacked[3] = ((packed[0] & 0b1100'0000u) >> 6) |
-      ((packed[1] & 0b1100'0000u) >> 4) | ((packed[2] & 0b1100'0000u) >> 2);
-}
+// Unpacks data packed by pack_4_uint6_values.
+// Input is 24 bits = 3 bytes, output is 4 bytes. Shared scalar logic.
+using torchao::uint6_scalar::unpack_4_uint6_values;
 
 TORCHAO_ALWAYS_INLINE inline void vec_pack_32_uint6_values(
     uint8_t* packed,

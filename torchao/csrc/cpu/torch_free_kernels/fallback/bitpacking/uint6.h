@@ -7,6 +7,7 @@
 #pragma once
 
 #include <torchao/csrc/cpu/torch_free_kernels/macro.h>
+#include <torchao/csrc/cpu/torch_free_kernels/shared/uint6_scalar.h>
 #include <cstdint>
 
 namespace torchao::kernels::cpu::fallback::bitpacking {
@@ -17,36 +18,20 @@ namespace internal {
  *
  * @param packed Pointer to the destination memory (3 bytes).
  * @param unpacked Pointer to the source memory (4 bytes).
+ *
+ * The scalar logic is backend-independent and shared with the NEON backend.
  */
-TORCHAO_ALWAYS_INLINE inline void pack_4_uint6_values(
-    uint8_t* packed,
-    const uint8_t* unpacked) {
-  // pack 4 uint6 values (u0..u3) into 3 bytes (p0..p2)
-  // p0's low 6 bits = u0; p0's high 2 bits = u3's low 2 bits
-  // p1's low 6 bits = u1; p1's high 2 bits = u3's mid 2 bits
-  // p2's low 6 bits = u2; p2's high 2 bits = u3's high 2 bits
-  const uint8_t u3 = unpacked[3] & 0x3F;
-  packed[0] = (unpacked[0] & 0x3F) | ((u3 & 0x03) << 6);
-  packed[1] = (unpacked[1] & 0x3F) | ((u3 & 0x0C) << 4);
-  packed[2] = (unpacked[2] & 0x3F) | ((u3 & 0x30) << 2);
-}
+using torchao::uint6_scalar::pack_4_uint6_values;
 
 /**
  * @brief Unpacks 3 bytes into 4 bytes, each containing a 6-bit value.
  *
  * @param unpacked Pointer to the destination memory (4 bytes).
  * @param packed Pointer to the source memory (3 bytes).
+ *
+ * Compatible with the scalar NEON version; shared scalar logic.
  */
-TORCHAO_ALWAYS_INLINE inline void unpack_4_uint6_values(
-    uint8_t* unpacked,
-    const uint8_t* packed) {
-  // This is compatible with the scalar NEON version.
-  unpacked[0] = packed[0] & 0x3F;
-  unpacked[1] = packed[1] & 0x3F;
-  unpacked[2] = packed[2] & 0x3F;
-  unpacked[3] = ((packed[0] & 0xC0) >> 6) | ((packed[1] & 0xC0) >> 4) |
-      ((packed[2] & 0xC0) >> 2);
-}
+using torchao::uint6_scalar::unpack_4_uint6_values;
 
 /**
  * @brief Packs 32 bytes (each a 6-bit value) into 24 bytes.
