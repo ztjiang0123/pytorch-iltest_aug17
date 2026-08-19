@@ -16,11 +16,48 @@ The Hadamard transform H/sqrt(D) is orthogonal and self-inverse:
 so the same butterfly + normalization is used for both forward and inverse.
 """
 
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+
+
+@dataclass
+class QuantizeSpec:
+    """Per-tensor launch parameters for the FP8 quantize kernel pipeline.
+
+    Bundles the scalars shared by the phase1/reduce/phase2 kernel launches so the
+    per-tensor helper functions take a single spec argument instead of a long
+    parameter list. One instance is built per Q/K/V tensor at the call site.
+
+    Fields used by every helper: ``B``, ``H`` (this tensor's head count), ``S``,
+    ``D``, ``H_kv``, ``groups`` (``H // H_kv`` for Q, 1 for K/V), ``num_chunks``.
+    RoPE/Hadamard helpers additionally use ``D_HALF``, ``LOG2_D``,
+    ``use_bfloat16``, ``rope_interleaved`` and ``apply_hadamard``.
+    """
+
+    B: int
+    H: int
+    S: int
+    D: int
+    H_kv: int
+    groups: int
+    num_chunks: int
+    D_HALF: Optional[int] = None
+    LOG2_D: Optional[int] = None
+    use_bfloat16: bool = False
+    rope_interleaved: bool = False
+    apply_hadamard: bool = True
+
+    @property
+    def chunk_size(self) -> int:
+        return (self.S + self.num_chunks - 1) // self.num_chunks
+
+    @property
+    def grid(self):
+        return (self.B, self.H, self.num_chunks)
 
 
 def _get_log2_d(D: int) -> int:

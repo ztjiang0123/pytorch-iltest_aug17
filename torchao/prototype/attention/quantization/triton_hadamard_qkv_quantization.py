@@ -26,6 +26,7 @@ import triton
 import triton.language as tl
 
 from torchao.prototype.attention.quantization.triton_hadamard_utils import (
+    QuantizeSpec,
     _apply_hadamard,
     _compute_num_chunks,
     _get_log2_d,
@@ -118,18 +119,20 @@ def hadamard_single_phase1_kernel(
     tl.store(partial_max_ptr + chunk_idx, x_max_scalar)
 
 
-def _hadamard_quantize_one(
-    x, B, H, S, D, H_kv, groups, num_chunks, LOG2_D, use_bfloat16, apply_hadamard
-):
+def _hadamard_quantize_one(x, spec):
     """Quantize a single [B, H, S, D] tensor to FP8 with per-(KV)head scaling.
 
-    When ``apply_hadamard`` is True the Hadamard transform is applied before
+    When ``spec.apply_hadamard`` is True the Hadamard transform is applied before
     quantization (phase1 emits a Hadamard'd intermediate that phase2 consumes);
-    otherwise the tensor is quantized directly. ``groups`` is ``H // H_kv`` for Q
-    and 1 for K/V. Returns ``(x_fp8, x_descale)`` with descale of shape [B, H_kv].
+    otherwise the tensor is quantized directly. ``spec`` is a
+    :class:`QuantizeSpec`. Returns ``(x_fp8, x_descale)`` with descale [B, H_kv].
     """
-    chunk_size = (S + num_chunks - 1) // num_chunks
-    grid = (B, H, num_chunks)
+    B, H, S, D, H_kv = spec.B, spec.H, spec.S, spec.D, spec.H_kv
+    groups, num_chunks = spec.groups, spec.num_chunks
+    LOG2_D, use_bfloat16 = spec.LOG2_D, spec.use_bfloat16
+    apply_hadamard = spec.apply_hadamard
+    grid = spec.grid
+    chunk_size = spec.chunk_size
 
     x_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     partial_max = torch.empty(B * H * num_chunks, dtype=torch.float32, device=x.device)
@@ -285,42 +288,48 @@ def triton_fp8_hadamard_sdpa_quantize(
     # Q uses per-KV-group scaling (groups); K/V are per-head (groups=1).
     q_fp8, q_descale = _hadamard_quantize_one(
         q,
-        B,
-        H_q,
-        S_q,
-        D,
-        H_kv,
-        groups,
-        q_num_chunks,
-        LOG2_D,
-        use_bfloat16,
-        apply_hadamard=not v_only,
+        QuantizeSpec(
+            B,
+            H_q,
+            S_q,
+            D,
+            H_kv,
+            groups,
+            q_num_chunks,
+            LOG2_D=LOG2_D,
+            use_bfloat16=use_bfloat16,
+            apply_hadamard=not v_only,
+        ),
     )
     k_fp8, k_descale = _hadamard_quantize_one(
         k,
-        B,
-        H_kv,
-        S_kv,
-        D,
-        H_kv,
-        1,
-        kv_num_chunks,
-        LOG2_D,
-        use_bfloat16,
-        apply_hadamard=not v_only,
+        QuantizeSpec(
+            B,
+            H_kv,
+            S_kv,
+            D,
+            H_kv,
+            1,
+            kv_num_chunks,
+            LOG2_D=LOG2_D,
+            use_bfloat16=use_bfloat16,
+            apply_hadamard=not v_only,
+        ),
     )
     v_fp8, v_descale = _hadamard_quantize_one(
         v,
-        B,
-        H_kv,
-        S_kv,
-        D,
-        H_kv,
-        1,
-        kv_num_chunks,
-        LOG2_D,
-        use_bfloat16,
-        apply_hadamard=True,
+        QuantizeSpec(
+            B,
+            H_kv,
+            S_kv,
+            D,
+            H_kv,
+            1,
+            kv_num_chunks,
+            LOG2_D=LOG2_D,
+            use_bfloat16=use_bfloat16,
+            apply_hadamard=True,
+        ),
     )
 
     return q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale

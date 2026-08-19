@@ -18,6 +18,7 @@ import triton
 import triton.language as tl
 
 from torchao.prototype.attention.quantization.triton_hadamard_utils import (
+    QuantizeSpec,
     _compute_num_chunks,
 )
 
@@ -206,16 +207,17 @@ def single_phase2_kernel(
         tl.store(x_out_ptr + ptr_offset, x_fp8, mask=mask)
 
 
-def _quantize_one_tensor(x, B, H, S, D, H_kv, groups, num_chunks):
+def _quantize_one_tensor(x, spec):
     """Quantize a single [B, H, S, D] tensor to FP8 with block-wise per-(KV)head
     scaling via the phase1(max) -> reduce -> phase2(quantize) kernel pipeline.
 
-    ``groups`` is ``H // H_kv`` for the Q tensor (per-KV-group scaling) and 1 for
-    K/V (per-head scaling). Returns ``(x_fp8, x_descale)`` where ``x_descale`` has
-    shape ``[B, H_kv]``.
+    ``spec`` is a :class:`QuantizeSpec` describing this tensor's launch geometry.
+    Returns ``(x_fp8, x_descale)`` where ``x_descale`` has shape ``[B, H_kv]``.
     """
-    chunk_size = (S + num_chunks - 1) // num_chunks
-    grid = (B, H, num_chunks)
+    B, H, S, D, H_kv = spec.B, spec.H, spec.S, spec.D, spec.H_kv
+    groups, num_chunks = spec.groups, spec.num_chunks
+    grid = spec.grid
+    chunk_size = spec.chunk_size
 
     x_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     partial_max = torch.empty(B * H * num_chunks, dtype=torch.float32, device=x.device)
@@ -332,9 +334,13 @@ def triton_fp8_sdpa_quantize(
 
     # Q uses per-KV-group scaling (groups Q heads share a scale); K/V are per-head.
     q_fp8, q_descale = _quantize_one_tensor(
-        q, B, H_q, S_q, D, H_kv, groups, q_num_chunks
+        q, QuantizeSpec(B, H_q, S_q, D, H_kv, groups, q_num_chunks)
     )
-    k_fp8, k_descale = _quantize_one_tensor(k, B, H_kv, S_kv, D, H_kv, 1, kv_num_chunks)
-    v_fp8, v_descale = _quantize_one_tensor(v, B, H_kv, S_kv, D, H_kv, 1, kv_num_chunks)
+    k_fp8, k_descale = _quantize_one_tensor(
+        k, QuantizeSpec(B, H_kv, S_kv, D, H_kv, 1, kv_num_chunks)
+    )
+    v_fp8, v_descale = _quantize_one_tensor(
+        v, QuantizeSpec(B, H_kv, S_kv, D, H_kv, 1, kv_num_chunks)
+    )
 
     return q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale

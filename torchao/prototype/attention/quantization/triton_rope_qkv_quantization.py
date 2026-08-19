@@ -18,6 +18,7 @@ import triton
 import triton.language as tl
 
 from torchao.prototype.attention.quantization.triton_hadamard_utils import (
+    QuantizeSpec,
     _compute_num_chunks,
 )
 
@@ -437,14 +438,15 @@ def v_phase2_kernel(
         tl.store(v_out_ptr + out_offset, v_fp8, mask=mask)
 
 
-def _rope_quantize_one(
-    x, cos, sin, B, H, S, D, D_HALF, H_kv, groups, num_chunks, rope_interleaved
-):
+def _rope_quantize_one(x, cos, sin, spec):
     """Apply RoPE to a single [B, S, H, D] tensor and quantize it to FP8, emitting
-    the result in [B, H, S, D] layout. ``groups`` is ``H // H_kv`` for Q and 1 for
-    K. Returns ``(x_fp8, x_descale)`` with ``x_descale`` of shape [B, H_kv]."""
-    chunk_size = (S + num_chunks - 1) // num_chunks
-    grid = (B, H, num_chunks)
+    the result in [B, H, S, D] layout. ``spec`` is a :class:`QuantizeSpec`.
+    Returns ``(x_fp8, x_descale)`` with ``x_descale`` of shape [B, H_kv]."""
+    B, H, S, D, H_kv = spec.B, spec.H, spec.S, spec.D, spec.H_kv
+    D_HALF, groups, num_chunks = spec.D_HALF, spec.groups, spec.num_chunks
+    rope_interleaved = spec.rope_interleaved
+    grid = spec.grid
+    chunk_size = spec.chunk_size
 
     x_fp8 = torch.empty(B, H, S, D, dtype=torch.float8_e4m3fn, device=x.device)
     rope_intermediate = torch.empty(B, H, S, D, dtype=x.dtype, device=x.device)
@@ -495,11 +497,13 @@ def _rope_quantize_one(
     return x_fp8, descale
 
 
-def _quantize_v_transpose(v, B, H_kv, S, D, num_chunks):
-    """Quantize V (no RoPE) with a [B, S, H, D] -> [B, H, S, D] transpose. Returns
-    ``(v_fp8, v_descale)`` with ``v_descale`` of shape [B, H_kv]."""
-    chunk_size = (S + num_chunks - 1) // num_chunks
-    grid = (B, H_kv, num_chunks)
+def _quantize_v_transpose(v, spec):
+    """Quantize V (no RoPE) with a [B, S, H, D] -> [B, H, S, D] transpose. ``spec``
+    is a :class:`QuantizeSpec` with ``H == H_kv``. Returns ``(v_fp8, v_descale)``
+    with ``v_descale`` of shape [B, H_kv]."""
+    B, H_kv, S, D, num_chunks = spec.B, spec.H_kv, spec.S, spec.D, spec.num_chunks
+    grid = spec.grid
+    chunk_size = spec.chunk_size
 
     v_fp8 = torch.empty(B, H_kv, S, D, dtype=torch.float8_e4m3fn, device=v.device)
     partial_max = torch.empty(
@@ -628,12 +632,40 @@ def triton_fp8_rope_sdpa_quantize(
 
     # Q/K: RoPE + quantize (Q uses per-KV-group scaling, K is per-head).
     q_fp8, q_descale = _rope_quantize_one(
-        q, cos, sin, B, H_q, S, D, D_HALF, H_kv, groups, num_chunks, rope_interleaved
+        q,
+        cos,
+        sin,
+        QuantizeSpec(
+            B,
+            H_q,
+            S,
+            D,
+            H_kv,
+            groups,
+            num_chunks,
+            D_HALF=D_HALF,
+            rope_interleaved=rope_interleaved,
+        ),
     )
     k_fp8, k_descale = _rope_quantize_one(
-        k, cos, sin, B, H_kv, S, D, D_HALF, H_kv, 1, num_chunks, rope_interleaved
+        k,
+        cos,
+        sin,
+        QuantizeSpec(
+            B,
+            H_kv,
+            S,
+            D,
+            H_kv,
+            1,
+            num_chunks,
+            D_HALF=D_HALF,
+            rope_interleaved=rope_interleaved,
+        ),
     )
     # V: no RoPE, transpose + quantize (per-head).
-    v_fp8, v_descale = _quantize_v_transpose(v, B, H_kv, S, D, num_chunks)
+    v_fp8, v_descale = _quantize_v_transpose(
+        v, QuantizeSpec(B, H_kv, S, D, H_kv, 1, num_chunks)
+    )
 
     return q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale
