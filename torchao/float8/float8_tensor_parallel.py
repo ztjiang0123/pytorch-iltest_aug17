@@ -39,68 +39,75 @@ def _float8_linear_supports_float8_allgather(m):
     )
 
 
+def _float8_prepare_input_fn(
+    input_layouts, desired_input_layouts, mod, inputs, device_mesh
+):
+    # annotate module input placements/sharding with input_layouts
+    input_tensor = inputs[0]
+    if not isinstance(input_tensor, DTensor):
+        input_tensor = DTensor.from_local(
+            input_tensor, device_mesh, input_layouts, run_check=False
+        )
+
+    if not tensor_already_casted_to_fp8(input_tensor):
+        input_tensor = hp_tensor_to_float8_dynamic(
+            input_tensor,
+            mod.config.cast_config_input.target_dtype,
+            mod.linear_mm_config,
+            gemm_input_role=GemmInputRole.INPUT,
+        )  # DTensor(Float8TrainingTensor)
+
+    # transform the input layouts to the desired layouts
+    if input_layouts != desired_input_layouts:
+        input_tensor = input_tensor.redistribute(
+            placements=desired_input_layouts, async_op=True
+        )
+    return input_tensor
+
+
+def _float8_prepare_output_fn(
+    output_layouts, use_local_output, mod, outputs, device_mesh
+):
+    if outputs.placements != output_layouts:
+        outputs = outputs.redistribute(
+            placements=output_layouts, async_op=True
+        )  # DTensor(torch.Tensor)
+
+    # fwd noop bwd cast to DTensor(Float8TrainingTensor)
+    outputs = NoopFwToFloat8BwDynamic.apply(
+        outputs,
+        mod.linear_mm_config,
+        mod.config.cast_config_grad_output.target_dtype,
+    )
+
+    # back to local tensor
+    return outputs.to_local() if use_local_output else outputs
+
+
+def _check_float8_allgather_supported(module: nn.Module) -> None:
+    from torchao.float8.float8_linear import Float8Linear
+
+    if not isinstance(module, Float8Linear):
+        raise ValueError(
+            f"Expecting module to be Float8Linear but found {type(module)}"
+        )
+    elif isinstance(
+        module, Float8Linear
+    ) and not _float8_linear_supports_float8_allgather(module):
+        raise AssertionError("unsupported")
+
+
 class Float8ColwiseParallel(ColwiseParallel):
     """
     Like `ColwiseParallel`, but with all-gather in float8. This
     currently assumes tensorwise scaling.
     """
 
-    @staticmethod
-    def _prepare_input_fn(
-        input_layouts, desired_input_layouts, mod, inputs, device_mesh
-    ):
-        # annotate module input placements/sharding with input_layouts
-        input_tensor = inputs[0]
-        if not isinstance(input_tensor, DTensor):
-            input_tensor = DTensor.from_local(
-                input_tensor, device_mesh, input_layouts, run_check=False
-            )
-
-        if not tensor_already_casted_to_fp8(input_tensor):
-            input_tensor = hp_tensor_to_float8_dynamic(
-                input_tensor,
-                mod.config.cast_config_input.target_dtype,
-                mod.linear_mm_config,
-                gemm_input_role=GemmInputRole.INPUT,
-            )  # DTensor(Float8TrainingTensor)
-
-        # transform the input layouts to the desired layouts of ColwiseParallel
-        if input_layouts != desired_input_layouts:
-            input_tensor = input_tensor.redistribute(
-                placements=desired_input_layouts, async_op=True
-            )
-        return input_tensor
-
-    @staticmethod
-    def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
-        # outputs is a shard on last dimension DTensor, i.e. Shard(-1)
-        if outputs.placements != output_layouts:
-            outputs = outputs.redistribute(
-                placements=output_layouts, async_op=True
-            )  # DTensor(torch.Tensor)
-
-        # fwd noop bwd cast to DTensor(Float8TrainingTensor)
-        outputs = NoopFwToFloat8BwDynamic.apply(
-            outputs,
-            mod.linear_mm_config,
-            mod.config.cast_config_grad_output.target_dtype,
-        )
-
-        # back to local tensor
-        return outputs.to_local() if use_local_output else outputs
+    _prepare_input_fn = staticmethod(_float8_prepare_input_fn)
+    _prepare_output_fn = staticmethod(_float8_prepare_output_fn)
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        from torchao.float8.float8_linear import Float8Linear
-
-        if not isinstance(module, Float8Linear):
-            raise ValueError(
-                f"Expecting module to be Float8Linear but found {type(module)}"
-            )
-        elif isinstance(
-            module, Float8Linear
-        ) and not _float8_linear_supports_float8_allgather(module):
-            raise AssertionError("unsupported")
-
+        _check_float8_allgather_supported(module)
         return super()._apply(module, device_mesh)
 
 
@@ -110,60 +117,11 @@ class Float8RowwiseParallel(RowwiseParallel):
     currently assumes tensorwise scaling.
     """
 
-    @staticmethod
-    def _prepare_input_fn(
-        input_layouts, desired_input_layouts, mod, inputs, device_mesh
-    ):
-        input_tensor = inputs[0]
-        if not isinstance(input_tensor, DTensor):
-            input_tensor = DTensor.from_local(
-                input_tensor, device_mesh, input_layouts, run_check=False
-            )
-
-        if not tensor_already_casted_to_fp8(input_tensor):
-            input_tensor = hp_tensor_to_float8_dynamic(
-                input_tensor,
-                mod.config.cast_config_input.target_dtype,
-                mod.linear_mm_config,
-                gemm_input_role=GemmInputRole.INPUT,
-            )  # DTensor(Float8TrainingTensor)
-
-        if input_layouts != desired_input_layouts:
-            input_tensor = input_tensor.redistribute(
-                placements=desired_input_layouts, async_op=True
-            )
-        return input_tensor
-
-    @staticmethod
-    def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
-        # Rowwise sharding produces partial output, depending on output layouts:
-        # 1. to replicate -> allreduce
-        # 2. to shard -> reduce_scatter
-        if outputs.placements != output_layouts:
-            outputs = outputs.redistribute(placements=output_layouts, async_op=True)
-
-        # fwd noop bwd cast to DTensor(Float8TrainingTensor)
-        outputs = NoopFwToFloat8BwDynamic.apply(
-            outputs,
-            mod.linear_mm_config,
-            mod.config.cast_config_grad_output.target_dtype,
-        )
-
-        # back to local tensor if use_local_output is True
-        return outputs.to_local() if use_local_output else outputs
+    _prepare_input_fn = staticmethod(_float8_prepare_input_fn)
+    _prepare_output_fn = staticmethod(_float8_prepare_output_fn)
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        from torchao.float8.float8_linear import Float8Linear
-
-        if not isinstance(module, Float8Linear):
-            raise ValueError(
-                f"Expecting module to be Float8Linear but found {type(module)}"
-            )
-        elif isinstance(
-            module, Float8Linear
-        ) and not _float8_linear_supports_float8_allgather(module):
-            raise AssertionError("unsupported")
-
+        _check_float8_allgather_supported(module)
         return super()._apply(module, device_mesh)
 
 
