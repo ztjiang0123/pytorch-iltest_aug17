@@ -11,6 +11,51 @@
 
 namespace torchao::kernels::cpu::fallback::bitpacking {
 namespace internal {
+
+/**
+ * @brief Shared "transpose-and-pack" primitive for the 7-bit format.
+ *
+ * The count-64 and count-128 transpose loops are byte-for-byte identical apart
+ * from the block size, so the loop lives here once, parameterized by `block`
+ * (the number of columns, equal to the packed row stride). The unpacked data is
+ * organized as eight rows of `block` values: rows 0..6 supply the low 7 bits of
+ * each packed byte, and row 7 is bit-sliced across the most significant bit of
+ * the seven packed bytes in each column.
+ *
+ * @tparam block Number of columns (== packed row stride).
+ */
+template <int block>
+TORCHAO_ALWAYS_INLINE inline void pack_transpose_uint7_values(
+    uint8_t* packed,
+    const uint8_t* unpacked) {
+  for (int j = 0; j < block; ++j) { // Iterate through columns
+    const uint8_t u7 = unpacked[7 * block + j] & 0x7F;
+    for (int i = 0; i < 7; ++i) { // Iterate through rows
+      uint8_t u7_bit = (u7 >> i) & 1;
+      packed[i * block + j] = (unpacked[i * block + j] & 0x7F) | (u7_bit << 7);
+    }
+  }
+}
+
+/**
+ * @brief Inverse of pack_transpose_uint7_values.
+ *
+ * @tparam block Number of columns (== packed row stride).
+ */
+template <int block>
+TORCHAO_ALWAYS_INLINE inline void unpack_transpose_uint7_values(
+    uint8_t* unpacked,
+    const uint8_t* packed) {
+  for (int j = 0; j < block; ++j) { // Iterate through columns
+    uint8_t u7 = 0;
+    for (int i = 0; i < 7; ++i) { // Iterate through rows
+      unpacked[i * block + j] = packed[i * block + j] & 0x7F;
+      u7 |= ((packed[i * block + j] >> 7) & 1) << i;
+    }
+    unpacked[7 * block + j] = u7;
+  }
+}
+
 /**
  * @brief Packs 8 bytes, each holding a 7-bit value (0-127), into 7 bytes.
  *
@@ -64,14 +109,7 @@ TORCHAO_ALWAYS_INLINE inline void unpack_8_uint7_values(
 TORCHAO_ALWAYS_INLINE inline void pack_64_uint7_values(
     uint8_t* packed,
     const uint8_t* unpacked) {
-  // Transpose-and-pack operation
-  for (int j = 0; j < 8; ++j) { // Iterate through columns
-    const uint8_t u7 = unpacked[56 + j] & 0x7F;
-    for (int i = 0; i < 7; ++i) { // Iterate through rows
-      uint8_t u7_bit = (u7 >> i) & 1;
-      packed[i * 8 + j] = (unpacked[i * 8 + j] & 0x7F) | (u7_bit << 7);
-    }
-  }
+  pack_transpose_uint7_values<8>(packed, unpacked);
 }
 
 /**
@@ -84,15 +122,7 @@ TORCHAO_ALWAYS_INLINE inline void pack_64_uint7_values(
 TORCHAO_ALWAYS_INLINE inline void unpack_64_uint7_values(
     uint8_t* unpacked,
     const uint8_t* packed) {
-  // Unpack-and-transpose operation
-  for (int j = 0; j < 8; ++j) { // Iterate through columns
-    uint8_t u7 = 0;
-    for (int i = 0; i < 7; ++i) { // Iterate through rows
-      unpacked[i * 8 + j] = packed[i * 8 + j] & 0x7F;
-      u7 |= ((packed[i * 8 + j] >> 7) & 1) << i;
-    }
-    unpacked[56 + j] = u7;
-  }
+  unpack_transpose_uint7_values<8>(unpacked, packed);
 }
 
 /**
@@ -105,14 +135,7 @@ TORCHAO_ALWAYS_INLINE inline void unpack_64_uint7_values(
 TORCHAO_ALWAYS_INLINE inline void pack_128_uint7_values(
     uint8_t* packed,
     const uint8_t* unpacked) {
-  // Transpose-and-pack operation
-  for (int j = 0; j < 16; ++j) { // Iterate through columns
-    const uint8_t u7 = unpacked[112 + j] & 0x7F;
-    for (int i = 0; i < 7; ++i) { // Iterate through rows
-      uint8_t u7_bit = (u7 >> i) & 1;
-      packed[i * 16 + j] = (unpacked[i * 16 + j] & 0x7F) | (u7_bit << 7);
-    }
-  }
+  pack_transpose_uint7_values<16>(packed, unpacked);
 }
 
 /**
@@ -125,15 +148,7 @@ TORCHAO_ALWAYS_INLINE inline void pack_128_uint7_values(
 TORCHAO_ALWAYS_INLINE inline void unpack_128_uint7_values(
     uint8_t* unpacked,
     const uint8_t* packed) {
-  // Unpack-and-transpose operation
-  for (int j = 0; j < 16; ++j) { // Iterate through columns
-    uint8_t u7 = 0;
-    for (int i = 0; i < 7; ++i) { // Iterate through rows
-      unpacked[i * 16 + j] = packed[i * 16 + j] & 0x7F;
-      u7 |= ((packed[i * 16 + j] >> 7) & 1) << i;
-    }
-    unpacked[112 + j] = u7;
-  }
+  unpack_transpose_uint7_values<16>(unpacked, packed);
 }
 
 } // namespace internal
