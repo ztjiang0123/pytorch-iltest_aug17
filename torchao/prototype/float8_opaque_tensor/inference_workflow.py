@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 
-import torchao
 from torchao.core.config import AOBaseConfig
 
 if TYPE_CHECKING:
@@ -23,7 +22,7 @@ from torchao.quantization.quantize_.workflows import QuantizeTensorToFloat8Kwarg
 from torchao.quantization.transform_module import (
     register_quantize_module_handler,
 )
-from torchao.quantization.utils import _set_quantized_parameter, get_block_size
+from torchao.quantization.utils import _apply_weight_quant_transform, get_block_size
 
 from .float8_opaque_tensor import Float8OpaqueTensor
 
@@ -87,14 +86,12 @@ def _float8_dynamic_activation_float8_weight_opaque_tensor_transform(
     *,
     parameter_name: str = "weight",
 ):
-    if config.set_inductor_config:
-        torchao.quantization.utils.recommended_inductor_config_setter()
-
-    assert hasattr(module, parameter_name), (
-        f"applying float8 dynamic activation quant requires module to have parameter {parameter_name} attribute"
-        + f" but {module} does not have one"
+    return _apply_weight_quant_transform(
+        module,
+        parameter_name,
+        lambda weight: _float8_dynamic_activation_float8_weight_opaque_tensor_quantize(
+            weight, config
+        ),
+        quant_name="float8 dynamic activation float8 weight",
+        set_inductor_config=config.set_inductor_config,
     )
-    quantized_tensor = _float8_dynamic_activation_float8_weight_opaque_tensor_quantize(
-        getattr(module, parameter_name), config
-    )
-    return _set_quantized_parameter(module, parameter_name, quantized_tensor)

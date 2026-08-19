@@ -790,6 +790,34 @@ def _set_quantized_parameter(module, parameter_name, new_weight):
     return module
 
 
+def _apply_weight_quant_transform(
+    module,
+    parameter_name,
+    quantize_fn,
+    *,
+    quant_name,
+    set_inductor_config=True,
+):
+    """Shared body of the ``_..._transform`` module handlers.
+
+    Every weight-quantization transform runs the same steps: optionally set the
+    recommended inductor config, assert the target parameter exists, quantize it
+    with ``quantize_fn(weight)``, then install the result via
+    ``_set_quantized_parameter``. This captures that skeleton so each handler is
+    just a call supplying its own ``quantize_fn`` and human-readable
+    ``quant_name`` (used in the assertion message). Returns ``module``.
+    """
+    if set_inductor_config:
+        recommended_inductor_config_setter()
+
+    assert hasattr(module, parameter_name), (
+        f"applying {quant_name} quant requires module to have {parameter_name} "
+        f"attribute but {module} does not have one"
+    )
+    new_weight = quantize_fn(getattr(module, parameter_name))
+    return _set_quantized_parameter(module, parameter_name, new_weight)
+
+
 def _fp8_mm_compat(weight: torch.Tensor) -> bool:
     """
     Check if a weight tensor meets float8 quantization requirements.
