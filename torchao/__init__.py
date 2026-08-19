@@ -1,6 +1,5 @@
 import logging
 import os
-import re
 
 # torch/nested/_internal/nested_tensor.py:417: UserWarning: Failed to initialize NumPy: No module named 'numpy'
 import warnings
@@ -26,26 +25,11 @@ except PackageNotFoundError:
 logger = logging.getLogger(__name__)
 
 
+from torchao._version_utils import parse_version as _parse_version
+
+
 def is_fbcode():
     return not hasattr(torch.version, "git_version")
-
-
-def _parse_version(version_string):
-    """
-    Parse version string representing pre-release with -1
-
-    Examples: "2.5.0.dev20240708+cu121" -> [2, 5, -1], "2.5.0" -> [2, 5, 0]
-    """
-    # Check for pre-release indicators
-    is_prerelease = bool(re.search(r"(git|dev)", version_string))
-    match = re.match(r"(\d+)\.(\d+)\.(\d+)", version_string)
-    if match:
-        major, minor, patch = map(int, match.groups())
-        if is_prerelease:
-            patch = -1
-        return [major, minor, patch]
-    else:
-        raise ValueError(f"Invalid version string format: {version_string}")
 
 
 skip_loading_so_files = False

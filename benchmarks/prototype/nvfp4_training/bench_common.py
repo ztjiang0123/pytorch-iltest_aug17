@@ -10,6 +10,7 @@ import argparse
 from typing import Callable, List
 
 import torch
+from tabulate import tabulate
 from tqdm import tqdm
 
 LLAMA_BATCH_SIZE = 1
@@ -70,3 +71,29 @@ def run_benchmark_main(
         if result is not None:
             results.append(make_experiment(config, result))
     print_results(results)
+
+
+def print_results(experiments: List[object]):
+    """Print an M/N/time/gbps results table for the given experiments.
+
+    Each experiment is expected to expose ``config`` (with ``m``, ``n``,
+    optional ``model``/``shape`` fields) and ``result`` (with ``time_us`` and
+    ``gbps`` fields). ``model``/``shape`` label columns are added only when at
+    least one experiment provides them.
+    """
+    has_labels = any(e.config.model or e.config.shape for e in experiments)
+    headers = ["M", "N", "time_us", "gbps"]
+    rows = []
+    for e in experiments:
+        row = [
+            e.config.m,
+            e.config.n,
+            round(e.result.time_us, 3),
+            round(e.result.gbps, 3),
+        ]
+        if has_labels:
+            row = [e.config.model, e.config.shape] + row
+        rows.append(row)
+    if has_labels:
+        headers = ["model", "shape"] + headers
+    print(tabulate(rows, headers=headers))

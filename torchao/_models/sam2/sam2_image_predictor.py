@@ -12,7 +12,7 @@ import torch
 from PIL.Image import Image
 
 from torchao._models.sam2.modeling.sam2_base import SAM2Base
-from torchao._models.sam2.utils.misc import get_image_size
+from torchao._models.sam2.utils.misc import get_image_size, load_pretrained_sam2_model
 from torchao._models.sam2.utils.transforms import SAM2Transforms
 
 
@@ -79,10 +79,7 @@ class SAM2ImagePredictor(torch.nn.Module):
         Returns:
           (SAM2ImagePredictor): The loaded model.
         """
-        from sam2.build_sam import build_sam2_hf
-
-        sam_model = build_sam2_hf(model_id, **kwargs)
-        return cls(sam_model, **kwargs)
+        return load_pretrained_sam2_model(cls, model_id, **kwargs)
 
     @torch.no_grad()
     def set_image(

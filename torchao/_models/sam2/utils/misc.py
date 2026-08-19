@@ -15,6 +15,26 @@ from PIL import Image
 from tqdm import tqdm
 
 
+def load_pretrained_sam2_model(cls, model_id: str, **kwargs):
+    """Load a pretrained SAM2 model from the Hugging Face hub and wrap it.
+
+    Shared implementation for the ``from_pretrained`` classmethods on the SAM2
+    predictor/generator classes.
+
+    Arguments:
+      cls: The class to instantiate with the loaded backbone model.
+      model_id (str): The Hugging Face repository ID.
+      **kwargs: Additional arguments to pass to the model constructor.
+
+    Returns:
+      An instance of ``cls`` wrapping the loaded model.
+    """
+    from sam2.build_sam import build_sam2_hf
+
+    sam_model = build_sam2_hf(model_id, **kwargs)
+    return cls(sam_model, **kwargs)
+
+
 def get_sdpa_settings():
     if torch.cuda.is_available():
         old_gpu = torch.cuda.get_device_properties(0).major < 7
