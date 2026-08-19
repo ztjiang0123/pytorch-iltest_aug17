@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-import argparse
 import itertools
 from dataclasses import dataclass
 from typing import List
@@ -12,8 +11,11 @@ from typing import List
 import torch
 import triton
 from tabulate import tabulate
-from tqdm import tqdm
 
+from benchmarks.prototype.nvfp4_training.bench_common import (
+    build_representative_model_configs,
+    run_benchmark_main,
+)
 from benchmarks.utils import benchmark_cuda_function_in_microseconds
 from torchao.prototype.moe_training.nvfp4_training.hadamard_amax_triton import (
     _hadamard_amax_kernel,
@@ -28,8 +30,6 @@ M_SHAPES = [128, 256, 1024, 8192]
 N_SHAPES = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 BENCH_OUTPUT_BUFFER_COUNT = 1_000_000
 
-LLAMA_BATCH_SIZE = 1
-LLAMA_SEQ_LEN = 2048
 RHT_SIGN_VECTOR = (
     1,
     1,
@@ -77,14 +77,7 @@ def get_configs() -> List[ExperimentConfig]:
 
 
 def get_representative_model_configs() -> List[ExperimentConfig]:
-    llama_m = LLAMA_BATCH_SIZE * LLAMA_SEQ_LEN
-
-    return [
-        ExperimentConfig(llama_m, 4096, "Llama 3 8B", "hidden-state input"),
-        ExperimentConfig(llama_m, 14336, "Llama 3 8B", "mlp.down input"),
-        ExperimentConfig(llama_m, 8192, "Llama 3 70B", "hidden-state input"),
-        ExperimentConfig(llama_m, 28672, "Llama 3 70B", "mlp.down input"),
-    ]
+    return build_representative_model_configs(ExperimentConfig)
 
 
 def run_experiment(config: ExperimentConfig) -> ExperimentResult:
@@ -156,26 +149,15 @@ def print_results(experiments: List[Experiment]):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--shape-set",
-        choices=("sweep", "representative-models"),
-        default="sweep",
-        help="Benchmark the original sweep or selected model-derived shapes.",
+    run_benchmark_main(
+        get_configs=get_configs,
+        get_representative_model_configs=get_representative_model_configs,
+        run_experiment=run_experiment,
+        make_experiment=lambda config, result: Experiment(
+            config=config, result=result
+        ),
+        print_results=print_results,
     )
-    args = parser.parse_args()
-
-    torch.random.manual_seed(123)
-    configs = (
-        get_representative_model_configs()
-        if args.shape_set == "representative-models"
-        else get_configs()
-    )
-    results = []
-    for config in tqdm(configs):
-        result = run_experiment(config)
-        results.append(Experiment(config=config, result=result))
-    print_results(results)
 
 
 if __name__ == "__main__":
