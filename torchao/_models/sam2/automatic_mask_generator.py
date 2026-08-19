@@ -36,6 +36,7 @@ from torchao._models.sam2.utils.amg import (
 from torchao._models.sam2.utils.misc import (
     crop_image,
     get_image_size,
+    load_pretrained_sam2_model,
 )
 
 
@@ -173,10 +174,7 @@ class SAM2AutomaticMaskGenerator(torch.nn.Module):
         Returns:
           (SAM2AutomaticMaskGenerator): The loaded model.
         """
-        from sam2.build_sam import build_sam2_hf
-
-        sam_model = build_sam2_hf(model_id, **kwargs)
-        return cls(sam_model, **kwargs)
+        return load_pretrained_sam2_model(cls, model_id, **kwargs)
 
     @torch.no_grad()
     def generate(self, image: np.ndarray) -> List[Dict[str, Any]]:

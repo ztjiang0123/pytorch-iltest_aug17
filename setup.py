@@ -8,7 +8,6 @@ import glob
 import json
 import os
 import pickle
-import re
 import subprocess
 import sys
 import time
@@ -150,24 +149,22 @@ from torch.utils.cpp_extension import (
 )
 
 
-# Check if torch version is at least 2.10.0 (for stable ABI support)
-# util copied from torchao/utils.py
-def _parse_version(version_string):
-    """
-    Parse version string representing pre-release with -1
+# Check if torch version is at least 2.10.0 (for stable ABI support).
+# Load the shared version parser by file path so we don't import the full
+# ``torchao`` package (and therefore ``torch``/compiled extensions) at build
+# time. This keeps the parsing logic in exactly one place
+# (torchao/_version_utils.py).
+def _load_parse_version():
+    import importlib.util
 
-    Examples: "2.5.0.dev20240708+cu121" -> [2, 5, -1], "2.5.0" -> [2, 5, 0]
-    """
-    # Check for pre-release indicators
-    is_prerelease = bool(re.search(r"(git|dev)", version_string))
-    match = re.match(r"(\d+)\.(\d+)\.(\d+)", version_string)
-    if match:
-        major, minor, patch = map(int, match.groups())
-        if is_prerelease:
-            patch = -1
-        return [major, minor, patch]
-    else:
-        raise ValueError(f"Invalid version string format: {version_string}")
+    module_path = Path(__file__).parent / "torchao" / "_version_utils.py"
+    spec = importlib.util.spec_from_file_location("torchao_version_utils", module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.parse_version
+
+
+_parse_version = _load_parse_version()
 
 
 def _is_fbcode():

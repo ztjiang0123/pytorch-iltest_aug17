@@ -23,6 +23,7 @@ from torchao.quantization import (
     quantize_,
 )
 from torchao.sparsity import apply_fake_sparsity, semi_sparse_weight, sparsify_
+from torchao.utils import profiler_runner
 
 torch._dynamo.config.cache_size_limit = 50000
 
@@ -217,19 +218,6 @@ def build_results(
 
 def identity_runner(fn, *args, **kwargs):
     return fn(*args, **kwargs)
-
-
-def profiler_runner(path, fn, *args, **kwargs):
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        record_shapes=True,
-    ) as prof:
-        result = fn(*args, **kwargs)
-    prof.export_chrome_trace(path)
-    return result
 
 
 def profile_top_runner(fn, *args, **kwargs):

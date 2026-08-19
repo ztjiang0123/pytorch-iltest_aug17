@@ -10,10 +10,10 @@ from typing import List
 
 import torch
 import triton
-from tabulate import tabulate
 
 from benchmarks.prototype.nvfp4_training.bench_common import (
     build_representative_model_configs,
+    print_results,
     run_benchmark_main,
 )
 from benchmarks.utils import benchmark_cuda_function_in_microseconds
@@ -110,25 +110,6 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult | None:
     gbps = ((read_bytes + write_fp4 + write_scales) / 1e9) / (time_us / 1e6)
 
     return ExperimentResult(time_us=time_us, gbps=gbps)
-
-
-def print_results(experiments: List[Experiment]):
-    has_labels = any(e.config.model or e.config.shape for e in experiments)
-    headers = ["M", "N", "time_us", "gbps"]
-    rows = []
-    for e in experiments:
-        row = [
-            e.config.m,
-            e.config.n,
-            round(e.result.time_us, 3),
-            round(e.result.gbps, 3),
-        ]
-        if has_labels:
-            row = [e.config.model, e.config.shape] + row
-        rows.append(row)
-    if has_labels:
-        headers = ["model", "shape"] + headers
-    print(tabulate(rows, headers=headers))
 
 
 def main():

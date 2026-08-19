@@ -6,7 +6,6 @@
 import functools
 import importlib
 import itertools
-import re
 import time
 from functools import reduce
 from importlib.metadata import version
@@ -372,22 +371,9 @@ def _is_float8_type(dtype: torch.dtype) -> bool:
     return dtype in fp8_types
 
 
-def parse_version(version_string):
-    """
-    Parse version string representing pre-release with -1
-
-    Examples: "2.5.0.dev20240708+cu121" -> [2, 5, -1], "2.5.0" -> [2, 5, 0]
-    """
-    # Check for pre-release indicators
-    is_prerelease = bool(re.search(r"(git|dev)", version_string))
-    match = re.match(r"(\d+)\.(\d+)\.(\d+)", version_string)
-    if match:
-        major, minor, patch = map(int, match.groups())
-        if is_prerelease:
-            patch = -1
-        return [major, minor, patch]
-    else:
-        raise ValueError(f"Invalid version string format: {version_string}")
+# Re-exported from the standalone helper so version parsing lives in exactly
+# one place (see torchao/_version_utils.py).
+from torchao._version_utils import parse_version  # noqa: E402,F401
 
 
 def is_fbcode():

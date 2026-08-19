@@ -141,16 +141,17 @@ def _hf_download(model_id):
     return config_name, ckpt_path
 
 
-def build_sam2_hf(model_id, **kwargs):
+def _build_from_hf(builder, model_id, **kwargs):
     config_name, ckpt_path = _hf_download(model_id)
-    return build_sam2(config_file=config_name, ckpt_path=ckpt_path, **kwargs)
+    return builder(config_file=config_name, ckpt_path=ckpt_path, **kwargs)
+
+
+def build_sam2_hf(model_id, **kwargs):
+    return _build_from_hf(build_sam2, model_id, **kwargs)
 
 
 def build_sam2_video_predictor_hf(model_id, **kwargs):
-    config_name, ckpt_path = _hf_download(model_id)
-    return build_sam2_video_predictor(
-        config_file=config_name, ckpt_path=ckpt_path, **kwargs
-    )
+    return _build_from_hf(build_sam2_video_predictor, model_id, **kwargs)
 
 
 def _load_checkpoint(model, ckpt_path):
