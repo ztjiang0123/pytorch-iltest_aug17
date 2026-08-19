@@ -202,39 +202,23 @@ class RooflineModel:
         time_s = total_gb / self.memory_bandwidth_gbs
         return time_s
 
-    def compute_mxfp8_2d_3d_gemm_flops(self, M, K, N):
-        """
-        Compute FLOPs for MXFP8 2D-3D grouped GEMM (forward/backward input).
+    def _compute_mxfp8_gemm_time(self, dim0, dim1, dim2):
+        """Compute MXFP8 grouped GEMM time from its three dimensions.
 
-        Operation: (M, K) @ (G, K, N)^T -> (M, N)
-        Each of M tokens goes to exactly one group.
-        Total FLOPs = 2 * M * K * N
+        The 2D-3D and 2D-2D grouped GEMMs both have total FLOPs of
+        2 * dim0 * dim1 * dim2, so they share a single roofline computation.
         """
-        return 2 * M * K * N
-
-    def compute_mxfp8_2d_2d_gemm_flops(self, N, M, K):
-        """
-        Compute FLOPs for MXFP8 2D-2D grouped GEMM (backward weight).
-
-        Operation: (N, M) @ (M, K) -> G separate (N, K) matrices
-        G instances of (N, M/g) @ (M/g, K) -> G separate (N, K) matrices
-        Total FLOPs = 2 * N * M * K
-        """
-        return 2 * N * M * K
+        total_flops = 2 * dim0 * dim1 * dim2
+        total_tflops = total_flops / 1e12
+        return total_tflops / self.mxfp8_tflops
 
     def compute_mxfp8_2d_3d_gemm_time(self, M, K, N):
         """Compute time for MXFP8 2D-3D grouped GEMM"""
-        total_flops = self.compute_mxfp8_2d_3d_gemm_flops(M, K, N)
-        total_tflops = total_flops / 1e12
-        time_s = total_tflops / self.mxfp8_tflops
-        return time_s
+        return self._compute_mxfp8_gemm_time(M, K, N)
 
     def compute_mxfp8_2d_2d_gemm_time(self, N, M, K):
         """Compute time for MXFP8 2D-2D grouped GEMM"""
-        total_flops = self.compute_mxfp8_2d_2d_gemm_flops(N, M, K)
-        total_tflops = total_flops / 1e12
-        time_s = total_tflops / self.mxfp8_tflops
-        return time_s
+        return self._compute_mxfp8_gemm_time(N, M, K)
 
     def compute_mxfp8_fwd_bwd_time(self, M, K, N, G):
         """Compute time for MXFP8 forward + backward pass."""
@@ -330,6 +314,31 @@ class RooflineModel:
         time_s = total_gb / self.memory_bandwidth_gbs
         return time_s
 
+    def _compute_rearrange_2d_time(self, dim0, dim1):
+        """Compute roofline time for a 2D scale rearrangement.
+
+        The M-groups and K-groups rearrangements read a (dim0, dim1) uint8
+        scale tensor and write a same-shaped float8 tensor, so they share one
+        roofline computation.
+
+        Args:
+            dim0: Size of the first dimension of the scale tensor
+            dim1: Size of the second dimension of the scale tensor
+
+        Returns:
+            Time in seconds
+        """
+        # Input: (dim0, dim1) uint8 scales
+        read_bytes = dim0 * dim1 * 1  # uint8
+
+        # Output: Rearranged (dim0, dim1) float8 scales
+        write_bytes = dim0 * dim1 * 1  # float8
+
+        total_bytes = read_bytes + write_bytes
+        total_gb = total_bytes / 1e9
+
+        return total_gb / self.memory_bandwidth_gbs
+
     def compute_rearrange_2d_M_groups_time(self, Mg, K):
         """
         Compute roofline time for 2D M-groups scale rearrangement.
@@ -341,17 +350,7 @@ class RooflineModel:
         Returns:
             Time in seconds
         """
-        # Input: (Mg, K) uint8 scales
-        read_bytes = Mg * K * 1  # uint8
-
-        # Output: Rearranged (Mg, K) float8 scales
-        write_bytes = Mg * K * 1  # float8
-
-        total_bytes = read_bytes + write_bytes
-        total_gb = total_bytes / 1e9
-
-        time_s = total_gb / self.memory_bandwidth_gbs
-        return time_s
+        return self._compute_rearrange_2d_time(Mg, K)
 
     def compute_rearrange_2d_K_groups_time(self, N, M):
         """
@@ -364,17 +363,7 @@ class RooflineModel:
         Returns:
             Time in seconds
         """
-        # Input: (N, M) uint8 scales
-        read_bytes = N * M * 1  # uint8
-
-        # Output: Rearranged (N, M) float8 scales
-        write_bytes = N * M * 1  # float8
-
-        total_bytes = read_bytes + write_bytes
-        total_gb = total_bytes / 1e9
-
-        time_s = total_gb / self.memory_bandwidth_gbs
-        return time_s
+        return self._compute_rearrange_2d_time(N, M)
 
     def compute_rearrange_3d_per_group_time(self, G, N, K_blocks):
         """
