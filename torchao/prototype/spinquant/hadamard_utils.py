@@ -11,6 +11,12 @@
 
 import torch
 
+from torchao.ops import (
+    register_custom_op as register_custom_op_abstract,
+)
+from torchao.ops import (
+    register_custom_op_impl,
+)
 from torchao.prototype.spinquant._hadamard_matrices import (
     get_had12,
     get_had20,
@@ -44,20 +50,6 @@ except ImportError:
 
     def matmul_hadU(X, hadK, K):
         return matmul_hadU_slow(X, hadK, K)
-
-
-def register_custom_op_impl(name):
-    def decorator(func):
-        return torch.library.custom_op(f"{name}", mutates_args=())(func)
-
-    return decorator
-
-
-def register_custom_op_abstract(name):
-    def decorator(func):
-        return torch.library.register_fake(f"{name}")(func)
-
-    return decorator
 
 
 @register_custom_op_impl("torchao::hadamard_transform")
