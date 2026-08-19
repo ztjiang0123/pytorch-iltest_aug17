@@ -242,40 +242,8 @@ struct KernelImpl<true, false, false> {
 
 } // namespace fp32_a_input_channelwise_8bit_b_1x16x4_f32::internal
 
-namespace fp32_a_input_channelwise_8bit_b_1x16x4_f32 {
-template <bool b_has_zeros, bool a_transposed, bool b_transposed>
-void kernel(
-    int m,
-    int n,
-    int k,
-    const float* lhs,
-    int lhs_stride_m,
-    const int8_t* rhs,
-    int rhs_stride_n,
-    float32_t* output,
-    int out_stride_m,
-    const int8_t* rhs_zero_points,
-    const float* rhs_scales,
-    const float beta,
-    const int rhs_qparams_stride) {
-  torchao::kernels::cpu::aarch64::quantized_matmul::
-      fp32_a_input_channelwise_8bit_b_1x16x4_f32::internal::
-          KernelImpl<b_has_zeros, a_transposed, b_transposed>::run(
-              m,
-              n,
-              k,
-              lhs,
-              lhs_stride_m,
-              rhs,
-              rhs_stride_n,
-              output,
-              out_stride_m,
-              rhs_zero_points,
-              rhs_scales,
-              beta,
-              rhs_qparams_stride);
-}
-} // namespace fp32_a_input_channelwise_8bit_b_1x16x4_f32
+TORCHAO_DEFINE_FP32_A_CHANNELWISE_8BIT_B_MATMUL_KERNEL(
+    fp32_a_input_channelwise_8bit_b_1x16x4_f32)
 } // namespace torchao::kernels::cpu::aarch64::quantized_matmul
 
 #endif // defined(__aarch64__) && defined(__ARM_NEON)

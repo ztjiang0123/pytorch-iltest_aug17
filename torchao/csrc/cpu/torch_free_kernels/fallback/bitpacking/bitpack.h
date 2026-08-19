@@ -19,6 +19,196 @@
 
 namespace torchao::kernels::cpu::fallback::bitpacking {
 namespace internal {
+
+/**
+ * @brief Applies a fixed-size bitpacking primitive across a strided sequence.
+ *
+ * A count-N pack/unpack of `nbit` values decomposes into `num_blocks`
+ * back-to-back invocations of a primitive that handles `unpacked_block` values
+ * (consuming/producing `packed_block` packed bytes). This driver walks both the
+ * packed and unpacked buffers in lockstep so the offset arithmetic lives in one
+ * place instead of being spelled out per (count, nbit) case.
+ *
+ * @tparam num_blocks Number of primitive invocations.
+ * @tparam unpacked_block Number of unpacked (uint8_t) values per invocation.
+ * @tparam packed_block Number of packed bytes per invocation.
+ * @param prim Primitive with signature void(uint8_t* dst, const uint8_t* src).
+ * @param dst Destination base pointer.
+ * @param src Source base pointer.
+ * @param dst_is_packed Whether `dst` advances by `packed_block` (true, pack)
+ *   or by `unpacked_block` (false, unpack); `src` advances by the other.
+ */
+template <int num_blocks, int unpacked_block, int packed_block, typename Prim>
+inline void apply_bitpack_blocks(
+    Prim&& prim,
+    uint8_t* dst,
+    const uint8_t* src,
+    bool dst_is_packed) {
+  const int dst_stride = dst_is_packed ? packed_block : unpacked_block;
+  const int src_stride = dst_is_packed ? unpacked_block : packed_block;
+  for (int b = 0; b < num_blocks; ++b) {
+    prim(dst + b * dst_stride, src + b * src_stride);
+  }
+}
+
+/**
+ * @brief Packs `count` unsigned 8-bit integers into a packed 'nbit' format.
+ *
+ * Shared by the 128/64/32 pack helpers below; dispatches on (count, nbit) to
+ * the appropriate fixed-size primitive and drives it via
+ * `apply_bitpack_blocks`.
+ *
+ * @tparam nbit The number of bits to pack each value into (1-8).
+ * @tparam count The number of values to pack (128, 64, or 32).
+ */
+template <int nbit, int count>
+inline void pack_uint_values_impl(
+    uint8_t* packed,
+    const uint8_t* unpacked_values) {
+  static_assert(nbit >= 1 && nbit <= 8, "nbit must be between 1 and 8");
+  static_assert(
+      count == 128 || count == 64 || count == 32,
+      "count must be 128, 64, or 32");
+
+  if constexpr (nbit == 8) {
+    std::memcpy(packed, unpacked_values, count);
+  } else if constexpr (count == 128) {
+    if constexpr (nbit == 1) {
+      pack_128_uint1_values(packed, unpacked_values);
+    } else if constexpr (nbit == 2) {
+      apply_bitpack_blocks<2, 64, 16>(
+          pack_64_uint2_values, packed, unpacked_values, true);
+    } else if constexpr (nbit == 3) {
+      pack_128_uint3_values(packed, unpacked_values);
+    } else if constexpr (nbit == 4) {
+      apply_bitpack_blocks<4, 32, 16>(
+          pack_32_uint4_values, packed, unpacked_values, true);
+    } else if constexpr (nbit == 5) {
+      pack_128_uint5_values(packed, unpacked_values);
+    } else if constexpr (nbit == 6) {
+      apply_bitpack_blocks<2, 64, 48>(
+          pack_64_uint6_values, packed, unpacked_values, true);
+    } else if constexpr (nbit == 7) {
+      pack_128_uint7_values(packed, unpacked_values);
+    }
+  } else if constexpr (count == 64) {
+    if constexpr (nbit == 1) {
+      pack_64_uint1_values(packed, unpacked_values);
+    } else if constexpr (nbit == 2) {
+      pack_64_uint2_values(packed, unpacked_values);
+    } else if constexpr (nbit == 3) {
+      pack_64_uint3_values(packed, unpacked_values);
+    } else if constexpr (nbit == 4) {
+      apply_bitpack_blocks<2, 32, 16>(
+          pack_32_uint4_values, packed, unpacked_values, true);
+    } else if constexpr (nbit == 5) {
+      pack_64_uint5_values(packed, unpacked_values);
+    } else if constexpr (nbit == 6) {
+      pack_64_uint6_values(packed, unpacked_values);
+    } else if constexpr (nbit == 7) {
+      pack_64_uint7_values(packed, unpacked_values);
+    }
+  } else { // count == 32
+    if constexpr (nbit == 1) {
+      pack_32_uint1_values(packed, unpacked_values);
+    } else if constexpr (nbit == 2) {
+      pack_32_uint2_values(packed, unpacked_values);
+    } else if constexpr (nbit == 3) {
+      apply_bitpack_blocks<4, 8, 3>(
+          pack_8_uint3_values, packed, unpacked_values, true);
+    } else if constexpr (nbit == 4) {
+      pack_32_uint4_values(packed, unpacked_values);
+    } else if constexpr (nbit == 5) {
+      apply_bitpack_blocks<4, 8, 5>(
+          pack_8_uint5_values, packed, unpacked_values, true);
+    } else if constexpr (nbit == 6) {
+      pack_32_uint6_values(packed, unpacked_values);
+    } else if constexpr (nbit == 7) {
+      apply_bitpack_blocks<4, 8, 7>(
+          pack_8_uint7_values, packed, unpacked_values, true);
+    }
+  }
+}
+
+/**
+ * @brief Unpacks 'nbit' data into `count` unsigned 8-bit integers.
+ *
+ * Shared by the 128/64/32 unpack helpers below; dispatches on (count, nbit) to
+ * the appropriate fixed-size primitive and drives it via
+ * `apply_bitpack_blocks`.
+ *
+ * @tparam nbit The number of bits per value in the packed format (1-8).
+ * @tparam count The number of values to unpack (128, 64, or 32).
+ */
+template <int nbit, int count>
+inline void unpack_uint_values_impl(
+    uint8_t* unpacked_values,
+    const uint8_t* packed) {
+  static_assert(nbit >= 1 && nbit <= 8, "nbit must be between 1 and 8");
+  static_assert(
+      count == 128 || count == 64 || count == 32,
+      "count must be 128, 64, or 32");
+
+  if constexpr (nbit == 8) {
+    std::memcpy(unpacked_values, packed, count);
+  } else if constexpr (count == 128) {
+    if constexpr (nbit == 1) {
+      unpack_128_uint1_values(unpacked_values, packed);
+    } else if constexpr (nbit == 2) {
+      apply_bitpack_blocks<2, 64, 16>(
+          unpack_64_uint2_values, unpacked_values, packed, false);
+    } else if constexpr (nbit == 3) {
+      unpack_128_uint3_values(unpacked_values, packed);
+    } else if constexpr (nbit == 4) {
+      apply_bitpack_blocks<4, 32, 16>(
+          unpack_32_uint4_values, unpacked_values, packed, false);
+    } else if constexpr (nbit == 5) {
+      unpack_128_uint5_values(unpacked_values, packed);
+    } else if constexpr (nbit == 6) {
+      apply_bitpack_blocks<2, 64, 48>(
+          unpack_64_uint6_values, unpacked_values, packed, false);
+    } else if constexpr (nbit == 7) {
+      unpack_128_uint7_values(unpacked_values, packed);
+    }
+  } else if constexpr (count == 64) {
+    if constexpr (nbit == 1) {
+      unpack_64_uint1_values(unpacked_values, packed);
+    } else if constexpr (nbit == 2) {
+      unpack_64_uint2_values(unpacked_values, packed);
+    } else if constexpr (nbit == 3) {
+      unpack_64_uint3_values(unpacked_values, packed);
+    } else if constexpr (nbit == 4) {
+      apply_bitpack_blocks<2, 32, 16>(
+          unpack_32_uint4_values, unpacked_values, packed, false);
+    } else if constexpr (nbit == 5) {
+      unpack_64_uint5_values(unpacked_values, packed);
+    } else if constexpr (nbit == 6) {
+      unpack_64_uint6_values(unpacked_values, packed);
+    } else if constexpr (nbit == 7) {
+      unpack_64_uint7_values(unpacked_values, packed);
+    }
+  } else { // count == 32
+    if constexpr (nbit == 1) {
+      unpack_32_uint1_values(unpacked_values, packed);
+    } else if constexpr (nbit == 2) {
+      unpack_32_uint2_values(unpacked_values, packed);
+    } else if constexpr (nbit == 3) {
+      apply_bitpack_blocks<4, 8, 3>(
+          unpack_8_uint3_values, unpacked_values, packed, false);
+    } else if constexpr (nbit == 4) {
+      unpack_32_uint4_values(unpacked_values, packed);
+    } else if constexpr (nbit == 5) {
+      apply_bitpack_blocks<4, 8, 5>(
+          unpack_8_uint5_values, unpacked_values, packed, false);
+    } else if constexpr (nbit == 6) {
+      unpack_32_uint6_values(unpacked_values, packed);
+    } else if constexpr (nbit == 7) {
+      apply_bitpack_blocks<4, 8, 7>(
+          unpack_8_uint7_values, unpacked_values, packed, false);
+    }
+  }
+}
+
 /**
  * @brief Packs 128 unsigned 8-bit integers into a packed format of 'nbit' bits.
  *
@@ -30,30 +220,7 @@ template <int nbit>
 inline void pack_128_uint_values(
     uint8_t* packed,
     const uint8_t* unpacked_values) {
-  static_assert(nbit >= 1 && nbit <= 8, "nbit must be between 1 and 8");
-
-  if constexpr (nbit == 1) {
-    pack_128_uint1_values(packed, unpacked_values);
-  } else if constexpr (nbit == 2) {
-    pack_64_uint2_values(packed, unpacked_values);
-    pack_64_uint2_values(packed + 16, unpacked_values + 64);
-  } else if constexpr (nbit == 3) {
-    pack_128_uint3_values(packed, unpacked_values);
-  } else if constexpr (nbit == 4) {
-    pack_32_uint4_values(packed, unpacked_values);
-    pack_32_uint4_values(packed + 16, unpacked_values + 32);
-    pack_32_uint4_values(packed + 32, unpacked_values + 64);
-    pack_32_uint4_values(packed + 48, unpacked_values + 96);
-  } else if constexpr (nbit == 5) {
-    pack_128_uint5_values(packed, unpacked_values);
-  } else if constexpr (nbit == 6) {
-    pack_64_uint6_values(packed, unpacked_values);
-    pack_64_uint6_values(packed + 48, unpacked_values + 64);
-  } else if constexpr (nbit == 7) {
-    pack_128_uint7_values(packed, unpacked_values);
-  } else if constexpr (nbit == 8) {
-    std::memcpy(packed, unpacked_values, 128);
-  }
+  pack_uint_values_impl<nbit, 128>(packed, unpacked_values);
 }
 
 /**
@@ -67,26 +234,7 @@ template <int nbit>
 inline void pack_64_uint_values(
     uint8_t* packed,
     const uint8_t* unpacked_values) {
-  static_assert(nbit >= 1 && nbit <= 8, "nbit must be between 1 and 8");
-
-  if constexpr (nbit == 1) {
-    pack_64_uint1_values(packed, unpacked_values);
-  } else if constexpr (nbit == 2) {
-    pack_64_uint2_values(packed, unpacked_values);
-  } else if constexpr (nbit == 3) {
-    pack_64_uint3_values(packed, unpacked_values);
-  } else if constexpr (nbit == 4) {
-    pack_32_uint4_values(packed, unpacked_values);
-    pack_32_uint4_values(packed + 16, unpacked_values + 32);
-  } else if constexpr (nbit == 5) {
-    pack_64_uint5_values(packed, unpacked_values);
-  } else if constexpr (nbit == 6) {
-    pack_64_uint6_values(packed, unpacked_values);
-  } else if constexpr (nbit == 7) {
-    pack_64_uint7_values(packed, unpacked_values);
-  } else if constexpr (nbit == 8) {
-    std::memcpy(packed, unpacked_values, 64);
-  }
+  pack_uint_values_impl<nbit, 64>(packed, unpacked_values);
 }
 
 /**
@@ -100,35 +248,9 @@ template <int nbit>
 inline void pack_32_uint_values(
     uint8_t* packed,
     const uint8_t* unpacked_values) {
-  static_assert(nbit >= 1 && nbit <= 8, "nbit must be between 1 and 8");
-
-  if constexpr (nbit == 1) {
-    pack_32_uint1_values(packed, unpacked_values);
-  } else if constexpr (nbit == 2) {
-    pack_32_uint2_values(packed, unpacked_values);
-  } else if constexpr (nbit == 3) {
-    pack_8_uint3_values(packed, unpacked_values);
-    pack_8_uint3_values(packed + 3, unpacked_values + 8);
-    pack_8_uint3_values(packed + 6, unpacked_values + 16);
-    pack_8_uint3_values(packed + 9, unpacked_values + 24);
-  } else if constexpr (nbit == 4) {
-    pack_32_uint4_values(packed, unpacked_values);
-  } else if constexpr (nbit == 5) {
-    pack_8_uint5_values(packed, unpacked_values);
-    pack_8_uint5_values(packed + 5, unpacked_values + 8);
-    pack_8_uint5_values(packed + 10, unpacked_values + 16);
-    pack_8_uint5_values(packed + 15, unpacked_values + 24);
-  } else if constexpr (nbit == 6) {
-    pack_32_uint6_values(packed, unpacked_values);
-  } else if constexpr (nbit == 7) {
-    pack_8_uint7_values(packed, unpacked_values);
-    pack_8_uint7_values(packed + 7, unpacked_values + 8);
-    pack_8_uint7_values(packed + 14, unpacked_values + 16);
-    pack_8_uint7_values(packed + 21, unpacked_values + 24);
-  } else if constexpr (nbit == 8) {
-    std::memcpy(packed, unpacked_values, 32);
-  }
+  pack_uint_values_impl<nbit, 32>(packed, unpacked_values);
 }
+
 /**
  * @brief Unpacks 'nbit' data into 128 unsigned 8-bit integers.
  *
@@ -141,29 +263,65 @@ template <int nbit>
 inline void unpack_128_uint_values(
     uint8_t* unpacked_values,
     const uint8_t* packed) {
-  static_assert(nbit >= 1 && nbit <= 8, "nbit must be between 1 and 8");
+  unpack_uint_values_impl<nbit, 128>(unpacked_values, packed);
+}
 
-  if constexpr (nbit == 1) {
-    unpack_128_uint1_values(unpacked_values, packed);
-  } else if constexpr (nbit == 2) {
-    unpack_64_uint2_values(unpacked_values, packed);
-    unpack_64_uint2_values(unpacked_values + 64, packed + 16);
-  } else if constexpr (nbit == 3) {
-    unpack_128_uint3_values(unpacked_values, packed);
-  } else if constexpr (nbit == 4) {
-    unpack_32_uint4_values(unpacked_values, packed);
-    unpack_32_uint4_values(unpacked_values + 32, packed + 16);
-    unpack_32_uint4_values(unpacked_values + 64, packed + 32);
-    unpack_32_uint4_values(unpacked_values + 96, packed + 48);
-  } else if constexpr (nbit == 5) {
-    unpack_128_uint5_values(unpacked_values, packed);
-  } else if constexpr (nbit == 6) {
-    unpack_64_uint6_values(unpacked_values, packed);
-    unpack_64_uint6_values(unpacked_values + 64, packed + 48);
-  } else if constexpr (nbit == 7) {
-    unpack_128_uint7_values(unpacked_values, packed);
-  } else if constexpr (nbit == 8) {
-    std::memcpy(unpacked_values, packed, 128);
+/**
+ * @brief Packs `count` signed 8-bit integers into a packed format of 'nbit'
+ * bits.
+ *
+ * Converts the signed input to unsigned (offset by 2^(nbit-1) for nbit < 8),
+ * then delegates to the generalized uint packing function. This single
+ * implementation backs the 128/64/32 signed pack helpers below.
+ *
+ * @tparam nbit The number of bits to pack each value into (1-8).
+ * @tparam count The number of values to pack (128, 64, or 32).
+ */
+template <int nbit, int count>
+inline void pack_lowbit_int_values(uint8_t* packed, const int8_t* unpacked) {
+  // 1. Convert signed input to a temporary buffer of unsigned values.
+  uint8_t temp_unpacked[count];
+  if constexpr (nbit < 8) {
+    const int8_t shift = 1 << (nbit - 1);
+    for (int i = 0; i < count; ++i) {
+      temp_unpacked[i] = static_cast<uint8_t>(unpacked[i] + shift);
+    }
+  } else { // nbit == 8
+    for (int i = 0; i < count; ++i) {
+      temp_unpacked[i] = static_cast<uint8_t>(unpacked[i]);
+    }
+  }
+
+  // 2. Call the generalized uint packing function.
+  pack_uint_values_impl<nbit, count>(packed, temp_unpacked);
+}
+
+/**
+ * @brief Unpacks 'nbit' data into `count` signed 8-bit integers.
+ *
+ * Delegates to the generalized uint unpacking function, then applies the
+ * signed conversion (offset by -2^(nbit-1) for nbit < 8). This single
+ * implementation backs the 128/64/32 signed unpack helpers below.
+ *
+ * @tparam nbit The number of bits per value in the packed format (1-8).
+ * @tparam count The number of values to unpack (128, 64, or 32).
+ */
+template <int nbit, int count>
+inline void unpack_lowbit_int_values(int8_t* unpacked, const uint8_t* packed) {
+  // 1. Get the raw unsigned values by calling the base function.
+  uint8_t temp_unpacked[count];
+  unpack_uint_values_impl<nbit, count>(temp_unpacked, packed);
+
+  // 2. Perform the signed conversion.
+  if constexpr (nbit < 8) {
+    const int8_t unshift = -(1 << (nbit - 1));
+    for (int i = 0; i < count; ++i) {
+      unpacked[i] = static_cast<int8_t>(temp_unpacked[i]) + unshift;
+    }
+  } else { // nbit == 8
+    for (int i = 0; i < count; ++i) {
+      unpacked[i] = static_cast<int8_t>(temp_unpacked[i]);
+    }
   }
 }
 
@@ -178,42 +336,14 @@ template <int nbit>
 inline void pack_128_lowbit_int_values(
     uint8_t* packed,
     const int8_t* unpacked) {
-  // 1. Convert signed input to a temporary buffer of unsigned values.
-  uint8_t temp_unpacked[128];
-  if constexpr (nbit < 8) {
-    const int8_t shift = 1 << (nbit - 1);
-    for (int i = 0; i < 128; ++i) {
-      temp_unpacked[i] = static_cast<uint8_t>(unpacked[i] + shift);
-    }
-  } else { // nbit == 8
-    for (int i = 0; i < 128; ++i) {
-      temp_unpacked[i] = static_cast<uint8_t>(unpacked[i]);
-    }
-  }
-
-  // 2. Call the generalized uint packing function.
-  pack_128_uint_values<nbit>(packed, temp_unpacked);
+  pack_lowbit_int_values<nbit, 128>(packed, unpacked);
 }
 
 template <int nbit>
 inline void unpack_128_lowbit_int_values(
     int8_t* unpacked,
     const uint8_t* packed) {
-  // 1. Get the raw unsigned values by calling the base function.
-  uint8_t temp_unpacked[128];
-  unpack_128_uint_values<nbit>(temp_unpacked, packed);
-
-  // 2. Perform the signed conversion.
-  if constexpr (nbit < 8) {
-    const int8_t unshift = -(1 << (nbit - 1));
-    for (int i = 0; i < 128; ++i) {
-      unpacked[i] = static_cast<int8_t>(temp_unpacked[i]) + unshift;
-    }
-  } else { // nbit == 8
-    for (int i = 0; i < 128; ++i) {
-      unpacked[i] = static_cast<int8_t>(temp_unpacked[i]);
-    }
-  }
+  unpack_lowbit_int_values<nbit, 128>(unpacked, packed);
 }
 
 /**
@@ -227,21 +357,7 @@ template <int nbit>
 inline void pack_64_lowbit_int_values(
     uint8_t* packed,
     const int8_t* unpacked) {
-  // 1. Convert signed input to a temporary buffer of unsigned values.
-  uint8_t temp_unpacked[64];
-  if constexpr (nbit < 8) {
-    const int8_t shift = 1 << (nbit - 1);
-    for (int i = 0; i < 64; ++i) {
-      temp_unpacked[i] = static_cast<uint8_t>(unpacked[i] + shift);
-    }
-  } else { // nbit == 8
-    for (int i = 0; i < 64; ++i) {
-      temp_unpacked[i] = static_cast<uint8_t>(unpacked[i]);
-    }
-  }
-
-  // 2. Call the generalized uint packing function.
-  pack_64_uint_values<nbit>(packed, temp_unpacked);
+  pack_lowbit_int_values<nbit, 64>(packed, unpacked);
 }
 
 /**
@@ -255,21 +371,7 @@ template <int nbit>
 inline void pack_32_lowbit_int_values(
     uint8_t* packed,
     const int8_t* unpacked) {
-  // 1. Convert signed input to a temporary buffer of unsigned values.
-  uint8_t temp_unpacked[32];
-  if constexpr (nbit < 8) {
-    const int8_t shift = 1 << (nbit - 1);
-    for (int i = 0; i < 32; ++i) {
-      temp_unpacked[i] = static_cast<uint8_t>(unpacked[i] + shift);
-    }
-  } else { // nbit == 8
-    for (int i = 0; i < 32; ++i) {
-      temp_unpacked[i] = static_cast<uint8_t>(unpacked[i]);
-    }
-  }
-
-  // 2. Call the generalized uint packing function.
-  pack_32_uint_values<nbit>(packed, temp_unpacked);
+  pack_lowbit_int_values<nbit, 32>(packed, unpacked);
 }
 
 /**
@@ -283,26 +385,7 @@ template <int nbit>
 inline void unpack_64_uint_values(
     uint8_t* unpacked_values,
     const uint8_t* packed) {
-  static_assert(nbit >= 1 && nbit <= 8, "nbit must be between 1 and 8");
-
-  if constexpr (nbit == 1) {
-    unpack_64_uint1_values(unpacked_values, packed);
-  } else if constexpr (nbit == 2) {
-    unpack_64_uint2_values(unpacked_values, packed);
-  } else if constexpr (nbit == 3) {
-    unpack_64_uint3_values(unpacked_values, packed);
-  } else if constexpr (nbit == 4) {
-    unpack_32_uint4_values(unpacked_values, packed);
-    unpack_32_uint4_values(unpacked_values + 32, packed + 16);
-  } else if constexpr (nbit == 5) {
-    unpack_64_uint5_values(unpacked_values, packed);
-  } else if constexpr (nbit == 6) {
-    unpack_64_uint6_values(unpacked_values, packed);
-  } else if constexpr (nbit == 7) {
-    unpack_64_uint7_values(unpacked_values, packed);
-  } else if constexpr (nbit == 8) {
-    std::memcpy(unpacked_values, packed, 64);
-  }
+  unpack_uint_values_impl<nbit, 64>(unpacked_values, packed);
 }
 
 /**
@@ -316,34 +399,7 @@ template <int nbit>
 inline void unpack_32_uint_values(
     uint8_t* unpacked_values,
     const uint8_t* packed) {
-  static_assert(nbit >= 1 && nbit <= 8, "nbit must be between 1 and 8");
-
-  if constexpr (nbit == 1) {
-    unpack_32_uint1_values(unpacked_values, packed);
-  } else if constexpr (nbit == 2) {
-    unpack_32_uint2_values(unpacked_values, packed);
-  } else if constexpr (nbit == 3) {
-    unpack_8_uint3_values(unpacked_values, packed);
-    unpack_8_uint3_values(unpacked_values + 8, packed + 3);
-    unpack_8_uint3_values(unpacked_values + 16, packed + 6);
-    unpack_8_uint3_values(unpacked_values + 24, packed + 9);
-  } else if constexpr (nbit == 4) {
-    unpack_32_uint4_values(unpacked_values, packed);
-  } else if constexpr (nbit == 5) {
-    unpack_8_uint5_values(unpacked_values, packed);
-    unpack_8_uint5_values(unpacked_values + 8, packed + 5);
-    unpack_8_uint5_values(unpacked_values + 16, packed + 10);
-    unpack_8_uint5_values(unpacked_values + 24, packed + 15);
-  } else if constexpr (nbit == 6) {
-    unpack_32_uint6_values(unpacked_values, packed);
-  } else if constexpr (nbit == 7) {
-    unpack_8_uint7_values(unpacked_values, packed);
-    unpack_8_uint7_values(unpacked_values + 8, packed + 7);
-    unpack_8_uint7_values(unpacked_values + 16, packed + 14);
-    unpack_8_uint7_values(unpacked_values + 24, packed + 21);
-  } else if constexpr (nbit == 8) {
-    std::memcpy(unpacked_values, packed, 32);
-  }
+  unpack_uint_values_impl<nbit, 32>(unpacked_values, packed);
 }
 
 /**
@@ -357,19 +413,7 @@ template <int nbit>
 inline void unpack_64_lowbit_int_values(
     int8_t* unpacked,
     const uint8_t* packed) {
-  uint8_t temp_unpacked[64];
-  unpack_64_uint_values<nbit>(temp_unpacked, packed);
-
-  if constexpr (nbit < 8) {
-    const int8_t unshift = -(1 << (nbit - 1));
-    for (int i = 0; i < 64; ++i) {
-      unpacked[i] = static_cast<int8_t>(temp_unpacked[i]) + unshift;
-    }
-  } else {
-    for (int i = 0; i < 64; ++i) {
-      unpacked[i] = static_cast<int8_t>(temp_unpacked[i]);
-    }
-  }
+  unpack_lowbit_int_values<nbit, 64>(unpacked, packed);
 }
 
 /**
@@ -383,19 +427,7 @@ template <int nbit>
 inline void unpack_32_lowbit_int_values(
     int8_t* unpacked,
     const uint8_t* packed) {
-  uint8_t temp_unpacked[32];
-  unpack_32_uint_values<nbit>(temp_unpacked, packed);
-
-  if constexpr (nbit < 8) {
-    const int8_t unshift = -(1 << (nbit - 1));
-    for (int i = 0; i < 32; ++i) {
-      unpacked[i] = static_cast<int8_t>(temp_unpacked[i]) + unshift;
-    }
-  } else {
-    for (int i = 0; i < 32; ++i) {
-      unpacked[i] = static_cast<int8_t>(temp_unpacked[i]);
-    }
-  }
+  unpack_lowbit_int_values<nbit, 32>(unpacked, packed);
 }
 
 /**
