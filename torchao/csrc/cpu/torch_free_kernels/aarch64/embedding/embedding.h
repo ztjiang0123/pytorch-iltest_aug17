@@ -12,6 +12,7 @@
 #include <torchao/csrc/cpu/torch_free_kernels/aarch64/bitpacking/bitpack.h>
 #include <torchao/csrc/cpu/torch_free_kernels/aarch64/linear/channelwise_8bit_activation_groupwise_lowbit_weight/pack_weights.h>
 #include <torchao/csrc/cpu/torch_free_kernels/macro.h>
+#include <torchao/csrc/cpu/torch_free_kernels/shared/embedding_indexing.h>
 #include <torchao/csrc/cpu/torch_free_kernels/weight_packing/weight_packing.h>
 #include <cassert>
 #include <vector>
@@ -285,27 +286,28 @@ inline void embedding(
     const float* weight_scales,
     const int8_t* weight_zeros,
     int index) {
-  assert(group_size % 32 == 0);
-  assert(embedding_dim % group_size == 0);
-
-  auto packed_weight_qvals_byte_ptr =
-      reinterpret_cast<const uint8_t*>(packed_weight_qvals);
-
-  int groups_per_embedding = embedding_dim / group_size;
-  int packed_bytes_per_embedding = embedding_dim * weight_nbit / 8;
-
-  packed_weight_qvals_byte_ptr += (index * packed_bytes_per_embedding);
-  weight_scales += index * groups_per_embedding;
-  if (weight_zeros != nullptr) {
-    weight_zeros += index * groups_per_embedding;
-  }
-  embedding_<weight_nbit>(
+  torchao::kernels::cpu::embedding_shared::embedding_at_index<weight_nbit>(
+      [](float* out,
+         int embedding_dim,
+         int group_size,
+         const uint8_t* packed_weight_qvals,
+         const float* weight_scales,
+         const int8_t* weight_zeros) {
+        embedding_<weight_nbit>(
+            out,
+            embedding_dim,
+            group_size,
+            packed_weight_qvals,
+            weight_scales,
+            weight_zeros);
+      },
       out,
       embedding_dim,
       group_size,
-      packed_weight_qvals_byte_ptr,
+      packed_weight_qvals,
       weight_scales,
-      weight_zeros);
+      weight_zeros,
+      index);
 }
 
 template <int weight_nbit>
@@ -316,14 +318,17 @@ inline void pack_embedding_weight_qvals(
     int embedding_dim,
     const int8_t* qvals,
     int index) {
-  assert(embedding_dim % 8 == 0);
-  int packed_bytes_per_embedding = embedding_dim * weight_nbit / 8;
-  auto packed_qvals_byte_ptr = reinterpret_cast<uint8_t*>(packed_qvals);
-
-  pack_embedding_weight_qvals_<weight_nbit>(
-      packed_qvals_byte_ptr + index * packed_bytes_per_embedding,
-      embedding_dim,
-      qvals + index * embedding_dim);
+  torchao::kernels::cpu::embedding_shared::
+      pack_embedding_weight_qvals_at_index<weight_nbit>(
+          [](uint8_t* packed_qvals, int embedding_dim, const int8_t* qvals) {
+            pack_embedding_weight_qvals_<weight_nbit>(
+                packed_qvals, embedding_dim, qvals);
+          },
+          /*embedding_dim_multiple=*/8,
+          packed_qvals,
+          embedding_dim,
+          qvals,
+          index);
 }
 
 // Embedding op that shares weights with unembedding linear op

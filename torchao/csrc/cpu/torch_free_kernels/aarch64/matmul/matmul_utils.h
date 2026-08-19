@@ -150,4 +150,54 @@ void pack_kxn_b_matrix_for_mx8_dotprod_ukernel(
 } // namespace utils
 } // namespace torchao::kernels::cpu::aarch64::quantized_matmul
 
+// Defines the public `kernel(...)` entry point for a channelwise_8bit x
+// channelwise_8bit matmul variant. Every variant's entry point has the same
+// signature and simply forwards all arguments to its variant-specific
+// `internal::KernelImpl::run`. This macro captures that shared wrapper so the
+// forwarding body is not copy-pasted across variants; only the variant
+// namespace differs.
+#define TORCHAO_DEFINE_CHANNELWISE_8BIT_MATMUL_KERNEL(VARIANT_NS)             \
+  namespace VARIANT_NS {                                                      \
+  template <                                                                  \
+      bool a_has_zeros,                                                       \
+      bool b_has_zeros,                                                       \
+      bool a_transposed,                                                      \
+      bool b_transposed>                                                      \
+  void kernel(                                                                \
+      int m,                                                                  \
+      int n,                                                                  \
+      int k,                                                                  \
+      const void* lhs,                                                        \
+      int lhs_stride_m,                                                       \
+      const void* rhs,                                                        \
+      int rhs_stride_n,                                                       \
+      float32_t* output,                                                      \
+      int out_stride_m,                                                       \
+      const int8_t* lhs_zero_points,                                          \
+      const int8_t* rhs_zero_points,                                          \
+      const float* lhs_scales,                                                \
+      const float* rhs_scales,                                                \
+      const int lhs_qparams_stride,                                           \
+      const int rhs_qparams_stride) {                                         \
+    torchao::kernels::cpu::aarch64::quantized_matmul::VARIANT_NS::internal::  \
+        KernelImpl<a_has_zeros, b_has_zeros, a_transposed, b_transposed>::    \
+            run(                                                              \
+                m,                                                            \
+                n,                                                            \
+                k,                                                            \
+                lhs,                                                          \
+                lhs_stride_m,                                                 \
+                rhs,                                                          \
+                rhs_stride_n,                                                 \
+                output,                                                       \
+                out_stride_m,                                                 \
+                lhs_zero_points,                                              \
+                rhs_zero_points,                                              \
+                lhs_scales,                                                   \
+                rhs_scales,                                                   \
+                lhs_qparams_stride,                                           \
+                rhs_qparams_stride);                                          \
+  }                                                                          \
+  } /* namespace VARIANT_NS */
+
 #endif // defined(__aarch64__) || defined(__ARM_NEON)

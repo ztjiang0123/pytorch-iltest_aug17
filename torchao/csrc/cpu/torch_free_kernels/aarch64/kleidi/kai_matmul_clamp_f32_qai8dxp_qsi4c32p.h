@@ -65,8 +65,15 @@ namespace kai_matmul_clamp_f32_qai8dxp_qsi4c32p {
 
 using Ukernel = struct kai_matmul_clamp_f32_qai8dxp_qsi4c32p_ukernel;
 
-size_t packed_activations_size(
-    int m,
+namespace internal {
+// packed_activations_size and packed_activations_offset both ignore
+// group_size/has_weight_zeros and forward the leading dimension plus the
+// (mr, kr, sr) tiling to one of the lhs_packing query functions, which share
+// the same signature. This helper holds that shared forwarding so the two
+// public entry points only have to name which query they want.
+inline size_t query_lhs_packing(
+    lhs_packing::get_lhs_packed_size_t query,
+    int leading_dim,
     int k,
     int group_size,
     bool has_weight_zeros,
@@ -75,8 +82,27 @@ size_t packed_activations_size(
     int sr) {
   (void)group_size; // unused
   (void)has_weight_zeros; // unused
-  auto lhs_packing = get_lhs_packing();
-  return lhs_packing.get_lhs_packed_size(m, k, mr, kr, sr);
+  return query(leading_dim, k, mr, kr, sr);
+}
+} // namespace internal
+
+size_t packed_activations_size(
+    int m,
+    int k,
+    int group_size,
+    bool has_weight_zeros,
+    int mr,
+    int kr,
+    int sr) {
+  return internal::query_lhs_packing(
+      get_lhs_packing().get_lhs_packed_size,
+      m,
+      k,
+      group_size,
+      has_weight_zeros,
+      mr,
+      kr,
+      sr);
 }
 
 size_t packed_activations_offset(
@@ -87,10 +113,15 @@ size_t packed_activations_offset(
     int mr,
     int kr,
     int sr) {
-  (void)group_size; // unused
-  (void)has_weight_zeros; // unused
-  auto lhs_pack = get_lhs_packing();
-  return lhs_pack.get_lhs_packed_offset(m_idx, k, mr, kr, sr);
+  return internal::query_lhs_packing(
+      get_lhs_packing().get_lhs_packed_offset,
+      m_idx,
+      k,
+      group_size,
+      has_weight_zeros,
+      mr,
+      kr,
+      sr);
 }
 
 void pack_activations(
