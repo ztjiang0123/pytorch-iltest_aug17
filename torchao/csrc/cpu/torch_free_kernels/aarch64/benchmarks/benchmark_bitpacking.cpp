@@ -131,7 +131,7 @@ TORCHAO_ALWAYS_INLINE inline void unpack_uint_odd_bit_values(
             unpacked2,
             unpacked3,
             packed + ((i * nbit) / bitsPerByte));
-        torchao::bitpacking::internal::vec_store_64_uint8_values(
+        torchao::bitpacking::internal::vec_store_4_uint8_vectors<16>(
             unpacked + i, unpacked0, unpacked1, unpacked2, unpacked3);
       }
       break;
@@ -147,9 +147,9 @@ TORCHAO_ALWAYS_INLINE inline void unpack_uint_odd_bit_values(
             unpacked6,
             unpacked7,
             packed + ((i * nbit) / bitsPerByte));
-        torchao::bitpacking::internal::vec_store_64_uint8_values(
+        torchao::bitpacking::internal::vec_store_4_uint8_vectors<16>(
             unpacked + i, unpacked0, unpacked1, unpacked2, unpacked3);
-        torchao::bitpacking::internal::vec_store_64_uint8_values(
+        torchao::bitpacking::internal::vec_store_4_uint8_vectors<16>(
             unpacked + i + 64, unpacked4, unpacked5, unpacked6, unpacked7);
       }
       break;
@@ -411,7 +411,7 @@ void unpack_uint_values<2>(
             unpacked2_8x8,
             unpacked3_8x8,
             packed + ((i * nbit) / bitsPerByte));
-        torchao::bitpacking::internal::vec_store_32_uint8_values(
+        torchao::bitpacking::internal::vec_store_4_uint8_vectors<8>(
             unpacked + i,
             unpacked0_8x8,
             unpacked1_8x8,
@@ -427,7 +427,7 @@ void unpack_uint_values<2>(
             unpacked2_8x16,
             unpacked3_8x16,
             packed + ((i * nbit) / bitsPerByte));
-        torchao::bitpacking::internal::vec_store_64_uint8_values(
+        torchao::bitpacking::internal::vec_store_4_uint8_vectors<16>(
             unpacked + i,
             unpacked0_8x16,
             unpacked1_8x16,

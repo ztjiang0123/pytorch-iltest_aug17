@@ -275,61 +275,11 @@ inline void embedding_(
   assert(i == embedding_dim); // because 32 | embedding_dim
 }
 
-template <int weight_nbit>
-inline void embedding(
-    // Output
-    float* out,
-    // Inputs
-    int embedding_dim,
-    int group_size,
-    const void* packed_weight_qvals,
-    const float* weight_scales,
-    const int8_t* weight_zeros,
-    int index) {
-  torchao::kernels::cpu::embedding_shared::embedding_at_index<weight_nbit>(
-      [](float* out,
-         int embedding_dim,
-         int group_size,
-         const uint8_t* packed_weight_qvals,
-         const float* weight_scales,
-         const int8_t* weight_zeros) {
-        embedding_<weight_nbit>(
-            out,
-            embedding_dim,
-            group_size,
-            packed_weight_qvals,
-            weight_scales,
-            weight_zeros);
-      },
-      out,
-      embedding_dim,
-      group_size,
-      packed_weight_qvals,
-      weight_scales,
-      weight_zeros,
-      index);
-}
-
-template <int weight_nbit>
-inline void pack_embedding_weight_qvals(
-    // Output
-    void* packed_qvals,
-    // Inputs
-    int embedding_dim,
-    const int8_t* qvals,
-    int index) {
-  torchao::kernels::cpu::embedding_shared::
-      pack_embedding_weight_qvals_at_index<weight_nbit>(
-          [](uint8_t* packed_qvals, int embedding_dim, const int8_t* qvals) {
-            pack_embedding_weight_qvals_<weight_nbit>(
-                packed_qvals, embedding_dim, qvals);
-          },
-          /*embedding_dim_multiple=*/8,
-          packed_qvals,
-          embedding_dim,
-          qvals,
-          index);
-}
+// Defines embedding<weight_nbit>() and pack_embedding_weight_qvals<weight_nbit>()
+// in terms of this backend's embedding_/pack_embedding_weight_qvals_ single-row
+// implementations. The aarch64 backend requires embedding_dim to be a multiple
+// of 8. See TORCHAO_DEFINE_EMBEDDING_ENTRY_POINTS in embedding_indexing.h.
+TORCHAO_DEFINE_EMBEDDING_ENTRY_POINTS(/*embedding_dim_multiple=*/8)
 
 // Embedding op that shares weights with unembedding linear op
 template <int weight_nbit, int nr, int kr, int sr>
