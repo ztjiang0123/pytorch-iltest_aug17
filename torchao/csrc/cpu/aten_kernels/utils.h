@@ -8,7 +8,23 @@
 
 #include <cstdint>
 #include <tuple>
+#include <utility>
 #include <ATen/native/cpu/utils.h>
+
+// Registers a sequence of (schema name, implementation) pairs into a
+// torch::Library. This collapses the otherwise-repeated `m.impl(...)` blocks
+// that every operator-registration site would otherwise duplicate.
+template <typename Library, typename Fn, typename... Rest>
+inline void torchao_register_impls(
+    Library& m,
+    const char* name,
+    Fn&& fn,
+    Rest&&... rest) {
+  m.impl(name, std::forward<Fn>(fn));
+  if constexpr (sizeof...(rest) > 0) {
+    torchao_register_impls(m, std::forward<Rest>(rest)...);
+  }
+}
 
 inline int64_t get_m_block(int64_t M) {
   if (M <= 48) {

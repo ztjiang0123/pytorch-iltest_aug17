@@ -40,35 +40,27 @@
       "_pack_embedding_" #weight_nbit "bit",                              \
       &pack_embedding_meta<weight_nbit>);
 
+// Applies a single-argument macro DEFINE(weight_nbit) to every supported
+// weight bit-width. Keeps the per-registration expansion in one place so the
+// individual registration blocks don't each re-list the bit-widths.
+#define FOR_EACH_WEIGHT_NBIT(DEFINE) \
+  DEFINE(1);                         \
+  DEFINE(2);                         \
+  DEFINE(3);                         \
+  DEFINE(4);                         \
+  DEFINE(5);                         \
+  DEFINE(6);                         \
+  DEFINE(7);                         \
+  DEFINE(8);
+
 TORCH_LIBRARY_FRAGMENT(torchao, m) {
-  DEFINE_OP(1);
-  DEFINE_OP(2);
-  DEFINE_OP(3);
-  DEFINE_OP(4);
-  DEFINE_OP(5);
-  DEFINE_OP(6);
-  DEFINE_OP(7);
-  DEFINE_OP(8);
+  FOR_EACH_WEIGHT_NBIT(DEFINE_OP);
 }
 
 TORCH_LIBRARY_IMPL(torchao, CPU, m) {
-  DEFINE_CPU_IMPL(1);
-  DEFINE_CPU_IMPL(2);
-  DEFINE_CPU_IMPL(3);
-  DEFINE_CPU_IMPL(4);
-  DEFINE_CPU_IMPL(5);
-  DEFINE_CPU_IMPL(6);
-  DEFINE_CPU_IMPL(7);
-  DEFINE_CPU_IMPL(8);
+  FOR_EACH_WEIGHT_NBIT(DEFINE_CPU_IMPL);
 }
 
 TORCH_LIBRARY_IMPL(torchao, Meta, m) {
-  DEFINE_META_IMPL(1);
-  DEFINE_META_IMPL(2);
-  DEFINE_META_IMPL(3);
-  DEFINE_META_IMPL(4);
-  DEFINE_META_IMPL(5);
-  DEFINE_META_IMPL(6);
-  DEFINE_META_IMPL(7);
-  DEFINE_META_IMPL(8);
+  FOR_EACH_WEIGHT_NBIT(DEFINE_META_IMPL);
 }

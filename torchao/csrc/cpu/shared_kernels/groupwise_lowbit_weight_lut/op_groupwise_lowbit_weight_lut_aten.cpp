@@ -37,33 +37,25 @@
       "_linear_groupwise_" #weight_nbit "bit_weight_with_lut.out", \
       &linear_out_cpu<weight_nbit>);
 
-TORCH_LIBRARY_FRAGMENT(torchao, m) {
-  DEFINE_PACK_OP(1);
-  DEFINE_PACK_OP(2);
-  DEFINE_PACK_OP(3);
-  DEFINE_PACK_OP(4);
+// Applies a single-argument macro DEFINE(weight_nbit) to every supported
+// weight bit-width. Keeps the per-registration expansion in one place so the
+// individual registration blocks don't each re-list the bit-widths.
+#define FOR_EACH_WEIGHT_NBIT(DEFINE) \
+  DEFINE(1);                         \
+  DEFINE(2);                         \
+  DEFINE(3);                         \
+  DEFINE(4);
 
-  DEFINE_LINEAR_OP(1);
-  DEFINE_LINEAR_OP(2);
-  DEFINE_LINEAR_OP(3);
-  DEFINE_LINEAR_OP(4);
+TORCH_LIBRARY_FRAGMENT(torchao, m) {
+  FOR_EACH_WEIGHT_NBIT(DEFINE_PACK_OP);
+  FOR_EACH_WEIGHT_NBIT(DEFINE_LINEAR_OP);
 }
 
 TORCH_LIBRARY_IMPL(torchao, CPU, m) {
-  DEFINE_PACK_CPU_IMPL(1);
-  DEFINE_PACK_CPU_IMPL(2);
-  DEFINE_PACK_CPU_IMPL(3);
-  DEFINE_PACK_CPU_IMPL(4);
-
-  DEFINE_LINEAR_CPU_IMPL(1);
-  DEFINE_LINEAR_CPU_IMPL(2);
-  DEFINE_LINEAR_CPU_IMPL(3);
-  DEFINE_LINEAR_CPU_IMPL(4);
+  FOR_EACH_WEIGHT_NBIT(DEFINE_PACK_CPU_IMPL);
+  FOR_EACH_WEIGHT_NBIT(DEFINE_LINEAR_CPU_IMPL);
 }
 
 TORCH_LIBRARY_IMPL(torchao, Meta, m) {
-  DEFINE_PACK_META_IMPL(1);
-  DEFINE_PACK_META_IMPL(2);
-  DEFINE_PACK_META_IMPL(3);
-  DEFINE_PACK_META_IMPL(4);
+  FOR_EACH_WEIGHT_NBIT(DEFINE_PACK_META_IMPL);
 }
