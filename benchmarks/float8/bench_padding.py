@@ -9,8 +9,8 @@ from typing import Optional
 import fire
 import torch
 from tabulate import tabulate
-from torch._inductor.utils import do_bench_using_profiling
 from tqdm import tqdm
+from utils import benchmark_fn_in_usec
 
 from torchao.float8.float8_training_tensor import (
     GemmInputRole,
@@ -35,12 +35,6 @@ dtype_to_peak_tops = {
     torch.float8_e4m3fn: h100_peak_tops_float8_tc,
     torch.float8_e5m2: h100_peak_tops_float8_tc,
 }
-
-
-def benchmark_fn_in_usec(f, *args, **kwargs):
-    no_args = lambda: f(*args, **kwargs)
-    time = do_bench_using_profiling(no_args)
-    return time * 1e3
 
 
 def get_tops_info(tops, time, peak_tops):
