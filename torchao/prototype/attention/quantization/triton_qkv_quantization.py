@@ -19,7 +19,6 @@ import triton.language as tl
 
 from torchao.prototype.attention.quantization.triton_hadamard_utils import (
     _compute_num_chunks,
-    group_reduce_kernel,
 )
 
 
@@ -355,9 +354,12 @@ def triton_fp8_sdpa_quantize(
     )
 
     # ---- Reduce ----
-    # Q: group reduce across `groups` Q heads per KV head
-    group_reduce_kernel[(B, H_kv)](
-        q_partial_max, q_scale, q_descale, H_q, H_kv, groups, q_num_chunks
+    # Q: group reduce across `groups` Q heads per KV head. Because the Q partial-max
+    # buffer is laid out as [B, H_q, q_num_chunks] and the `groups` Q heads that map
+    # to a KV head are contiguous, a group reduce is exactly a single reduce over
+    # `groups * q_num_chunks` contiguous entries per (batch, kv_head).
+    single_reduce_kernel[(B, H_kv)](
+        q_partial_max, q_scale, q_descale, H_kv, groups * q_num_chunks
     )
     # K, V: per-head reduce
     single_reduce_kernel[(B, H_kv)](
