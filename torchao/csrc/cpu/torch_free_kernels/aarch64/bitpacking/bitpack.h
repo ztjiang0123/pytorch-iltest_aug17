@@ -23,9 +23,9 @@ namespace torchao {
 namespace bitpacking {
 
 namespace internal {
-// Store one NEON vector's worth of bytes. `stride` is the number of lanes and
-// is used by vec_store_4_uint8_vectors to advance the destination pointer, so
-// the 64-bit and 128-bit store helpers can share a single implementation.
+// Store one NEON vector's worth of bytes. Overloaded on the vector width so
+// vec_store_4_uint8_vectors can store either 8-lane or 16-lane vectors through
+// a single implementation.
 TORCHAO_ALWAYS_INLINE inline void vec_store_uint8_vector(
     uint8_t* dest,
     const uint8x8_t& vec) {
@@ -37,7 +37,12 @@ TORCHAO_ALWAYS_INLINE inline void vec_store_uint8_vector(
   vst1q_u8(dest, vec);
 }
 
-template <typename vec_t, int stride>
+// Stores four consecutive NEON vectors starting at `dest`. `vec_t` is deduced
+// from the arguments (uint8x8_t stores 32 bytes total, uint8x16_t stores 64);
+// `stride` is that vector's lane count. This is the single store entry point —
+// call it directly with the appropriate stride rather than through per-arity
+// wrappers.
+template <int stride, typename vec_t>
 TORCHAO_ALWAYS_INLINE inline void vec_store_4_uint8_vectors(
     uint8_t* dest,
     const vec_t& vec0,
@@ -50,15 +55,6 @@ TORCHAO_ALWAYS_INLINE inline void vec_store_4_uint8_vectors(
   vec_store_uint8_vector(dest + 3 * stride, vec3);
 }
 
-TORCHAO_ALWAYS_INLINE inline void vec_store_32_uint8_values(
-    uint8_t* dest,
-    const uint8x8_t& vec0,
-    const uint8x8_t& vec1,
-    const uint8x8_t& vec2,
-    const uint8x8_t& vec3) {
-  vec_store_4_uint8_vectors<uint8x8_t, 8>(dest, vec0, vec1, vec2, vec3);
-}
-
 TORCHAO_ALWAYS_INLINE inline void vec_load_32_uint8_values(
     uint8x8_t& vec0,
     uint8x8_t& vec1,
@@ -69,15 +65,6 @@ TORCHAO_ALWAYS_INLINE inline void vec_load_32_uint8_values(
   vec1 = vld1_u8(src + 8);
   vec2 = vld1_u8(src + 16);
   vec3 = vld1_u8(src + 24);
-}
-
-TORCHAO_ALWAYS_INLINE inline void vec_store_64_uint8_values(
-    uint8_t* dest,
-    const uint8x16_t& vec0,
-    const uint8x16_t& vec1,
-    const uint8x16_t& vec2,
-    const uint8x16_t& vec3) {
-  vec_store_4_uint8_vectors<uint8x16_t, 16>(dest, vec0, vec1, vec2, vec3);
 }
 
 TORCHAO_ALWAYS_INLINE inline void vec_load_64_uint8_values(

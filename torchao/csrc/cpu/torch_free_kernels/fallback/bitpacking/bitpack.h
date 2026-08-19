@@ -51,12 +51,114 @@ inline void apply_bitpack_blocks(
   }
 }
 
+// Direction of a bitpacking transform. `kPack` maps `count` unpacked uint8
+// values to packed nbit bytes; `kUnpack` is the inverse.
+enum class BitpackDir { kPack, kUnpack };
+
+// Block-decomposition layout for one (count, nbit): a count-N transform that
+// does not have a whole-count primitive is expressed as `num_blocks`
+// back-to-back invocations of a smaller primitive handling `unpacked_block`
+// values / `packed_block` bytes (see apply_bitpack_blocks). `num_blocks == 0`
+// means "no decomposition — use the whole-count primitive directly".
+struct BitpackBlockLayout {
+  int num_blocks;
+  int unpacked_block;
+  int packed_block;
+};
+
+// Returns the block layout for (count, nbit), or {0, 0, 0} when the transform
+// has a dedicated whole-count primitive. This is the single place the
+// (count, nbit) -> layout table lives; it is shared by pack and unpack because
+// the decomposition is direction-independent. Flat, so it adds no nesting to
+// the caller.
+constexpr BitpackBlockLayout bitpack_block_layout(int count, int nbit) {
+  if (count == 128 && nbit == 2) {
+    return {2, 64, 16};
+  }
+  if (count == 128 && nbit == 4) {
+    return {4, 32, 16};
+  }
+  if (count == 128 && nbit == 6) {
+    return {2, 64, 48};
+  }
+  if (count == 64 && nbit == 4) {
+    return {2, 32, 16};
+  }
+  if (count == 32 && nbit == 3) {
+    return {4, 8, 3};
+  }
+  if (count == 32 && nbit == 5) {
+    return {4, 8, 5};
+  }
+  if (count == 32 && nbit == 7) {
+    return {4, 8, 7};
+  }
+  return {0, 0, 0};
+}
+
+/**
+ * @brief Shared (count, nbit) dispatch for packing and unpacking.
+ *
+ * Packing and unpacking make the same three-way choice: 8-bit is a raw
+ * `memcpy`; a `(count, nbit)` with a block layout is driven through
+ * `apply_bitpack_blocks`; everything else calls a whole-count primitive. Only
+ * two things differ between the directions — which primitive family is invoked
+ * (`pack_*` vs `unpack_*`) and whether `dst` is the packed buffer — and both
+ * are captured by the two callables and the `BitpackDir` tag, so the dispatch
+ * lives here once instead of being spelled out twice. The `(count, nbit)`
+ * layout table is factored into `bitpack_block_layout`, keeping this body flat.
+ *
+ * @tparam nbit  Bits per value (1-8).
+ * @tparam count Number of unpacked values (128, 64, or 32).
+ * @tparam Dir   BitpackDir::kPack or BitpackDir::kUnpack.
+ * @param direct Whole-count primitive: void(uint8_t* dst, const uint8_t* src).
+ * @param block  Fixed-size primitive used with apply_bitpack_blocks, same
+ *   signature as `direct`.
+ * @param dst    Destination base pointer (packed for kPack, unpacked otherwise).
+ * @param src    Source base pointer.
+ *
+ * Within a single instantiation only the primitives named in the taken branch
+ * are odr-used, so unused families need not exist for that (count, nbit).
+ */
+template <
+    int nbit,
+    int count,
+    BitpackDir Dir,
+    typename DirectFn,
+    typename BlockFn>
+inline void bitpack_uint_values_impl(
+    DirectFn direct,
+    BlockFn block,
+    uint8_t* dst,
+    const uint8_t* src) {
+  static_assert(nbit >= 1 && nbit <= 8, "nbit must be between 1 and 8");
+  static_assert(
+      count == 128 || count == 64 || count == 32,
+      "count must be 128, 64, or 32");
+  constexpr bool dst_is_packed = (Dir == BitpackDir::kPack);
+  constexpr BitpackBlockLayout kLayout = bitpack_block_layout(count, nbit);
+
+  if constexpr (nbit == 8) {
+    (void)direct;
+    (void)block;
+    std::memcpy(dst, src, count);
+  } else if constexpr (kLayout.num_blocks == 0) {
+    (void)block;
+    direct(dst, src);
+  } else {
+    (void)direct;
+    apply_bitpack_blocks<
+        kLayout.num_blocks,
+        kLayout.unpacked_block,
+        kLayout.packed_block>(block, dst, src, dst_is_packed);
+  }
+}
+
 /**
  * @brief Packs `count` unsigned 8-bit integers into a packed 'nbit' format.
  *
- * Shared by the 128/64/32 pack helpers below; dispatches on (count, nbit) to
- * the appropriate fixed-size primitive and drives it via
- * `apply_bitpack_blocks`.
+ * Shared by the 128/64/32 pack helpers below; selects the pack primitive
+ * families and drives the common dispatch in `bitpack_uint_values_impl`.
  *
  * @tparam nbit The number of bits to pack each value into (1-8).
  * @tparam count The number of values to pack (128, 64, or 32).
@@ -65,77 +167,71 @@ template <int nbit, int count>
 inline void pack_uint_values_impl(
     uint8_t* packed,
     const uint8_t* unpacked_values) {
-  static_assert(nbit >= 1 && nbit <= 8, "nbit must be between 1 and 8");
-  static_assert(
-      count == 128 || count == 64 || count == 32,
-      "count must be 128, 64, or 32");
-
-  if constexpr (nbit == 8) {
-    std::memcpy(packed, unpacked_values, count);
-  } else if constexpr (count == 128) {
-    if constexpr (nbit == 1) {
-      pack_128_uint1_values(packed, unpacked_values);
-    } else if constexpr (nbit == 2) {
-      apply_bitpack_blocks<2, 64, 16>(
-          pack_64_uint2_values, packed, unpacked_values, true);
-    } else if constexpr (nbit == 3) {
-      pack_128_uint3_values(packed, unpacked_values);
-    } else if constexpr (nbit == 4) {
-      apply_bitpack_blocks<4, 32, 16>(
-          pack_32_uint4_values, packed, unpacked_values, true);
-    } else if constexpr (nbit == 5) {
-      pack_128_uint5_values(packed, unpacked_values);
-    } else if constexpr (nbit == 6) {
-      apply_bitpack_blocks<2, 64, 48>(
-          pack_64_uint6_values, packed, unpacked_values, true);
-    } else if constexpr (nbit == 7) {
-      pack_128_uint7_values(packed, unpacked_values);
+  // `direct` is the whole-count primitive for this (count, nbit); `block` is
+  // the fixed-size primitive used when the count decomposes into blocks. Only
+  // the one selected by the taken constexpr branch is odr-used per
+  // instantiation.
+  auto direct = [](uint8_t* dst, const uint8_t* src) {
+    if constexpr (count == 128) {
+      if constexpr (nbit == 1) {
+        pack_128_uint1_values(dst, src);
+      } else if constexpr (nbit == 3) {
+        pack_128_uint3_values(dst, src);
+      } else if constexpr (nbit == 5) {
+        pack_128_uint5_values(dst, src);
+      } else if constexpr (nbit == 7) {
+        pack_128_uint7_values(dst, src);
+      }
+    } else if constexpr (count == 64) {
+      if constexpr (nbit == 1) {
+        pack_64_uint1_values(dst, src);
+      } else if constexpr (nbit == 2) {
+        pack_64_uint2_values(dst, src);
+      } else if constexpr (nbit == 3) {
+        pack_64_uint3_values(dst, src);
+      } else if constexpr (nbit == 5) {
+        pack_64_uint5_values(dst, src);
+      } else if constexpr (nbit == 6) {
+        pack_64_uint6_values(dst, src);
+      } else if constexpr (nbit == 7) {
+        pack_64_uint7_values(dst, src);
+      }
+    } else { // count == 32
+      if constexpr (nbit == 1) {
+        pack_32_uint1_values(dst, src);
+      } else if constexpr (nbit == 2) {
+        pack_32_uint2_values(dst, src);
+      } else if constexpr (nbit == 4) {
+        pack_32_uint4_values(dst, src);
+      } else if constexpr (nbit == 6) {
+        pack_32_uint6_values(dst, src);
+      }
     }
-  } else if constexpr (count == 64) {
-    if constexpr (nbit == 1) {
-      pack_64_uint1_values(packed, unpacked_values);
-    } else if constexpr (nbit == 2) {
-      pack_64_uint2_values(packed, unpacked_values);
-    } else if constexpr (nbit == 3) {
-      pack_64_uint3_values(packed, unpacked_values);
+  };
+  auto block = [](uint8_t* dst, const uint8_t* src) {
+    if constexpr (nbit == 2) {
+      pack_64_uint2_values(dst, src);
     } else if constexpr (nbit == 4) {
-      apply_bitpack_blocks<2, 32, 16>(
-          pack_32_uint4_values, packed, unpacked_values, true);
-    } else if constexpr (nbit == 5) {
-      pack_64_uint5_values(packed, unpacked_values);
+      pack_32_uint4_values(dst, src);
     } else if constexpr (nbit == 6) {
-      pack_64_uint6_values(packed, unpacked_values);
-    } else if constexpr (nbit == 7) {
-      pack_64_uint7_values(packed, unpacked_values);
-    }
-  } else { // count == 32
-    if constexpr (nbit == 1) {
-      pack_32_uint1_values(packed, unpacked_values);
-    } else if constexpr (nbit == 2) {
-      pack_32_uint2_values(packed, unpacked_values);
+      pack_64_uint6_values(dst, src);
     } else if constexpr (nbit == 3) {
-      apply_bitpack_blocks<4, 8, 3>(
-          pack_8_uint3_values, packed, unpacked_values, true);
-    } else if constexpr (nbit == 4) {
-      pack_32_uint4_values(packed, unpacked_values);
+      pack_8_uint3_values(dst, src);
     } else if constexpr (nbit == 5) {
-      apply_bitpack_blocks<4, 8, 5>(
-          pack_8_uint5_values, packed, unpacked_values, true);
-    } else if constexpr (nbit == 6) {
-      pack_32_uint6_values(packed, unpacked_values);
+      pack_8_uint5_values(dst, src);
     } else if constexpr (nbit == 7) {
-      apply_bitpack_blocks<4, 8, 7>(
-          pack_8_uint7_values, packed, unpacked_values, true);
+      pack_8_uint7_values(dst, src);
     }
-  }
+  };
+  bitpack_uint_values_impl<nbit, count, BitpackDir::kPack>(
+      direct, block, packed, unpacked_values);
 }
 
 /**
  * @brief Unpacks 'nbit' data into `count` unsigned 8-bit integers.
  *
- * Shared by the 128/64/32 unpack helpers below; dispatches on (count, nbit) to
- * the appropriate fixed-size primitive and drives it via
- * `apply_bitpack_blocks`.
+ * Shared by the 128/64/32 unpack helpers below; selects the unpack primitive
+ * families and drives the common dispatch in `bitpack_uint_values_impl`.
  *
  * @tparam nbit The number of bits per value in the packed format (1-8).
  * @tparam count The number of values to unpack (128, 64, or 32).
@@ -144,69 +240,62 @@ template <int nbit, int count>
 inline void unpack_uint_values_impl(
     uint8_t* unpacked_values,
     const uint8_t* packed) {
-  static_assert(nbit >= 1 && nbit <= 8, "nbit must be between 1 and 8");
-  static_assert(
-      count == 128 || count == 64 || count == 32,
-      "count must be 128, 64, or 32");
-
-  if constexpr (nbit == 8) {
-    std::memcpy(unpacked_values, packed, count);
-  } else if constexpr (count == 128) {
-    if constexpr (nbit == 1) {
-      unpack_128_uint1_values(unpacked_values, packed);
-    } else if constexpr (nbit == 2) {
-      apply_bitpack_blocks<2, 64, 16>(
-          unpack_64_uint2_values, unpacked_values, packed, false);
-    } else if constexpr (nbit == 3) {
-      unpack_128_uint3_values(unpacked_values, packed);
-    } else if constexpr (nbit == 4) {
-      apply_bitpack_blocks<4, 32, 16>(
-          unpack_32_uint4_values, unpacked_values, packed, false);
-    } else if constexpr (nbit == 5) {
-      unpack_128_uint5_values(unpacked_values, packed);
-    } else if constexpr (nbit == 6) {
-      apply_bitpack_blocks<2, 64, 48>(
-          unpack_64_uint6_values, unpacked_values, packed, false);
-    } else if constexpr (nbit == 7) {
-      unpack_128_uint7_values(unpacked_values, packed);
+  // `direct`/`block` mirror the pack side, selecting the unpack_* primitive
+  // families. `dst` is the unpacked buffer, `src` the packed buffer.
+  auto direct = [](uint8_t* dst, const uint8_t* src) {
+    if constexpr (count == 128) {
+      if constexpr (nbit == 1) {
+        unpack_128_uint1_values(dst, src);
+      } else if constexpr (nbit == 3) {
+        unpack_128_uint3_values(dst, src);
+      } else if constexpr (nbit == 5) {
+        unpack_128_uint5_values(dst, src);
+      } else if constexpr (nbit == 7) {
+        unpack_128_uint7_values(dst, src);
+      }
+    } else if constexpr (count == 64) {
+      if constexpr (nbit == 1) {
+        unpack_64_uint1_values(dst, src);
+      } else if constexpr (nbit == 2) {
+        unpack_64_uint2_values(dst, src);
+      } else if constexpr (nbit == 3) {
+        unpack_64_uint3_values(dst, src);
+      } else if constexpr (nbit == 5) {
+        unpack_64_uint5_values(dst, src);
+      } else if constexpr (nbit == 6) {
+        unpack_64_uint6_values(dst, src);
+      } else if constexpr (nbit == 7) {
+        unpack_64_uint7_values(dst, src);
+      }
+    } else { // count == 32
+      if constexpr (nbit == 1) {
+        unpack_32_uint1_values(dst, src);
+      } else if constexpr (nbit == 2) {
+        unpack_32_uint2_values(dst, src);
+      } else if constexpr (nbit == 4) {
+        unpack_32_uint4_values(dst, src);
+      } else if constexpr (nbit == 6) {
+        unpack_32_uint6_values(dst, src);
+      }
     }
-  } else if constexpr (count == 64) {
-    if constexpr (nbit == 1) {
-      unpack_64_uint1_values(unpacked_values, packed);
-    } else if constexpr (nbit == 2) {
-      unpack_64_uint2_values(unpacked_values, packed);
-    } else if constexpr (nbit == 3) {
-      unpack_64_uint3_values(unpacked_values, packed);
+  };
+  auto block = [](uint8_t* dst, const uint8_t* src) {
+    if constexpr (nbit == 2) {
+      unpack_64_uint2_values(dst, src);
     } else if constexpr (nbit == 4) {
-      apply_bitpack_blocks<2, 32, 16>(
-          unpack_32_uint4_values, unpacked_values, packed, false);
-    } else if constexpr (nbit == 5) {
-      unpack_64_uint5_values(unpacked_values, packed);
+      unpack_32_uint4_values(dst, src);
     } else if constexpr (nbit == 6) {
-      unpack_64_uint6_values(unpacked_values, packed);
-    } else if constexpr (nbit == 7) {
-      unpack_64_uint7_values(unpacked_values, packed);
-    }
-  } else { // count == 32
-    if constexpr (nbit == 1) {
-      unpack_32_uint1_values(unpacked_values, packed);
-    } else if constexpr (nbit == 2) {
-      unpack_32_uint2_values(unpacked_values, packed);
+      unpack_64_uint6_values(dst, src);
     } else if constexpr (nbit == 3) {
-      apply_bitpack_blocks<4, 8, 3>(
-          unpack_8_uint3_values, unpacked_values, packed, false);
-    } else if constexpr (nbit == 4) {
-      unpack_32_uint4_values(unpacked_values, packed);
+      unpack_8_uint3_values(dst, src);
     } else if constexpr (nbit == 5) {
-      apply_bitpack_blocks<4, 8, 5>(
-          unpack_8_uint5_values, unpacked_values, packed, false);
-    } else if constexpr (nbit == 6) {
-      unpack_32_uint6_values(unpacked_values, packed);
+      unpack_8_uint5_values(dst, src);
     } else if constexpr (nbit == 7) {
-      apply_bitpack_blocks<4, 8, 7>(
-          unpack_8_uint7_values, unpacked_values, packed, false);
+      unpack_8_uint7_values(dst, src);
     }
-  }
+  };
+  bitpack_uint_values_impl<nbit, count, BitpackDir::kUnpack>(
+      direct, block, unpacked_values, packed);
 }
 
 /**

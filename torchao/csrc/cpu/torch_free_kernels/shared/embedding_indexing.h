@@ -86,3 +86,71 @@ inline void pack_embedding_weight_qvals_at_index(
 }
 
 } // namespace torchao::kernels::cpu::embedding_shared
+
+// Emits the two per-row entry points (`embedding` and
+// `pack_embedding_weight_qvals`) that every backend exposes. Their bodies were
+// byte-for-byte identical across the aarch64 and fallback headers apart from the
+// backend's `embedding_dim` alignment requirement, so they are generated here
+// once. Each backend invokes this macro inside its own namespace; the
+// `embedding_` / `pack_embedding_weight_qvals_` single-row implementations it
+// forwards to are resolved from that enclosing namespace.
+//
+// `embedding_dim_multiple` is the backend's alignment requirement for
+// `embedding_dim` (the aarch64 backend permits multiples of 8, the fallback
+// backend requires multiples of 32).
+#define TORCHAO_DEFINE_EMBEDDING_ENTRY_POINTS(embedding_dim_multiple)          \
+  template <int weight_nbit>                                                   \
+  inline void embedding(                                                       \
+      /* Output */                                                             \
+      float* out,                                                             \
+      /* Inputs */                                                            \
+      int embedding_dim,                                                       \
+      int group_size,                                                          \
+      const void* packed_weight_qvals,                                         \
+      const float* weight_scales,                                              \
+      const int8_t* weight_zeros,                                              \
+      int index) {                                                             \
+    torchao::kernels::cpu::embedding_shared::embedding_at_index<weight_nbit>(  \
+        [](float* out,                                                         \
+           int embedding_dim,                                                  \
+           int group_size,                                                     \
+           const uint8_t* packed_weight_qvals,                                 \
+           const float* weight_scales,                                         \
+           const int8_t* weight_zeros) {                                       \
+          embedding_<weight_nbit>(                                             \
+              out,                                                             \
+              embedding_dim,                                                   \
+              group_size,                                                      \
+              packed_weight_qvals,                                             \
+              weight_scales,                                                   \
+              weight_zeros);                                                   \
+        },                                                                     \
+        out,                                                                   \
+        embedding_dim,                                                         \
+        group_size,                                                            \
+        packed_weight_qvals,                                                   \
+        weight_scales,                                                         \
+        weight_zeros,                                                          \
+        index);                                                               \
+  }                                                                            \
+                                                                              \
+  template <int weight_nbit>                                                   \
+  inline void pack_embedding_weight_qvals(                                     \
+      /* Output */                                                             \
+      void* packed_qvals,                                                      \
+      /* Inputs */                                                             \
+      int embedding_dim,                                                       \
+      const int8_t* qvals,                                                     \
+      int index) {                                                             \
+    torchao::kernels::cpu::embedding_shared::                                  \
+        pack_embedding_weight_qvals_at_index<weight_nbit>(                     \
+            [](uint8_t* packed_qvals, int embedding_dim, const int8_t* qvals) {\
+              pack_embedding_weight_qvals_<weight_nbit>(                       \
+                  packed_qvals, embedding_dim, qvals);                         \
+            },                                                                 \
+            /*embedding_dim_multiple=*/(embedding_dim_multiple),               \
+            packed_qvals,                                                      \
+            embedding_dim,                                                     \
+            qvals,                                                             \
+            index);                                                            \
+  }

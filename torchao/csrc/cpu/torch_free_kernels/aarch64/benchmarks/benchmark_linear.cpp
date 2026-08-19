@@ -15,186 +15,101 @@ namespace {
 // The three benchmark entry points below (1x1x32, 1x4x16 and 1x8x16) differ
 // only in which kernel namespace their pack/prepare/kernel symbols resolve to.
 // Each KernelApi tag forwards those namespace-scoped calls, so the benchmark
-// body can be written exactly once in run_channelwise_benchmark().
-struct KernelApi1x1x32 {
-  static size_t activation_data_size(
-      int m,
-      int k,
-      int group_size,
-      bool has_weight_zeros) {
-    using namespace torchao::kernels::cpu::aarch64::linear::
-        channelwise_8bit_activation_groupwise_lowbit_weight_1x1x32_f32_neondot;
-    return activation_data_size(m, k, group_size, has_weight_zeros);
+// body can be written exactly once in run_channelwise_benchmark(). Because a
+// namespace cannot be a template argument, the forwarding struct is emitted by
+// this macro instead of being written out once per kernel namespace.
+#define TORCHAO_DEFINE_KERNEL_API(StructName, KernelNamespace)                 \
+  struct StructName {                                                          \
+    static size_t activation_data_size(                                        \
+        int m, int k, int group_size, bool has_weight_zeros) {                \
+      using namespace KernelNamespace;                                         \
+      return activation_data_size(m, k, group_size, has_weight_zeros);         \
+    }                                                                          \
+    static void prepare_activation_data(                                       \
+        void* activation_data,                                                 \
+        int m,                                                                 \
+        int k,                                                                 \
+        int group_size,                                                        \
+        const float* activations,                                             \
+        bool has_weight_zeros) {                                               \
+      using namespace KernelNamespace;                                         \
+      prepare_activation_data(                                                 \
+          activation_data, m, k, group_size, activations, has_weight_zeros);   \
+    }                                                                          \
+    template <int weight_nbit>                                                 \
+    static size_t weight_data_size(                                           \
+        int n,                                                                 \
+        int k,                                                                 \
+        int group_size,                                                        \
+        bool has_weight_zeros,                                                 \
+        bool has_bias) {                                                       \
+      using namespace KernelNamespace;                                         \
+      return weight_data_size<weight_nbit>(                                    \
+          n, k, group_size, has_weight_zeros, has_bias);                       \
+    }                                                                          \
+    template <int weight_nbit>                                                 \
+    static void prepare_weight_data(                                          \
+        void* weight_data,                                                     \
+        int n,                                                                 \
+        int k,                                                                 \
+        int group_size,                                                        \
+        const int8_t* weight_qvals,                                           \
+        const float* weight_scales,                                           \
+        const int8_t* weight_zeros,                                           \
+        const float* bias) {                                                   \
+      using namespace KernelNamespace;                                         \
+      prepare_weight_data<weight_nbit>(                                        \
+          weight_data,                                                         \
+          n,                                                                   \
+          k,                                                                   \
+          group_size,                                                         \
+          weight_qvals,                                                        \
+          weight_scales,                                                       \
+          weight_zeros,                                                        \
+          bias);                                                               \
+    }                                                                          \
+    template <int weight_nbit>                                                 \
+    static void kernel(                                                       \
+        float* output,                                                        \
+        int output_m_stride,                                                   \
+        int m,                                                                 \
+        int n,                                                                 \
+        int k,                                                                 \
+        int group_size,                                                        \
+        const void* weight_data,                                              \
+        const void* activation_data,                                          \
+        float clamp_min,                                                       \
+        float clamp_max,                                                       \
+        bool has_weight_zeros,                                                 \
+        bool has_bias,                                                         \
+        bool has_clamp) {                                                      \
+      using namespace KernelNamespace;                                         \
+      kernel<weight_nbit>(                                                     \
+          output,                                                              \
+          output_m_stride,                                                     \
+          m,                                                                   \
+          n,                                                                   \
+          k,                                                                   \
+          group_size,                                                         \
+          weight_data,                                                         \
+          activation_data,                                                     \
+          clamp_min,                                                           \
+          clamp_max,                                                           \
+          has_weight_zeros,                                                     \
+          has_bias,                                                            \
+          has_clamp);                                                          \
+    }                                                                          \
   }
-  static void prepare_activation_data(
-      void* activation_data,
-      int m,
-      int k,
-      int group_size,
-      const float* activations,
-      bool has_weight_zeros) {
-    using namespace torchao::kernels::cpu::aarch64::linear::
-        channelwise_8bit_activation_groupwise_lowbit_weight_1x1x32_f32_neondot;
-    prepare_activation_data(
-        activation_data, m, k, group_size, activations, has_weight_zeros);
-  }
-  template <int weight_nbit>
-  static size_t weight_data_size(
-      int n,
-      int k,
-      int group_size,
-      bool has_weight_zeros,
-      bool has_bias) {
-    using namespace torchao::kernels::cpu::aarch64::linear::
-        channelwise_8bit_activation_groupwise_lowbit_weight_1x1x32_f32_neondot;
-    return weight_data_size<weight_nbit>(
-        n, k, group_size, has_weight_zeros, has_bias);
-  }
-  template <int weight_nbit>
-  static void prepare_weight_data(
-      void* weight_data,
-      int n,
-      int k,
-      int group_size,
-      const int8_t* weight_qvals,
-      const float* weight_scales,
-      const int8_t* weight_zeros,
-      const float* bias) {
-    using namespace torchao::kernels::cpu::aarch64::linear::
-        channelwise_8bit_activation_groupwise_lowbit_weight_1x1x32_f32_neondot;
-    prepare_weight_data<weight_nbit>(
-        weight_data,
-        n,
-        k,
-        group_size,
-        weight_qvals,
-        weight_scales,
-        weight_zeros,
-        bias);
-  }
-  template <int weight_nbit>
-  static void kernel(
-      float* output,
-      int output_m_stride,
-      int m,
-      int n,
-      int k,
-      int group_size,
-      const void* weight_data,
-      const void* activation_data,
-      float clamp_min,
-      float clamp_max,
-      bool has_weight_zeros,
-      bool has_bias,
-      bool has_clamp) {
-    using namespace torchao::kernels::cpu::aarch64::linear::
-        channelwise_8bit_activation_groupwise_lowbit_weight_1x1x32_f32_neondot;
-    kernel<weight_nbit>(
-        output,
-        output_m_stride,
-        m,
-        n,
-        k,
-        group_size,
-        weight_data,
-        activation_data,
-        clamp_min,
-        clamp_max,
-        has_weight_zeros,
-        has_bias,
-        has_clamp);
-  }
-};
 
-struct KernelApiDefault {
-  static size_t activation_data_size(
-      int m,
-      int k,
-      int group_size,
-      bool has_weight_zeros) {
-    using namespace torchao::kernels::cpu::aarch64::linear::
-        channelwise_8bit_activation_groupwise_lowbit_weight;
-    return activation_data_size(m, k, group_size, has_weight_zeros);
-  }
-  static void prepare_activation_data(
-      void* activation_data,
-      int m,
-      int k,
-      int group_size,
-      const float* activations,
-      bool has_weight_zeros) {
-    using namespace torchao::kernels::cpu::aarch64::linear::
-        channelwise_8bit_activation_groupwise_lowbit_weight;
-    prepare_activation_data(
-        activation_data, m, k, group_size, activations, has_weight_zeros);
-  }
-  template <int weight_nbit>
-  static size_t weight_data_size(
-      int n,
-      int k,
-      int group_size,
-      bool has_weight_zeros,
-      bool has_bias) {
-    using namespace torchao::kernels::cpu::aarch64::linear::
-        channelwise_8bit_activation_groupwise_lowbit_weight;
-    return weight_data_size<weight_nbit>(
-        n, k, group_size, has_weight_zeros, has_bias);
-  }
-  template <int weight_nbit>
-  static void prepare_weight_data(
-      void* weight_data,
-      int n,
-      int k,
-      int group_size,
-      const int8_t* weight_qvals,
-      const float* weight_scales,
-      const int8_t* weight_zeros,
-      const float* bias) {
-    using namespace torchao::kernels::cpu::aarch64::linear::
-        channelwise_8bit_activation_groupwise_lowbit_weight;
-    prepare_weight_data<weight_nbit>(
-        weight_data,
-        n,
-        k,
-        group_size,
-        weight_qvals,
-        weight_scales,
-        weight_zeros,
-        bias);
-  }
-  template <int weight_nbit>
-  static void kernel(
-      float* output,
-      int output_m_stride,
-      int m,
-      int n,
-      int k,
-      int group_size,
-      const void* weight_data,
-      const void* activation_data,
-      float clamp_min,
-      float clamp_max,
-      bool has_weight_zeros,
-      bool has_bias,
-      bool has_clamp) {
-    using namespace torchao::kernels::cpu::aarch64::linear::
-        channelwise_8bit_activation_groupwise_lowbit_weight;
-    kernel<weight_nbit>(
-        output,
-        output_m_stride,
-        m,
-        n,
-        k,
-        group_size,
-        weight_data,
-        activation_data,
-        clamp_min,
-        clamp_max,
-        has_weight_zeros,
-        has_bias,
-        has_clamp);
-  }
-};
+TORCHAO_DEFINE_KERNEL_API(
+    KernelApi1x1x32,
+    torchao::kernels::cpu::aarch64::linear::
+        channelwise_8bit_activation_groupwise_lowbit_weight_1x1x32_f32_neondot);
+
+TORCHAO_DEFINE_KERNEL_API(
+    KernelApiDefault,
+    torchao::kernels::cpu::aarch64::linear::
+        channelwise_8bit_activation_groupwise_lowbit_weight);
 
 template <
     typename KernelApi,
