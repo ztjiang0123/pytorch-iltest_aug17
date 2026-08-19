@@ -5,17 +5,6 @@
 // LICENSE file in the root directory of this source tree.
 #pragma once
 
-#include <optional>
-#include <torch/csrc/stable/tensor.h>
-#include <torch/headeronly/core/ScalarType.h>
+#include "rowwise_scaled_linear_sparse_cutlass_decl.h"
 
-namespace torchao {
-
-torch::stable::Tensor
-rowwise_scaled_linear_sparse_cutlass_e5m2e5m2(
-    const torch::stable::Tensor& Xq, const torch::stable::Tensor& X_scale, const torch::stable::Tensor& Wq,
-    const torch::stable::Tensor& W_meta, const torch::stable::Tensor& W_scale,
-    const std::optional<torch::stable::Tensor>& bias_opt,
-    const std::optional<torch::headeronly::ScalarType> out_dtype_opt);
-
-}  // namespace torchao
+TORCHAO_DECLARE_ROWWISE_SCALED_LINEAR_SPARSE_CUTLASS(e5m2e5m2)

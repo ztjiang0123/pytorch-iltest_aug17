@@ -8,27 +8,13 @@
 
 #include <torchao/csrc/cpu/torch_free_kernels/fallback/bitpacking/bitpack.h>
 #include <torchao/csrc/cpu/torch_free_kernels/macro.h>
+#include <torchao/csrc/cpu/torch_free_kernels/shared/dequantize.h>
 #include <torchao/csrc/cpu/torch_free_kernels/shared/embedding_indexing.h>
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
 
 namespace torchao::kernels::cpu::fallback::embedding {
-
-namespace internal {
-
-TORCHAO_ALWAYS_INLINE inline void dequantize_and_store_values(
-    float* out,
-    const int8_t* qvals,
-    int count,
-    float scale,
-    float zero) {
-  for (int i = 0; i < count; ++i) {
-    out[i] = (static_cast<float>(qvals[i]) - zero) * scale;
-  }
-}
-
-} // namespace internal
 
 template <int weight_nbit>
 inline void pack_embedding_weight_qvals_(
@@ -117,7 +103,7 @@ inline void embedding_(
           : 0.0f;
 
       int chunk_size = std::min(32, 128 - j);
-      internal::dequantize_and_store_values(
+      torchao::kernels::cpu::shared::dequantize_and_store_values(
           out + i + j, qvals_buffer + j, chunk_size, scale, zero);
     }
   }
@@ -137,7 +123,7 @@ inline void embedding_(
           : 0.0f;
 
       int chunk_size = std::min(32, 64 - j);
-      internal::dequantize_and_store_values(
+      torchao::kernels::cpu::shared::dequantize_and_store_values(
           out + i + j, qvals_buffer + j, chunk_size, scale, zero);
     }
     i += 64;
@@ -156,7 +142,7 @@ inline void embedding_(
         ? static_cast<float>(weight_zeros[group_idx])
         : 0.0f;
 
-    internal::dequantize_and_store_values(out + i, qvals_buffer, 32, scale, zero);
+    torchao::kernels::cpu::shared::dequantize_and_store_values(out + i, qvals_buffer, 32, scale, zero);
     i += 32;
   }
 

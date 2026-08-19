@@ -491,8 +491,14 @@ def allgather_fp8(aten_op, args, kwargs=None):
     )
 
 
-@implements([c10d_functional.wait_tensor.default, _c10d_functional.wait_tensor.default])
-def wait_tensor_fp8(aten_op, args, kwargs=None):
+def _apply_op_to_fp8_data_passthrough(aten_op, args, kwargs):
+    """
+    Run a tensorwise-scaled op on the underlying fp8 ``_data`` of ``args[0]``
+    and re-wrap the result in a Float8TrainingTensor that preserves the input's
+    scale and metadata. Shared by the collective passthrough ops (wait_tensor
+    and _wrap_tensor_autograd) whose only Float8-specific behavior is unwrapping
+    the data, applying the op, and rewrapping.
+    """
     _assert_tensorwise_scale(aten_op, args[0]._scale)
     fp8_input = args[0]
     assert isinstance(fp8_input, Float8TrainingTensor)
@@ -508,6 +514,11 @@ def wait_tensor_fp8(aten_op, args, kwargs=None):
     )
 
 
+@implements([c10d_functional.wait_tensor.default, _c10d_functional.wait_tensor.default])
+def wait_tensor_fp8(aten_op, args, kwargs=None):
+    return _apply_op_to_fp8_data_passthrough(aten_op, args, kwargs)
+
+
 # _wrap_tensor_autograd was added in PyTorch 2.11.0.dev
 if torch_version_at_least("2.11.0.dev"):
 
@@ -518,19 +529,7 @@ if torch_version_at_least("2.11.0.dev"):
         This wraps the underlying fp8 data in AsyncCollectiveTensor while
         preserving the Float8TrainingTensor wrapper with its scale and metadata.
         """
-        _assert_tensorwise_scale(aten_op, args[0]._scale)
-        fp8_input = args[0]
-        assert isinstance(fp8_input, Float8TrainingTensor)
-
-        fp8_data = fp8_input._data
-        fp8_out = aten_op(fp8_data, *args[1:], **kwargs)
-        return Float8TrainingTensor(
-            fp8_out,
-            fp8_input._scale,
-            fp8_input._orig_dtype,
-            fp8_input._linear_mm_config,
-            fp8_input._gemm_input_role,
-        )
+        return _apply_op_to_fp8_data_passthrough(aten_op, args, kwargs)
 
 
 @implements([aten.index_put_.default])
