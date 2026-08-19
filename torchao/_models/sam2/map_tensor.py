@@ -135,21 +135,28 @@ def select_impl(func, types, args, kwargs):
     return wrap(func(unwrapped_args[0], unwrapped_args[1] + 1, unwrapped_args[2]))
 
 
-@implements(torch.ops.aten.slice.Tensor)
-def slice_impl(func, types, args, kwargs):
+def _wrap_dim_args_impl(func, args, kwargs, num_args, dim_indices):
+    """Shared implementation for ops that shift one or more positional dim
+    arguments by one to account for the leading map dimension.
+
+    ``dim_indices`` lists the positions in ``args`` that hold dim arguments;
+    every other positional argument is passed through unchanged.
+    """
     unwrapped_args = tree_map(unwrap, args)
     unwrapped_kwargs = tree_map(unwrap, kwargs)
     assert len(unwrapped_kwargs) == 0
-    assert len(unwrapped_args) == 4, f"args: {unwrapped_args}"
+    assert len(unwrapped_args) == num_args, f"args: {unwrapped_args}"
     dim = unwrapped_args[0].dim()
-    return wrap(
-        func(
-            unwrapped_args[0],
-            wrap_dim(unwrapped_args[1], dim - 1) + 1,
-            unwrapped_args[2],
-            unwrapped_args[3],
-        )
-    )
+    new_args = [
+        wrap_dim(a, dim - 1) + 1 if i in dim_indices else a
+        for i, a in enumerate(unwrapped_args)
+    ]
+    return wrap(func(*new_args))
+
+
+@implements(torch.ops.aten.slice.Tensor)
+def slice_impl(func, types, args, kwargs):
+    return _wrap_dim_args_impl(func, args, kwargs, num_args=4, dim_indices={1})
 
 
 @implements(
@@ -246,8 +253,9 @@ def mm_ops_impl(func, types, args, kwargs):
     return wrap(torch.matmul(*unwrapped_args))
 
 
-@implements(torch.ops.aten.unsqueeze.default)
-def unsqueeze_impl(func, types, args, kwargs):
+def _shift_dim_arg_impl(func, args, kwargs):
+    """Shared implementation for ops that take a single dim argument which must
+    be shifted by one to account for the leading map dimension."""
     unwrapped_args = tree_map(unwrap, args)
     unwrapped_kwargs = tree_map(unwrap, kwargs)
     assert len(unwrapped_kwargs) == 0
@@ -256,18 +264,16 @@ def unsqueeze_impl(func, types, args, kwargs):
     if new_i >= 0:
         new_i += 1
     return wrap(func(unwrapped_args[0], new_i))
+
+
+@implements(torch.ops.aten.unsqueeze.default)
+def unsqueeze_impl(func, types, args, kwargs):
+    return _shift_dim_arg_impl(func, args, kwargs)
 
 
 @implements(torch.ops.aten.squeeze.dim)
 def squeeze_impl(func, types, args, kwargs):
-    unwrapped_args = tree_map(unwrap, args)
-    unwrapped_kwargs = tree_map(unwrap, kwargs)
-    assert len(unwrapped_kwargs) == 0
-    assert len(unwrapped_args) == 2, f"args: {unwrapped_args}"
-    new_i = unwrapped_args[1]
-    if new_i >= 0:
-        new_i += 1
-    return wrap(func(unwrapped_args[0], new_i))
+    return _shift_dim_arg_impl(func, args, kwargs)
 
 
 @implements(torch.ops.aten.addmm.default)
@@ -279,64 +285,43 @@ def addmm_impl(func, types, args, kwargs):
     return wrap(torch.matmul(unwrapped_args[1], unwrapped_args[2]) + unwrapped_args[0])
 
 
-@implements(torch.ops.aten.convolution.default)
-def convolution_impl(func, types, args, kwargs):
+def _flatten_map_dim_impl(func, args, kwargs, num_args):
+    """Shared implementation for ops that flatten the leading map dimension into
+    the batch dimension, call ``func``, then restore the map dimension.
+
+    It's scary that the ``.contiguous`` seems necessary, but we're below the
+    composite op which might expect contiguous output.
+    """
     unwrapped_args = tree_map(unwrap, args)
     unwrapped_kwargs = tree_map(unwrap, kwargs)
     assert len(unwrapped_kwargs) == 0
-    assert len(unwrapped_args) == 9, f"args: {unwrapped_args}"
-    a = unwrapped_args[0]
+    assert len(unwrapped_args) == num_args, f"args: {unwrapped_args}"
     a = unwrapped_args[0].flatten(0, 1)
-    # TODO: It's scary that this .contiguous seems necessary, but I we're below composite conv
-    # which might expected contiguous output
     resa = func(*((a,) + unwrapped_args[1:])).contiguous()
     resb = resa.view(
         (unwrapped_args[0].size(0), unwrapped_args[0].size(1)) + resa.size()[1:]
     )
     return wrap(resb)
+
+
+@implements(torch.ops.aten.convolution.default)
+def convolution_impl(func, types, args, kwargs):
+    return _flatten_map_dim_impl(func, args, kwargs, num_args=9)
 
 
 @implements(torch.ops.aten.upsample_bilinear2d.default)
 def upsample_bilinear2d_impl(func, types, args, kwargs):
-    unwrapped_args = tree_map(unwrap, args)
-    unwrapped_kwargs = tree_map(unwrap, kwargs)
-    assert len(unwrapped_kwargs) == 0
-    assert len(unwrapped_args) == 3, f"args: {unwrapped_args}"
-    a = unwrapped_args[0]
-    a = unwrapped_args[0].flatten(0, 1)
-    # NOTE: It's scary that this .contiguous seems necessary, but we're below composite upsample
-    # which might expected contiguous output
-    resa = func(*((a,) + unwrapped_args[1:])).contiguous()
-    resb = resa.view(
-        (unwrapped_args[0].size(0), unwrapped_args[0].size(1)) + resa.size()[1:]
-    )
-    return wrap(resb)
+    return _flatten_map_dim_impl(func, args, kwargs, num_args=3)
 
 
 @implements(torch.ops.aten.transpose.int)
 def transpose_impl(func, types, args, kwargs):
-    unwrapped_args = tree_map(unwrap, args)
-    unwrapped_kwargs = tree_map(unwrap, kwargs)
-    assert len(unwrapped_kwargs) == 0
-    assert len(unwrapped_args) == 3, f"args: {unwrapped_args}"
-    dim = unwrapped_args[0].dim()
-    return wrap(
-        func(
-            unwrapped_args[0],
-            wrap_dim(unwrapped_args[1], dim - 1) + 1,
-            wrap_dim(unwrapped_args[2], dim - 1) + 1,
-        )
-    )
+    return _wrap_dim_args_impl(func, args, kwargs, num_args=3, dim_indices={1, 2})
 
 
 @implements(torch.ops.aten.unbind.int)
 def unbind_impl(func, types, args, kwargs):
-    unwrapped_args = tree_map(unwrap, args)
-    unwrapped_kwargs = tree_map(unwrap, kwargs)
-    assert len(unwrapped_kwargs) == 0
-    assert len(unwrapped_args) == 2, f"args: {unwrapped_args}"
-    dim = unwrapped_args[0].dim()
-    return wrap(func(unwrapped_args[0], wrap_dim(unwrapped_args[1], dim - 1) + 1))
+    return _wrap_dim_args_impl(func, args, kwargs, num_args=2, dim_indices={1})
 
 
 @implements(torch.ops.aten.permute.default)
@@ -354,33 +339,31 @@ def permute_impl(func, types, args, kwargs):
     )
 
 
-@implements(torch.ops.aten._scaled_dot_product_efficient_attention.default)
-def _scaled_dot_product_efficient_attention_impl(func, types, args, kwargs):
-    unwrapped_args = tree_map(unwrap, args)
-    unwrapped_kwargs = tree_map(unwrap, kwargs)
-    assert len(args) == 5
+def _sdpa_map_impl(func, args, unwrapped_args, call_func):
+    """Shared dispatch for the scaled-dot-product-attention variants.
+
+    Both the efficient and flash implementations broadcast/flatten the leading
+    map dimension of whichever of ``q``, ``k``, ``v`` are ``MapTensor`` s, run
+    the underlying op via ``call_func(a0, a1, a2)``, then restore the map
+    dimension on the attention output. The only difference between the two
+    variants is the extra positional arguments they forward, which is captured
+    by ``call_func``.
+    """
     if all(isinstance(a, MapTensor) for a in args[:3]):
-        # assert len(unwrapped_kwargs) == 0
-        assert len(unwrapped_args) == 5, f"args: {unwrapped_args}"
         assert unwrapped_args[0].dim() == 5
         assert unwrapped_args[1].dim() == 5
         assert unwrapped_args[2].dim() == 5
         sdpa_res = wrap(
-            func(
+            call_func(
                 unwrapped_args[0].flatten(0, 1),
                 unwrapped_args[1].flatten(0, 1),
                 unwrapped_args[2].flatten(0, 1),
-                unwrapped_args[3],
-                unwrapped_args[4],
-                **unwrapped_kwargs,
             )
         )
         return (wrap(sdpa_res[0].view(unwrapped_args[0].size())),) + sdpa_res[1:]
     if isinstance(args[0], MapTensor) and not any(
         isinstance(a, MapTensor) for a in args[1:]
     ):
-        # assert len(unwrapped_kwargs) == 0
-        assert len(unwrapped_args) == 5, f"args: {unwrapped_args}"
         assert unwrapped_args[0].dim() == 5
         assert unwrapped_args[1].dim() == 4
         assert unwrapped_args[2].dim() == 4
@@ -388,24 +371,13 @@ def _scaled_dot_product_efficient_attention_impl(func, types, args, kwargs):
         a1_size = unwrapped_args[1].size()
         a1 = unwrapped_args[1].unsqueeze(0).expand((a0.size(0),) + a1_size)
         a2 = unwrapped_args[2].unsqueeze(0).expand((a0.size(0),) + a1_size)
-        sdpa_res = wrap(
-            func(
-                a0.flatten(0, 1),
-                a1.flatten(0, 1),
-                a2.flatten(0, 1),
-                unwrapped_args[3],
-                unwrapped_args[4],
-                **unwrapped_kwargs,
-            )
-        )
+        sdpa_res = wrap(call_func(a0.flatten(0, 1), a1.flatten(0, 1), a2.flatten(0, 1)))
         return (wrap(sdpa_res[0].view(unwrapped_args[0].size())),) + sdpa_res[1:]
     if (
         (not isinstance(args[0], MapTensor))
         and isinstance(args[1], MapTensor)
         and (not isinstance(args[2], MapTensor))
     ):
-        assert len(unwrapped_kwargs) == 0
-        assert len(unwrapped_args) == 5, f"args: {unwrapped_args}"
         assert unwrapped_args[0].dim() == 4
         assert unwrapped_args[1].dim() == 5
         assert unwrapped_args[2].dim() == 4
@@ -415,28 +387,19 @@ def _scaled_dot_product_efficient_attention_impl(func, types, args, kwargs):
             .unsqueeze(0)
             .expand((a1_size[0],) + unwrapped_args[0].size()[1:])
         )
+        a1 = unwrapped_args[1]
         a2 = (
             unwrapped_args[2]
             .unsqueeze(0)
             .expand((a1_size[0],) + unwrapped_args[2].size()[1:])
         )
-        sdpa_res = wrap(
-            func(
-                a0.flatten(0, 1),
-                a1.flatten(0, 1),
-                a2.flatten(0, 1),
-                unwrapped_args[3],
-                unwrapped_args[4],
-            )
-        )
+        sdpa_res = wrap(call_func(a0.flatten(0, 1), a1.flatten(0, 1), a2.flatten(0, 1)))
         return (wrap(sdpa_res[0].view(unwrapped_args[0].size())),) + sdpa_res[1:]
     if (
         (not isinstance(args[0], MapTensor))
         and isinstance(args[1], MapTensor)
         and isinstance(args[2], MapTensor)
     ):
-        # assert len(unwrapped_kwargs) == 0
-        assert len(unwrapped_args) == 5, f"args: {unwrapped_args}"
         assert unwrapped_args[0].dim() == 4
         assert unwrapped_args[1].dim() == 5
         assert unwrapped_args[2].dim() == 5
@@ -445,18 +408,29 @@ def _scaled_dot_product_efficient_attention_impl(func, types, args, kwargs):
         a0 = unwrapped_args[0].unsqueeze(0).expand((a1_size[0],) + a0_size)
         a1 = unwrapped_args[1]
         a2 = unwrapped_args[2]
-        sdpa_res = wrap(
-            func(
-                a0.flatten(0, 1),
-                a1.flatten(0, 1),
-                a2.flatten(0, 1),
-                unwrapped_args[3],
-                unwrapped_args[4],
-                **unwrapped_kwargs,
-            )
-        )
+        sdpa_res = wrap(call_func(a0.flatten(0, 1), a1.flatten(0, 1), a2.flatten(0, 1)))
         return (wrap(sdpa_res[0].view((a1_size[0],) + a0_size)),) + sdpa_res[1:]
     return NotImplemented
+
+
+@implements(torch.ops.aten._scaled_dot_product_efficient_attention.default)
+def _scaled_dot_product_efficient_attention_impl(func, types, args, kwargs):
+    unwrapped_args = tree_map(unwrap, args)
+    unwrapped_kwargs = tree_map(unwrap, kwargs)
+    assert len(args) == 5
+    assert len(unwrapped_args) == 5, f"args: {unwrapped_args}"
+
+    def call_func(a0, a1, a2):
+        return func(
+            a0,
+            a1,
+            a2,
+            unwrapped_args[3],
+            unwrapped_args[4],
+            **unwrapped_kwargs,
+        )
+
+    return _sdpa_map_impl(func, args, unwrapped_args, call_func)
 
 
 @implements(torch.ops.aten._scaled_dot_product_flash_attention.default)
@@ -466,80 +440,11 @@ def _scaled_dot_product_flash_attention_impl(func, types, args, kwargs):
     assert len(args) == 3
     assert len(unwrapped_kwargs) == 1
     assert len(unwrapped_args) == 3, f"args: {unwrapped_args}"
-    if all(isinstance(a, MapTensor) for a in args[:3]):
-        assert unwrapped_args[0].dim() == 5
-        assert unwrapped_args[1].dim() == 5
-        assert unwrapped_args[2].dim() == 5
-        sdpa_res = wrap(
-            func(
-                unwrapped_args[0].flatten(0, 1),
-                unwrapped_args[1].flatten(0, 1),
-                unwrapped_args[2].flatten(0, 1),
-                **unwrapped_kwargs,
-            )
-        )
-        return (wrap(sdpa_res[0].view(unwrapped_args[0].size())),) + sdpa_res[1:]
-    if isinstance(args[0], MapTensor) and not any(
-        isinstance(a, MapTensor) for a in args[1:]
-    ):
-        assert unwrapped_args[0].dim() == 5
-        assert unwrapped_args[1].dim() == 4
-        assert unwrapped_args[2].dim() == 4
-        a0 = unwrapped_args[0]
-        a1_size = unwrapped_args[1].size()
-        a1 = unwrapped_args[1].unsqueeze(0).expand((a0.size(0),) + a1_size)
-        a2 = unwrapped_args[2].unsqueeze(0).expand((a0.size(0),) + a1_size)
-        sdpa_res = wrap(
-            func(
-                a0.flatten(0, 1), a1.flatten(0, 1), a2.flatten(0, 1), **unwrapped_kwargs
-            )
-        )
-        return (wrap(sdpa_res[0].view(unwrapped_args[0].size())),) + sdpa_res[1:]
-    if (
-        (not isinstance(args[0], MapTensor))
-        and isinstance(args[1], MapTensor)
-        and (not isinstance(args[2], MapTensor))
-    ):
-        assert unwrapped_args[0].dim() == 4
-        assert unwrapped_args[1].dim() == 5
-        assert unwrapped_args[2].dim() == 4
-        a1_size = unwrapped_args[1].size()
-        a0 = (
-            unwrapped_args[0]
-            .unsqueeze(0)
-            .expand((a1_size[0],) + unwrapped_args[0].size()[1:])
-        )
-        a2 = (
-            unwrapped_args[2]
-            .unsqueeze(0)
-            .expand((a1_size[0],) + unwrapped_args[2].size()[1:])
-        )
-        sdpa_res = wrap(
-            func(
-                a0.flatten(0, 1), a1.flatten(0, 1), a2.flatten(0, 1), **unwrapped_kwargs
-            )
-        )
-        return (wrap(sdpa_res[0].view(unwrapped_args[0].size())),) + sdpa_res[1:]
-    if (
-        (not isinstance(args[0], MapTensor))
-        and isinstance(args[1], MapTensor)
-        and isinstance(args[2], MapTensor)
-    ):
-        assert unwrapped_args[0].dim() == 4
-        assert unwrapped_args[1].dim() == 5
-        assert unwrapped_args[2].dim() == 5
-        a0_size = unwrapped_args[0].size()
-        a1_size = unwrapped_args[1].size()
-        a0 = unwrapped_args[0].unsqueeze(0).expand((a1_size[0],) + a0_size)
-        a1 = unwrapped_args[1]
-        a2 = unwrapped_args[2]
-        sdpa_res = wrap(
-            func(
-                a0.flatten(0, 1), a1.flatten(0, 1), a2.flatten(0, 1), **unwrapped_kwargs
-            )
-        )
-        return (wrap(sdpa_res[0].view((a1_size[0],) + a0_size)),) + sdpa_res[1:]
-    return NotImplemented
+
+    def call_func(a0, a1, a2):
+        return func(a0, a1, a2, **unwrapped_kwargs)
+
+    return _sdpa_map_impl(func, args, unwrapped_args, call_func)
 
 
 # torch.ops.aten._unsafe_index.Tensor is only needed by inductor for compile

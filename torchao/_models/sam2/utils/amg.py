@@ -407,24 +407,23 @@ def generate_crop_boxes(
     return crop_boxes, layer_idxs
 
 
+def _uncrop_offset(coords: torch.Tensor, offset_values: List[int]) -> torch.Tensor:
+    offset = torch.tensor([offset_values]).pin_memory()
+    offset = offset.to(device=coords.device, non_blocking=True)
+    # Check if coords has a channel dimension
+    if len(coords.shape) == 3:
+        offset = offset.unsqueeze(1)
+    return coords + offset
+
+
 def uncrop_boxes_xyxy(boxes: torch.Tensor, crop_box: List[int]) -> torch.Tensor:
     x0, y0, _, _ = crop_box
-    offset = torch.tensor([[x0, y0, x0, y0]]).pin_memory()
-    offset = offset.to(device=boxes.device, non_blocking=True)
-    # Check if boxes has a channel dimension
-    if len(boxes.shape) == 3:
-        offset = offset.unsqueeze(1)
-    return boxes + offset
+    return _uncrop_offset(boxes, [x0, y0, x0, y0])
 
 
 def uncrop_points(points: torch.Tensor, crop_box: List[int]) -> torch.Tensor:
     x0, y0, _, _ = crop_box
-    offset = torch.tensor([[x0, y0]]).pin_memory()
-    offset = offset.to(device=points.device, non_blocking=True)
-    # Check if points has a channel dimension
-    if len(points.shape) == 3:
-        offset = offset.unsqueeze(1)
-    return points + offset
+    return _uncrop_offset(points, [x0, y0])
 
 
 def uncrop_masks(
