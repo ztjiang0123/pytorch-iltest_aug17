@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <torchao/csrc/cpu/torch_free_kernels/fallback/bitpacking/uint_transpose.h>
 #include <torchao/csrc/cpu/torch_free_kernels/macro.h>
 #include <cstdint>
 
@@ -183,12 +184,7 @@ TORCHAO_ALWAYS_INLINE inline void unpack_64_uint1_values(
 TORCHAO_ALWAYS_INLINE inline void pack_128_uint1_values(
     uint8_t* packed,
     const uint8_t* unpacked) {
-  for (int i = 0; i < 16; ++i) {
-    packed[i] = (unpacked[i + 16 * 0] << 7) | (unpacked[i + 16 * 1] << 6) |
-        (unpacked[i + 16 * 2] << 5) | (unpacked[i + 16 * 3] << 4) |
-        (unpacked[i + 16 * 4] << 3) | (unpacked[i + 16 * 5] << 2) |
-        (unpacked[i + 16 * 6] << 1) | (unpacked[i + 16 * 7] << 0);
-  }
+  pack_transpose_uint_values<1, 16, TransposeOrder::kMsbFirst>(packed, unpacked);
 }
 
 /**
@@ -202,17 +198,8 @@ TORCHAO_ALWAYS_INLINE inline void pack_128_uint1_values(
 TORCHAO_ALWAYS_INLINE inline void unpack_128_uint1_values(
     uint8_t* unpacked,
     const uint8_t* packed) {
-  for (int i = 0; i < 16; ++i) {
-    const uint8_t packed_byte = packed[i];
-    unpacked[i + 16 * 0] = (packed_byte >> 7) & 1;
-    unpacked[i + 16 * 1] = (packed_byte >> 6) & 1;
-    unpacked[i + 16 * 2] = (packed_byte >> 5) & 1;
-    unpacked[i + 16 * 3] = (packed_byte >> 4) & 1;
-    unpacked[i + 16 * 4] = (packed_byte >> 3) & 1;
-    unpacked[i + 16 * 5] = (packed_byte >> 2) & 1;
-    unpacked[i + 16 * 6] = (packed_byte >> 1) & 1;
-    unpacked[i + 16 * 7] = (packed_byte >> 0) & 1;
-  }
+  unpack_transpose_uint_values<1, 16, TransposeOrder::kMsbFirst>(
+      unpacked, packed);
 }
 } // namespace internal
 } // namespace torchao::kernels::cpu::fallback::bitpacking

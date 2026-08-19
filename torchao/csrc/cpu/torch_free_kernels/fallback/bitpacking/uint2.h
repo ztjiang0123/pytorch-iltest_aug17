@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <torchao/csrc/cpu/torch_free_kernels/fallback/bitpacking/uint_transpose.h>
 #include <torchao/csrc/cpu/torch_free_kernels/macro.h>
 #include <cstdint>
 namespace torchao::kernels::cpu::fallback::bitpacking {
@@ -51,10 +52,7 @@ TORCHAO_ALWAYS_INLINE inline void unpack_4_uint2_values(
 TORCHAO_ALWAYS_INLINE inline void pack_32_uint2_values(
     uint8_t* packed,
     const uint8_t* unpacked) {
-  for (int i = 0; i < 8; ++i) {
-    packed[i] = (unpacked[i + 8 * 0] << 6) | (unpacked[i + 8 * 1] << 4) |
-        (unpacked[i + 8 * 2] << 2) | (unpacked[i + 8 * 3] << 0);
-  }
+  pack_transpose_uint_values<2, 8, TransposeOrder::kMsbFirst>(packed, unpacked);
 }
 
 /**
@@ -68,13 +66,8 @@ TORCHAO_ALWAYS_INLINE inline void pack_32_uint2_values(
 TORCHAO_ALWAYS_INLINE inline void unpack_32_uint2_values(
     uint8_t* unpacked,
     const uint8_t* packed) {
-  for (int i = 0; i < 8; ++i) {
-    const uint8_t packed_byte = packed[i];
-    unpacked[i + 8 * 0] = (packed_byte >> 6) & 0x03;
-    unpacked[i + 8 * 1] = (packed_byte >> 4) & 0x03;
-    unpacked[i + 8 * 2] = (packed_byte >> 2) & 0x03;
-    unpacked[i + 8 * 3] = (packed_byte >> 0) & 0x03;
-  }
+  unpack_transpose_uint_values<2, 8, TransposeOrder::kMsbFirst>(
+      unpacked, packed);
 }
 
 /**
@@ -89,10 +82,7 @@ TORCHAO_ALWAYS_INLINE inline void unpack_32_uint2_values(
 TORCHAO_ALWAYS_INLINE inline void pack_64_uint2_values(
     uint8_t* packed,
     const uint8_t* unpacked) {
-  for (int i = 0; i < 16; ++i) {
-    packed[i] = (unpacked[i + 16 * 0] << 6) | (unpacked[i + 16 * 1] << 4) |
-        (unpacked[i + 16 * 2] << 2) | (unpacked[i + 16 * 3] << 0);
-  }
+  pack_transpose_uint_values<2, 16, TransposeOrder::kMsbFirst>(packed, unpacked);
 }
 
 /**
@@ -106,13 +96,8 @@ TORCHAO_ALWAYS_INLINE inline void pack_64_uint2_values(
 TORCHAO_ALWAYS_INLINE inline void unpack_64_uint2_values(
     uint8_t* unpacked,
     const uint8_t* packed) {
-  for (int i = 0; i < 16; ++i) {
-    const uint8_t packed_byte = packed[i];
-    unpacked[i + 16 * 0] = (packed_byte >> 6) & 0x03;
-    unpacked[i + 16 * 1] = (packed_byte >> 4) & 0x03;
-    unpacked[i + 16 * 2] = (packed_byte >> 2) & 0x03;
-    unpacked[i + 16 * 3] = (packed_byte >> 0) & 0x03;
-  }
+  unpack_transpose_uint_values<2, 16, TransposeOrder::kMsbFirst>(
+      unpacked, packed);
 }
 
 } // namespace internal
