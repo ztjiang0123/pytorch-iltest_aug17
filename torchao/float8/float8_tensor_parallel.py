@@ -91,38 +91,38 @@ def _check_float8_allgather_supported(module: nn.Module) -> None:
         raise ValueError(
             f"Expecting module to be Float8Linear but found {type(module)}"
         )
-    elif isinstance(
-        module, Float8Linear
-    ) and not _float8_linear_supports_float8_allgather(module):
+    if not _float8_linear_supports_float8_allgather(module):
         raise AssertionError("unsupported")
 
 
-class Float8ColwiseParallel(ColwiseParallel):
+class _Float8ParallelStyleMixin:
+    """
+    Shared float8 behavior for the Colwise/Rowwise parallel styles: both use
+    the same input/output casting and the same `_apply` gate. The concrete
+    parallel style (`ColwiseParallel` / `RowwiseParallel`) is resolved through
+    the MRO by `super()._apply`, so a single definition works for either base.
+    """
+
+    _prepare_input_fn = staticmethod(_float8_prepare_input_fn)
+    _prepare_output_fn = staticmethod(_float8_prepare_output_fn)
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        _check_float8_allgather_supported(module)
+        return super()._apply(module, device_mesh)
+
+
+class Float8ColwiseParallel(_Float8ParallelStyleMixin, ColwiseParallel):
     """
     Like `ColwiseParallel`, but with all-gather in float8. This
     currently assumes tensorwise scaling.
     """
 
-    _prepare_input_fn = staticmethod(_float8_prepare_input_fn)
-    _prepare_output_fn = staticmethod(_float8_prepare_output_fn)
 
-    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        _check_float8_allgather_supported(module)
-        return super()._apply(module, device_mesh)
-
-
-class Float8RowwiseParallel(RowwiseParallel):
+class Float8RowwiseParallel(_Float8ParallelStyleMixin, RowwiseParallel):
     """
     Like `RowwiseParallel`, but with all-gather in float8. This
     currently assumes tensorwise scaling.
     """
-
-    _prepare_input_fn = staticmethod(_float8_prepare_input_fn)
-    _prepare_output_fn = staticmethod(_float8_prepare_output_fn)
-
-    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        _check_float8_allgather_supported(module)
-        return super()._apply(module, device_mesh)
 
 
 class PrepareFloat8ModuleInput(PrepareModuleInput):
