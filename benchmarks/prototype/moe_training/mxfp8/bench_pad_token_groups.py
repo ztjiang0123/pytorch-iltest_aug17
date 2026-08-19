@@ -6,13 +6,15 @@
 # this benchmarking script is a modified version of the original script from: https://github.com/drisspg/transformer_nuggets/blob/main/transformer_nuggets/utils/benchmark.py
 
 import argparse
-import itertools
 from dataclasses import dataclass
 from typing import List
 
 import torch
-from tabulate import tabulate
 
+from benchmarks.prototype.moe_training.bench_utils import (
+    build_token_group_configs,
+    print_token_group_results,
+)
 from benchmarks.utils import (
     benchmark_cuda_function_in_microseconds,
     profile_fn,
@@ -54,25 +56,7 @@ class Experiment:
 
 
 def get_configs() -> List[ExperimentConfig]:
-    # Various token group sizes and dimensions
-    num_tokens_list = [16384]
-    dim_list = [1536, 2048, 5120, 7168]
-    num_groups_list = [1, 4, 8, 16]
-    alignment_size_list = [32]
-
-    configs = []
-    for num_tokens, dim, num_groups, alignment_size in itertools.product(
-        num_tokens_list, dim_list, num_groups_list, alignment_size_list
-    ):
-        configs.append(
-            ExperimentConfig(
-                num_tokens=num_tokens,
-                dim=dim,
-                num_groups=num_groups,
-                alignment_size=alignment_size,
-            )
-        )
-    return configs
+    return build_token_group_configs(ExperimentConfig)
 
 
 def run_experiment(config: ExperimentConfig, profile=False) -> ExperimentResult:
@@ -85,13 +69,16 @@ def run_experiment(config: ExperimentConfig, profile=False) -> ExperimentResult:
 
     inputs = torch.randn(num_tokens, dim, dtype=torch.bfloat16, device=device)
 
-    def torch_eager_with_offsets():
+    def pad_with_fresh_offsets(pad_fn):
+        # Each benchmarked call regenerates offsets so the buffer-allocation
+        # overhead is included; ``pad_fn`` is the eager or CUDA pad kernel.
         group_offsets = generate_jagged_offs(
             num_groups, num_tokens, multiple_of=1, device=device
         )
-        return torch_pad_token_groups(
-            inputs, group_offsets, alignment_size
-        )  # Returns 3 values
+        return pad_fn(inputs, group_offsets, alignment_size)
+
+    def torch_eager_with_offsets():
+        return pad_with_fresh_offsets(torch_pad_token_groups)  # Returns 3 values
 
     def warmup(fn):
         for _ in range(5):
@@ -118,10 +105,7 @@ def run_experiment(config: ExperimentConfig, profile=False) -> ExperimentResult:
     if _mxfp8_cuda_kernels_available:
 
         def cuda_with_offsets():
-            group_offsets = generate_jagged_offs(
-                num_groups, num_tokens, multiple_of=1, device=device
-            )
-            return fused_pad_token_groups_cuda(inputs, group_offsets, alignment_size)
+            return pad_with_fresh_offsets(fused_pad_token_groups_cuda)
 
         warmup(cuda_with_offsets)
         cuda_time_us = benchmark_cuda_function_in_microseconds(cuda_with_offsets)
@@ -178,43 +162,7 @@ def run_experiment(config: ExperimentConfig, profile=False) -> ExperimentResult:
 
 
 def print_results(experiments: List[Experiment]):
-    headers = [
-        "num_tokens",
-        "dim",
-        "num_groups",
-        "torch_us",
-        "cuda_us",
-        "torch_mem_bw_gbps",
-        "cuda_mem_bw_gbps",
-        "cuda_vs_torch",
-    ]
-    rows = []
-    for experiment in experiments:
-        cuda_time = experiment.result.cuda_time_us
-        cuda_vs_torch = (
-            f"{experiment.result.torch_eager_time_us / cuda_time:.2f}x"
-            if cuda_time != float("inf") and cuda_time > 0
-            else "N/A"
-        )
-        cuda_bw_str = (
-            f"{experiment.result.cuda_mem_bw_gbps:.2f}"
-            if experiment.result.cuda_mem_bw_gbps > 0
-            else "N/A"
-        )
-
-        rows.append(
-            [
-                experiment.config.num_tokens,
-                experiment.config.dim,
-                experiment.config.num_groups,
-                experiment.result.torch_eager_time_us,
-                experiment.result.cuda_time_us,
-                f"{experiment.result.torch_mem_bw_gbps:.2f}",
-                cuda_bw_str,
-                cuda_vs_torch,
-            ]
-        )
-    print(tabulate(rows, headers=headers))
+    print_token_group_results(experiments)
 
 
 def main(args: argparse.Namespace):

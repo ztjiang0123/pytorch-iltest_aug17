@@ -26,7 +26,10 @@ from torch.distributed._functional_collectives import (
 from torch.nn import functional as F
 from tqdm import tqdm
 
-from benchmarks.prototype.moe_training.bench_utils import setup_distributed
+from benchmarks.prototype.moe_training.bench_utils import (
+    build_input_shape_configs,
+    setup_distributed,
+)
 from benchmarks.utils import profile_fn
 from torchao.prototype.moe_training.kernels.mxfp8.comms import (
     to_mxfp8_a2a_dequant,
@@ -63,14 +66,7 @@ def get_configs() -> List[ExperimentConfig]:
         (8, 8192, 5120),
         (16, 8192, 5120),
     ]
-    configs = []
-    for shape in input_shapes:
-        configs.append(
-            ExperimentConfig(
-                input_shape=shape,
-            )
-        )
-    return configs
+    return build_input_shape_configs(input_shapes, ExperimentConfig)
 
 
 def default_a2a_fwd(

@@ -10,8 +10,10 @@ from dataclasses import dataclass
 from typing import List
 
 import torch
-from tabulate import tabulate
 
+from benchmarks.prototype.moe_training.bench_utils import (
+    print_cutedsl_rearrange_results,
+)
 from benchmarks.utils import (
     benchmark_cuda_function_in_microseconds,
     run_experiments_and_print,
@@ -161,35 +163,12 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
 
 
 def print_results(experiments: List[Experiment]):
-    headers = [
-        "input_shape",
-        "scaling_mode",
-        "num_groups",
-        "cutedsl_blocked_us",
-        "triton+rearrange_us",
-        "speedup",
-        "cutedsl_gbps",
-        "triton+rearrange_gbps",
-    ]
-    rows = []
-    for experiment in experiments:
-        speedup = (
-            experiment.result.triton_plus_rearrange_us
-            / experiment.result.cutedsl_blocked_us
-        )
-        rows.append(
-            [
-                str(experiment.config.input_shape),
-                experiment.config.scaling_mode,
-                experiment.config.num_groups,
-                f"{experiment.result.cutedsl_blocked_us:.2f}",
-                f"{experiment.result.triton_plus_rearrange_us:.2f}",
-                f"{speedup:.2f}x",
-                f"{experiment.result.cutedsl_blocked_gbps:.1f}",
-                f"{experiment.result.triton_plus_rearrange_gbps:.1f}",
-            ]
-        )
-    print(tabulate(rows, headers=headers))
+    print_cutedsl_rearrange_results(
+        experiments,
+        baseline_label="triton",
+        baseline_us_attr="triton_plus_rearrange_us",
+        baseline_gbps_attr="triton_plus_rearrange_gbps",
+    )
 
 
 def main():
