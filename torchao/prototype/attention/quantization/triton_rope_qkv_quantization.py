@@ -18,6 +18,7 @@ import triton
 import triton.language as tl
 
 from torchao.prototype.attention.quantization.triton_hadamard_utils import (
+    QuantizeSpec,
     _compute_num_chunks,
 )
 
@@ -278,43 +279,6 @@ def single_reduce_kernel(
     tl.store(descale_ptr + scale_idx, tl.where(x_max > eps, x_max / FP8_MAX, 1.0))
 
 
-@triton.jit
-def group_reduce_kernel(
-    partial_max_ptr,  # [B * H_q * num_chunks]
-    scale_ptr,  # [B, H_kv]
-    descale_ptr,  # [B, H_kv]
-    H_q,
-    H_kv,
-    groups,  # H_q // H_kv
-    num_chunks,
-):
-    """
-    Reduce partial maxes across head groups for GQA Q tensor.
-
-    For each KV group, reduces the max across all Q heads in that group
-    and all chunks, producing one scale per (batch, kv_head).
-
-    Grid: (B, H_kv)
-    """
-    pid_b = tl.program_id(axis=0)
-    pid_hkv = tl.program_id(axis=1)
-
-    x_max = 0.0
-
-    for g in range(groups):
-        h_q = pid_hkv * groups + g
-        base_idx = (pid_b * H_q + h_q) * num_chunks
-        for c in range(num_chunks):
-            x_max = tl.maximum(x_max, tl.load(partial_max_ptr + base_idx + c))
-
-    FP8_MAX = 448.0
-    eps = 1e-12
-    scale_idx = pid_b * H_kv + pid_hkv
-
-    tl.store(scale_ptr + scale_idx, tl.where(x_max > eps, FP8_MAX / x_max, 1.0))
-    tl.store(descale_ptr + scale_idx, tl.where(x_max > eps, x_max / FP8_MAX, 1.0))
-
-
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_SIZE": 512}, num_warps=4),
@@ -474,6 +438,114 @@ def v_phase2_kernel(
         tl.store(v_out_ptr + out_offset, v_fp8, mask=mask)
 
 
+def _rope_quantize_one(x, cos, sin, spec):
+    """Apply RoPE to a single [B, S, H, D] tensor and quantize it to FP8, emitting
+    the result in [B, H, S, D] layout. ``spec`` is a :class:`QuantizeSpec`.
+    Returns ``(x_fp8, x_descale)`` with ``x_descale`` of shape [B, H_kv]."""
+    B, H, S, D, H_kv = spec.B, spec.H, spec.S, spec.D, spec.H_kv
+    D_HALF, groups, num_chunks = spec.D_HALF, spec.groups, spec.num_chunks
+    rope_interleaved = spec.rope_interleaved
+    grid = spec.grid
+    chunk_size = spec.chunk_size
+
+    x_fp8 = torch.empty(B, H, S, D, dtype=torch.float8_e4m3fn, device=x.device)
+    rope_intermediate = torch.empty(B, H, S, D, dtype=x.dtype, device=x.device)
+    partial_max = torch.empty(B * H * num_chunks, dtype=torch.float32, device=x.device)
+    scale = torch.empty(B, H_kv, dtype=torch.float32, device=x.device)
+    descale = torch.empty(B, H_kv, dtype=torch.float32, device=x.device)
+
+    rope_single_phase1_kernel[grid](
+        x,
+        cos,
+        sin,
+        rope_intermediate,
+        partial_max,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        x.stride(3),
+        rope_intermediate.stride(0),
+        rope_intermediate.stride(1),
+        rope_intermediate.stride(2),
+        rope_intermediate.stride(3),
+        S,
+        D,
+        D_HALF,
+        H,
+        chunk_size,
+        num_chunks,
+        ROPE_INTERLEAVED=rope_interleaved,
+    )
+    single_reduce_kernel[(B, H_kv)](
+        partial_max, scale, descale, H_kv, groups * num_chunks
+    )
+    rope_single_phase2_kernel[grid](
+        rope_intermediate,
+        x_fp8,
+        scale,
+        x_fp8.stride(0),
+        x_fp8.stride(1),
+        x_fp8.stride(2),
+        x_fp8.stride(3),
+        S,
+        D,
+        H,
+        chunk_size,
+        H_kv,
+        groups,
+    )
+    return x_fp8, descale
+
+
+def _quantize_v_transpose(v, spec):
+    """Quantize V (no RoPE) with a [B, S, H, D] -> [B, H, S, D] transpose. ``spec``
+    is a :class:`QuantizeSpec` with ``H == H_kv``. Returns ``(v_fp8, v_descale)``
+    with ``v_descale`` of shape [B, H_kv]."""
+    B, H_kv, S, D, num_chunks = spec.B, spec.H_kv, spec.S, spec.D, spec.num_chunks
+    grid = spec.grid
+    chunk_size = spec.chunk_size
+
+    v_fp8 = torch.empty(B, H_kv, S, D, dtype=torch.float8_e4m3fn, device=v.device)
+    partial_max = torch.empty(
+        B * H_kv * num_chunks, dtype=torch.float32, device=v.device
+    )
+    scale = torch.empty(B, H_kv, dtype=torch.float32, device=v.device)
+    descale = torch.empty(B, H_kv, dtype=torch.float32, device=v.device)
+
+    v_phase1_kernel[grid](
+        v,
+        partial_max,
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        S,
+        D,
+        H_kv,
+        chunk_size,
+        num_chunks,
+    )
+    single_reduce_kernel[(B, H_kv)](partial_max, scale, descale, H_kv, num_chunks)
+    v_phase2_kernel[grid](
+        v,
+        v_fp8,
+        scale,
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        v_fp8.stride(0),
+        v_fp8.stride(1),
+        v_fp8.stride(2),
+        v_fp8.stride(3),
+        S,
+        D,
+        H_kv,
+        chunk_size,
+    )
+    return v_fp8, descale
+
+
 def triton_fp8_rope_sdpa_quantize(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -557,175 +629,43 @@ def triton_fp8_rope_sdpa_quantize(
     # Compute number of chunks
     if num_chunks is None:
         num_chunks = _compute_num_chunks(q.device, B, H_q, S)
-    chunk_size = (S + num_chunks - 1) // num_chunks
 
-    # Allocate output tensors in [B, H, S, D] layout for SDPA
-    q_fp8 = torch.empty(B, H_q, S, D, dtype=torch.float8_e4m3fn, device=q.device)
-    k_fp8 = torch.empty(B, H_kv, S, D, dtype=torch.float8_e4m3fn, device=q.device)
-    v_fp8 = torch.empty(B, H_kv, S, D, dtype=torch.float8_e4m3fn, device=q.device)
-
-    # Allocate intermediate buffers for RoPE'd Q, K in [B, H, S, D] layout
-    q_rope_intermediate = torch.empty(B, H_q, S, D, dtype=q.dtype, device=q.device)
-    k_rope_intermediate = torch.empty(B, H_kv, S, D, dtype=k.dtype, device=q.device)
-
-    # Allocate partial max buffers (one per tensor)
-    q_partial_max = torch.empty(
-        B * H_q * num_chunks, dtype=torch.float32, device=q.device
-    )
-    k_partial_max = torch.empty(
-        B * H_kv * num_chunks, dtype=torch.float32, device=q.device
-    )
-    v_partial_max = torch.empty(
-        B * H_kv * num_chunks, dtype=torch.float32, device=q.device
-    )
-
-    # Allocate scale/descale tensors.
-    # For GQA, Q scale/descale are [B, H_kv] (per KV group).
-    # K and V are always [B, H_kv] (per head).
-    q_scale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    k_scale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    v_scale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    q_descale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    k_descale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    v_descale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-
-    q_grid_chunked = (B, H_q, num_chunks)
-    kv_grid_chunked = (B, H_kv, num_chunks)
-
-    # ---- Phase 1: RoPE + max for Q ----
-    rope_single_phase1_kernel[q_grid_chunked](
+    # Q/K: RoPE + quantize (Q uses per-KV-group scaling, K is per-head).
+    q_fp8, q_descale = _rope_quantize_one(
         q,
         cos,
         sin,
-        q_rope_intermediate,
-        q_partial_max,
-        # Input strides [B, S, H_q, D]
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        # Output strides [B, H_q, S, D]
-        q_rope_intermediate.stride(0),
-        q_rope_intermediate.stride(1),
-        q_rope_intermediate.stride(2),
-        q_rope_intermediate.stride(3),
-        S,
-        D,
-        D_HALF,
-        H_q,
-        chunk_size,
-        num_chunks,
-        ROPE_INTERLEAVED=rope_interleaved,
+        QuantizeSpec(
+            B,
+            H_q,
+            S,
+            D,
+            H_kv,
+            groups,
+            num_chunks,
+            D_HALF=D_HALF,
+            rope_interleaved=rope_interleaved,
+        ),
     )
-
-    # ---- Phase 1: RoPE + max for K ----
-    rope_single_phase1_kernel[kv_grid_chunked](
+    k_fp8, k_descale = _rope_quantize_one(
         k,
         cos,
         sin,
-        k_rope_intermediate,
-        k_partial_max,
-        # Input strides [B, S, H_kv, D]
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        # Output strides [B, H_kv, S, D]
-        k_rope_intermediate.stride(0),
-        k_rope_intermediate.stride(1),
-        k_rope_intermediate.stride(2),
-        k_rope_intermediate.stride(3),
-        S,
-        D,
-        D_HALF,
-        H_kv,
-        chunk_size,
-        num_chunks,
-        ROPE_INTERLEAVED=rope_interleaved,
+        QuantizeSpec(
+            B,
+            H_kv,
+            S,
+            D,
+            H_kv,
+            1,
+            num_chunks,
+            D_HALF=D_HALF,
+            rope_interleaved=rope_interleaved,
+        ),
     )
-
-    # ---- Phase 1: Max for V (no RoPE) ----
-    v_phase1_kernel[kv_grid_chunked](
-        v,
-        v_partial_max,
-        # Input strides [B, S, H_kv, D]
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        S,
-        D,
-        H_kv,
-        chunk_size,
-        num_chunks,
-    )
-
-    # ---- Reduce ----
-    # Q: group reduce across `groups` Q heads per KV head
-    group_reduce_kernel[(B, H_kv)](
-        q_partial_max, q_scale, q_descale, H_q, H_kv, groups, num_chunks
-    )
-    # K, V: per-head reduce
-    single_reduce_kernel[(B, H_kv)](k_partial_max, k_scale, k_descale, H_kv, num_chunks)
-    single_reduce_kernel[(B, H_kv)](v_partial_max, v_scale, v_descale, H_kv, num_chunks)
-
-    # ---- Phase 2: Quantize Q from intermediate ----
-    # Q scale is [B, H_kv]; each group of `groups` Q heads shares one scale.
-    rope_single_phase2_kernel[q_grid_chunked](
-        q_rope_intermediate,
-        q_fp8,
-        q_scale,
-        # Strides [B, H_q, S, D]
-        q_fp8.stride(0),
-        q_fp8.stride(1),
-        q_fp8.stride(2),
-        q_fp8.stride(3),
-        S,
-        D,
-        H_q,
-        chunk_size,
-        H_kv,
-        groups,
-    )
-
-    # ---- Phase 2: Quantize K from intermediate ----
-    # K scale is [B, H_kv]; groups=1 (per-head).
-    rope_single_phase2_kernel[kv_grid_chunked](
-        k_rope_intermediate,
-        k_fp8,
-        k_scale,
-        # Strides [B, H_kv, S, D]
-        k_fp8.stride(0),
-        k_fp8.stride(1),
-        k_fp8.stride(2),
-        k_fp8.stride(3),
-        S,
-        D,
-        H_kv,
-        chunk_size,
-        H_kv,
-        1,
-    )
-
-    # ---- Phase 2: Transpose + quantize V ----
-    v_phase2_kernel[kv_grid_chunked](
-        v,
-        v_fp8,
-        v_scale,
-        # V input strides [B, S, H_kv, D]
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        # Output strides [B, H_kv, S, D]
-        v_fp8.stride(0),
-        v_fp8.stride(1),
-        v_fp8.stride(2),
-        v_fp8.stride(3),
-        S,
-        D,
-        H_kv,
-        chunk_size,
+    # V: no RoPE, transpose + quantize (per-head).
+    v_fp8, v_descale = _quantize_v_transpose(
+        v, QuantizeSpec(B, H_kv, S, D, H_kv, 1, num_chunks)
     )
 
     return q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale

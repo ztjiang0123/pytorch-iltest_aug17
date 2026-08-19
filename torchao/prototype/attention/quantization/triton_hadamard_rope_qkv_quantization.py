@@ -21,12 +21,12 @@ import triton
 import triton.language as tl
 
 from torchao.prototype.attention.quantization.triton_hadamard_utils import (
+    QuantizeSpec,
     _apply_hadamard,
     _compute_num_chunks,
     _get_log2_d,
 )
 from torchao.prototype.attention.quantization.triton_rope_qkv_quantization import (
-    group_reduce_kernel,
     rope_single_phase1_kernel,
     rope_single_phase2_kernel,
     single_reduce_kernel,
@@ -251,6 +251,162 @@ def hadamard_v_phase1_kernel(
     tl.store(partial_max_ptr + chunk_idx, v_max_scalar)
 
 
+def _rope_hadamard_quantize_one(x, cos, sin, spec):
+    """RoPE (+ optional Hadamard) a single [B, S, H, D] tensor and quantize it to
+    FP8, emitting [B, H, S, D]. When ``spec.apply_hadamard`` is False only RoPE is
+    applied (the `v_only` path). ``spec`` is a :class:`QuantizeSpec`.
+    Returns ``(x_fp8, x_descale)`` with descale of shape [B, H_kv]."""
+    B, H, S, D, H_kv = spec.B, spec.H, spec.S, spec.D, spec.H_kv
+    D_HALF, groups, num_chunks = spec.D_HALF, spec.groups, spec.num_chunks
+    LOG2_D, use_bfloat16 = spec.LOG2_D, spec.use_bfloat16
+    rope_interleaved, apply_hadamard = spec.rope_interleaved, spec.apply_hadamard
+    grid = spec.grid
+    chunk_size = spec.chunk_size
+
+    x_fp8 = torch.empty(B, H, S, D, dtype=torch.float8_e4m3fn, device=x.device)
+    intermediate = torch.empty(B, H, S, D, dtype=x.dtype, device=x.device)
+    partial_max = torch.empty(B * H * num_chunks, dtype=torch.float32, device=x.device)
+    scale = torch.empty(B, H_kv, dtype=torch.float32, device=x.device)
+    descale = torch.empty(B, H_kv, dtype=torch.float32, device=x.device)
+
+    if apply_hadamard:
+        temp = torch.empty(B, H, num_chunks, D, dtype=torch.float32, device=x.device)
+        hadamard_rope_single_phase1_kernel[grid](
+            x,
+            cos,
+            sin,
+            intermediate,
+            temp,
+            partial_max,
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),
+            x.stride(3),
+            intermediate.stride(0),
+            intermediate.stride(1),
+            intermediate.stride(2),
+            intermediate.stride(3),
+            temp.stride(0),
+            temp.stride(1),
+            temp.stride(2),
+            temp.stride(3),
+            S,
+            H,
+            D_HALF,
+            chunk_size,
+            num_chunks,
+            D=D,
+            LOG2_D=LOG2_D,
+            USE_BFLOAT16=use_bfloat16,
+            ROPE_INTERLEAVED=rope_interleaved,
+        )
+    else:
+        rope_single_phase1_kernel[grid](
+            x,
+            cos,
+            sin,
+            intermediate,
+            partial_max,
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),
+            x.stride(3),
+            intermediate.stride(0),
+            intermediate.stride(1),
+            intermediate.stride(2),
+            intermediate.stride(3),
+            S,
+            D,
+            D_HALF,
+            H,
+            chunk_size,
+            num_chunks,
+            ROPE_INTERLEAVED=rope_interleaved,
+        )
+
+    single_reduce_kernel[(B, H_kv)](
+        partial_max, scale, descale, H_kv, groups * num_chunks
+    )
+    rope_single_phase2_kernel[grid](
+        intermediate,
+        x_fp8,
+        scale,
+        x_fp8.stride(0),
+        x_fp8.stride(1),
+        x_fp8.stride(2),
+        x_fp8.stride(3),
+        S,
+        D,
+        H,
+        chunk_size,
+        H_kv,
+        groups,
+    )
+    return x_fp8, descale
+
+
+def _hadamard_v_quantize(v, spec):
+    """Hadamard-transform V (no RoPE) with a [B, S, H, D] -> [B, H, S, D]
+    transpose and quantize to FP8. ``spec`` is a :class:`QuantizeSpec` with
+    ``H == H_kv``. Returns ``(v_fp8, v_descale)``."""
+    B, H_kv, S, D, num_chunks = spec.B, spec.H_kv, spec.S, spec.D, spec.num_chunks
+    LOG2_D, use_bfloat16 = spec.LOG2_D, spec.use_bfloat16
+    grid = spec.grid
+    chunk_size = spec.chunk_size
+
+    v_fp8 = torch.empty(B, H_kv, S, D, dtype=torch.float8_e4m3fn, device=v.device)
+    intermediate = torch.empty(B, H_kv, S, D, dtype=v.dtype, device=v.device)
+    temp = torch.empty(B, H_kv, num_chunks, D, dtype=torch.float32, device=v.device)
+    partial_max = torch.empty(
+        B * H_kv * num_chunks, dtype=torch.float32, device=v.device
+    )
+    scale = torch.empty(B, H_kv, dtype=torch.float32, device=v.device)
+    descale = torch.empty(B, H_kv, dtype=torch.float32, device=v.device)
+
+    hadamard_v_phase1_kernel[grid](
+        v,
+        intermediate,
+        temp,
+        partial_max,
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        intermediate.stride(0),
+        intermediate.stride(1),
+        intermediate.stride(2),
+        intermediate.stride(3),
+        temp.stride(0),
+        temp.stride(1),
+        temp.stride(2),
+        temp.stride(3),
+        S,
+        H_kv,
+        chunk_size,
+        num_chunks,
+        D=D,
+        LOG2_D=LOG2_D,
+        USE_BFLOAT16=use_bfloat16,
+    )
+    single_reduce_kernel[(B, H_kv)](partial_max, scale, descale, H_kv, num_chunks)
+    rope_single_phase2_kernel[grid](
+        intermediate,
+        v_fp8,
+        scale,
+        v_fp8.stride(0),
+        v_fp8.stride(1),
+        v_fp8.stride(2),
+        v_fp8.stride(3),
+        S,
+        D,
+        H_kv,
+        chunk_size,
+        H_kv,
+        1,
+    )
+    return v_fp8, descale
+
+
 def triton_fp8_hadamard_rope_sdpa_quantize(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -351,261 +507,60 @@ def triton_fp8_hadamard_rope_sdpa_quantize(
     # Compute number of chunks
     if num_chunks is None:
         num_chunks = _compute_num_chunks(q.device, B, H_q, S)
-    chunk_size = (S + num_chunks - 1) // num_chunks
 
-    # Allocate output tensors in [B, H, S, D] layout for SDPA
-    q_fp8 = torch.empty(B, H_q, S, D, dtype=torch.float8_e4m3fn, device=q.device)
-    k_fp8 = torch.empty(B, H_kv, S, D, dtype=torch.float8_e4m3fn, device=q.device)
-    v_fp8 = torch.empty(B, H_kv, S, D, dtype=torch.float8_e4m3fn, device=q.device)
-
-    # Intermediate buffers [B, H, S, D] for transformed values
-    q_intermediate = torch.empty(B, H_q, S, D, dtype=q.dtype, device=q.device)
-    k_intermediate = torch.empty(B, H_kv, S, D, dtype=k.dtype, device=q.device)
-    v_intermediate = torch.empty(B, H_kv, S, D, dtype=v.dtype, device=q.device)
-
-    # Temp buffers for Hadamard butterfly
-    if not v_only:
-        q_temp = torch.empty(
-            B, H_q, num_chunks, D, dtype=torch.float32, device=q.device
-        )
-    kv_temp = torch.empty(B, H_kv, num_chunks, D, dtype=torch.float32, device=q.device)
-
-    # Partial max buffers
-    q_partial_max = torch.empty(
-        B * H_q * num_chunks, dtype=torch.float32, device=q.device
-    )
-    k_partial_max = torch.empty(
-        B * H_kv * num_chunks, dtype=torch.float32, device=q.device
-    )
-    v_partial_max = torch.empty(
-        B * H_kv * num_chunks, dtype=torch.float32, device=q.device
-    )
-
-    # Scale/descale tensors
-    q_scale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    k_scale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    v_scale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    q_descale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    k_descale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    v_descale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-
-    q_grid = (B, H_q, num_chunks)
-    kv_grid = (B, H_kv, num_chunks)
-
-    # ---- Phase 1: Q ----
-    if v_only:
-        rope_single_phase1_kernel[q_grid](
-            q,
-            cos,
-            sin,
-            q_intermediate,
-            q_partial_max,
-            # Input strides [B, S, H_q, D]
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            # Output strides [B, H_q, S, D]
-            q_intermediate.stride(0),
-            q_intermediate.stride(1),
-            q_intermediate.stride(2),
-            q_intermediate.stride(3),
+    # Q/K: RoPE (+ Hadamard unless v_only) + quantize. Q uses per-KV-group scaling.
+    q_fp8, q_descale = _rope_hadamard_quantize_one(
+        q,
+        cos,
+        sin,
+        QuantizeSpec(
+            B,
+            H_q,
             S,
             D,
-            D_HALF,
-            H_q,
-            chunk_size,
+            H_kv,
+            groups,
             num_chunks,
-            ROPE_INTERLEAVED=rope_interleaved,
-        )
-    else:
-        hadamard_rope_single_phase1_kernel[q_grid](
-            q,
-            cos,
-            sin,
-            q_intermediate,
-            q_temp,
-            q_partial_max,
-            # Input strides [B, S, H_q, D]
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            # Output strides [B, H_q, S, D]
-            q_intermediate.stride(0),
-            q_intermediate.stride(1),
-            q_intermediate.stride(2),
-            q_intermediate.stride(3),
-            # Temp strides
-            q_temp.stride(0),
-            q_temp.stride(1),
-            q_temp.stride(2),
-            q_temp.stride(3),
-            S,
-            H_q,
-            D_HALF,
-            chunk_size,
-            num_chunks,
-            D=D,
+            D_HALF=D_HALF,
             LOG2_D=LOG2_D,
-            USE_BFLOAT16=use_bfloat16,
-            ROPE_INTERLEAVED=rope_interleaved,
-        )
-
-    # ---- Phase 1: K ----
-    if v_only:
-        rope_single_phase1_kernel[kv_grid](
-            k,
-            cos,
-            sin,
-            k_intermediate,
-            k_partial_max,
-            # Input strides [B, S, H_kv, D]
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-            # Output strides [B, H_kv, S, D]
-            k_intermediate.stride(0),
-            k_intermediate.stride(1),
-            k_intermediate.stride(2),
-            k_intermediate.stride(3),
+            use_bfloat16=use_bfloat16,
+            rope_interleaved=rope_interleaved,
+            apply_hadamard=not v_only,
+        ),
+    )
+    k_fp8, k_descale = _rope_hadamard_quantize_one(
+        k,
+        cos,
+        sin,
+        QuantizeSpec(
+            B,
+            H_kv,
             S,
             D,
-            D_HALF,
             H_kv,
-            chunk_size,
+            1,
             num_chunks,
-            ROPE_INTERLEAVED=rope_interleaved,
-        )
-    else:
-        hadamard_rope_single_phase1_kernel[kv_grid](
-            k,
-            cos,
-            sin,
-            k_intermediate,
-            kv_temp,
-            k_partial_max,
-            # Input strides [B, S, H_kv, D]
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-            # Output strides [B, H_kv, S, D]
-            k_intermediate.stride(0),
-            k_intermediate.stride(1),
-            k_intermediate.stride(2),
-            k_intermediate.stride(3),
-            # Temp strides
-            kv_temp.stride(0),
-            kv_temp.stride(1),
-            kv_temp.stride(2),
-            kv_temp.stride(3),
-            S,
-            H_kv,
-            D_HALF,
-            chunk_size,
-            num_chunks,
-            D=D,
+            D_HALF=D_HALF,
             LOG2_D=LOG2_D,
-            USE_BFLOAT16=use_bfloat16,
-            ROPE_INTERLEAVED=rope_interleaved,
-        )
-
-    # ---- Phase 1: V (always Hadamard + transpose, no RoPE) ----
-    # kv_temp reused from K (when not v_only): safe because both launches are
-    # on the same CUDA stream, so K's kernel fully completes before V's starts.
-    hadamard_v_phase1_kernel[kv_grid](
+            use_bfloat16=use_bfloat16,
+            rope_interleaved=rope_interleaved,
+            apply_hadamard=not v_only,
+        ),
+    )
+    # V: always Hadamard + transpose, no RoPE.
+    v_fp8, v_descale = _hadamard_v_quantize(
         v,
-        v_intermediate,
-        kv_temp,
-        v_partial_max,
-        # Input strides [B, S, H_kv, D]
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        # Output strides [B, H_kv, S, D]
-        v_intermediate.stride(0),
-        v_intermediate.stride(1),
-        v_intermediate.stride(2),
-        v_intermediate.stride(3),
-        # Temp strides
-        kv_temp.stride(0),
-        kv_temp.stride(1),
-        kv_temp.stride(2),
-        kv_temp.stride(3),
-        S,
-        H_kv,
-        chunk_size,
-        num_chunks,
-        D=D,
-        LOG2_D=LOG2_D,
-        USE_BFLOAT16=use_bfloat16,
-    )
-
-    # ---- Reduce ----
-    # Q: group reduce across `groups` Q heads per KV head
-    group_reduce_kernel[(B, H_kv)](
-        q_partial_max, q_scale, q_descale, H_q, H_kv, groups, num_chunks
-    )
-    # K, V: per-head reduce
-    single_reduce_kernel[(B, H_kv)](k_partial_max, k_scale, k_descale, H_kv, num_chunks)
-    single_reduce_kernel[(B, H_kv)](v_partial_max, v_scale, v_descale, H_kv, num_chunks)
-
-    # ---- Phase 2: Quantize Q from intermediate ----
-    rope_single_phase2_kernel[q_grid](
-        q_intermediate,
-        q_fp8,
-        q_scale,
-        # Strides [B, H_q, S, D]
-        q_fp8.stride(0),
-        q_fp8.stride(1),
-        q_fp8.stride(2),
-        q_fp8.stride(3),
-        S,
-        D,
-        H_q,
-        chunk_size,
-        H_kv,
-        groups,
-    )
-
-    # ---- Phase 2: Quantize K from intermediate ----
-    rope_single_phase2_kernel[kv_grid](
-        k_intermediate,
-        k_fp8,
-        k_scale,
-        # Strides [B, H_kv, S, D]
-        k_fp8.stride(0),
-        k_fp8.stride(1),
-        k_fp8.stride(2),
-        k_fp8.stride(3),
-        S,
-        D,
-        H_kv,
-        chunk_size,
-        H_kv,
-        1,
-    )
-
-    # ---- Phase 2: Quantize V from intermediate ----
-    # V intermediate is already [B, H, S, D] (transposed in phase1)
-    rope_single_phase2_kernel[kv_grid](
-        v_intermediate,
-        v_fp8,
-        v_scale,
-        # Strides [B, H_kv, S, D]
-        v_fp8.stride(0),
-        v_fp8.stride(1),
-        v_fp8.stride(2),
-        v_fp8.stride(3),
-        S,
-        D,
-        H_kv,
-        chunk_size,
-        H_kv,
-        1,
+        QuantizeSpec(
+            B,
+            H_kv,
+            S,
+            D,
+            H_kv,
+            1,
+            num_chunks,
+            LOG2_D=LOG2_D,
+            use_bfloat16=use_bfloat16,
+        ),
     )
 
     return q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale

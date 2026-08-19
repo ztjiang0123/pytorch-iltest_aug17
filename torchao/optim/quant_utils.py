@@ -72,44 +72,32 @@ def scale_tensor(input: Tensor, block_size: int):
     return input.view(shape), scale
 
 
-def quantize_8bit_with_qmap(input: Tensor, qmap: Tensor):
+def _quantize_with_qmap(input: Tensor, qmap: Tensor, n_bits: int):
     # GPU-friendly binary search
     # https://blog.demofox.org/2017/06/20/simd-gpu-friendly-branchless-binary-search/
-    codes = torch.where(input >= qmap[128], 128, 0)
-    codes += torch.where(input >= qmap[codes + 64], 64, 0)
-    codes += torch.where(input >= qmap[codes + 32], 32, 0)
-    codes += torch.where(input >= qmap[codes + 16], 16, 0)
-    codes += torch.where(input >= qmap[codes + 8], 8, 0)
-    codes += torch.where(input >= qmap[codes + 4], 4, 0)
-    codes += torch.where(input >= qmap[codes + 2], 2, 0)
-    codes += torch.where(input >= qmap[codes + 1], 1, 0)
+    # `qmap` has 2**n_bits entries, so codes range over [0, 2**n_bits - 1].
+    max_code = (1 << n_bits) - 1
+    codes = torch.where(input >= qmap[1 << (n_bits - 1)], 1 << (n_bits - 1), 0)
+    for shift in range(n_bits - 2, -1, -1):
+        step = 1 << shift
+        codes += torch.where(input >= qmap[codes + step], step, 0)
 
     # rounding
-    codes_up = (codes + 1).clip(max=255)
+    codes_up = (codes + 1).clip(max=max_code)
     val_down = qmap[codes]
     val_up = qmap[codes_up]
     residual = input - val_down
     codes = torch.where(residual >= (val_up - val_down) * 0.5, codes_up, codes)
 
     return codes.to(torch.uint8)
+
+
+def quantize_8bit_with_qmap(input: Tensor, qmap: Tensor):
+    return _quantize_with_qmap(input, qmap, n_bits=8)
 
 
 def quantize_4bit_with_qmap(input: Tensor, qmap: Tensor):
-    # GPU-friendly binary search
-    # https://blog.demofox.org/2017/06/20/simd-gpu-friendly-branchless-binary-search/
-    codes = torch.where(input >= qmap[8], 8, 0)
-    codes += torch.where(input >= qmap[codes + 4], 4, 0)
-    codes += torch.where(input >= qmap[codes + 2], 2, 0)
-    codes += torch.where(input >= qmap[codes + 1], 1, 0)
-
-    # rounding
-    codes_up = (codes + 1).clip(max=15)
-    val_down = qmap[codes]
-    val_up = qmap[codes_up]
-    residual = input - val_down
-    codes = torch.where(residual >= (val_up - val_down) * 0.5, codes_up, codes)
-
-    return codes.to(torch.uint8)
+    return _quantize_with_qmap(input, qmap, n_bits=4)
 
 
 def dequant_with_qmap(codes: Tensor, qmap: Tensor, scale: Tensor):

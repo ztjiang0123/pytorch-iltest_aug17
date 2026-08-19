@@ -14,7 +14,7 @@ from torchao.core.config import AOBaseConfig
 from torchao.quantization.transform_module import (
     register_quantize_module_handler,
 )
-from torchao.utils import TorchAOBaseTensor
+from torchao.utils import TorchAOBaseTensor, _dequantize_and_run
 
 aten = torch.ops.aten
 c10d_functional = torch.ops.c10d_functional
@@ -228,11 +228,7 @@ def _(func, types, args, kwargs):
 # out-of-place math ops always return plain tensor
 @implements([aten.sub.Tensor, aten.mul.Tensor])
 def _(func, types, args, kwargs):
-    args = [
-        x.dequantize() if isinstance(x, Int8QuantizedTrainingLinearWeight) else x
-        for x in args
-    ]
-    return func(*args, **kwargs)
+    return _dequantize_and_run(func, args, kwargs, Int8QuantizedTrainingLinearWeight)
 
 
 @implements(aten.copy_.default)

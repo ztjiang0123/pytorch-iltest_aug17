@@ -29,6 +29,7 @@ class _AdamBase(Optimizer):
         block_size,
         bf16_stochastic_round,
         is_adamw,
+        api_usage_name=None,
     ) -> None:
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
@@ -49,6 +50,8 @@ class _AdamBase(Optimizer):
         self.block_size = block_size
         self.bf16_stochastic_round = bf16_stochastic_round
         self.is_adamw = is_adamw
+        if api_usage_name is not None:
+            torch._C._log_api_usage_once(api_usage_name)
 
     def add_param_group(self, param_group: dict) -> None:
         super().add_param_group(param_group)
@@ -209,19 +212,37 @@ def single_param_adam(
         p.copy_(p_f32)
 
 
-class Adam8bit(_AdamBase):
+class _AdamSubclassBase(_AdamBase):
+    """Shared ``__init__`` for the quantized Adam/AdamW optimizers.
+
+    Concrete subclasses only declare what differs between them via class
+    attributes: whether they use decoupled weight decay (``_IS_ADAMW``), the
+    default ``weight_decay`` and ``block_size``, the API-usage name reported to
+    PyTorch, and how to build zero-filled optimizer-state buffers
+    (``_subclass_zeros``).
+    """
+
+    _IS_ADAMW: bool
+    _DEFAULT_WEIGHT_DECAY: float
+    _DEFAULT_BLOCK_SIZE: int
+    _API_USAGE_NAME: str
+
     def __init__(
         self,
         params,
         lr=1e-3,
         betas=(0.9, 0.999),
         eps=1e-8,
-        weight_decay=0,
+        weight_decay=None,
         amsgrad=False,
         *,
-        block_size=256,
+        block_size=None,
         bf16_stochastic_round=False,
     ) -> None:
+        if weight_decay is None:
+            weight_decay = self._DEFAULT_WEIGHT_DECAY
+        if block_size is None:
+            block_size = self._DEFAULT_BLOCK_SIZE
         super().__init__(
             params,
             lr,
@@ -231,9 +252,16 @@ class Adam8bit(_AdamBase):
             amsgrad,
             block_size=block_size,
             bf16_stochastic_round=bf16_stochastic_round,
-            is_adamw=False,
+            is_adamw=self._IS_ADAMW,
+            api_usage_name=self._API_USAGE_NAME,
         )
-        torch._C._log_api_usage_once("torchao.optim.Adam8bit")
+
+
+class Adam8bit(_AdamSubclassBase):
+    _IS_ADAMW = False
+    _DEFAULT_WEIGHT_DECAY = 0
+    _DEFAULT_BLOCK_SIZE = 256
+    _API_USAGE_NAME = "torchao.optim.Adam8bit"
 
     @staticmethod
     def _subclass_zeros(p: Tensor, signed: bool, block_size: int):
@@ -242,31 +270,11 @@ class Adam8bit(_AdamBase):
         )
 
 
-class Adam4bit(_AdamBase):
-    def __init__(
-        self,
-        params,
-        lr=1e-3,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=0,
-        amsgrad=False,
-        *,
-        block_size=128,
-        bf16_stochastic_round=False,
-    ) -> None:
-        super().__init__(
-            params,
-            lr,
-            betas,
-            eps,
-            weight_decay,
-            amsgrad,
-            block_size=block_size,
-            bf16_stochastic_round=bf16_stochastic_round,
-            is_adamw=False,
-        )
-        torch._C._log_api_usage_once("torchao.optim.Adam4bit")
+class Adam4bit(_AdamSubclassBase):
+    _IS_ADAMW = False
+    _DEFAULT_WEIGHT_DECAY = 0
+    _DEFAULT_BLOCK_SIZE = 128
+    _API_USAGE_NAME = "torchao.optim.Adam4bit"
 
     @staticmethod
     def _subclass_zeros(p: Tensor, signed: bool, block_size: int):
@@ -275,62 +283,22 @@ class Adam4bit(_AdamBase):
         )
 
 
-class AdamFp8(_AdamBase):
-    def __init__(
-        self,
-        params,
-        lr=1e-3,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=0,
-        amsgrad=False,
-        *,
-        block_size=256,
-        bf16_stochastic_round=False,
-    ) -> None:
-        super().__init__(
-            params,
-            lr,
-            betas,
-            eps,
-            weight_decay,
-            amsgrad,
-            block_size=block_size,
-            bf16_stochastic_round=bf16_stochastic_round,
-            is_adamw=False,
-        )
-        torch._C._log_api_usage_once("torchao.optim.AdamFp8")
+class AdamFp8(_AdamSubclassBase):
+    _IS_ADAMW = False
+    _DEFAULT_WEIGHT_DECAY = 0
+    _DEFAULT_BLOCK_SIZE = 256
+    _API_USAGE_NAME = "torchao.optim.AdamFp8"
 
     @staticmethod
     def _subclass_zeros(p: Tensor, signed: bool, block_size: int):
         return OptimStateFp8.zeros(p.shape, block_size, p.device, dtype=p.dtype)
 
 
-class AdamW8bit(_AdamBase):
-    def __init__(
-        self,
-        params,
-        lr=1e-3,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=1e-2,
-        amsgrad=False,
-        *,
-        block_size=256,
-        bf16_stochastic_round=False,
-    ) -> None:
-        super().__init__(
-            params,
-            lr,
-            betas,
-            eps,
-            weight_decay,
-            amsgrad,
-            block_size=block_size,
-            bf16_stochastic_round=bf16_stochastic_round,
-            is_adamw=True,
-        )
-        torch._C._log_api_usage_once("torchao.optim.AdamW8bit")
+class AdamW8bit(_AdamSubclassBase):
+    _IS_ADAMW = True
+    _DEFAULT_WEIGHT_DECAY = 1e-2
+    _DEFAULT_BLOCK_SIZE = 256
+    _API_USAGE_NAME = "torchao.optim.AdamW8bit"
 
     @staticmethod
     def _subclass_zeros(p: Tensor, signed: bool, block_size: int):
@@ -339,31 +307,11 @@ class AdamW8bit(_AdamBase):
         )
 
 
-class AdamW4bit(_AdamBase):
-    def __init__(
-        self,
-        params,
-        lr=1e-3,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=1e-2,
-        amsgrad=False,
-        *,
-        block_size=128,
-        bf16_stochastic_round=False,
-    ) -> None:
-        super().__init__(
-            params,
-            lr,
-            betas,
-            eps,
-            weight_decay,
-            amsgrad,
-            block_size=block_size,
-            bf16_stochastic_round=bf16_stochastic_round,
-            is_adamw=True,
-        )
-        torch._C._log_api_usage_once("torchao.optim.AdamW4bit")
+class AdamW4bit(_AdamSubclassBase):
+    _IS_ADAMW = True
+    _DEFAULT_WEIGHT_DECAY = 1e-2
+    _DEFAULT_BLOCK_SIZE = 128
+    _API_USAGE_NAME = "torchao.optim.AdamW4bit"
 
     @staticmethod
     def _subclass_zeros(p: Tensor, signed: bool, block_size: int):
@@ -372,31 +320,11 @@ class AdamW4bit(_AdamBase):
         )
 
 
-class AdamWFp8(_AdamBase):
-    def __init__(
-        self,
-        params,
-        lr=1e-3,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=1e-2,
-        amsgrad=False,
-        *,
-        block_size=256,
-        bf16_stochastic_round=False,
-    ) -> None:
-        super().__init__(
-            params,
-            lr,
-            betas,
-            eps,
-            weight_decay,
-            amsgrad,
-            block_size=block_size,
-            bf16_stochastic_round=bf16_stochastic_round,
-            is_adamw=True,
-        )
-        torch._C._log_api_usage_once("torchao.optim.AdamWFp8")
+class AdamWFp8(_AdamSubclassBase):
+    _IS_ADAMW = True
+    _DEFAULT_WEIGHT_DECAY = 1e-2
+    _DEFAULT_BLOCK_SIZE = 256
+    _API_USAGE_NAME = "torchao.optim.AdamWFp8"
 
     @staticmethod
     def _subclass_zeros(p: Tensor, signed: bool, block_size: int):
