@@ -78,6 +78,7 @@ from torchao.quantization.utils import (
     _linear_extra_repr,
     _module_extra_repr,
     _quantization_type,
+    _set_quantized_parameter,
 )
 from torchao.utils import (
     is_MI300,
@@ -637,20 +638,7 @@ def _int4_weight_only_transform(
     new_weight = _int4_weight_only_quantize_tensor(
         getattr(module, parameter_name), config
     )
-    setattr(
-        module,
-        parameter_name,
-        torch.nn.Parameter(new_weight, requires_grad=False),
-    )
-    module.extra_repr = types.MethodType(
-        partial(
-            _module_extra_repr,
-            original_extra_repr=module.extra_repr,
-            parameter_name=parameter_name,
-        ),
-        module,
-    )
-    return module
+    return _set_quantized_parameter(module, parameter_name, new_weight)
 
 
 @dataclass

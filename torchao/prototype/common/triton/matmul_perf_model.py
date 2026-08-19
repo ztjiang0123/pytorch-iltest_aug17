@@ -39,46 +39,34 @@ def get_clock_rate_in_khz():
         return pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_SM) * 1e3
 
 
-def get_tensorcore_tflops(device, num_ctas, num_warps, dtype):
-    """return compute throughput in TOPS"""
-    total_warps = num_ctas * min(num_warps, 4)
+def _get_num_subcores(device):
+    """return the number of subcores for the given device"""
     if hasattr(driver, "active"):
-        num_subcores = (
-            driver.active.utils.get_device_properties(device)["multiprocessor_count"]
-            * 4
-        )  # on recent GPUs
+        props = driver.active.utils.get_device_properties(device)
     else:
-        num_subcores = (
-            driver.utils.get_device_properties(device)["multiprocessor_count"] * 4
-        )  # on recent GPUs
+        props = driver.utils.get_device_properties(device)
+    return props["multiprocessor_count"] * 4  # on recent GPUs
 
-    tflops = (
+
+def _get_tflops(get_max_tflops, device, num_ctas, num_warps, dtype):
+    """return compute throughput in TOPS scaled by the given peak-tflops fn"""
+    total_warps = num_ctas * min(num_warps, 4)
+    num_subcores = _get_num_subcores(device)
+    return (
         min(num_subcores, total_warps)
         / num_subcores
-        * get_max_tensorcore_tflops(dtype, get_clock_rate_in_khz(), device)
+        * get_max_tflops(dtype, get_clock_rate_in_khz(), device)
     )
-    return tflops
+
+
+def get_tensorcore_tflops(device, num_ctas, num_warps, dtype):
+    """return compute throughput in TOPS"""
+    return _get_tflops(get_max_tensorcore_tflops, device, num_ctas, num_warps, dtype)
 
 
 def get_simd_tflops(device, num_ctas, num_warps, dtype):
     """return compute throughput in TOPS"""
-    total_warps = num_ctas * min(num_warps, 4)
-    if hasattr(driver, "active"):
-        num_subcores = (
-            driver.active.utils.get_device_properties(device)["multiprocessor_count"]
-            * 4
-        )  # on recent GPUs
-    else:
-        num_subcores = (
-            driver.utils.get_device_properties(device)["multiprocessor_count"] * 4
-        )  # on recent GPUs
-
-    tflops = (
-        min(num_subcores, total_warps)
-        / num_subcores
-        * get_max_simd_tflops(dtype, get_clock_rate_in_khz(), device)
-    )
-    return tflops
+    return _get_tflops(get_max_simd_tflops, device, num_ctas, num_warps, dtype)
 
 
 def get_tflops(device, num_ctas, num_warps, dtype):

@@ -10,7 +10,7 @@ import torch
 from torch.utils._python_dispatch import return_and_correct_aliasing
 
 from torchao.prototype.dtypes.uintx.bitpacking import pack, unpack
-from torchao.utils import TorchAOBaseTensor
+from torchao.utils import TorchAOBaseTensor, _get_to_kwargs_with_memory_format
 
 aten = torch.ops.aten
 
@@ -118,18 +118,7 @@ class UintxTensor(TorchAOBaseTensor):
         return cls(shards, int_data.shape, bit_width, pack_dim)
 
     def _get_to_kwargs(self, *args, **kwargs):
-        device, dtype, _, memory_format = torch._C._nn._parse_to(*args, **kwargs)
-        device = self.device if device is None else device
-        dtype = self.dtype if dtype is None else dtype
-        memory_format = (
-            memory_format if memory_format is not None else torch.preserve_format
-        )
-        kwargs = {
-            "device": device,
-            "dtype": dtype,
-            "memory_format": memory_format,
-        }
-        return kwargs
+        return _get_to_kwargs_with_memory_format(self, *args, **kwargs)
 
     def to(self, *args, **kwargs):
         if "copy" in kwargs:

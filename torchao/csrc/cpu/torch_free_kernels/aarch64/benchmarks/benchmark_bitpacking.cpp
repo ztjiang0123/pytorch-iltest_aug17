@@ -244,7 +244,32 @@ struct odd_bit_functions<7> {
       torchao::bitpacking::internal::vec_unpack_128_uint7_values;
 };
 
-// Single forwarding body shared by every odd-bit pack specialization.
+// Single forwarding body shared by every odd-bit pack and unpack
+// specialization. Both directions have the identical shape: select the
+// nbit-specific internal function triple from odd_bit_functions<nbit> and
+// forward it, along with the passthrough arguments, to the given *_values
+// dispatcher. The three function-triple members and the dispatcher are passed
+// as parameters so this forwarding logic lives in exactly one place.
+template <
+    int nbit,
+    typename fn8_type,
+    typename fn64_type,
+    typename fn128_type,
+    typename dispatch_fn_type>
+void forward_uint_odd_bit(
+    fn8_type fn_8,
+    fn64_type fn_64,
+    fn128_type fn_128,
+    dispatch_fn_type dispatch,
+    uint8_t* dst,
+    uint8_t* src,
+    int dst_size,
+    int src_size,
+    int variant) {
+  dispatch(fn_8, fn_64, fn_128, nbit, dst, src, dst_size, src_size, variant);
+}
+
+// Benchmark utility to compare variants of odd bit packing.
 template <int nbit>
 void pack_uint_odd_bit(
     uint8_t* packed,
@@ -253,11 +278,14 @@ void pack_uint_odd_bit(
     int unpacked_size,
     int variant) {
   using fns = odd_bit_functions<nbit>;
-  pack_uint_odd_bit_values(
+  forward_uint_odd_bit<nbit>(
       fns::pack_8,
       fns::vec_pack_64,
       fns::vec_pack_128,
-      nbit,
+      pack_uint_odd_bit_values<
+          decltype(fns::pack_8),
+          decltype(fns::vec_pack_64),
+          decltype(fns::vec_pack_128)>,
       packed,
       unpacked,
       packed_size,
@@ -265,7 +293,7 @@ void pack_uint_odd_bit(
       variant);
 }
 
-// Single forwarding body shared by every odd-bit unpack specialization.
+// Benchmark utility to compare variants of odd bit unpacking.
 template <int nbit>
 void unpack_uint_odd_bit(
     uint8_t* unpacked,
@@ -274,11 +302,14 @@ void unpack_uint_odd_bit(
     int packed_size,
     int variant) {
   using fns = odd_bit_functions<nbit>;
-  unpack_uint_odd_bit_values(
+  forward_uint_odd_bit<nbit>(
       fns::unpack_8,
       fns::vec_unpack_64,
       fns::vec_unpack_128,
-      nbit,
+      unpack_uint_odd_bit_values<
+          decltype(fns::unpack_8),
+          decltype(fns::vec_unpack_64),
+          decltype(fns::vec_unpack_128)>,
       unpacked,
       packed,
       unpacked_size,

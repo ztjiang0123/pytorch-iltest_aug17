@@ -19,14 +19,11 @@ if TYPE_CHECKING:
 # Define FP8Granularity type alias to break circular import dependencies
 FP8Granularity = Union["PerTensor", "PerRow", "PerGroup"]
 
-import types
-from functools import partial
-
 from torchao.quantization.quantize_.workflows import QuantizeTensorToFloat8Kwargs
 from torchao.quantization.transform_module import (
     register_quantize_module_handler,
 )
-from torchao.quantization.utils import _module_extra_repr, get_block_size
+from torchao.quantization.utils import _set_quantized_parameter, get_block_size
 
 from .float8_opaque_tensor import Float8OpaqueTensor
 
@@ -100,17 +97,4 @@ def _float8_dynamic_activation_float8_weight_opaque_tensor_transform(
     quantized_tensor = _float8_dynamic_activation_float8_weight_opaque_tensor_quantize(
         getattr(module, parameter_name), config
     )
-    setattr(
-        module,
-        parameter_name,
-        torch.nn.Parameter(quantized_tensor, requires_grad=False),
-    )
-    module.extra_repr = types.MethodType(
-        partial(
-            _module_extra_repr,
-            original_extra_repr=module.extra_repr,
-            parameter_name=parameter_name,
-        ),
-        module,
-    )
-    return module
+    return _set_quantized_parameter(module, parameter_name, quantized_tensor)

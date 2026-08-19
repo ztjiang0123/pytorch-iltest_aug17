@@ -731,6 +731,33 @@ def _dispatch__torch_dispatch__(cls, func, types, args, kwargs):
     )
 
 
+def _get_to_kwargs_with_memory_format(
+    self, *args, include_requires_grad=False, **kwargs
+):
+    """Helper to build the device/dtype/memory_format keyword args for ``.to``.
+
+    Shared by tensor subclasses whose ``to`` implementation forwards a
+    ``memory_format`` (rather than ``non_blocking``). Set ``include_requires_grad``
+    to also propagate ``self.requires_grad``.
+
+    Returns: ``{"device": device, "dtype": dtype, "memory_format": memory_format[, "requires_grad": ...]}``
+    """
+    device, dtype, _, memory_format = torch._C._nn._parse_to(*args, **kwargs)
+    device = self.device if device is None else device
+    dtype = self.dtype if dtype is None else dtype
+    memory_format = (
+        memory_format if memory_format is not None else torch.preserve_format
+    )
+    result = {
+        "device": device,
+        "dtype": dtype,
+        "memory_format": memory_format,
+    }
+    if include_requires_grad:
+        result["requires_grad"] = self.requires_grad
+    return result
+
+
 def _get_to_kwargs(self, *args, **kwargs):
     """Helper function to get the device, dtype and non_blocking keyword args for `aten._to_copy.default` op
 

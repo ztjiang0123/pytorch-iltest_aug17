@@ -18,7 +18,7 @@ from torchao.quantization.quant_primitives import (
     _get_and_check_qmin_qmax,
     choose_qparams_affine,
 )
-from torchao.utils import TorchAOBaseTensor
+from torchao.utils import TorchAOBaseTensor, _get_to_kwargs_with_memory_format
 
 aten = torch.ops.aten
 
@@ -211,19 +211,9 @@ class _AffineFakeQuantizedTensor(TorchAOBaseTensor):
             return self.original_tensor
 
     def _get_to_kwargs(self, *args, **kwargs):
-        device, dtype, _, memory_format = torch._C._nn._parse_to(*args, **kwargs)
-        device = self.device if device is None else device
-        dtype = self.dtype if dtype is None else dtype
-        memory_format = (
-            memory_format if memory_format is not None else torch.preserve_format
+        return _get_to_kwargs_with_memory_format(
+            self, *args, include_requires_grad=True, **kwargs
         )
-        kwargs = {
-            "device": device,
-            "dtype": dtype,
-            "memory_format": memory_format,
-            "requires_grad": self.requires_grad,
-        }
-        return kwargs
 
     def to(self, *args, **kwargs):
         kwargs = self._get_to_kwargs(*args, **kwargs)

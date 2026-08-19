@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import logging
+import types
+from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -762,6 +764,30 @@ def _module_extra_repr(self, original_extra_repr, parameter_name):
         f"{parameter_name}={_quantization_type(getattr(self, parameter_name))}"
     )
     return ", ".join(module_torchao_extra_repr)
+
+
+def _set_quantized_parameter(module, parameter_name, new_weight):
+    """Install ``new_weight`` as a (non-grad) parameter on ``module`` and wire up
+    the torchao extra_repr for ``parameter_name``.
+
+    Shared tail of the ``_..._transform`` handlers: given the already-quantized
+    weight, this replaces the parameter and patches ``module.extra_repr`` so the
+    quantization type is reflected in ``repr(module)``. Returns ``module``.
+    """
+    setattr(
+        module,
+        parameter_name,
+        torch.nn.Parameter(new_weight, requires_grad=False),
+    )
+    module.extra_repr = types.MethodType(
+        partial(
+            _module_extra_repr,
+            original_extra_repr=module.extra_repr,
+            parameter_name=parameter_name,
+        ),
+        module,
+    )
+    return module
 
 
 def _fp8_mm_compat(weight: torch.Tensor) -> bool:
