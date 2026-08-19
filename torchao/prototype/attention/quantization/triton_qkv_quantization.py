@@ -206,6 +206,59 @@ def single_phase2_kernel(
         tl.store(x_out_ptr + ptr_offset, x_fp8, mask=mask)
 
 
+def _quantize_one_tensor(x, B, H, S, D, H_kv, groups, num_chunks):
+    """Quantize a single [B, H, S, D] tensor to FP8 with block-wise per-(KV)head
+    scaling via the phase1(max) -> reduce -> phase2(quantize) kernel pipeline.
+
+    ``groups`` is ``H // H_kv`` for the Q tensor (per-KV-group scaling) and 1 for
+    K/V (per-head scaling). Returns ``(x_fp8, x_descale)`` where ``x_descale`` has
+    shape ``[B, H_kv]``.
+    """
+    chunk_size = (S + num_chunks - 1) // num_chunks
+    grid = (B, H, num_chunks)
+
+    x_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    partial_max = torch.empty(B * H * num_chunks, dtype=torch.float32, device=x.device)
+    scale = torch.empty(B, H_kv, dtype=torch.float32, device=x.device)
+    descale = torch.empty(B, H_kv, dtype=torch.float32, device=x.device)
+
+    single_phase1_kernel[grid](
+        x,
+        partial_max,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        x.stride(3),
+        S,
+        D,
+        H,
+        chunk_size,
+        num_chunks,
+    )
+    # A group reduce over the [B, H, num_chunks] buffer is a single reduce over
+    # `groups * num_chunks` contiguous entries per (batch, kv_head), since the
+    # `groups` heads mapping to a KV head are contiguous.
+    single_reduce_kernel[(B, H_kv)](
+        partial_max, scale, descale, H_kv, groups * num_chunks
+    )
+    single_phase2_kernel[grid](
+        x,
+        x_fp8,
+        scale,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        x.stride(3),
+        S,
+        D,
+        H,
+        chunk_size,
+        H_kv,
+        groups,
+    )
+    return x_fp8, descale
+
+
 def triton_fp8_sdpa_quantize(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -276,151 +329,12 @@ def triton_fp8_sdpa_quantize(
     else:
         q_num_chunks = num_chunks
         kv_num_chunks = num_chunks
-    q_chunk_size = (S_q + q_num_chunks - 1) // q_num_chunks
-    kv_chunk_size = (S_kv + kv_num_chunks - 1) // kv_num_chunks
 
-    # Allocate output tensors
-    q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
-    k_fp8 = torch.empty_like(k, dtype=torch.float8_e4m3fn)
-    v_fp8 = torch.empty_like(v, dtype=torch.float8_e4m3fn)
-
-    # Allocate partial max buffers (one per tensor)
-    q_partial_max = torch.empty(
-        B * H_q * q_num_chunks, dtype=torch.float32, device=q.device
+    # Q uses per-KV-group scaling (groups Q heads share a scale); K/V are per-head.
+    q_fp8, q_descale = _quantize_one_tensor(
+        q, B, H_q, S_q, D, H_kv, groups, q_num_chunks
     )
-    k_partial_max = torch.empty(
-        B * H_kv * kv_num_chunks, dtype=torch.float32, device=q.device
-    )
-    v_partial_max = torch.empty(
-        B * H_kv * kv_num_chunks, dtype=torch.float32, device=q.device
-    )
-
-    # Allocate scale/descale tensors.
-    # For GQA, Q scale/descale are [B, H_kv] (per KV group).
-    # K and V are always [B, H_kv] (per head).
-    q_scale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    k_scale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    v_scale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    q_descale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    k_descale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    v_descale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-
-    q_grid_chunked = (B, H_q, q_num_chunks)
-    kv_grid_chunked = (B, H_kv, kv_num_chunks)
-
-    # ---- Phase 1: Max for Q ----
-    single_phase1_kernel[q_grid_chunked](
-        q,
-        q_partial_max,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        S_q,
-        D,
-        H_q,
-        q_chunk_size,
-        q_num_chunks,
-    )
-
-    # ---- Phase 1: Max for K ----
-    single_phase1_kernel[kv_grid_chunked](
-        k,
-        k_partial_max,
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        S_kv,
-        D,
-        H_kv,
-        kv_chunk_size,
-        kv_num_chunks,
-    )
-
-    # ---- Phase 1: Max for V ----
-    single_phase1_kernel[kv_grid_chunked](
-        v,
-        v_partial_max,
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        S_kv,
-        D,
-        H_kv,
-        kv_chunk_size,
-        kv_num_chunks,
-    )
-
-    # ---- Reduce ----
-    # Q: group reduce across `groups` Q heads per KV head. Because the Q partial-max
-    # buffer is laid out as [B, H_q, q_num_chunks] and the `groups` Q heads that map
-    # to a KV head are contiguous, a group reduce is exactly a single reduce over
-    # `groups * q_num_chunks` contiguous entries per (batch, kv_head).
-    single_reduce_kernel[(B, H_kv)](
-        q_partial_max, q_scale, q_descale, H_kv, groups * q_num_chunks
-    )
-    # K, V: per-head reduce
-    single_reduce_kernel[(B, H_kv)](
-        k_partial_max, k_scale, k_descale, H_kv, kv_num_chunks
-    )
-    single_reduce_kernel[(B, H_kv)](
-        v_partial_max, v_scale, v_descale, H_kv, kv_num_chunks
-    )
-
-    # ---- Phase 2: Quantize Q ----
-    # Q scale is [B, H_kv]; each group of `groups` Q heads shares one scale.
-    single_phase2_kernel[q_grid_chunked](
-        q,
-        q_fp8,
-        q_scale,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        S_q,
-        D,
-        H_q,
-        q_chunk_size,
-        H_kv,
-        groups,
-    )
-
-    # ---- Phase 2: Quantize K ----
-    # K scale is [B, H_kv]; groups=1 (per-head).
-    single_phase2_kernel[kv_grid_chunked](
-        k,
-        k_fp8,
-        k_scale,
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        S_kv,
-        D,
-        H_kv,
-        kv_chunk_size,
-        H_kv,
-        1,
-    )
-
-    # ---- Phase 2: Quantize V ----
-    # V scale is [B, H_kv]; groups=1 (per-head).
-    single_phase2_kernel[kv_grid_chunked](
-        v,
-        v_fp8,
-        v_scale,
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        S_kv,
-        D,
-        H_kv,
-        kv_chunk_size,
-        H_kv,
-        1,
-    )
+    k_fp8, k_descale = _quantize_one_tensor(k, B, H_kv, S_kv, D, H_kv, 1, kv_num_chunks)
+    v_fp8, v_descale = _quantize_one_tensor(v, B, H_kv, S_kv, D, H_kv, 1, kv_num_chunks)
 
     return q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale

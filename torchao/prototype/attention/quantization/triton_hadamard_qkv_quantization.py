@@ -118,6 +118,86 @@ def hadamard_single_phase1_kernel(
     tl.store(partial_max_ptr + chunk_idx, x_max_scalar)
 
 
+def _hadamard_quantize_one(
+    x, B, H, S, D, H_kv, groups, num_chunks, LOG2_D, use_bfloat16, apply_hadamard
+):
+    """Quantize a single [B, H, S, D] tensor to FP8 with per-(KV)head scaling.
+
+    When ``apply_hadamard`` is True the Hadamard transform is applied before
+    quantization (phase1 emits a Hadamard'd intermediate that phase2 consumes);
+    otherwise the tensor is quantized directly. ``groups`` is ``H // H_kv`` for Q
+    and 1 for K/V. Returns ``(x_fp8, x_descale)`` with descale of shape [B, H_kv].
+    """
+    chunk_size = (S + num_chunks - 1) // num_chunks
+    grid = (B, H, num_chunks)
+
+    x_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    partial_max = torch.empty(B * H * num_chunks, dtype=torch.float32, device=x.device)
+    scale = torch.empty(B, H_kv, dtype=torch.float32, device=x.device)
+    descale = torch.empty(B, H_kv, dtype=torch.float32, device=x.device)
+
+    if apply_hadamard:
+        had = torch.empty_like(x)
+        temp = torch.empty(B, H, num_chunks, D, dtype=torch.float32, device=x.device)
+        hadamard_single_phase1_kernel[grid](
+            x,
+            had,
+            temp,
+            partial_max,
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),
+            x.stride(3),
+            temp.stride(0),
+            temp.stride(1),
+            temp.stride(2),
+            temp.stride(3),
+            S,
+            H,
+            chunk_size,
+            num_chunks,
+            D=D,
+            LOG2_D=LOG2_D,
+            USE_BFLOAT16=use_bfloat16,
+        )
+        phase2_input = had
+    else:
+        single_phase1_kernel[grid](
+            x,
+            partial_max,
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),
+            x.stride(3),
+            S,
+            D,
+            H,
+            chunk_size,
+            num_chunks,
+        )
+        phase2_input = x
+
+    single_reduce_kernel[(B, H_kv)](
+        partial_max, scale, descale, H_kv, groups * num_chunks
+    )
+    single_phase2_kernel[grid](
+        phase2_input,
+        x_fp8,
+        scale,
+        phase2_input.stride(0),
+        phase2_input.stride(1),
+        phase2_input.stride(2),
+        phase2_input.stride(3),
+        S,
+        D,
+        H,
+        chunk_size,
+        H_kv,
+        groups,
+    )
+    return x_fp8, descale
+
+
 def triton_fp8_hadamard_sdpa_quantize(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -200,216 +280,47 @@ def triton_fp8_hadamard_sdpa_quantize(
     else:
         q_num_chunks = num_chunks
         kv_num_chunks = num_chunks
-    q_chunk_size = (S_q + q_num_chunks - 1) // q_num_chunks
-    kv_chunk_size = (S_kv + kv_num_chunks - 1) // kv_num_chunks
 
-    # Allocate output tensors
-    q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
-    k_fp8 = torch.empty_like(k, dtype=torch.float8_e4m3fn)
-    v_fp8 = torch.empty_like(v, dtype=torch.float8_e4m3fn)
-
-    # Intermediate buffers for Hadamard'd values
-    if not v_only:
-        q_had = torch.empty_like(q)
-        k_had = torch.empty_like(k)
-        q_temp = torch.empty(
-            B, H_q, q_num_chunks, D, dtype=torch.float32, device=q.device
-        )
-    v_had = torch.empty_like(v)
-    kv_temp = torch.empty(
-        B, H_kv, kv_num_chunks, D, dtype=torch.float32, device=q.device
-    )
-
-    # Partial max buffers
-    q_partial_max = torch.empty(
-        B * H_q * q_num_chunks, dtype=torch.float32, device=q.device
-    )
-    k_partial_max = torch.empty(
-        B * H_kv * kv_num_chunks, dtype=torch.float32, device=q.device
-    )
-    v_partial_max = torch.empty(
-        B * H_kv * kv_num_chunks, dtype=torch.float32, device=q.device
-    )
-
-    # Scale/descale tensors (per KV group for Q, per head for K/V)
-    q_scale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    k_scale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    v_scale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    q_descale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    k_descale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-    v_descale = torch.empty(B, H_kv, dtype=torch.float32, device=q.device)
-
-    q_grid = (B, H_q, q_num_chunks)
-    kv_grid = (B, H_kv, kv_num_chunks)
-
-    # ---- Phase 1: Q ----
-    if v_only:
-        single_phase1_kernel[q_grid](
-            q,
-            q_partial_max,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            S_q,
-            D,
-            H_q,
-            q_chunk_size,
-            q_num_chunks,
-        )
-    else:
-        hadamard_single_phase1_kernel[q_grid](
-            q,
-            q_had,
-            q_temp,
-            q_partial_max,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            q_temp.stride(0),
-            q_temp.stride(1),
-            q_temp.stride(2),
-            q_temp.stride(3),
-            S_q,
-            H_q,
-            q_chunk_size,
-            q_num_chunks,
-            D=D,
-            LOG2_D=LOG2_D,
-            USE_BFLOAT16=use_bfloat16,
-        )
-
-    # ---- Phase 1: K ----
-    if v_only:
-        single_phase1_kernel[kv_grid](
-            k,
-            k_partial_max,
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-            S_kv,
-            D,
-            H_kv,
-            kv_chunk_size,
-            kv_num_chunks,
-        )
-    else:
-        hadamard_single_phase1_kernel[kv_grid](
-            k,
-            k_had,
-            kv_temp,
-            k_partial_max,
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-            kv_temp.stride(0),
-            kv_temp.stride(1),
-            kv_temp.stride(2),
-            kv_temp.stride(3),
-            S_kv,
-            H_kv,
-            kv_chunk_size,
-            kv_num_chunks,
-            D=D,
-            LOG2_D=LOG2_D,
-            USE_BFLOAT16=use_bfloat16,
-        )
-
-    # ---- Phase 1: Hadamard + max for V (always Hadamard) ----
-    # kv_temp reused from K (when not v_only): safe because both launches are
-    # on the same CUDA stream, so K's kernel fully completes before V's starts.
-    hadamard_single_phase1_kernel[kv_grid](
-        v,
-        v_had,
-        kv_temp,
-        v_partial_max,
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        kv_temp.stride(0),
-        kv_temp.stride(1),
-        kv_temp.stride(2),
-        kv_temp.stride(3),
-        S_kv,
-        H_kv,
-        kv_chunk_size,
-        kv_num_chunks,
-        D=D,
-        LOG2_D=LOG2_D,
-        USE_BFLOAT16=use_bfloat16,
-    )
-
-    # ---- Reduce ----
-    # Q: group reduce across `groups` Q heads per KV head. Because the Q partial-max
-    # buffer is laid out as [B, H_q, q_num_chunks] and the `groups` Q heads that map
-    # to a KV head are contiguous, a group reduce is exactly a single reduce over
-    # `groups * q_num_chunks` contiguous entries per (batch, kv_head).
-    single_reduce_kernel[(B, H_kv)](
-        q_partial_max, q_scale, q_descale, H_kv, groups * q_num_chunks
-    )
-    # K, V: per-head reduce
-    single_reduce_kernel[(B, H_kv)](
-        k_partial_max, k_scale, k_descale, H_kv, kv_num_chunks
-    )
-    single_reduce_kernel[(B, H_kv)](
-        v_partial_max, v_scale, v_descale, H_kv, kv_num_chunks
-    )
-
-    # ---- Phase 2: Quantize Q ----
-    q_phase2_input = q if v_only else q_had
-    single_phase2_kernel[q_grid](
-        q_phase2_input,
-        q_fp8,
-        q_scale,
-        q_phase2_input.stride(0),
-        q_phase2_input.stride(1),
-        q_phase2_input.stride(2),
-        q_phase2_input.stride(3),
+    # Q/K apply the Hadamard transform unless `v_only`; V always applies it.
+    # Q uses per-KV-group scaling (groups); K/V are per-head (groups=1).
+    q_fp8, q_descale = _hadamard_quantize_one(
+        q,
+        B,
+        H_q,
         S_q,
         D,
-        H_q,
-        q_chunk_size,
         H_kv,
         groups,
+        q_num_chunks,
+        LOG2_D,
+        use_bfloat16,
+        apply_hadamard=not v_only,
     )
-
-    # ---- Phase 2: Quantize K ----
-    k_phase2_input = k if v_only else k_had
-    single_phase2_kernel[kv_grid](
-        k_phase2_input,
-        k_fp8,
-        k_scale,
-        k_phase2_input.stride(0),
-        k_phase2_input.stride(1),
-        k_phase2_input.stride(2),
-        k_phase2_input.stride(3),
+    k_fp8, k_descale = _hadamard_quantize_one(
+        k,
+        B,
+        H_kv,
         S_kv,
         D,
         H_kv,
-        kv_chunk_size,
-        H_kv,
         1,
+        kv_num_chunks,
+        LOG2_D,
+        use_bfloat16,
+        apply_hadamard=not v_only,
     )
-
-    # ---- Phase 2: Quantize V (always from Hadamard'd intermediate) ----
-    single_phase2_kernel[kv_grid](
-        v_had,
-        v_fp8,
-        v_scale,
-        v_had.stride(0),
-        v_had.stride(1),
-        v_had.stride(2),
-        v_had.stride(3),
+    v_fp8, v_descale = _hadamard_quantize_one(
+        v,
+        B,
+        H_kv,
         S_kv,
         D,
         H_kv,
-        kv_chunk_size,
-        H_kv,
         1,
+        kv_num_chunks,
+        LOG2_D,
+        use_bfloat16,
+        apply_hadamard=True,
     )
 
     return q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale
