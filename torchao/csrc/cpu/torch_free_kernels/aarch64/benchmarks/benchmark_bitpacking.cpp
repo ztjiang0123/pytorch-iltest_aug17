@@ -172,6 +172,120 @@ void unpack_uint_values(
     int packed_size,
     int variant);
 
+// The odd-bit specializations (1, 3, 5, 7) all forward to
+// pack_uint_odd_bit_values / unpack_uint_odd_bit_values with an identical
+// shape, differing only in the nbit-specific internal function triple. This
+// trait exposes that triple as data so the forwarding body can live in exactly
+// one place (pack_uint_odd_bit / unpack_uint_odd_bit below).
+template <int nbit>
+struct odd_bit_functions;
+
+template <>
+struct odd_bit_functions<1> {
+  static constexpr auto pack_8 =
+      torchao::bitpacking::internal::pack_8_uint1_values;
+  static constexpr auto vec_pack_64 =
+      torchao::bitpacking::internal::vec_pack_64_uint1_values;
+  static constexpr auto vec_pack_128 =
+      torchao::bitpacking::internal::vec_pack_128_uint1_values;
+  static constexpr auto unpack_8 =
+      torchao::bitpacking::internal::unpack_8_uint1_values;
+  static constexpr auto vec_unpack_64 =
+      torchao::bitpacking::internal::vec_unpack_64_uint1_values;
+  static constexpr auto vec_unpack_128 =
+      torchao::bitpacking::internal::vec_unpack_128_uint1_values;
+};
+
+template <>
+struct odd_bit_functions<3> {
+  static constexpr auto pack_8 =
+      torchao::bitpacking::internal::pack_8_uint3_values;
+  static constexpr auto vec_pack_64 =
+      torchao::bitpacking::internal::vec_pack_64_uint3_values;
+  static constexpr auto vec_pack_128 =
+      torchao::bitpacking::internal::vec_pack_128_uint3_values;
+  static constexpr auto unpack_8 =
+      torchao::bitpacking::internal::unpack_8_uint3_values;
+  static constexpr auto vec_unpack_64 =
+      torchao::bitpacking::internal::vec_unpack_64_uint3_values;
+  static constexpr auto vec_unpack_128 =
+      torchao::bitpacking::internal::vec_unpack_128_uint3_values;
+};
+
+template <>
+struct odd_bit_functions<5> {
+  static constexpr auto pack_8 =
+      torchao::bitpacking::internal::pack_8_uint5_values;
+  static constexpr auto vec_pack_64 =
+      torchao::bitpacking::internal::vec_pack_64_uint5_values;
+  static constexpr auto vec_pack_128 =
+      torchao::bitpacking::internal::vec_pack_128_uint5_values;
+  static constexpr auto unpack_8 =
+      torchao::bitpacking::internal::unpack_8_uint5_values;
+  static constexpr auto vec_unpack_64 =
+      torchao::bitpacking::internal::vec_unpack_64_uint5_values;
+  static constexpr auto vec_unpack_128 =
+      torchao::bitpacking::internal::vec_unpack_128_uint5_values;
+};
+
+template <>
+struct odd_bit_functions<7> {
+  static constexpr auto pack_8 =
+      torchao::bitpacking::internal::pack_8_uint7_values;
+  static constexpr auto vec_pack_64 =
+      torchao::bitpacking::internal::vec_pack_64_uint7_values;
+  static constexpr auto vec_pack_128 =
+      torchao::bitpacking::internal::vec_pack_128_uint7_values;
+  static constexpr auto unpack_8 =
+      torchao::bitpacking::internal::unpack_8_uint7_values;
+  static constexpr auto vec_unpack_64 =
+      torchao::bitpacking::internal::vec_unpack_64_uint7_values;
+  static constexpr auto vec_unpack_128 =
+      torchao::bitpacking::internal::vec_unpack_128_uint7_values;
+};
+
+// Single forwarding body shared by every odd-bit pack specialization.
+template <int nbit>
+void pack_uint_odd_bit(
+    uint8_t* packed,
+    uint8_t* unpacked,
+    int packed_size,
+    int unpacked_size,
+    int variant) {
+  using fns = odd_bit_functions<nbit>;
+  pack_uint_odd_bit_values(
+      fns::pack_8,
+      fns::vec_pack_64,
+      fns::vec_pack_128,
+      nbit,
+      packed,
+      unpacked,
+      packed_size,
+      unpacked_size,
+      variant);
+}
+
+// Single forwarding body shared by every odd-bit unpack specialization.
+template <int nbit>
+void unpack_uint_odd_bit(
+    uint8_t* unpacked,
+    uint8_t* packed,
+    int unpacked_size,
+    int packed_size,
+    int variant) {
+  using fns = odd_bit_functions<nbit>;
+  unpack_uint_odd_bit_values(
+      fns::unpack_8,
+      fns::vec_unpack_64,
+      fns::vec_unpack_128,
+      nbit,
+      unpacked,
+      packed,
+      unpacked_size,
+      packed_size,
+      variant);
+}
+
 // Benchmark utility to compare variants of uint1 packing
 template <>
 void pack_uint_values<1>(
@@ -180,17 +294,7 @@ void pack_uint_values<1>(
     int packed_size,
     int unpacked_size,
     int variant) {
-  constexpr int nbit = 1;
-  pack_uint_odd_bit_values(
-      torchao::bitpacking::internal::pack_8_uint1_values,
-      torchao::bitpacking::internal::vec_pack_64_uint1_values,
-      torchao::bitpacking::internal::vec_pack_128_uint1_values,
-      nbit,
-      packed,
-      unpacked,
-      packed_size,
-      unpacked_size,
-      variant);
+  pack_uint_odd_bit<1>(packed, unpacked, packed_size, unpacked_size, variant);
 }
 
 // Benchmark utility to compare variants of uint1 unpacking
@@ -201,17 +305,7 @@ void unpack_uint_values<1>(
     int unpacked_size,
     int packed_size,
     int variant) {
-  constexpr int nbit = 1;
-  unpack_uint_odd_bit_values(
-      torchao::bitpacking::internal::unpack_8_uint1_values,
-      torchao::bitpacking::internal::vec_unpack_64_uint1_values,
-      torchao::bitpacking::internal::vec_unpack_128_uint1_values,
-      nbit,
-      unpacked,
-      packed,
-      unpacked_size,
-      packed_size,
-      variant);
+  unpack_uint_odd_bit<1>(unpacked, packed, unpacked_size, packed_size, variant);
 }
 
 // Benchmark utility to compare variants of uint2 packing
@@ -352,17 +446,7 @@ void pack_uint_values<3>(
     int packed_size,
     int unpacked_size,
     int variant) {
-  constexpr int nbit = 3;
-  pack_uint_odd_bit_values(
-      torchao::bitpacking::internal::pack_8_uint3_values,
-      torchao::bitpacking::internal::vec_pack_64_uint3_values,
-      torchao::bitpacking::internal::vec_pack_128_uint3_values,
-      nbit,
-      packed,
-      unpacked,
-      packed_size,
-      unpacked_size,
-      variant);
+  pack_uint_odd_bit<3>(packed, unpacked, packed_size, unpacked_size, variant);
 }
 
 // Benchmark utility to compare variants of uint3 unpacking
@@ -373,17 +457,7 @@ void unpack_uint_values<3>(
     int unpacked_size,
     int packed_size,
     int variant) {
-  constexpr int nbit = 3;
-  unpack_uint_odd_bit_values(
-      torchao::bitpacking::internal::unpack_8_uint3_values,
-      torchao::bitpacking::internal::vec_unpack_64_uint3_values,
-      torchao::bitpacking::internal::vec_unpack_128_uint3_values,
-      nbit,
-      unpacked,
-      packed,
-      unpacked_size,
-      packed_size,
-      variant);
+  unpack_uint_odd_bit<3>(unpacked, packed, unpacked_size, packed_size, variant);
 }
 
 // Benchmark utility to compare variants of uint4 packing
@@ -476,17 +550,7 @@ void pack_uint_values<5>(
     int packed_size,
     int unpacked_size,
     int variant) {
-  constexpr int nbit = 5;
-  pack_uint_odd_bit_values(
-      torchao::bitpacking::internal::pack_8_uint5_values,
-      torchao::bitpacking::internal::vec_pack_64_uint5_values,
-      torchao::bitpacking::internal::vec_pack_128_uint5_values,
-      nbit,
-      packed,
-      unpacked,
-      packed_size,
-      unpacked_size,
-      variant);
+  pack_uint_odd_bit<5>(packed, unpacked, packed_size, unpacked_size, variant);
 }
 
 // Benchmark utility to compare variants of uint5 unpacking
@@ -497,17 +561,7 @@ void unpack_uint_values<5>(
     int unpacked_size,
     int packed_size,
     int variant) {
-  constexpr int nbit = 5;
-  unpack_uint_odd_bit_values(
-      torchao::bitpacking::internal::unpack_8_uint5_values,
-      torchao::bitpacking::internal::vec_unpack_64_uint5_values,
-      torchao::bitpacking::internal::vec_unpack_128_uint5_values,
-      nbit,
-      unpacked,
-      packed,
-      unpacked_size,
-      packed_size,
-      variant);
+  unpack_uint_odd_bit<5>(unpacked, packed, unpacked_size, packed_size, variant);
 }
 
 // Benchmark utility to compare variants of uint6 packing
@@ -610,17 +664,7 @@ void pack_uint_values<7>(
     int packed_size,
     int unpacked_size,
     int variant) {
-  constexpr int nbit = 7;
-  pack_uint_odd_bit_values(
-      torchao::bitpacking::internal::pack_8_uint7_values,
-      torchao::bitpacking::internal::vec_pack_64_uint7_values,
-      torchao::bitpacking::internal::vec_pack_128_uint7_values,
-      nbit,
-      packed,
-      unpacked,
-      packed_size,
-      unpacked_size,
-      variant);
+  pack_uint_odd_bit<7>(packed, unpacked, packed_size, unpacked_size, variant);
 }
 
 // Benchmark utility to compare variants of uint7 unpacking.
@@ -631,17 +675,7 @@ void unpack_uint_values<7>(
     int unpacked_size,
     int packed_size,
     int variant) {
-  constexpr int nbit = 7;
-  unpack_uint_odd_bit_values(
-      torchao::bitpacking::internal::unpack_8_uint7_values,
-      torchao::bitpacking::internal::vec_unpack_64_uint7_values,
-      torchao::bitpacking::internal::vec_unpack_128_uint7_values,
-      nbit,
-      unpacked,
-      packed,
-      unpacked_size,
-      packed_size,
-      variant);
+  unpack_uint_odd_bit<7>(unpacked, packed, unpacked_size, packed_size, variant);
 }
 
 
