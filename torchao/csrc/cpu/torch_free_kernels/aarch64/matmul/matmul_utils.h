@@ -200,4 +200,45 @@ void pack_kxn_b_matrix_for_mx8_dotprod_ukernel(
   }                                                                          \
   } /* namespace VARIANT_NS */
 
+// Defines the public `kernel(...)` entry point for an
+// fp32_a x channelwise_8bit_b matmul variant. Every such variant's entry point
+// has the same signature and simply forwards all arguments to its
+// variant-specific `internal::KernelImpl::run`. This macro captures that shared
+// wrapper so the forwarding body is not copy-pasted across the 1x16x4 / 4x16x4
+// (and future) variants; only the variant namespace differs.
+#define TORCHAO_DEFINE_FP32_A_CHANNELWISE_8BIT_B_MATMUL_KERNEL(VARIANT_NS)     \
+  namespace VARIANT_NS {                                                       \
+  template <bool b_has_zeros, bool a_transposed, bool b_transposed>            \
+  void kernel(                                                                 \
+      int m,                                                                   \
+      int n,                                                                   \
+      int k,                                                                   \
+      const float* lhs,                                                        \
+      int lhs_stride_m,                                                        \
+      const int8_t* rhs,                                                       \
+      int rhs_stride_n,                                                        \
+      float32_t* output,                                                       \
+      int out_stride_m,                                                        \
+      const int8_t* rhs_zero_points,                                           \
+      const float* rhs_scales,                                                 \
+      const float beta,                                                        \
+      const int rhs_qparams_stride) {                                         \
+    torchao::kernels::cpu::aarch64::quantized_matmul::VARIANT_NS::internal::   \
+        KernelImpl<b_has_zeros, a_transposed, b_transposed>::run(              \
+            m,                                                                 \
+            n,                                                                 \
+            k,                                                                 \
+            lhs,                                                               \
+            lhs_stride_m,                                                      \
+            rhs,                                                               \
+            rhs_stride_n,                                                      \
+            output,                                                            \
+            out_stride_m,                                                      \
+            rhs_zero_points,                                                   \
+            rhs_scales,                                                        \
+            beta,                                                              \
+            rhs_qparams_stride);                                               \
+  }                                                                           \
+  } /* namespace VARIANT_NS */
+
 #endif // defined(__aarch64__) || defined(__ARM_NEON)
