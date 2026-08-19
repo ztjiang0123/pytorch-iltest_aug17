@@ -12,6 +12,7 @@ try:
 except ImportError:
     raise "triton and hqq required to run this benchmark"
 
+from dataclasses import dataclass, field
 from io import StringIO
 
 import pandas as pd
@@ -75,12 +76,27 @@ def bench_hqq(
     return t
 
 
-def run_benchmark(
-    shape, group_size, dtype, axis=1, transposed=False, quant_dtype=torch.uint8
-):
+@dataclass
+class BenchmarkConfig:
+    """Bundles the parameters that describe a single HQQ benchmark run."""
+
+    shape: list
+    group_size: int
+    dtype: torch.dtype
+    axis: int = 1
+    transposed: bool = False
+    quant_dtype: torch.dtype = field(default=torch.uint8)
+
+
+def run_benchmark(config: BenchmarkConfig):
+    shape = config.shape
+    group_size = config.group_size
+    dtype = config.dtype
+    transposed = config.transposed
+
     qcfg = {
         **BASE_QUANT_CONFIG,
-        **dict(group_size=group_size, axis=axis),
+        **dict(group_size=group_size, axis=config.axis),
     }
     M, N, K = shape
 
@@ -110,7 +126,7 @@ def run_benchmark(
         if quant_config["weight_quant_params"]["bitpack"] == False
         else W_q
     )
-    W_q = W_q.to(dtype=quant_dtype)
+    W_q = W_q.to(dtype=config.quant_dtype)
     scales = scales.reshape(N, -1)
     zeros = zeros.reshape(N, -1)
     tt_time = bench_custom_kernel(
@@ -174,7 +190,12 @@ if __name__ == "__main__":
             for dtype in DTYPES:
                 for transposed in TRANSPOSED:
                     timings = run_benchmark(
-                        shape, group_size, dtype, transposed=transposed
+                        BenchmarkConfig(
+                            shape=shape,
+                            group_size=group_size,
+                            dtype=dtype,
+                            transposed=transposed,
+                        )
                     )
                     data.append((*shape, group_size, dtype, transposed, *timings))
 
