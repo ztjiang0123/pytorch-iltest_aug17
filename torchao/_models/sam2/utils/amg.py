@@ -407,8 +407,17 @@ def generate_crop_boxes(
     return crop_boxes, layer_idxs
 
 
-def _uncrop_offset(coords: torch.Tensor, offset_values: List[int]) -> torch.Tensor:
-    offset = torch.tensor([offset_values]).pin_memory()
+def uncrop_coords(coords: torch.Tensor, crop_box: List[int]) -> torch.Tensor:
+    """Add a crop's top-left offset back to ``coords``.
+
+    ``coords`` has its last dimension laid out as repeated ``(x, y)`` pairs
+    (e.g. width 2 for points ``[x, y]`` or width 4 for xyxy boxes
+    ``[x0, y0, x1, y1]``). The crop's ``(x0, y0)`` offset is tiled to match that
+    width, so this single implementation handles both boxes and points.
+    """
+    x0, y0, _, _ = crop_box
+    num_pairs = coords.shape[-1] // 2
+    offset = torch.tensor([[x0, y0] * num_pairs]).pin_memory()
     offset = offset.to(device=coords.device, non_blocking=True)
     # Check if coords has a channel dimension
     if len(coords.shape) == 3:
@@ -416,14 +425,10 @@ def _uncrop_offset(coords: torch.Tensor, offset_values: List[int]) -> torch.Tens
     return coords + offset
 
 
-def uncrop_boxes_xyxy(boxes: torch.Tensor, crop_box: List[int]) -> torch.Tensor:
-    x0, y0, _, _ = crop_box
-    return _uncrop_offset(boxes, [x0, y0, x0, y0])
-
-
-def uncrop_points(points: torch.Tensor, crop_box: List[int]) -> torch.Tensor:
-    x0, y0, _, _ = crop_box
-    return _uncrop_offset(points, [x0, y0])
+# ``uncrop_boxes_xyxy`` and ``uncrop_points`` used to be near-identical wrappers;
+# both are just the shared coordinate un-crop, so they now alias one function.
+uncrop_boxes_xyxy = uncrop_coords
+uncrop_points = uncrop_coords
 
 
 def uncrop_masks(

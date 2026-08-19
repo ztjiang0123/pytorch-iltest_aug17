@@ -92,13 +92,9 @@ GroupwiseTilingParams GroupwiseTilingParams::from_target_tiles_per_thread(
     int n,
     int n_step,
     int target_tiles_per_thread) {
-  auto tile_sizes = torchao::ops::internal::compute_tile_sizes_per_thread(
-      m, m_step, n, n_step, target_tiles_per_thread);
-
-  GroupwiseTilingParams tiling_params;
-  tiling_params.mc = tile_sizes.mc;
-  tiling_params.nc = tile_sizes.nc;
-  return tiling_params;
+  return torchao::ops::internal::
+      make_tiling_params_from_target_tiles_per_thread<GroupwiseTilingParams>(
+          m, m_step, n, n_step, target_tiles_per_thread);
 }
 
 void groupwise_lowbit_weight_lut_parallel_operator(

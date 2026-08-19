@@ -27,7 +27,7 @@ from torch.nn import functional as F
 from tqdm import tqdm
 
 from benchmarks.prototype.moe_training.bench_utils import (
-    build_input_shape_configs,
+    make_input_shape_config_getter,
     setup_distributed,
 )
 from benchmarks.utils import profile_fn
@@ -57,16 +57,16 @@ class Experiment:
     result: ExperimentResult
 
 
-def get_configs() -> List[ExperimentConfig]:
-    # (batch_size, seq_len, dim)
-    input_shapes = [
-        (1, 8192, 5120),
-        (2, 8192, 5120),
-        (4, 8192, 5120),
-        (8, 8192, 5120),
-        (16, 8192, 5120),
-    ]
-    return build_input_shape_configs(input_shapes, ExperimentConfig)
+# (batch_size, seq_len, dim)
+INPUT_SHAPES = [
+    (1, 8192, 5120),
+    (2, 8192, 5120),
+    (4, 8192, 5120),
+    (8, 8192, 5120),
+    (16, 8192, 5120),
+]
+
+get_configs = make_input_shape_config_getter(INPUT_SHAPES, ExperimentConfig)
 
 
 def default_a2a_fwd(

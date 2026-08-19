@@ -35,6 +35,29 @@ def load_pretrained_sam2_model(cls, model_id: str, **kwargs):
     return cls(sam_model, **kwargs)
 
 
+class SAM2HFPretrainedMixin:
+    """Provides a shared ``from_pretrained`` classmethod for SAM2 classes.
+
+    Classes that construct as ``cls(sam_model, **kwargs)`` from a Hugging Face
+    backbone can inherit this mixin instead of each defining an identical
+    ``from_pretrained`` wrapper around :func:`load_pretrained_sam2_model`.
+    """
+
+    @classmethod
+    def from_pretrained(cls, model_id: str, **kwargs):
+        """
+        Load a pretrained model from the Hugging Face hub.
+
+        Arguments:
+          model_id (str): The Hugging Face repository ID.
+          **kwargs: Additional arguments to pass to the model constructor.
+
+        Returns:
+          An instance of the class wrapping the loaded model.
+        """
+        return load_pretrained_sam2_model(cls, model_id, **kwargs)
+
+
 def get_sdpa_settings():
     if torch.cuda.is_available():
         old_gpu = torch.cuda.get_device_properties(0).major < 7

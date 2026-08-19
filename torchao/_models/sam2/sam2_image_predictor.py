@@ -12,11 +12,11 @@ import torch
 from PIL.Image import Image
 
 from torchao._models.sam2.modeling.sam2_base import SAM2Base
-from torchao._models.sam2.utils.misc import get_image_size, load_pretrained_sam2_model
+from torchao._models.sam2.utils.misc import SAM2HFPretrainedMixin, get_image_size
 from torchao._models.sam2.utils.transforms import SAM2Transforms
 
 
-class SAM2ImagePredictor(torch.nn.Module):
+class SAM2ImagePredictor(torch.nn.Module, SAM2HFPretrainedMixin):
     def __init__(
         self,
         sam_model: SAM2Base,
@@ -66,20 +66,6 @@ class SAM2ImagePredictor(torch.nn.Module):
 
         self._image_dtype = torch.float32
         self._transforms_device = "cpu"
-
-    @classmethod
-    def from_pretrained(cls, model_id: str, **kwargs) -> "SAM2ImagePredictor":
-        """
-        Load a pretrained model from the Hugging Face hub.
-
-        Arguments:
-          model_id (str): The Hugging Face repository ID.
-          **kwargs: Additional arguments to pass to the model constructor.
-
-        Returns:
-          (SAM2ImagePredictor): The loaded model.
-        """
-        return load_pretrained_sam2_model(cls, model_id, **kwargs)
 
     @torch.no_grad()
     def set_image(

@@ -34,13 +34,13 @@ from torchao._models.sam2.utils.amg import (
     uncrop_points,
 )
 from torchao._models.sam2.utils.misc import (
+    SAM2HFPretrainedMixin,
     crop_image,
     get_image_size,
-    load_pretrained_sam2_model,
 )
 
 
-class SAM2AutomaticMaskGenerator(torch.nn.Module):
+class SAM2AutomaticMaskGenerator(torch.nn.Module, SAM2HFPretrainedMixin):
     def __init__(
         self,
         model: SAM2Base,
@@ -161,20 +161,6 @@ class SAM2AutomaticMaskGenerator(torch.nn.Module):
 
         self.calculate_stability_score = calculate_stability_score
         self.batched_mask_to_box = batched_mask_to_box
-
-    @classmethod
-    def from_pretrained(cls, model_id: str, **kwargs) -> "SAM2AutomaticMaskGenerator":
-        """
-        Load a pretrained model from the Hugging Face hub.
-
-        Arguments:
-          model_id (str): The Hugging Face repository ID.
-          **kwargs: Additional arguments to pass to the model constructor.
-
-        Returns:
-          (SAM2AutomaticMaskGenerator): The loaded model.
-        """
-        return load_pretrained_sam2_model(cls, model_id, **kwargs)
 
     @torch.no_grad()
     def generate(self, image: np.ndarray) -> List[Dict[str, Any]]:
