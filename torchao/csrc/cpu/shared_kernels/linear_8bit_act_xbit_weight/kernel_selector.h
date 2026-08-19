@@ -6,6 +6,7 @@
 
 #pragma once
 #include <cpuinfo.h>
+#include <torchao/csrc/cpu/shared_kernels/internal/ukernel_config_registration_table.h>
 #include <torchao/csrc/cpu/shared_kernels/linear_8bit_act_xbit_weight/kernel_config.h>
 #include <torchao/csrc/cpu/shared_kernels/linear_8bit_act_xbit_weight/packed_weights_format.h>
 #include <optional>
@@ -27,47 +28,10 @@
 
 namespace torchao::ops::linear_8bit_act_xbit_weight {
 
-struct UKernelConfigRegistrationTable {
- private:
-  using Key = std::pair<torchao::ops::PackedWeightsHeader, cpuinfo_uarch>;
-  struct KeyHasher {
-    std::size_t operator()(const Key& k) const {
-      return std::hash<torchao::ops::PackedWeightsHeader>()(k.first) ^
-          std::hash<int>()(static_cast<int>(k.second));
-    }
-  };
-  std::unordered_map<Key, UKernelConfig, KeyHasher> registration_table_;
-  inline Key make_key(
-      torchao::ops::PackedWeightsHeader header,
-      cpuinfo_uarch uarch) const {
-    return std::make_pair(header, uarch);
-  }
-
- public:
-  void register_ukernel_config(
-      PackedWeightsFormat format,
-      cpuinfo_uarch uarch,
-      UKernelConfig config) {
-    auto header = format.to_packed_weights_header();
-    auto key = make_key(header, uarch);
-    if (registration_table_.find(key) != registration_table_.end()) {
-      throw std::runtime_error(
-          "UKernelConfig is already registered for this format");
-    }
-    config.validate();
-    registration_table_[key] = config;
-  }
-  std::optional<UKernelConfig> get_ukernel_config(
-      torchao::ops::PackedWeightsHeader header,
-      cpuinfo_uarch uarch) const {
-    auto key = make_key(header, uarch);
-    auto it = registration_table_.find(key);
-    if (it == registration_table_.end()) {
-      return std::nullopt;
-    }
-    return it->second;
-  }
-};
+// The registration table is a generic container shared across op namespaces.
+// See torchao/csrc/cpu/shared_kernels/internal/ukernel_config_registration_table.h
+using UKernelConfigRegistrationTable = torchao::ops::
+    UKernelConfigRegistrationTable<UKernelConfig, PackedWeightsFormat>;
 
 void inline log_registration(PackedWeightsFormat format, std::string description) {
   // Logging is only supported in ATen mode
