@@ -63,6 +63,27 @@ inline TileSizes compute_tile_sizes_per_thread(
   return TileSizes{mc, nc};
 }
 
+// Builds a *TilingParams struct (any type exposing writable `int mc` and
+// `int nc` members) from a target number of tiles per thread. This is the
+// shared implementation behind the various
+// *TilingParams::from_target_tiles_per_thread factory functions, which differ
+// only in the concrete struct type they return.
+template <typename TilingParams>
+inline TilingParams make_tiling_params_from_target_tiles_per_thread(
+    int m,
+    int m_step,
+    int n,
+    int n_step,
+    int target_tiles_per_thread) {
+  auto tile_sizes = compute_tile_sizes_per_thread(
+      m, m_step, n, n_step, target_tiles_per_thread);
+
+  TilingParams tiling_params;
+  tiling_params.mc = tile_sizes.mc;
+  tiling_params.nc = tile_sizes.nc;
+  return tiling_params;
+}
+
 // Selects the index of the appropriate config in a sorted (ascending m_step)
 // array of configs based on m. Each element of `configs` must expose an
 // `int m_step` member. The first config must be set (m_step >= 1), and set

@@ -92,6 +92,24 @@ def build_input_shape_configs(
     return [config_cls(input_shape=shape) for shape in input_shapes]
 
 
+def make_input_shape_config_getter(
+    input_shapes: Sequence[Any],
+    config_cls: Type,
+) -> Callable[[], List]:
+    """Return a zero-arg ``get_configs`` callable for a single-field benchmark.
+
+    The single-field ``ExperimentConfig`` benchmarks each need an identically
+    shaped ``get_configs()`` that only differs in its hard-coded shape list.
+    Rather than copying that wrapper into every script, each benchmark binds its
+    own ``INPUT_SHAPES`` here so the wrapper has a single source of truth.
+    """
+
+    def get_configs() -> List:
+        return build_input_shape_configs(input_shapes, config_cls)
+
+    return get_configs
+
+
 def build_token_group_configs(config_cls: Type) -> List:
     """Build the standard token-group sweep of ``config_cls`` instances.
 
