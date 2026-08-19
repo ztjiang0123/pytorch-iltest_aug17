@@ -19,6 +19,7 @@ import triton.language as tl
 
 from torchao.prototype.attention.quantization.triton_hadamard_utils import (
     _compute_num_chunks,
+    group_reduce_kernel,
 )
 
 
@@ -273,43 +274,6 @@ def single_reduce_kernel(
     FP8_MAX = 448.0
     eps = 1e-12
     scale_idx = pid_b * H + pid_h
-
-    tl.store(scale_ptr + scale_idx, tl.where(x_max > eps, FP8_MAX / x_max, 1.0))
-    tl.store(descale_ptr + scale_idx, tl.where(x_max > eps, x_max / FP8_MAX, 1.0))
-
-
-@triton.jit
-def group_reduce_kernel(
-    partial_max_ptr,  # [B * H_q * num_chunks]
-    scale_ptr,  # [B, H_kv]
-    descale_ptr,  # [B, H_kv]
-    H_q,
-    H_kv,
-    groups,  # H_q // H_kv
-    num_chunks,
-):
-    """
-    Reduce partial maxes across head groups for GQA Q tensor.
-
-    For each KV group, reduces the max across all Q heads in that group
-    and all chunks, producing one scale per (batch, kv_head).
-
-    Grid: (B, H_kv)
-    """
-    pid_b = tl.program_id(axis=0)
-    pid_hkv = tl.program_id(axis=1)
-
-    x_max = 0.0
-
-    for g in range(groups):
-        h_q = pid_hkv * groups + g
-        base_idx = (pid_b * H_q + h_q) * num_chunks
-        for c in range(num_chunks):
-            x_max = tl.maximum(x_max, tl.load(partial_max_ptr + base_idx + c))
-
-    FP8_MAX = 448.0
-    eps = 1e-12
-    scale_idx = pid_b * H_kv + pid_hkv
 
     tl.store(scale_ptr + scale_idx, tl.where(x_max > eps, FP8_MAX / x_max, 1.0))
     tl.store(descale_ptr + scale_idx, tl.where(x_max > eps, x_max / FP8_MAX, 1.0))

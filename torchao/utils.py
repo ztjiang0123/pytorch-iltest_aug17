@@ -6,6 +6,7 @@
 import functools
 import importlib
 import itertools
+import math
 import time
 from functools import reduce
 from importlib.metadata import version
@@ -640,6 +641,53 @@ def _torchao_base_tensor__setstate__(self, state):
             self, optional_tensor_attribute_name
         ):
             setattr(self, optional_tensor_attribute_name, None)
+
+
+def _dequantize_and_run(func, args, kwargs, tensor_cls):
+    """Common dispatch implementation for ops that have no quantized-domain
+    equivalent: dequantize any ``tensor_cls`` argument to a plain tensor, then
+    run ``func`` on the dequantized args.
+
+    Used by tensor subclasses to implement ops such as ``aten.lerp`` or
+    out-of-place arithmetic where the result is a plain tensor.
+    """
+    args = [x.dequantize() if isinstance(x, tensor_cls) else x for x in args]
+    return func(*args, **kwargs)
+
+
+def _slice_first_dim_quantized(x, args):
+    """Common ``aten.slice.Tensor`` logic for block-wise quantized tensor
+    subclasses whose ``codes`` share the original tensor's leading dim.
+
+    Validates that the slice is along dim 0 with step 1 and aligned to the
+    block boundary, then returns ``(codes_slice, scale_slice)`` — the sliced
+    per-code data and the correspondingly sliced block-wise scale. Callers wrap
+    these into their own subclass.
+    """
+    dim, start, end = args[1:4]
+    step = args[4] if len(args) > 4 else 1
+
+    # input validation
+    if dim != 0:
+        raise ValueError("Only support aten.slice along the first dim")
+    if step != 1:
+        raise ValueError("Only support aten.slice with step=1")
+
+    block_size = x.block_size
+    stride = math.prod(x.shape[1:])
+
+    # for 1 increment in x along the first dim,
+    # (flattened) scale will increment by stride / block_size
+    if (start * stride) % block_size != 0 or (end * stride) % block_size != 0:
+        raise ValueError(
+            f"Invalid start or end for shape={x.shape} and block_size={block_size}. "
+            f"Make sure start and end align with block boundary. "
+            f"Received start={start}, end={end}."
+        )
+
+    codes = x.codes[start:end]
+    scale = x.scale[start * stride // block_size : end * stride // block_size]
+    return codes, scale
 
 
 def _dispatch__torch_function__(cls, func, types, args=(), kwargs=None):

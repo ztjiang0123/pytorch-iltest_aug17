@@ -3,14 +3,17 @@
 #
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
-import math
-
 import torch
 from torch import Tensor
 from torch.serialization import add_safe_globals
 from torch.utils._python_dispatch import return_and_correct_aliasing
 
-from torchao.utils import TorchAOBaseTensor, torch_version_at_least
+from torchao.utils import (
+    TorchAOBaseTensor,
+    _dequantize_and_run,
+    _slice_first_dim_quantized,
+    torch_version_at_least,
+)
 
 aten = torch.ops.aten
 c10d_functional = torch.ops.c10d_functional
@@ -138,8 +141,7 @@ def _(func, types, args, kwargs):
 
 @OptimStateFp8.implements(aten.lerp.Scalar)
 def _(func, types, args, kwargs):
-    args = [x.dequantize() if isinstance(x, OptimStateFp8) else x for x in args]
-    return func(*args, **kwargs)
+    return _dequantize_and_run(func, args, kwargs, OptimStateFp8)
 
 
 # this is needed for DTensor.from_local()
@@ -188,31 +190,9 @@ def _(func, types, args, kwargs):
 # required by torch.distributed.checkpoint.load when world size changes i.e. re-sharding
 @OptimStateFp8.implements(aten.slice.Tensor)
 def _(func, types, args, kwargs):
-    x, dim, start, end = args[:4]
-    step = args[4] if len(args) > 4 else 1
-
-    # input validation
-    if dim != 0:
-        raise ValueError("Only support aten.slice along the first dim")
-    if step != 1:
-        raise ValueError("Only support aten.slice with step=1")
-
-    block_size = x.block_size
-    stride = math.prod(x.shape[1:])
-
-    # for 1 increment in x along the first dim,
-    # (flattened) scale will increment by stride / block_size
-    if (start * stride) % block_size != 0 or (end * stride) % block_size != 0:
-        raise ValueError(
-            f"Invalid start or end for shape={x.shape} and block_size={block_size}. "
-            f"Make sure start and end align with block boundary. "
-            f"Received start={start}, end={end}."
-        )
-
-    return OptimStateFp8(
-        x.codes[start:end],
-        x.scale[start * stride // block_size : end * stride // block_size],
-    )
+    x = args[0]
+    codes, scale = _slice_first_dim_quantized(x, args)
+    return OptimStateFp8(codes, scale)
 
 
 add_safe_globals([OptimStateFp8])

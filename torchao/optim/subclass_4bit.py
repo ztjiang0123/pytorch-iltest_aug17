@@ -10,7 +10,11 @@ from torch import Tensor
 from torch.serialization import add_safe_globals
 from torch.utils._python_dispatch import return_and_correct_aliasing
 
-from torchao.utils import TorchAOBaseTensor, torch_version_at_least
+from torchao.utils import (
+    TorchAOBaseTensor,
+    _dequantize_and_run,
+    torch_version_at_least,
+)
 
 from .quant_utils import (
     create_dynamic_map,
@@ -182,8 +186,7 @@ def _(func, types, args, kwargs):
 
 @OptimState4bit.implements(aten.lerp.Scalar)
 def _(func, types, args, kwargs):
-    args = [x.dequantize() if isinstance(x, OptimState4bit) else x for x in args]
-    return func(*args, **kwargs)
+    return _dequantize_and_run(func, args, kwargs, OptimState4bit)
 
 
 # this is needed for DTensor.from_local() and for flattening tensor
