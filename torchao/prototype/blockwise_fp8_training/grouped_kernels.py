@@ -15,7 +15,8 @@ from torchao.prototype.blockwise_fp8_training.kernels import (
     FP8_E4M3_DTYPES,
     _is_column_major,
     _is_row_major,
-    _prepare_blockwise_scaled_mm_rhs_scale,
+    _pad_blockwise_128x128_scale_k_major,
+    _prepare_128x128_rhs_scale,
     _scaling_type_value,
     triton_fp8_blockwise_weight_quant_rhs,
     triton_fp8_blockwise_weight_quant_transposed_rhs,
@@ -25,9 +26,7 @@ from torchao.utils import ceil_div
 
 def _prepare_grouped_128x128_scale(scale: torch.Tensor) -> torch.Tensor:
     if scale.ndim == 2:
-        return _prepare_blockwise_scaled_mm_rhs_scale(
-            scale, BLOCKWISE_128X128_SCALING_TYPE
-        )
+        return _pad_blockwise_128x128_scale_k_major(scale)
     assert scale.ndim == 3, "expected 2D or 3D scale tensor"
     padded_k_blocks = ceil_div(scale.shape[-2], 4) * 4
     if padded_k_blocks == scale.shape[-2]:
@@ -47,11 +46,9 @@ def _prepare_grouped_rhs_scale(
     scale: torch.Tensor,
     scale_recipe,
 ) -> torch.Tensor:
-    if _scaling_type_value(scale_recipe) != _scaling_type_value(
-        BLOCKWISE_128X128_SCALING_TYPE
-    ):
-        return scale
-    return _prepare_grouped_128x128_scale(scale)
+    return _prepare_128x128_rhs_scale(
+        scale, scale_recipe, _prepare_grouped_128x128_scale
+    )
 
 
 @torch.library.custom_op(

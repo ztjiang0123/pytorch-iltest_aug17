@@ -4,7 +4,8 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Callable, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -70,25 +71,44 @@ def _pad_blockwise_128x128_scale_k_major(scale: torch.Tensor) -> torch.Tensor:
     return padded_scale
 
 
-def _prepare_blockwise_scaled_mm_rhs_scale(
+def _prepare_128x128_rhs_scale(
     scale: torch.Tensor,
     scale_recipe,
+    pad_fn,
 ) -> torch.Tensor:
+    """Apply ``pad_fn`` only when ``scale_recipe`` is the 128x128 recipe.
+
+    RHS scales for other recipes are passed through untouched. Callers supply
+    the padder that matches the tensor rank they operate on (2D k-major for the
+    dense ``_scaled_mm`` path, 2D/3D for the grouped path).
+    """
     if _scaling_type_value(scale_recipe) != _scaling_type_value(
         BLOCKWISE_128X128_SCALING_TYPE
     ):
         return scale
-    return _pad_blockwise_128x128_scale_k_major(scale)
+    return pad_fn(scale)
+
+
+def _prepare_blockwise_scaled_mm_rhs_scale(
+    scale: torch.Tensor,
+    scale_recipe,
+) -> torch.Tensor:
+    return _prepare_128x128_rhs_scale(
+        scale, scale_recipe, _pad_blockwise_128x128_scale_k_major
+    )
+
+
+def _is_contiguous_along(x: torch.Tensor, axis: int) -> bool:
+    assert x.ndim == 2 or x.ndim == 3, "input tensor must be 2D or 3D"
+    return x.stride(axis) == 1
 
 
 def _is_column_major(x: torch.Tensor) -> bool:
-    assert x.ndim == 2 or x.ndim == 3, "input tensor must be 2D or 3D"
-    return x.stride(-2) == 1
+    return _is_contiguous_along(x, -2)
 
 
 def _is_row_major(x: torch.Tensor) -> bool:
-    assert x.ndim == 2 or x.ndim == 3, "input tensor must be 2D or 3D"
-    return x.stride(-1) == 1
+    return _is_contiguous_along(x, -1)
 
 
 def _two_output_quant_shardings(
@@ -260,22 +280,49 @@ def triton_fp8_gemm_1x128_128x128_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton_op("torchao::triton_fp8_gemm_1x128_128x128", mutates_args={})
-def triton_fp8_gemm_1x128_128x128(
-    a: torch.Tensor,  # (M, K)
-    b: torch.Tensor,  # (K, N)
-    a_s: torch.Tensor,  # (M, K // block_size)
-    b_s: torch.Tensor,  # (K // block_size, N // block_size)
-    block_size: int = 128,
-    out_dtype: torch.dtype = torch.float32,
+@dataclass(frozen=True)
+class _Fp8Gemm1x128Operands:
+    """The four tensors consumed by a 1x128-LHS-scaled FP8 GEMM."""
+
+    a: torch.Tensor  # (M, K)
+    b: torch.Tensor  # (K, N)
+    a_s: torch.Tensor  # (M, K // block_size)
+    b_s: torch.Tensor  # (K // block_size, N[// block_size])
+
+
+@dataclass(frozen=True)
+class _Fp8Gemm1x128Variant:
+    """Static per-RHS-recipe differences between the two 1x128 FP8 GEMMs."""
+
+    kernel: object
+    b_s_check: Callable[[torch.Tensor], bool]
+    b_s_layout: str
+    pass_c_strides: bool
+    pass_out_dtype: bool
+
+
+def _run_fp8_gemm_1x128(
+    variant: _Fp8Gemm1x128Variant,
+    operands: _Fp8Gemm1x128Operands,
+    block_size: int,
+    out_dtype: torch.dtype,
 ) -> torch.Tensor:
+    """Validate, allocate, and launch a 1x128-LHS-scaled FP8 GEMM.
+
+    The 128x128 and 128x1 RHS-scale variants share their entire launch path and
+    differ only in the fields carried by ``variant``: the B-scale layout they
+    require, the Triton kernel to launch, and whether that kernel takes the C
+    strides and an ``out_dtype`` constexpr.
+    """
+    a, b, a_s, b_s = operands.a, operands.b, operands.a_s, operands.b_s
+
     # 'a' must be in row-major layout, 'b' must be in column-major layout
     assert _is_row_major(a), "a must be row-major"
     assert _is_column_major(b), "b must be column-major"
 
-    # a_scales must be col-major, b_scales must be row-major
+    # a_scales must be col-major; b_scales layout depends on the RHS recipe
     assert _is_column_major(a_s), "a_s must be column-major"
-    assert _is_column_major(b_s), "b_s must be column-major"
+    assert variant.b_s_check(b_s), f"b_s must be {variant.b_s_layout}"
 
     M = a.size(0)
     K = a.size(1)
@@ -288,16 +335,10 @@ def triton_fp8_gemm_1x128_128x128(
             triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
 
-    wrap_triton(triton_fp8_gemm_1x128_128x128_kernel)[grid](
-        a,
-        a.stride(0),
-        a.stride(1),
-        b,
-        b.stride(0),
-        b.stride(1),
-        c,
-        c.stride(0),
-        c.stride(1),
+    args = [a, a.stride(0), a.stride(1), b, b.stride(0), b.stride(1), c]
+    if variant.pass_c_strides:
+        args += [c.stride(0), c.stride(1)]
+    args += [
         a_s,
         a_s.stride(0),
         a_s.stride(1),
@@ -307,10 +348,34 @@ def triton_fp8_gemm_1x128_128x128(
         M,
         N,
         K,
-        out_dtype=out_dtype,
-        BLOCK_SIZE_K=block_size,
-    )
+    ]
+    kwargs = {"BLOCK_SIZE_K": block_size}
+    if variant.pass_out_dtype:
+        kwargs["out_dtype"] = out_dtype
+
+    wrap_triton(variant.kernel)[grid](*args, **kwargs)
     return c
+
+
+@triton_op("torchao::triton_fp8_gemm_1x128_128x128", mutates_args={})
+def triton_fp8_gemm_1x128_128x128(
+    a: torch.Tensor,  # (M, K)
+    b: torch.Tensor,  # (K, N)
+    a_s: torch.Tensor,  # (M, K // block_size)
+    b_s: torch.Tensor,  # (K // block_size, N // block_size)
+    block_size: int = 128,
+    out_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    variant = _Fp8Gemm1x128Variant(
+        kernel=triton_fp8_gemm_1x128_128x128_kernel,
+        b_s_check=_is_column_major,
+        b_s_layout="column-major",
+        pass_c_strides=True,
+        pass_out_dtype=True,
+    )
+    return _run_fp8_gemm_1x128(
+        variant, _Fp8Gemm1x128Operands(a, b, a_s, b_s), block_size, out_dtype
+    )
 
 
 @triton.autotune(
@@ -388,45 +453,16 @@ def triton_fp8_gemm_1x128_128x1(
     block_size: int = 128,
     out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    # 'a' must be in row-major layout, 'b' must be in column-major layout
-    assert _is_row_major(a), "a must be row-major"
-    assert _is_column_major(b), "b must be column-major"
-
-    # a_scales must be col-major, b_scales must be row-major
-    assert _is_column_major(a_s), "a_s must be column-major"
-    assert _is_row_major(b_s), "b_s must be row-major"
-
-    M = a.size(0)
-    K = a.size(1)
-    N = b.size(1)
-    c = a.new_empty(M, N, dtype=out_dtype)
-
-    def grid(META):
-        return (
-            triton.cdiv(M, META["BLOCK_SIZE_M"]),
-            triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        )
-
-    wrap_triton(triton_fp8_gemm_1x128_128x1_kernel)[grid](
-        a,
-        a.stride(0),
-        a.stride(1),
-        b,
-        b.stride(0),
-        b.stride(1),
-        c,
-        a_s,
-        a_s.stride(0),
-        a_s.stride(1),
-        b_s,
-        b_s.stride(0),
-        b_s.stride(1),
-        M,
-        N,
-        K,
-        BLOCK_SIZE_K=block_size,
+    variant = _Fp8Gemm1x128Variant(
+        kernel=triton_fp8_gemm_1x128_128x1_kernel,
+        b_s_check=_is_row_major,
+        b_s_layout="row-major",
+        pass_c_strides=False,
+        pass_out_dtype=False,
     )
-    return c
+    return _run_fp8_gemm_1x128(
+        variant, _Fp8Gemm1x128Operands(a, b, a_s, b_s), block_size, out_dtype
+    )
 
 
 @register_sharding(torch.ops.torchao.triton_fp8_gemm_1x128_128x128.default)
