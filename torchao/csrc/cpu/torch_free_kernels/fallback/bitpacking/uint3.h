@@ -13,6 +13,74 @@ namespace torchao::kernels::cpu::fallback::bitpacking {
 namespace internal {
 
 /**
+ * @brief Shared "transpose-and-pack" primitive for the 3-bit format.
+ *
+ * The 3-bit packing scheme is non-uniform (see pack_8_uint3_values), so it does
+ * not fit the generic uniform helper. Both the count-64 and count-128 transpose
+ * loops are nonetheless byte-for-byte identical apart from the block size, so
+ * the loop lives here once, parameterized by `num_values` (the number of output
+ * triples, equal to the unpacked block size). Byte triple `i` consumes the eight
+ * values unpacked[i + num_values * lane] for lane 0..7 and writes the three
+ * packed bytes packed[i], packed[i + num_values], packed[i + 2 * num_values].
+ *
+ * @tparam num_values Number of 3-byte output groups (== unpacked block size).
+ */
+template <int num_values>
+TORCHAO_ALWAYS_INLINE inline void pack_transpose_uint3_values(
+    uint8_t* packed,
+    const uint8_t* unpacked) {
+  for (int i = 0; i < num_values; ++i) {
+    const uint8_t unpacked0 = unpacked[i + num_values * 0];
+    const uint8_t unpacked1 = unpacked[i + num_values * 1];
+    const uint8_t unpacked2 = unpacked[i + num_values * 2];
+    const uint8_t unpacked3 = unpacked[i + num_values * 3];
+    const uint8_t unpacked4 = unpacked[i + num_values * 4];
+    const uint8_t unpacked5 = unpacked[i + num_values * 5];
+    const uint8_t unpacked6 = unpacked[i + num_values * 6];
+    const uint8_t unpacked7 = unpacked[i + num_values * 7];
+
+    // byte 0: slot 1 in bits 0-2, slot 0 in bits 3-5, slot 6 (low 2 bits) in bits 6-7
+    // Note: unpacked1 is not masked - ARM stores raw value, unpacking extracts low 3 bits
+    packed[i] = ((unpacked6 & 0x03) << 6) | ((unpacked0 & 0x07) << 3) | unpacked1;
+
+    // byte 1: slot 3 in bits 0-2, slot 2 in bits 3-5, slot 7 (low 2 bits) in bits 6-7
+    // Note: unpacked3 is not masked - ARM stores raw value, unpacking extracts low 3 bits
+    packed[i + num_values] =
+        ((unpacked7 & 0x03) << 6) | ((unpacked2 & 0x07) << 3) | unpacked3;
+
+    // byte 2: slot 5 in bits 0-2, slot 4 in bits 3-5, slot 6 high bit in bit 7, slot 7 high bit in bit 6
+    // Note: unpacked5 is not masked - ARM stores raw value, unpacking extracts low 3 bits
+    packed[i + 2 * num_values] = ((unpacked6 & 0x04) << 5) |
+        ((unpacked7 & 0x04) << 4) | ((unpacked4 & 0x07) << 3) | unpacked5;
+  }
+}
+
+/**
+ * @brief Inverse of pack_transpose_uint3_values.
+ *
+ * @tparam num_values Number of 3-byte input groups (== unpacked block size).
+ */
+template <int num_values>
+TORCHAO_ALWAYS_INLINE inline void unpack_transpose_uint3_values(
+    uint8_t* unpacked,
+    const uint8_t* packed) {
+  for (int i = 0; i < num_values; ++i) {
+    const uint8_t b0 = packed[i];
+    const uint8_t b1 = packed[i + num_values];
+    const uint8_t b2 = packed[i + 2 * num_values];
+
+    unpacked[i + num_values * 0] = (b0 >> 3) & 0x07;
+    unpacked[i + num_values * 1] = b0 & 0x07;
+    unpacked[i + num_values * 2] = (b1 >> 3) & 0x07;
+    unpacked[i + num_values * 3] = b1 & 0x07;
+    unpacked[i + num_values * 4] = (b2 >> 3) & 0x07;
+    unpacked[i + num_values * 5] = b2 & 0x07;
+    unpacked[i + num_values * 6] = (b0 >> 6) | ((b2 >> 5) & 0x04);
+    unpacked[i + num_values * 7] = (b1 >> 6) | ((b2 >> 4) & 0x04);
+  }
+}
+
+/**
  * @brief Packs 8 bytes, each holding a 3-bit value (0-7), into 3 bytes.
  *
  * The packing scheme is non-trivial. Given 8 input values v0..v7, they are
@@ -77,29 +145,7 @@ TORCHAO_ALWAYS_INLINE inline void unpack_8_uint3_values(
 TORCHAO_ALWAYS_INLINE inline void pack_64_uint3_values(
     uint8_t* packed,
     const uint8_t* unpacked) {
-  for (int i = 0; i < 8; ++i) {
-    const uint8_t unpacked0 = unpacked[i + 8 * 0];
-    const uint8_t unpacked1 = unpacked[i + 8 * 1];
-    const uint8_t unpacked2 = unpacked[i + 8 * 2];
-    const uint8_t unpacked3 = unpacked[i + 8 * 3];
-    const uint8_t unpacked4 = unpacked[i + 8 * 4];
-    const uint8_t unpacked5 = unpacked[i + 8 * 5];
-    const uint8_t unpacked6 = unpacked[i + 8 * 6];
-    const uint8_t unpacked7 = unpacked[i + 8 * 7];
-
-    // byte 0: slot 1 in bits 0-2, slot 0 in bits 3-5, slot 6 (low 2 bits) in bits 6-7
-    // Note: unpacked1 is not masked - ARM stores raw value, unpacking extracts low 3 bits
-    packed[i] = ((unpacked6 & 0x03) << 6) | ((unpacked0 & 0x07) << 3) | unpacked1;
-
-    // byte 1: slot 3 in bits 0-2, slot 2 in bits 3-5, slot 7 (low 2 bits) in bits 6-7
-    // Note: unpacked3 is not masked - ARM stores raw value, unpacking extracts low 3 bits
-    packed[i + 8] = ((unpacked7 & 0x03) << 6) | ((unpacked2 & 0x07) << 3) | unpacked3;
-
-    // byte 2: slot 5 in bits 0-2, slot 4 in bits 3-5, slot 6 high bit in bit 7, slot 7 high bit in bit 6
-    // Note: unpacked5 is not masked - ARM stores raw value, unpacking extracts low 3 bits
-    packed[i + 16] = ((unpacked6 & 0x04) << 5) | ((unpacked7 & 0x04) << 4) |
-        ((unpacked4 & 0x07) << 3) | unpacked5;
-  }
+  pack_transpose_uint3_values<8>(packed, unpacked);
 }
 
 /**
@@ -113,20 +159,7 @@ TORCHAO_ALWAYS_INLINE inline void pack_64_uint3_values(
 TORCHAO_ALWAYS_INLINE inline void unpack_64_uint3_values(
     uint8_t* unpacked,
     const uint8_t* packed) {
-  for (int i = 0; i < 8; ++i) {
-    const uint8_t b0 = packed[i];
-    const uint8_t b1 = packed[i + 8];
-    const uint8_t b2 = packed[i + 16];
-
-    unpacked[i + 8 * 0] = (b0 >> 3) & 0x07;
-    unpacked[i + 8 * 1] = b0 & 0x07;
-    unpacked[i + 8 * 2] = (b1 >> 3) & 0x07;
-    unpacked[i + 8 * 3] = b1 & 0x07;
-    unpacked[i + 8 * 4] = (b2 >> 3) & 0x07;
-    unpacked[i + 8 * 5] = b2 & 0x07;
-    unpacked[i + 8 * 6] = (b0 >> 6) | ((b2 >> 5) & 0x04);
-    unpacked[i + 8 * 7] = (b1 >> 6) | ((b2 >> 4) & 0x04);
-  }
+  unpack_transpose_uint3_values<8>(unpacked, packed);
 }
 
 /**
@@ -141,29 +174,7 @@ TORCHAO_ALWAYS_INLINE inline void unpack_64_uint3_values(
 TORCHAO_ALWAYS_INLINE inline void pack_128_uint3_values(
     uint8_t* packed,
     const uint8_t* unpacked) {
-  for (int i = 0; i < 16; ++i) {
-    const uint8_t unpacked0 = unpacked[i + 16 * 0];
-    const uint8_t unpacked1 = unpacked[i + 16 * 1];
-    const uint8_t unpacked2 = unpacked[i + 16 * 2];
-    const uint8_t unpacked3 = unpacked[i + 16 * 3];
-    const uint8_t unpacked4 = unpacked[i + 16 * 4];
-    const uint8_t unpacked5 = unpacked[i + 16 * 5];
-    const uint8_t unpacked6 = unpacked[i + 16 * 6];
-    const uint8_t unpacked7 = unpacked[i + 16 * 7];
-
-    // byte 0: slot 1 in bits 0-2, slot 0 in bits 3-5, slot 6 (low 2 bits) in bits 6-7
-    // Note: unpacked1 is not masked - ARM stores raw value, unpacking extracts low 3 bits
-    packed[i] = ((unpacked6 & 0x03) << 6) | ((unpacked0 & 0x07) << 3) | unpacked1;
-
-    // byte 1: slot 3 in bits 0-2, slot 2 in bits 3-5, slot 7 (low 2 bits) in bits 6-7
-    // Note: unpacked3 is not masked - ARM stores raw value, unpacking extracts low 3 bits
-    packed[i + 16] = ((unpacked7 & 0x03) << 6) | ((unpacked2 & 0x07) << 3) | unpacked3;
-
-    // byte 2: slot 5 in bits 0-2, slot 4 in bits 3-5, slot 6 high bit in bit 7, slot 7 high bit in bit 6
-    // Note: unpacked5 is not masked - ARM stores raw value, unpacking extracts low 3 bits
-    packed[i + 32] = ((unpacked6 & 0x04) << 5) | ((unpacked7 & 0x04) << 4) |
-        ((unpacked4 & 0x07) << 3) | unpacked5;
-  }
+  pack_transpose_uint3_values<16>(packed, unpacked);
 }
 
 /**
@@ -177,20 +188,7 @@ TORCHAO_ALWAYS_INLINE inline void pack_128_uint3_values(
 TORCHAO_ALWAYS_INLINE inline void unpack_128_uint3_values(
     uint8_t* unpacked,
     const uint8_t* packed) {
-  for (int i = 0; i < 16; ++i) {
-    const uint8_t b0 = packed[i];
-    const uint8_t b1 = packed[i + 16];
-    const uint8_t b2 = packed[i + 32];
-
-    unpacked[i + 16 * 0] = (b0 >> 3) & 0x07;
-    unpacked[i + 16 * 1] = b0 & 0x07;
-    unpacked[i + 16 * 2] = (b1 >> 3) & 0x07;
-    unpacked[i + 16 * 3] = b1 & 0x07;
-    unpacked[i + 16 * 4] = (b2 >> 3) & 0x07;
-    unpacked[i + 16 * 5] = b2 & 0x07;
-    unpacked[i + 16 * 6] = (b0 >> 6) | ((b2 >> 5) & 0x04);
-    unpacked[i + 16 * 7] = (b1 >> 6) | ((b2 >> 4) & 0x04);
-  }
+  unpack_transpose_uint3_values<16>(unpacked, packed);
 }
 
 } // namespace internal
