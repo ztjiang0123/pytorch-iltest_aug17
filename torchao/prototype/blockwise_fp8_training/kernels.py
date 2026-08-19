@@ -70,25 +70,44 @@ def _pad_blockwise_128x128_scale_k_major(scale: torch.Tensor) -> torch.Tensor:
     return padded_scale
 
 
-def _prepare_blockwise_scaled_mm_rhs_scale(
+def _prepare_128x128_rhs_scale(
     scale: torch.Tensor,
     scale_recipe,
+    pad_fn,
 ) -> torch.Tensor:
+    """Apply ``pad_fn`` only when ``scale_recipe`` is the 128x128 recipe.
+
+    RHS scales for other recipes are passed through untouched. Callers supply
+    the padder that matches the tensor rank they operate on (2D k-major for the
+    dense ``_scaled_mm`` path, 2D/3D for the grouped path).
+    """
     if _scaling_type_value(scale_recipe) != _scaling_type_value(
         BLOCKWISE_128X128_SCALING_TYPE
     ):
         return scale
-    return _pad_blockwise_128x128_scale_k_major(scale)
+    return pad_fn(scale)
+
+
+def _prepare_blockwise_scaled_mm_rhs_scale(
+    scale: torch.Tensor,
+    scale_recipe,
+) -> torch.Tensor:
+    return _prepare_128x128_rhs_scale(
+        scale, scale_recipe, _pad_blockwise_128x128_scale_k_major
+    )
+
+
+def _is_contiguous_along(x: torch.Tensor, axis: int) -> bool:
+    assert x.ndim == 2 or x.ndim == 3, "input tensor must be 2D or 3D"
+    return x.stride(axis) == 1
 
 
 def _is_column_major(x: torch.Tensor) -> bool:
-    assert x.ndim == 2 or x.ndim == 3, "input tensor must be 2D or 3D"
-    return x.stride(-2) == 1
+    return _is_contiguous_along(x, -2)
 
 
 def _is_row_major(x: torch.Tensor) -> bool:
-    assert x.ndim == 2 or x.ndim == 3, "input tensor must be 2D or 3D"
-    return x.stride(-1) == 1
+    return _is_contiguous_along(x, -1)
 
 
 def _two_output_quant_shardings(
@@ -260,22 +279,25 @@ def triton_fp8_gemm_1x128_128x128_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton_op("torchao::triton_fp8_gemm_1x128_128x128", mutates_args={})
-def triton_fp8_gemm_1x128_128x128(
-    a: torch.Tensor,  # (M, K)
-    b: torch.Tensor,  # (K, N)
-    a_s: torch.Tensor,  # (M, K // block_size)
-    b_s: torch.Tensor,  # (K // block_size, N // block_size)
-    block_size: int = 128,
-    out_dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
+def _setup_fp8_gemm_1x128(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_s: torch.Tensor,
+    out_dtype: torch.dtype,
+):
+    """Validate operands and allocate the output for the 1x128 FP8 GEMMs.
+
+    Both ``triton_fp8_gemm_1x128_128x128`` and ``triton_fp8_gemm_1x128_128x1``
+    share the same A/B/a_s layout contract and output allocation; they differ
+    only in the B-scale layout (checked by the caller) and which Triton kernel
+    they launch. Returns ``(M, K, N, c, grid)``.
+    """
     # 'a' must be in row-major layout, 'b' must be in column-major layout
     assert _is_row_major(a), "a must be row-major"
     assert _is_column_major(b), "b must be column-major"
 
-    # a_scales must be col-major, b_scales must be row-major
+    # a_scales must be col-major
     assert _is_column_major(a_s), "a_s must be column-major"
-    assert _is_column_major(b_s), "b_s must be column-major"
 
     M = a.size(0)
     K = a.size(1)
@@ -287,6 +309,23 @@ def triton_fp8_gemm_1x128_128x128(
             triton.cdiv(M, META["BLOCK_SIZE_M"]),
             triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
+
+    return M, K, N, c, grid
+
+
+@triton_op("torchao::triton_fp8_gemm_1x128_128x128", mutates_args={})
+def triton_fp8_gemm_1x128_128x128(
+    a: torch.Tensor,  # (M, K)
+    b: torch.Tensor,  # (K, N)
+    a_s: torch.Tensor,  # (M, K // block_size)
+    b_s: torch.Tensor,  # (K // block_size, N // block_size)
+    block_size: int = 128,
+    out_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    # b_scales must be column-major
+    assert _is_column_major(b_s), "b_s must be column-major"
+
+    M, K, N, c, grid = _setup_fp8_gemm_1x128(a, b, a_s, out_dtype)
 
     wrap_triton(triton_fp8_gemm_1x128_128x128_kernel)[grid](
         a,
@@ -388,24 +427,10 @@ def triton_fp8_gemm_1x128_128x1(
     block_size: int = 128,
     out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    # 'a' must be in row-major layout, 'b' must be in column-major layout
-    assert _is_row_major(a), "a must be row-major"
-    assert _is_column_major(b), "b must be column-major"
-
-    # a_scales must be col-major, b_scales must be row-major
-    assert _is_column_major(a_s), "a_s must be column-major"
+    # b_scales must be row-major
     assert _is_row_major(b_s), "b_s must be row-major"
 
-    M = a.size(0)
-    K = a.size(1)
-    N = b.size(1)
-    c = a.new_empty(M, N, dtype=out_dtype)
-
-    def grid(META):
-        return (
-            triton.cdiv(M, META["BLOCK_SIZE_M"]),
-            triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        )
+    M, K, N, c, grid = _setup_fp8_gemm_1x128(a, b, a_s, out_dtype)
 
     wrap_triton(triton_fp8_gemm_1x128_128x1_kernel)[grid](
         a,

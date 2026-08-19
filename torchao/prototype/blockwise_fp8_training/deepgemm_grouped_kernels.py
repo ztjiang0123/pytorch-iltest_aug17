@@ -224,17 +224,40 @@ def _deepgemm_flat_k_grouped_operand(
     )
 
 
+def _torchao_operand(
+    data: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    dim_axis: int,
+    layout: DeepGemmKGroupedLayout,
+    name: str,
+) -> DeepGemmKGroupedOperand:
+    """Build a 2D TorchAO intermediate-layout operand.
+
+    ``dim_axis`` selects which physical axis of ``data`` carries the logical
+    non-token dimension used by DeepGEMM's K-grouped API (row for the
+    transposed LHS, column for the grouped-mm RHS).
+    """
+    assert data.ndim == 2, f"TorchAO {name} data must be 2D"
+    assert scale.ndim == 2, f"TorchAO {name} scale must be 2D"
+    return DeepGemmKGroupedOperand(
+        data=data,
+        scale=scale,
+        dim=data.shape[dim_axis],
+        layout=layout,
+    )
+
+
 def _torchao_transposed_lhs_operand(
     data: torch.Tensor,
     scale: torch.Tensor,
 ) -> DeepGemmKGroupedOperand:
-    assert data.ndim == 2, "TorchAO transposed-LHS data must be 2D"
-    assert scale.ndim == 2, "TorchAO transposed-LHS scale must be 2D"
-    return DeepGemmKGroupedOperand(
-        data=data,
-        scale=scale,
-        dim=data.shape[0],
+    return _torchao_operand(
+        data,
+        scale,
+        dim_axis=0,
         layout=DeepGemmKGroupedLayout.TORCHAO_TRANSPOSED_LHS,
+        name="transposed-LHS",
     )
 
 
@@ -242,13 +265,12 @@ def _torchao_rhs_operand(
     data: torch.Tensor,
     scale: torch.Tensor,
 ) -> DeepGemmKGroupedOperand:
-    assert data.ndim == 2, "TorchAO RHS data must be 2D"
-    assert scale.ndim == 2, "TorchAO RHS scale must be 2D"
-    return DeepGemmKGroupedOperand(
-        data=data,
-        scale=scale,
-        dim=data.shape[-1],
+    return _torchao_operand(
+        data,
+        scale,
+        dim_axis=-1,
         layout=DeepGemmKGroupedLayout.TORCHAO_RHS,
+        name="RHS",
     )
 
 
