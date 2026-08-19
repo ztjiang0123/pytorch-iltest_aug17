@@ -4,7 +4,8 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Callable, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -279,34 +280,49 @@ def triton_fp8_gemm_1x128_128x128_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+@dataclass(frozen=True)
+class _Fp8Gemm1x128Operands:
+    """The four tensors consumed by a 1x128-LHS-scaled FP8 GEMM."""
+
+    a: torch.Tensor  # (M, K)
+    b: torch.Tensor  # (K, N)
+    a_s: torch.Tensor  # (M, K // block_size)
+    b_s: torch.Tensor  # (K // block_size, N[// block_size])
+
+
+@dataclass(frozen=True)
+class _Fp8Gemm1x128Variant:
+    """Static per-RHS-recipe differences between the two 1x128 FP8 GEMMs."""
+
+    kernel: object
+    b_s_check: Callable[[torch.Tensor], bool]
+    b_s_layout: str
+    pass_c_strides: bool
+    pass_out_dtype: bool
+
+
 def _run_fp8_gemm_1x128(
-    kernel,
-    a: torch.Tensor,  # (M, K)
-    b: torch.Tensor,  # (K, N)
-    a_s: torch.Tensor,  # (M, K // block_size)
-    b_s: torch.Tensor,  # (K // block_size, N[// block_size])
+    variant: _Fp8Gemm1x128Variant,
+    operands: _Fp8Gemm1x128Operands,
     block_size: int,
     out_dtype: torch.dtype,
-    *,
-    b_s_check,
-    b_s_layout: str,
-    pass_c_strides: bool,
-    pass_out_dtype: bool,
 ) -> torch.Tensor:
     """Validate, allocate, and launch a 1x128-LHS-scaled FP8 GEMM.
 
     The 128x128 and 128x1 RHS-scale variants share their entire launch path and
-    differ only in a handful of parameters: the B-scale layout they require, the
-    Triton ``kernel`` to launch, and whether that kernel takes the C strides and
-    an ``out_dtype`` constexpr. Threading those through keeps a single launcher.
+    differ only in the fields carried by ``variant``: the B-scale layout they
+    require, the Triton kernel to launch, and whether that kernel takes the C
+    strides and an ``out_dtype`` constexpr.
     """
+    a, b, a_s, b_s = operands.a, operands.b, operands.a_s, operands.b_s
+
     # 'a' must be in row-major layout, 'b' must be in column-major layout
     assert _is_row_major(a), "a must be row-major"
     assert _is_column_major(b), "b must be column-major"
 
     # a_scales must be col-major; b_scales layout depends on the RHS recipe
     assert _is_column_major(a_s), "a_s must be column-major"
-    assert b_s_check(b_s), f"b_s must be {b_s_layout}"
+    assert variant.b_s_check(b_s), f"b_s must be {variant.b_s_layout}"
 
     M = a.size(0)
     K = a.size(1)
@@ -320,7 +336,7 @@ def _run_fp8_gemm_1x128(
         )
 
     args = [a, a.stride(0), a.stride(1), b, b.stride(0), b.stride(1), c]
-    if pass_c_strides:
+    if variant.pass_c_strides:
         args += [c.stride(0), c.stride(1)]
     args += [
         a_s,
@@ -334,10 +350,10 @@ def _run_fp8_gemm_1x128(
         K,
     ]
     kwargs = {"BLOCK_SIZE_K": block_size}
-    if pass_out_dtype:
+    if variant.pass_out_dtype:
         kwargs["out_dtype"] = out_dtype
 
-    wrap_triton(kernel)[grid](*args, **kwargs)
+    wrap_triton(variant.kernel)[grid](*args, **kwargs)
     return c
 
 
@@ -350,18 +366,15 @@ def triton_fp8_gemm_1x128_128x128(
     block_size: int = 128,
     out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    return _run_fp8_gemm_1x128(
-        triton_fp8_gemm_1x128_128x128_kernel,
-        a,
-        b,
-        a_s,
-        b_s,
-        block_size,
-        out_dtype,
+    variant = _Fp8Gemm1x128Variant(
+        kernel=triton_fp8_gemm_1x128_128x128_kernel,
         b_s_check=_is_column_major,
         b_s_layout="column-major",
         pass_c_strides=True,
         pass_out_dtype=True,
+    )
+    return _run_fp8_gemm_1x128(
+        variant, _Fp8Gemm1x128Operands(a, b, a_s, b_s), block_size, out_dtype
     )
 
 
@@ -440,18 +453,15 @@ def triton_fp8_gemm_1x128_128x1(
     block_size: int = 128,
     out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    return _run_fp8_gemm_1x128(
-        triton_fp8_gemm_1x128_128x1_kernel,
-        a,
-        b,
-        a_s,
-        b_s,
-        block_size,
-        out_dtype,
+    variant = _Fp8Gemm1x128Variant(
+        kernel=triton_fp8_gemm_1x128_128x1_kernel,
         b_s_check=_is_row_major,
         b_s_layout="row-major",
         pass_c_strides=False,
         pass_out_dtype=False,
+    )
+    return _run_fp8_gemm_1x128(
+        variant, _Fp8Gemm1x128Operands(a, b, a_s, b_s), block_size, out_dtype
     )
 
 
