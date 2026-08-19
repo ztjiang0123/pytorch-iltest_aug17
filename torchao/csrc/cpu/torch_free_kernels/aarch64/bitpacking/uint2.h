@@ -9,6 +9,7 @@
 #if defined(__aarch64__) || defined(__ARM_NEON)
 
 #include <arm_neon.h>
+#include <torchao/csrc/cpu/torch_free_kernels/fallback/bitpacking/uint2.h>
 #include <torchao/csrc/cpu/torch_free_kernels/macro.h>
 
 // This file contains bitpacking and unpacking methods for uint4.
@@ -19,25 +20,73 @@ namespace torchao {
 namespace bitpacking {
 namespace internal {
 
+// The scalar (non-vectorized) pack/unpack routines are identical to the
+// portable fallback implementations, so forward to that single source of truth
+// instead of maintaining a byte-for-byte copy here.
 TORCHAO_ALWAYS_INLINE inline void pack_4_uint2_values(
     uint8_t* packed,
     const uint8_t* unpacked) {
-  // Input is 4 bytes
-  // Output is 1 bytes
-
-  packed[0] = (unpacked[0] << 6) | (unpacked[1] << 4) | (unpacked[2] << 2) |
-      (unpacked[3]);
+  torchao::kernels::cpu::fallback::bitpacking::internal::pack_4_uint2_values(
+      packed, unpacked);
 }
 
 TORCHAO_ALWAYS_INLINE inline void unpack_4_uint2_values(
     uint8_t* unpacked,
     const uint8_t* packed) {
-  // Input is 1 bytes
-  // Output is 4 bytes
-  unpacked[0] = (packed[0] & 192) >> 6;
-  unpacked[1] = (packed[0] & 48) >> 4;
-  unpacked[2] = (packed[0] & 12) >> 2;
-  unpacked[3] = (packed[0] & 3);
+  torchao::kernels::cpu::fallback::bitpacking::internal::unpack_4_uint2_values(
+      unpacked, packed);
+}
+
+// Shared implementation of the vectorized uint2 pack, templated over the NEON
+// vector width so the 64-bit (uint8x8_t) and 128-bit (uint8x16_t) variants stay
+// a single source of truth. The width-specific intrinsics are provided by the
+// small overload sets below. The shift amount is a template non-type parameter
+// so the immediate operand of vshl_n_u8/vshlq_n_u8 is always a literal.
+template <int n>
+TORCHAO_ALWAYS_INLINE inline uint8x8_t vec_uint2_shl(const uint8x8_t& v) {
+  return vshl_n_u8(v, n);
+}
+template <int n>
+TORCHAO_ALWAYS_INLINE inline uint8x16_t vec_uint2_shl(const uint8x16_t& v) {
+  return vshlq_n_u8(v, n);
+}
+TORCHAO_ALWAYS_INLINE inline uint8x8_t vec_uint2_orr(
+    const uint8x8_t& a,
+    const uint8x8_t& b) {
+  return vorr_u8(a, b);
+}
+TORCHAO_ALWAYS_INLINE inline uint8x16_t vec_uint2_orr(
+    const uint8x16_t& a,
+    const uint8x16_t& b) {
+  return vorrq_u8(a, b);
+}
+TORCHAO_ALWAYS_INLINE inline void vec_uint2_store(
+    uint8_t* packed,
+    const uint8x8_t& v) {
+  vst1_u8(packed, v);
+}
+TORCHAO_ALWAYS_INLINE inline void vec_uint2_store(
+    uint8_t* packed,
+    const uint8x16_t& v) {
+  vst1q_u8(packed, v);
+}
+
+template <typename vec_t>
+TORCHAO_ALWAYS_INLINE inline void vec_pack_uint2_values(
+    uint8_t* packed,
+    const vec_t& unpacked0,
+    const vec_t& unpacked1,
+    const vec_t& unpacked2,
+    const vec_t& unpacked3) {
+  // Vectorize the following:
+  // packed[0] = (unpacked[0] << 6) | (unpacked[1] << 4) | (unpacked[2] << 2) |
+  // (unpacked[3]);
+  vec_t vec_packed;
+  vec_packed = vec_uint2_shl<6>(unpacked0);
+  vec_packed = vec_uint2_orr(vec_packed, vec_uint2_shl<4>(unpacked1));
+  vec_packed = vec_uint2_orr(vec_packed, vec_uint2_shl<2>(unpacked2));
+  vec_packed = vec_uint2_orr(vec_packed, unpacked3);
+  vec_uint2_store(packed, vec_packed);
 }
 
 TORCHAO_ALWAYS_INLINE inline void vec_pack_32_uint2_values(
@@ -48,17 +97,7 @@ TORCHAO_ALWAYS_INLINE inline void vec_pack_32_uint2_values(
     const uint8x8_t& unpacked3) {
   // Input is 32 bytes
   // Output is 8 bytes
-
-  // Vectorize the following:
-  // packed[0] = (unpacked[0] << 6) | (unpacked[1] << 4) | (unpacked[2] << 2) |
-  // (unpacked[3]);
-
-  uint8x8_t vec_packed;
-  vec_packed = vshl_n_u8(unpacked0, 6);
-  vec_packed = vorr_u8(vec_packed, vshl_n_u8(unpacked1, 4));
-  vec_packed = vorr_u8(vec_packed, vshl_n_u8(unpacked2, 2));
-  vec_packed = vorr_u8(vec_packed, unpacked3);
-  vst1_u8(packed, vec_packed);
+  vec_pack_uint2_values(packed, unpacked0, unpacked1, unpacked2, unpacked3);
 }
 
 TORCHAO_ALWAYS_INLINE inline void vec_unpack_32_uint2_values(
@@ -93,17 +132,7 @@ TORCHAO_ALWAYS_INLINE inline void vec_pack_64_uint2_values(
     const uint8x16_t& unpacked3) {
   // Input is 64 bytes
   // Output is 16 bytes
-
-  // Vectorize the following:
-  // packed[0] = (unpacked[0] << 6) | (unpacked[1] << 4) | (unpacked[2] << 2) |
-  // (unpacked[3]);
-
-  uint8x16_t vec_packed;
-  vec_packed = vshlq_n_u8(unpacked0, 6);
-  vec_packed = vorrq_u8(vec_packed, vshlq_n_u8(unpacked1, 4));
-  vec_packed = vorrq_u8(vec_packed, vshlq_n_u8(unpacked2, 2));
-  vec_packed = vorrq_u8(vec_packed, unpacked3);
-  vst1q_u8(packed, vec_packed);
+  vec_pack_uint2_values(packed, unpacked0, unpacked1, unpacked2, unpacked3);
 }
 
 TORCHAO_ALWAYS_INLINE inline void vec_unpack_64_uint2_values(

@@ -23,16 +23,40 @@ namespace torchao {
 namespace bitpacking {
 
 namespace internal {
+// Store one NEON vector's worth of bytes. `stride` is the number of lanes and
+// is used by vec_store_4_uint8_vectors to advance the destination pointer, so
+// the 64-bit and 128-bit store helpers can share a single implementation.
+TORCHAO_ALWAYS_INLINE inline void vec_store_uint8_vector(
+    uint8_t* dest,
+    const uint8x8_t& vec) {
+  vst1_u8(dest, vec);
+}
+TORCHAO_ALWAYS_INLINE inline void vec_store_uint8_vector(
+    uint8_t* dest,
+    const uint8x16_t& vec) {
+  vst1q_u8(dest, vec);
+}
+
+template <typename vec_t, int stride>
+TORCHAO_ALWAYS_INLINE inline void vec_store_4_uint8_vectors(
+    uint8_t* dest,
+    const vec_t& vec0,
+    const vec_t& vec1,
+    const vec_t& vec2,
+    const vec_t& vec3) {
+  vec_store_uint8_vector(dest, vec0);
+  vec_store_uint8_vector(dest + stride, vec1);
+  vec_store_uint8_vector(dest + 2 * stride, vec2);
+  vec_store_uint8_vector(dest + 3 * stride, vec3);
+}
+
 TORCHAO_ALWAYS_INLINE inline void vec_store_32_uint8_values(
     uint8_t* dest,
     const uint8x8_t& vec0,
     const uint8x8_t& vec1,
     const uint8x8_t& vec2,
     const uint8x8_t& vec3) {
-  vst1_u8(dest, vec0);
-  vst1_u8(dest + 8, vec1);
-  vst1_u8(dest + 16, vec2);
-  vst1_u8(dest + 24, vec3);
+  vec_store_4_uint8_vectors<uint8x8_t, 8>(dest, vec0, vec1, vec2, vec3);
 }
 
 TORCHAO_ALWAYS_INLINE inline void vec_load_32_uint8_values(
@@ -53,10 +77,7 @@ TORCHAO_ALWAYS_INLINE inline void vec_store_64_uint8_values(
     const uint8x16_t& vec1,
     const uint8x16_t& vec2,
     const uint8x16_t& vec3) {
-  vst1q_u8(dest, vec0);
-  vst1q_u8(dest + 16, vec1);
-  vst1q_u8(dest + 32, vec2);
-  vst1q_u8(dest + 48, vec3);
+  vec_store_4_uint8_vectors<uint8x16_t, 16>(dest, vec0, vec1, vec2, vec3);
 }
 
 TORCHAO_ALWAYS_INLINE inline void vec_load_64_uint8_values(
