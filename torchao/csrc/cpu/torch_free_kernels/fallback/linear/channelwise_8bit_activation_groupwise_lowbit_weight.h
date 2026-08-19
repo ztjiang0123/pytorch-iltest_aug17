@@ -7,6 +7,7 @@
 #pragma once
 
 #include <torchao/csrc/cpu/torch_free_kernels/macro.h>
+#include <torchao/csrc/cpu/torch_free_kernels/shared/dequantize.h>
 #include <torchao/csrc/cpu/torch_free_kernels/weight_packing/weight_packing.h>
 #include <algorithm>
 #include <cassert>
@@ -14,8 +15,28 @@
 #include <cstring>
 #include <vector>
 
+#include <stdexcept>
+#include <string>
+
 namespace torchao::kernels::cpu::fallback::linear::
     channelwise_8bit_activation_groupwise_lowbit_weight {
+
+namespace internal {
+
+// The fallback (x86) backend implements only the shared embedding op below.
+// The activation-packing and linear-kernel entry points exist solely to
+// satisfy UKernelConfig validation; if any of them is actually invoked it
+// means linear execution was attempted on a backend that requires ARM NEON.
+// Centralizing the "unsupported" throw keeps every stub a single line and
+// avoids near-duplicate throw bodies.
+[[noreturn]] inline void throw_unsupported(const char* fn_name) {
+  throw std::runtime_error(
+      std::string(fn_name) +
+      " not implemented for fallback (x86). "
+      "Linear execution requires ARM NEON.");
+}
+
+} // namespace internal
 
 // Stub functions for activation packing - required for UKernelConfig validation
 // but will throw at runtime since fallback doesn't support linear execution.
@@ -35,9 +56,7 @@ inline size_t packed_activations_size(
   (void)mr;
   (void)kr;
   (void)sr;
-  throw std::runtime_error(
-      "packed_activations_size not implemented for fallback (x86). "
-      "Linear execution requires ARM NEON.");
+  internal::throw_unsupported("packed_activations_size");
 }
 
 inline size_t packed_activations_offset(
@@ -55,9 +74,7 @@ inline size_t packed_activations_offset(
   (void)mr;
   (void)kr;
   (void)sr;
-  throw std::runtime_error(
-      "packed_activations_offset not implemented for fallback (x86). "
-      "Linear execution requires ARM NEON.");
+  internal::throw_unsupported("packed_activations_offset");
 }
 
 template <int mr_, int kr_, int sr_>
@@ -80,9 +97,7 @@ void pack_activations(
   (void)mr;
   (void)kr;
   (void)sr;
-  throw std::runtime_error(
-      "pack_activations not implemented for fallback (x86). "
-      "Linear execution requires ARM NEON.");
+  internal::throw_unsupported("pack_activations");
 }
 
 template <int weight_nbit, bool has_weight_zeros, bool has_lut>
@@ -113,25 +128,8 @@ void kernel_1x8x16_f32_fallback(
   (void)has_weight_zeros_runtime;
   (void)has_bias;
   (void)has_clamp;
-  throw std::runtime_error(
-      "kernel_1x8x16_f32_fallback not implemented for fallback (x86). "
-      "Linear execution requires ARM NEON.");
+  internal::throw_unsupported("kernel_1x8x16_f32_fallback");
 }
-
-namespace internal {
-
-TORCHAO_ALWAYS_INLINE inline void dequantize_and_store_values(
-    float* out,
-    const int8_t* qvals,
-    int count,
-    float scale,
-    float zero) {
-  for (int i = 0; i < count; ++i) {
-    out[i] = (static_cast<float>(qvals[i]) - zero) * scale;
-  }
-}
-
-} // namespace internal
 
 // Shared embedding op that uses linear packed weights
 template <int weight_nbit, int nr, int kr, int sr>
@@ -178,7 +176,7 @@ inline void shared_embedding(
       zero =
           static_cast<float>(weight_zeros[j * groups_per_k + i / group_size]);
     }
-    internal::dequantize_and_store_values(
+    torchao::kernels::cpu::shared::dequantize_and_store_values(
         out + i, weight_qvals.data() + j * k + i, chunk_size, scale, zero);
   }
 }
