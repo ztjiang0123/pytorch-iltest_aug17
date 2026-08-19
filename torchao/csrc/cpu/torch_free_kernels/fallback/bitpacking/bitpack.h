@@ -55,30 +55,69 @@ inline void apply_bitpack_blocks(
 // values to packed nbit bytes; `kUnpack` is the inverse.
 enum class BitpackDir { kPack, kUnpack };
 
+// Block-decomposition layout for one (count, nbit): a count-N transform that
+// does not have a whole-count primitive is expressed as `num_blocks`
+// back-to-back invocations of a smaller primitive handling `unpacked_block`
+// values / `packed_block` bytes (see apply_bitpack_blocks). `num_blocks == 0`
+// means "no decomposition — use the whole-count primitive directly".
+struct BitpackBlockLayout {
+  int num_blocks;
+  int unpacked_block;
+  int packed_block;
+};
+
+// Returns the block layout for (count, nbit), or {0, 0, 0} when the transform
+// has a dedicated whole-count primitive. This is the single place the
+// (count, nbit) -> layout table lives; it is shared by pack and unpack because
+// the decomposition is direction-independent. Flat, so it adds no nesting to
+// the caller.
+constexpr BitpackBlockLayout bitpack_block_layout(int count, int nbit) {
+  if (count == 128 && nbit == 2) {
+    return {2, 64, 16};
+  }
+  if (count == 128 && nbit == 4) {
+    return {4, 32, 16};
+  }
+  if (count == 128 && nbit == 6) {
+    return {2, 64, 48};
+  }
+  if (count == 64 && nbit == 4) {
+    return {2, 32, 16};
+  }
+  if (count == 32 && nbit == 3) {
+    return {4, 8, 3};
+  }
+  if (count == 32 && nbit == 5) {
+    return {4, 8, 5};
+  }
+  if (count == 32 && nbit == 7) {
+    return {4, 8, 7};
+  }
+  return {0, 0, 0};
+}
+
 /**
- * @brief Shared (count, nbit) dispatch skeleton for packing and unpacking.
+ * @brief Shared (count, nbit) dispatch for packing and unpacking.
  *
- * Packing and unpacking walk the exact same decision tree: dispatch on
- * (count, nbit) and either call a whole-count primitive directly or drive a
- * fixed-size primitive over `apply_bitpack_blocks`. Only two things differ
- * between the two directions: which primitive symbol is invoked (the `pack_*`
- * vs `unpack_*` family) and whether `dst` is the packed buffer. Both of those
- * are captured by the two callables and the `BitpackDir` tag, so the skeleton
- * lives here once instead of being spelled out twice.
+ * Packing and unpacking make the same three-way choice: 8-bit is a raw
+ * `memcpy`; a `(count, nbit)` with a block layout is driven through
+ * `apply_bitpack_blocks`; everything else calls a whole-count primitive. Only
+ * two things differ between the directions — which primitive family is invoked
+ * (`pack_*` vs `unpack_*`) and whether `dst` is the packed buffer — and both
+ * are captured by the two callables and the `BitpackDir` tag, so the dispatch
+ * lives here once instead of being spelled out twice. The `(count, nbit)`
+ * layout table is factored into `bitpack_block_layout`, keeping this body flat.
  *
  * @tparam nbit  Bits per value (1-8).
  * @tparam count Number of unpacked values (128, 64, or 32).
  * @tparam Dir   BitpackDir::kPack or BitpackDir::kUnpack.
- * @param direct    Whole-count primitive: void(uint8_t* dst, const uint8_t*
- *   src) — e.g. pack_64_uint2_values / unpack_64_uint2_values.
- * @param block     Fixed-size primitive used with apply_bitpack_blocks, same
+ * @param direct Whole-count primitive: void(uint8_t* dst, const uint8_t* src).
+ * @param block  Fixed-size primitive used with apply_bitpack_blocks, same
  *   signature as `direct`.
- * @param dst       Destination base pointer (packed for kPack, unpacked for
- *   kUnpack).
- * @param src       Source base pointer.
+ * @param dst    Destination base pointer (packed for kPack, unpacked otherwise).
+ * @param src    Source base pointer.
  *
- * The `direct`/`block` callables are the direction-specific primitive families;
- * within a single instantiation only the primitives named in the taken branch
+ * Within a single instantiation only the primitives named in the taken branch
  * are odr-used, so unused families need not exist for that (count, nbit).
  */
 template <
@@ -97,37 +136,21 @@ inline void bitpack_uint_values_impl(
       count == 128 || count == 64 || count == 32,
       "count must be 128, 64, or 32");
   constexpr bool dst_is_packed = (Dir == BitpackDir::kPack);
-  (void)direct;
-  (void)block;
+  constexpr BitpackBlockLayout kLayout = bitpack_block_layout(count, nbit);
 
   if constexpr (nbit == 8) {
+    (void)direct;
+    (void)block;
     std::memcpy(dst, src, count);
-  } else if constexpr (count == 128) {
-    if constexpr (nbit == 1 || nbit == 3 || nbit == 5 || nbit == 7) {
-      direct(dst, src);
-    } else if constexpr (nbit == 2) {
-      apply_bitpack_blocks<2, 64, 16>(block, dst, src, dst_is_packed);
-    } else if constexpr (nbit == 4) {
-      apply_bitpack_blocks<4, 32, 16>(block, dst, src, dst_is_packed);
-    } else if constexpr (nbit == 6) {
-      apply_bitpack_blocks<2, 64, 48>(block, dst, src, dst_is_packed);
-    }
-  } else if constexpr (count == 64) {
-    if constexpr (nbit == 4) {
-      apply_bitpack_blocks<2, 32, 16>(block, dst, src, dst_is_packed);
-    } else {
-      direct(dst, src);
-    }
-  } else { // count == 32
-    if constexpr (nbit == 3) {
-      apply_bitpack_blocks<4, 8, 3>(block, dst, src, dst_is_packed);
-    } else if constexpr (nbit == 5) {
-      apply_bitpack_blocks<4, 8, 5>(block, dst, src, dst_is_packed);
-    } else if constexpr (nbit == 7) {
-      apply_bitpack_blocks<4, 8, 7>(block, dst, src, dst_is_packed);
-    } else {
-      direct(dst, src);
-    }
+  } else if constexpr (kLayout.num_blocks == 0) {
+    (void)block;
+    direct(dst, src);
+  } else {
+    (void)direct;
+    apply_bitpack_blocks<
+        kLayout.num_blocks,
+        kLayout.unpacked_block,
+        kLayout.packed_block>(block, dst, src, dst_is_packed);
   }
 }
 
