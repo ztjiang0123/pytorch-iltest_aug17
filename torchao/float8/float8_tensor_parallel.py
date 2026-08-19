@@ -200,6 +200,27 @@ class PrepareFloat8ModuleInput(PrepareModuleInput):
         else:
             return input
 
+    @staticmethod
+    def _resolve_linear_mm_config(module: nn.Module):
+        """Search the submodules for a shared ``linear_mm_config``.
+
+        All ``Float8Linear`` submodules must agree on their ``linear_mm_config``;
+        the common value is returned.
+        """
+        from torchao.float8.float8_linear import Float8Linear
+
+        linear_mm_config = None
+        for mod in module.modules():
+            if not isinstance(mod, Float8Linear):
+                continue
+            if linear_mm_config is None:
+                linear_mm_config = mod.linear_mm_config
+            else:
+                assert linear_mm_config == mod.linear_mm_config, (
+                    "All the Float8Linear modules should have same linear_mm_config!"
+                )
+        return linear_mm_config
+
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
         from torchao.float8.float8_linear import Float8Linear
 
@@ -208,15 +229,7 @@ class PrepareFloat8ModuleInput(PrepareModuleInput):
             assert isinstance(fwd_linear, Float8Linear)
             self.linear_mm_config = fwd_linear.linear_mm_config
         else:
-            # search for ScaledMM configs for all the submodules and make sure they are the same
-            for mod in module.modules():
-                if isinstance(mod, Float8Linear):
-                    if self.linear_mm_config is None:
-                        self.linear_mm_config = mod.linear_mm_config
-                    else:
-                        assert self.linear_mm_config == mod.linear_mm_config, (
-                            "All the Float8Linear modules should have same linear_mm_config!"
-                        )
+            self.linear_mm_config = self._resolve_linear_mm_config(module)
 
         assert self.linear_mm_config is not None
         super()._apply(module, device_mesh)
