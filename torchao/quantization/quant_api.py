@@ -74,6 +74,7 @@ from torchao.quantization.transform_module import (
     register_quantize_module_handler,
 )
 from torchao.quantization.utils import (
+    _apply_weight_quant_transform,
     _fp8_mm_compat,
     _linear_extra_repr,
     _module_extra_repr,
@@ -627,30 +628,13 @@ def _int4_weight_only_transform(
     *,
     parameter_name: str = "weight",
 ) -> torch.nn.Module:
-    if config.set_inductor_config:
-        torchao.quantization.utils.recommended_inductor_config_setter()
-
-    assert hasattr(module, parameter_name), (
-        f"applying int4 weight only quant requires module to have {parameter_name} attribute"
-        + f" but {module} does not have one"
-    )
-    new_weight = _int4_weight_only_quantize_tensor(
-        getattr(module, parameter_name), config
-    )
-    setattr(
+    return _apply_weight_quant_transform(
         module,
         parameter_name,
-        torch.nn.Parameter(new_weight, requires_grad=False),
+        lambda weight: _int4_weight_only_quantize_tensor(weight, config),
+        quant_name="int4 weight only",
+        set_inductor_config=config.set_inductor_config,
     )
-    module.extra_repr = types.MethodType(
-        partial(
-            _module_extra_repr,
-            original_extra_repr=module.extra_repr,
-            parameter_name=parameter_name,
-        ),
-        module,
-    )
-    return module
 
 
 @dataclass
