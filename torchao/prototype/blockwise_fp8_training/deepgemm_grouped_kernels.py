@@ -256,6 +256,55 @@ def _should_quantize_k_grouped_directly(dim: int) -> bool:
     return dim >= _DEEPGEMM_DIRECT_K_GROUPED_QUANT_MIN_DIM
 
 
+@dataclass(frozen=True)
+class _WgradQuantInputs:
+    """Inputs shared by the LHS and RHS wgrad-operand quantizers.
+
+    Bundling these lets :func:`_quantize_wgrad_operand` take just the inputs plus
+    the narrow-dim strategy, instead of a long positional parameter list.
+    """
+
+    x: torch.Tensor
+    group_end_offsets: torch.Tensor
+    group_sizes: list[int]
+    block_size: int
+    dtype: torch.dtype
+    metadata: DeepGemmKGroupedQuantMetadata | None
+
+
+def _quantize_wgrad_operand(
+    inputs: _WgradQuantInputs,
+    narrow_quantizer,
+    narrow_operand,
+) -> DeepGemmKGroupedOperand:
+    """Quantize a wgrad operand for the DeepGEMM K-grouped GEMM.
+
+    Wide dims take the direct K-grouped path (shared by LHS and RHS); narrower
+    dims fall back to the TorchAO quantizer / operand builder passed in by the
+    caller (transposed-LHS for LHS, grouped-mm RHS for RHS).
+    """
+    x = inputs.x
+    if _should_quantize_k_grouped_directly(x.shape[-1]):
+        q, scale = _triton_fp8_blockwise_act_quant_k_grouped_deepgemm_with_group_sizes(
+            x.contiguous(),
+            inputs.group_end_offsets,
+            inputs.group_sizes,
+            block_size=inputs.block_size,
+            dtype=inputs.dtype,
+            metadata=inputs.metadata,
+        )
+        # Direct quantization writes the DeepGEMM input contract directly:
+        # flat per-expert (dim, tokens) data with (dim, token_blocks) scales.
+        return _deepgemm_flat_k_grouped_operand(q, scale)
+
+    q, scale = narrow_quantizer(
+        x.contiguous(),
+        block_size=inputs.block_size,
+        dtype=inputs.dtype,
+    )
+    return narrow_operand(q, scale)
+
+
 def _quantize_wgrad_lhs(
     x: torch.Tensor,
     group_end_offsets: torch.Tensor,
@@ -264,28 +313,16 @@ def _quantize_wgrad_lhs(
     dtype: torch.dtype,
     metadata: DeepGemmKGroupedQuantMetadata | None,
 ) -> DeepGemmKGroupedOperand:
-    if _should_quantize_k_grouped_directly(x.shape[-1]):
-        q, scale = _triton_fp8_blockwise_act_quant_k_grouped_deepgemm_with_group_sizes(
-            x.contiguous(),
-            group_end_offsets,
-            group_sizes,
-            block_size=block_size,
-            dtype=dtype,
-            metadata=metadata,
-        )
-        # Direct quantization writes the DeepGEMM input contract directly:
-        # flat per-expert (dim, tokens) data with (dim, token_blocks) scales.
-        return _deepgemm_flat_k_grouped_operand(q, scale)
-
-    q, scale = triton_fp8_blockwise_act_quant_transposed_lhs(
-        x.contiguous(),
-        block_size=block_size,
-        dtype=dtype,
-    )
     # For narrower LHS dimensions, TorchAO's transposed-LHS quantizer is
     # faster; the DeepGEMM launcher later flattens (dim, all_tokens) into
     # per-expert (dim, expert_tokens) chunks.
-    return _torchao_transposed_lhs_operand(q, scale)
+    return _quantize_wgrad_operand(
+        _WgradQuantInputs(
+            x, group_end_offsets, group_sizes, block_size, dtype, metadata
+        ),
+        narrow_quantizer=triton_fp8_blockwise_act_quant_transposed_lhs,
+        narrow_operand=_torchao_transposed_lhs_operand,
+    )
 
 
 def _quantize_wgrad_rhs(
@@ -296,28 +333,16 @@ def _quantize_wgrad_rhs(
     dtype: torch.dtype,
     metadata: DeepGemmKGroupedQuantMetadata | None,
 ) -> DeepGemmKGroupedOperand:
-    if _should_quantize_k_grouped_directly(x.shape[-1]):
-        q, scale = _triton_fp8_blockwise_act_quant_k_grouped_deepgemm_with_group_sizes(
-            x.contiguous(),
-            group_end_offsets,
-            group_sizes,
-            block_size=block_size,
-            dtype=dtype,
-            metadata=metadata,
-        )
-        # Direct quantization writes the DeepGEMM input contract directly:
-        # flat per-expert (dim, tokens) data with (dim, token_blocks) scales.
-        return _deepgemm_flat_k_grouped_operand(q, scale)
-
-    q, scale = triton_fp8_blockwise_act_quant_rhs(
-        x.contiguous(),
-        block_size=block_size,
-        dtype=dtype,
-    )
     # For narrower RHS dimensions, keep TorchAO's grouped-mm RHS contract:
     # logical (tokens, dim) data in column-major physical layout with
     # (token_blocks, dim) scales, then convert at DeepGEMM launch time.
-    return _torchao_rhs_operand(q, scale)
+    return _quantize_wgrad_operand(
+        _WgradQuantInputs(
+            x, group_end_offsets, group_sizes, block_size, dtype, metadata
+        ),
+        narrow_quantizer=triton_fp8_blockwise_act_quant_rhs,
+        narrow_operand=_torchao_rhs_operand,
+    )
 
 
 def prepare_deepgemm_wgrad_plan(

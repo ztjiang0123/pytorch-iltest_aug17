@@ -9,18 +9,21 @@ import importlib
 import torch
 
 
-def _is_hopper() -> bool:
+def _is_cuda_capability_major(major: int) -> bool:
+    """Return True if a CUDA device is available and its compute-capability
+    major version matches ``major``."""
     if not torch.cuda.is_available():
         return False
-    major, _ = torch.cuda.get_device_capability()
-    return major == 9
+    device_major, _ = torch.cuda.get_device_capability()
+    return device_major == major
+
+
+def _is_hopper() -> bool:
+    return _is_cuda_capability_major(9)
 
 
 def _is_blackwell() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major == 10
+    return _is_cuda_capability_major(10)
 
 
 def _is_fa3_available() -> bool:
