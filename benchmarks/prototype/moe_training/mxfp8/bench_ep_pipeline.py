@@ -292,6 +292,18 @@ def run_experiment(
         for _ in range(n):
             func_no_args()
 
+    def make_bwd_warmup(fwd_fn, input_t, weight_t):
+        # Build a backward-warmup closure for a given pipeline: reset grads,
+        # run the forward pass, then run loss + backward so kernels compile.
+        def bwd_warmup():
+            input_t.grad = None
+            weight_t.grad = None
+            output = fwd_fn(input_t, weight_t.transpose(-2, -1))
+            labels = torch.ones_like(output)
+            mse_loss_and_bwd(output, labels)
+
+        return bwd_warmup
+
     # Set seed for deterministic execution across both pipelines
     torch.manual_seed(42)
 
@@ -321,14 +333,7 @@ def run_experiment(
 
     # BF16 Backward
     # Warmup backward pass
-    def bf16_bwd_warmup():
-        ref_input_tensor.grad = None
-        ref_expert_weights.grad = None
-        output = bf16_fwd(ref_input_tensor, ref_expert_weights.transpose(-2, -1))
-        labels = torch.ones_like(output)
-        mse_loss_and_bwd(output, labels)
-
-    warmup(bf16_bwd_warmup)
+    warmup(make_bwd_warmup(bf16_fwd, ref_input_tensor, ref_expert_weights))
 
     # Do a fresh forward pass right before timing backward
     ref_input_tensor.grad = None
@@ -405,14 +410,7 @@ def run_experiment(
 
     # MXFP8 Backward
     # Warmup backward pass to compile Triton kernels
-    def mxfp8_bwd_warmup():
-        input_tensor.grad = None
-        expert_weights.grad = None
-        output = mxfp8_fwd(input_tensor, expert_weights.transpose(-2, -1))
-        labels = torch.ones_like(output)
-        mse_loss_and_bwd(output, labels)
-
-    warmup(mxfp8_bwd_warmup)
+    warmup(make_bwd_warmup(mxfp8_fwd, input_tensor, expert_weights))
 
     # Do a fresh forward pass right before timing backward
     input_tensor.grad = None

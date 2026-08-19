@@ -11,6 +11,7 @@ from typing import List
 import torch
 from tabulate import tabulate
 
+from benchmarks.prototype.moe_training.bench_utils import build_input_shape_configs
 from benchmarks.utils import (
     benchmark_cuda_function_in_microseconds,
     run_experiments_and_print,
@@ -52,14 +53,7 @@ def get_configs() -> List[ExperimentConfig]:
         (4, 8192, 7168),
         (8, 8192, 7168),
     ]
-    configs = []
-    for shape in input_shapes:
-        configs.append(
-            ExperimentConfig(
-                input_shape=shape,
-            )
-        )
-    return configs
+    return build_input_shape_configs(input_shapes, ExperimentConfig)
 
 
 def run_experiment(config: ExperimentConfig) -> ExperimentResult:
