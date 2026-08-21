@@ -5,6 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 
+from dataclasses import dataclass
+
 import torch
 
 if torch.cuda.is_available():
@@ -29,9 +31,18 @@ def benchmark_microseconds(f, *args, warmup=25, rep=100):
     )
 
 
-def get_blockwise_problem(
-    m: int, n: int, k: int, block_size: int, dtype: torch.dtype, device
-):
+@dataclass(frozen=True)
+class BlockwiseProblemShape:
+    """GEMM problem dimensions that travel together across the benchmarks."""
+
+    m: int
+    n: int
+    k: int
+    block_size: int
+
+
+def get_blockwise_problem(shape: BlockwiseProblemShape, dtype: torch.dtype, device):
+    m, n, k, block_size = shape.m, shape.n, shape.k, shape.block_size
     assert n % block_size == 0 and k % block_size == 0, (
         "N and K dims must be divisible by block_size"
     )
@@ -50,14 +61,13 @@ def get_blockwise_problem(
     return A, A_scale, B, B_scale
 
 
-def benchmark_latency(
-    m: int, k: int, n: int, block_size: int, dtype: torch.dtype, device
-):
+def benchmark_latency(shape: BlockwiseProblemShape, dtype: torch.dtype, device):
+    m, n, k, block_size = shape.m, shape.n, shape.k, shape.block_size
     A_ref = torch.randn((m, k), dtype=torch.half, device=device)
     B_ref = torch.randn((n, k), dtype=torch.half, device=device)
     fp16_time = benchmark_microseconds(torch.nn.functional.linear, A_ref, B_ref)
 
-    A, A_scale, B, B_scale = get_blockwise_problem(m, n, k, block_size, dtype, device)
+    A, A_scale, B, B_scale = get_blockwise_problem(shape, dtype, device)
     blockwise_time = benchmark_microseconds(
         blockwise_fp8_gemm, A, A_scale, B, B_scale, block_size
     )
@@ -74,9 +84,8 @@ def benchmark_latency(
     }
 
 
-def benchmark_precision(
-    m: int, k: int, n: int, block_size: int, dtype: torch.dtype, device
-):
+def benchmark_precision(shape: BlockwiseProblemShape, dtype: torch.dtype, device):
+    m, n, k, block_size = shape.m, shape.n, shape.k, shape.block_size
     lin = torch.nn.Linear(k, n, False, device, torch.half)
     A = torch.randn((m, k), dtype=torch.half, device=device)
     W = lin.weight
@@ -113,12 +122,9 @@ if __name__ == "__main__" and torch.cuda.is_available():
     for m in tqdm([1 << i for i in range(14)]):
         for dtype in available_dtypes:
             for n, k, block_size in zip(n_vals, k_vals, block_size_vals):
-                latency_results.append(
-                    benchmark_latency(m, k, n, block_size, dtype, device)
-                )
-                precision_results.append(
-                    benchmark_precision(m, k, n, block_size, dtype, device)
-                )
+                shape = BlockwiseProblemShape(m=m, n=n, k=k, block_size=block_size)
+                latency_results.append(benchmark_latency(shape, dtype, device))
+                precision_results.append(benchmark_precision(shape, dtype, device))
 
     df_latency = pd.DataFrame(latency_results)
     df_precision = pd.DataFrame(precision_results)
