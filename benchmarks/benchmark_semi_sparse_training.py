@@ -9,6 +9,7 @@
 import argparse
 import gc
 import itertools
+from dataclasses import dataclass
 
 import pandas as pd
 import torch
@@ -30,15 +31,24 @@ def product_dict(**kwargs):
         yield dict(zip(keys, instance))
 
 
-def benchmark_helper(
-    functions,
-    cases,
-    fw: bool = False,
-    bw: bool = False,
-    cuda_graph: bool = False,
-    compile: bool = False,
-    blocked_autorange=False,
-):
+@dataclass
+class BenchmarkConfig:
+    """Run-mode options that control how each benchmark case is executed."""
+
+    fw: bool = False
+    bw: bool = False
+    cuda_graph: bool = False
+    compile: bool = False
+    blocked_autorange: bool = False
+
+
+def benchmark_helper(functions, cases, config: BenchmarkConfig):
+    fw = config.fw
+    bw = config.bw
+    cuda_graph = config.cuda_graph
+    compile = config.compile
+    blocked_autorange = config.blocked_autorange
+
     assert fw or bw
     assert not (cuda_graph and compile)
     print(
@@ -249,7 +259,11 @@ if __name__ == "__main__":
         )
 
         df = benchmark_helper(
-            functions, cases, fw=True, bw=True, cuda_graph=True, blocked_autorange=True
+            functions,
+            cases,
+            BenchmarkConfig(
+                fw=True, bw=True, cuda_graph=True, blocked_autorange=True
+            ),
         )
     elif args.mode == "llama3-8b":
         functions = {
@@ -273,7 +287,11 @@ if __name__ == "__main__":
         )
 
         df = benchmark_helper(
-            functions, cases, fw=True, bw=False, cuda_graph=True, blocked_autorange=True
+            functions,
+            cases,
+            BenchmarkConfig(
+                fw=True, bw=False, cuda_graph=True, blocked_autorange=True
+            ),
         )
 
     elif args.mode == "vit":
@@ -284,7 +302,9 @@ if __name__ == "__main__":
         }
         cases = list(product_dict(model_type=["vit_l"], batch_size=[8]))
 
-        df = benchmark_helper(functions, cases, fw=True, bw=True, compile=True)
+        df = benchmark_helper(
+            functions, cases, BenchmarkConfig(fw=True, bw=True, compile=True)
+        )
 
     print(df)
     if args.save:
