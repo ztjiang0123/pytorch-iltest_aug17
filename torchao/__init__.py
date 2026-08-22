@@ -81,7 +81,7 @@ else:
             from . import ops
 
         # The following registers meta kernels for some CPU kernels
-        from torchao.csrc_meta_ops import *  # noqa: F403
+        from torchao.csrc_meta_ops import *
     except Exception as e:
         logger.debug(f"Skipping import of cpp extensions: {e}")
 
