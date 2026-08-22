@@ -13,14 +13,11 @@ from torchao.utils import ceil_div
 
 from .cute_utils import (
     F8_MAX,
-    compute_amax,
-    compute_scale_from_amax,
-    issue_tma_load,
-    issue_tma_store,
     load_vals_chunk_full,
     load_vals_chunk_tail,
     make_tile_smem_layout,
-    validate_group_sizes,
+    run_2d_quant_consumer,
+    run_2d_tma_quant_pipeline,
 )
 
 
@@ -472,63 +469,11 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
                 Intermediate: shared memory for tiles, registers for computation
             """
             tidx, _, _ = cute.arch.thread_idx()
-            warp_idx = cute.arch.warp_idx()
-            warp_idx = cute.arch.make_warp_uniform(warp_idx)
-            bidx, bidy, _ = cute.arch.block_idx()
-
-            # Validate group sizes are multiples of 128 if offs is provided
-            if cutlass.const_expr(offs is not None):
-                if tidx == 0:
-                    validate_group_sizes(offs)
 
             smem_allocator = utils.SmemAllocator()
             storage = smem_allocator.allocate(SharedStorage)
-            tma_mbar_ptr0 = storage.tma_mbar_ptr.data_ptr()
-            tma_mbar_ptr1 = tma_mbar_ptr0
-            if cutlass.const_expr(STAGE_COUNT_VALUE > 1):
-                tma_mbar_ptr1 = tma_mbar_ptr0 + 1
-
             smem_layout_in, smem_layout_out = _make_tile_smem_layouts(TILE_M, TILE_K)
-            staged_layout_in = cute.make_layout(
-                (STAGE_COUNT_VALUE, TILE_M, TILE_K),
-                stride=(TILE_M * TILE_K, TILE_K, 1),
-            )
-            staged_layout_out = cute.make_layout(
-                (STAGE_COUNT_VALUE, TILE_M, TILE_K),
-                stride=(TILE_M * TILE_K, TILE_K, 1),
-            )
-            sIN_staged = storage.in_smem.get_tensor(staged_layout_in)
-            sOUT_staged = storage.out_smem.get_tensor(staged_layout_out)
-            stage_elems = TILE_M * TILE_K
-            sIN_tile0 = cute.make_tensor(
-                sIN_staged.iterator + 0 * stage_elems, smem_layout_in
-            )
-            sOUT_tile0 = cute.make_tensor(
-                sOUT_staged.iterator + 0 * stage_elems, smem_layout_out
-            )
-            sIN_tile1 = sIN_tile0
-            sOUT_tile1 = sOUT_tile0
-            if cutlass.const_expr(STAGE_COUNT_VALUE > 1):
-                sIN_tile1 = cute.make_tensor(
-                    sIN_staged.iterator + 1 * stage_elems, smem_layout_in
-                )
-                sOUT_tile1 = cute.make_tensor(
-                    sOUT_staged.iterator + 1 * stage_elems, smem_layout_out
-                )
 
-            if tidx == 0:
-                cpasync.prefetch_descriptor(tma_atom_in)
-                cpasync.prefetch_descriptor(tma_atom_out)
-                cute.arch.mbarrier_init(tma_mbar_ptr0, 1)
-                if cutlass.const_expr(STAGE_COUNT_VALUE > 1):
-                    cute.arch.mbarrier_init(tma_mbar_ptr1, 1)
-            cute.arch.mbarrier_init_fence()
-            cute.arch.sync_threads()
-
-            # For 32x1 scaling: bidx is M tile group, bidy is K tile
-            m_tile_group_idx = cutlass.Int64(bidx)
-            k_tile = cutlass.Int64(bidy)
-            k0 = k_tile * TILE_K
             if cutlass.const_expr(BLOCKED_SCALE_OUTPUT_VALUE):
                 scales_tensor = cute.make_tensor(
                     scales_out_u8.iterator,
@@ -537,172 +482,53 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
             else:
                 scales_tensor = scales_out_u8
 
-            for tile_step in cutlass.range_constexpr(M_TILES_PER_CTA):
-                m_tile_eff = m_tile_group_idx * M_TILES_PER_CTA + tile_step
-                m0 = m_tile_eff * TILE_M
+            # 32x1 quantizes along M: the pipelined tile axis is M (bidx groups
+            # M tiles) and the orthogonal axis is K (bidy).
+            def make_tile_coord(m_tile_eff, k_tile):
+                return (m_tile_eff, k_tile)
 
-                stage_idx = tile_step % STAGE_COUNT
-
-                sIN_tile = sIN_tile0
-                sOUT_tile = sOUT_tile0
-                tma_mbar_ptr = tma_mbar_ptr0
-                if cutlass.const_expr(STAGE_COUNT > 1):
-                    tma_mbar_ptr = tma_mbar_ptr0 + stage_idx
-                if cutlass.const_expr(STAGE_COUNT > 1):
-                    if stage_idx == 1:
-                        sIN_tile = sIN_tile1
-                        sOUT_tile = sOUT_tile1
-
-                tma_phase = (tile_step // STAGE_COUNT) % 2
-
-                if cutlass.const_expr(
-                    tile_step == 0 or not (STAGE_COUNT > 1 and M_TILES_PER_CTA > 1)
-                ):
-                    gIN_tile = cute.local_tile(
-                        tma_tensor_in, (TILE_M, TILE_K), (m_tile_eff, k_tile)
-                    )
-                    issue_tma_load(
-                        tma_atom_in,
-                        (gIN_tile, sIN_tile, 1),
-                        tma_mbar_ptr,
+            def consume(sIN_tile, sOUT_tile, m_tile_eff, k_tile, warp_idx):
+                # 32x1: outer axis = K (orthogonal), block axis = M (pipelined).
+                run_2d_quant_consumer(
+                    (
+                        K_ITERS_PER_LANE,
+                        K_THREADS,
+                        TILE_K,
+                        M_BLOCKS_PER_TILE,
+                        SCALE_DIM_M_VALUE,
                         warp_idx,
-                        TILE_COPY_BYTES,
-                    )
-
-                if cutlass.const_expr(STAGE_COUNT > 1 and M_TILES_PER_CTA > 1):
-                    if cutlass.const_expr(tile_step + 1 < M_TILES_PER_CTA):
-                        m_tile_next = m_tile_group_idx * M_TILES_PER_CTA + tile_step + 1
-                        next_stage_idx = (tile_step + 1) % STAGE_COUNT
-                        sIN_tile_next = sIN_tile0
-                        tma_mbar_ptr_next = tma_mbar_ptr0
-                        if cutlass.const_expr(STAGE_COUNT > 1):
-                            tma_mbar_ptr_next = tma_mbar_ptr0 + next_stage_idx
-                        if cutlass.const_expr(STAGE_COUNT > 1):
-                            if next_stage_idx == 1:
-                                sIN_tile_next = sIN_tile1
-
-                        gIN_tile_next = cute.local_tile(
-                            tma_tensor_in, (TILE_M, TILE_K), (m_tile_next, k_tile)
-                        )
-                        issue_tma_load(
-                            tma_atom_in,
-                            (gIN_tile_next, sIN_tile_next, 1),
-                            tma_mbar_ptr_next,
-                            warp_idx,
-                            TILE_COPY_BYTES,
-                        )
-
-                if warp_idx >= 1 and warp_idx <= compute_warps:
-                    cute.arch.mbarrier_wait(tma_mbar_ptr, tma_phase)
-                    lane = tidx % 32
-                    k_lane = (warp_idx - 1) * 32 + lane
-
-                    for kk in cutlass.range_constexpr(K_ITERS_PER_LANE):
-                        k_rel = k_lane + kk * K_THREADS
-                        k = k0 + k_rel
-                        if cutlass.const_expr(IS_FULL_M_TILES):
-                            if k_rel < TILE_K:
-                                # Buffer scales for vectorized store
-                                scale_buffer = cute.make_rmem_tensor(
-                                    (M_BLOCKS_PER_TILE,), cutlass.Uint8
-                                )
-
-                                for mb in cutlass.range_constexpr(M_BLOCKS_PER_TILE):
-                                    m_base = mb * SCALE_DIM_M_VALUE
-                                    vals_block = self._load_block_full_smem_to_reg(
-                                        sIN_tile,
-                                        k_rel,
-                                        m_base,
-                                    )
-
-                                    amax = compute_amax(vals_block)
-
-                                    scale_biased, inv_scale = compute_scale_from_amax(
-                                        amax, USE_RCEIL
-                                    )
-                                    scale_buffer[mb] = cutlass.Uint8(scale_biased)
-
-                                    self._quantize_block_then_store_reg_to_smem_full(
-                                        vals_block,
-                                        inv_scale,
-                                        sOUT_tile,
-                                        k_rel,
-                                        m_base,
-                                        USE_RCEIL,
-                                    )
-
-                                # Vectorized scale store
-                                m_block_base = m_tile_eff * M_BLOCKS_PER_TILE
-                                self._store_scales_reg_to_gmem_vec(
-                                    scales_tensor,
-                                    k,
-                                    m_block_base,
-                                    scale_buffer,
-                                    cutlass.Int32(M_BLOCKS_PER_TILE),
-                                    BLOCKED_SCALE_OUTPUT_VALUE,
-                                )
-                        else:
-                            k_in_bounds = k < K
-                            if k_rel < TILE_K and k_in_bounds:
-                                # Buffer scales for vectorized store
-                                scale_buffer = cute.make_rmem_tensor(
-                                    (M_BLOCKS_PER_TILE,), cutlass.Uint8
-                                )
-                                num_valid_scales = cutlass.Int32(0)
-
-                                for mb in cutlass.range_constexpr(M_BLOCKS_PER_TILE):
-                                    m_block = m_tile_eff * M_BLOCKS_PER_TILE + mb
-                                    if m_block < m_blocks:
-                                        m_base = mb * SCALE_DIM_M_VALUE
-                                        vals_block = self._load_block_tail_smem_to_reg(
-                                            sIN_tile,
-                                            m0,
-                                            k_rel,
-                                            m_base,
-                                            M,
-                                        )
-
-                                        amax = compute_amax(vals_block)
-
-                                        scale_biased, inv_scale = (
-                                            compute_scale_from_amax(amax, USE_RCEIL)
-                                        )
-                                        scale_buffer[num_valid_scales] = cutlass.Uint8(
-                                            scale_biased
-                                        )
-                                        num_valid_scales = num_valid_scales + 1
-
-                                        self._quantize_block_then_store_reg_to_smem_tail(
-                                            vals_block,
-                                            inv_scale,
-                                            sOUT_tile,
-                                            m0,
-                                            k_rel,
-                                            m_base,
-                                            M,
-                                            USE_RCEIL,
-                                        )
-
-                                # Vectorized scale store
-                                if num_valid_scales > 0:
-                                    m_block_base = m_tile_eff * M_BLOCKS_PER_TILE
-                                    self._store_scales_reg_to_gmem_vec(
-                                        scales_tensor,
-                                        k,
-                                        m_block_base,
-                                        scale_buffer,
-                                        num_valid_scales,
-                                        BLOCKED_SCALE_OUTPUT_VALUE,
-                                    )
-
-                gOUT_tile = cute.local_tile(
-                    tma_tensor_out, (TILE_M, TILE_K), (m_tile_eff, k_tile)
+                        tidx,
+                    ),
+                    (self, sIN_tile, sOUT_tile),
+                    (
+                        USE_RCEIL,
+                        IS_FULL_M_TILES,
+                        BLOCKED_SCALE_OUTPUT_VALUE,
+                        scales_tensor,
+                        k_tile * TILE_K,
+                        K,
+                        m_tile_eff * TILE_M,
+                        m_tile_eff * M_BLOCKS_PER_TILE,
+                        m_blocks,
+                    ),
                 )
-                issue_tma_store(
-                    tma_atom_out,
-                    (gOUT_tile, sOUT_tile, 1),
-                    warp_idx,
-                )
+
+            run_2d_tma_quant_pipeline(
+                (
+                    storage,
+                    smem_layout_in,
+                    smem_layout_out,
+                    offs,
+                    (TILE_M, TILE_K),
+                    TILE_COPY_BYTES,
+                    M_TILES_PER_CTA,
+                    STAGE_COUNT,
+                    compute_warps,
+                ),
+                (tma_atom_in, tma_tensor_in, tma_atom_out, tma_tensor_out),
+                make_tile_coord,
+                consume,
+            )
 
         @cute.jit
         def __call__(
