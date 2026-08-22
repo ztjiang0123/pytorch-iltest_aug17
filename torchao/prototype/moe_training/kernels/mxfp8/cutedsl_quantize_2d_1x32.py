@@ -420,70 +420,6 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                     vals_chunk, inv_scale, sOUT_tile, m_rel, sout_base, USE_RCEIL
                 )
 
-        @cute.jit
-        def _issue_tma_load(
-            self,
-            tma_atom_in: cute.CopyAtom,
-            gIN_tile: cute.Tensor,
-            sIN_tile: cute.Tensor,
-            tma_mbar_ptr: cutlass.Int64,
-            warp_idx: cutlass.Int32,
-        ):
-            """Issue TMA load from global memory to shared memory (producer warp only).
-
-            Only warp 0 executes the TMA load and updates the barrier.
-
-            Args:
-                tma_atom_in: TMA copy atom for G2S
-                gIN_tile: Input tile in global memory (TILE_M, TILE_K)
-                sIN_tile: Input tile in shared memory (TILE_M, TILE_K)
-                tma_mbar_ptr: TMA barrier pointer
-                warp_idx: Warp index
-
-            Storage locations:
-                Source: gIN_tile (global memory)
-                Destination: sIN_tile (shared memory)
-            """
-            issue_tma_load(
-                tma_atom_in,
-                gIN_tile,
-                sIN_tile,
-                tma_mbar_ptr,
-                warp_idx,
-                TILE_COPY_BYTES,
-                1,
-            )
-
-        @cute.jit
-        def _issue_tma_store(
-            self,
-            tma_atom_out: cute.CopyAtom,
-            gOUT_tile: cute.Tensor,
-            sOUT_tile: cute.Tensor,
-            warp_idx: cutlass.Int32,
-        ):
-            """Issue TMA store from shared memory to global memory (producer warp only).
-
-            Synchronizes threads before store. Only warp 0 executes the TMA store.
-
-            Args:
-                tma_atom_out: TMA copy atom for S2G
-                gOUT_tile: Output tile in global memory (TILE_M, TILE_K)
-                sOUT_tile: Output tile in shared memory (TILE_M, TILE_K)
-                warp_idx: Warp index
-
-            Storage locations:
-                Source: sOUT_tile (shared memory)
-                Destination: gOUT_tile (global memory)
-            """
-            issue_tma_store(
-                tma_atom_out,
-                gOUT_tile,
-                sOUT_tile,
-                warp_idx,
-                1,
-            )
-
         @cute.kernel
         def kernel(
             self,
@@ -630,12 +566,12 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                     gIN_tile = cute.local_tile(
                         tma_tensor_in, (TILE_M, TILE_K), (m_tile, k_tile_eff)
                     )
-                    self._issue_tma_load(
+                    issue_tma_load(
                         tma_atom_in,
-                        gIN_tile,
-                        sIN_tile,
+                        (gIN_tile, sIN_tile, 1),
                         tma_mbar_ptr,
                         warp_idx,
+                        TILE_COPY_BYTES,
                     )
 
                 if cutlass.const_expr(STAGE_COUNT > 1 and K_TILES_PER_CTA > 1):
@@ -653,12 +589,12 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                         gIN_tile_next = cute.local_tile(
                             tma_tensor_in, (TILE_M, TILE_K), (m_tile, k_tile_next)
                         )
-                        self._issue_tma_load(
+                        issue_tma_load(
                             tma_atom_in,
-                            gIN_tile_next,
-                            sIN_tile_next,
+                            (gIN_tile_next, sIN_tile_next, 1),
                             tma_mbar_ptr_next,
                             warp_idx,
+                            TILE_COPY_BYTES,
                         )
 
                 if warp_idx >= 1 and warp_idx <= compute_warps:
@@ -767,10 +703,9 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                 gOUT_tile = cute.local_tile(
                     tma_tensor_out, (TILE_M, TILE_K), (m_tile, k_tile_eff)
                 )
-                self._issue_tma_store(
+                issue_tma_store(
                     tma_atom_out,
-                    gOUT_tile,
-                    sOUT_tile,
+                    (gOUT_tile, sOUT_tile, 1),
                     warp_idx,
                 )
 
