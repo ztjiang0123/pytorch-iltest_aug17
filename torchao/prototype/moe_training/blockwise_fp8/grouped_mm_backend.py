@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
+from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -45,27 +47,42 @@ class _GroupedMMBackendKind(str, Enum):
     EMULATED = "emulated"
 
 
-class _GroupedMMBackend:
+class _GroupedMMBackend(ABC):
     """Backend-specific quantization and grouped GEMM implementation."""
 
     kind: _GroupedMMBackendKind
 
-    def quantize_forward_rhs(
+    # Per-backend RHS quantizers, keyed by pass. Subclasses populate this map
+    # with the forward/dgrad quantizers that write their native RHS layout;
+    # ``quantize_rhs`` dispatches through it so a single method replaces the two
+    # otherwise near-identical ``quantize_{forward,dgrad}_rhs`` implementations.
+    _rhs_quantizers: dict[bool, Callable[..., tuple[torch.Tensor, torch.Tensor]]]
+
+    def quantize_rhs(
         self,
         B_t: torch.Tensor,
         block_size: int,
         dtype: torch.dtype,
+        *,
+        dgrad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError
+        """Quantize the grouped RHS operand for the forward or dgrad GEMM.
 
-    def quantize_dgrad_rhs(
-        self,
-        B_t: torch.Tensor,
-        block_size: int,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError
+        The forward and dgrad passes consume the RHS in different (transposed)
+        layouts, so each backend registers a single quantizer per pass in
+        ``_rhs_quantizers`` rather than defining two near-identical methods.
 
+        Args:
+            B_t: RHS weight tensor to quantize.
+            block_size: Blockwise quantization block size.
+            dtype: Target FP8 dtype.
+            dgrad: Select the dgrad (``grad_output @ weight``) layout when True,
+                otherwise the forward layout.
+        """
+        quantizer = self._rhs_quantizers[dgrad]
+        return quantizer(B_t, block_size=block_size, dtype=dtype)
+
+    @abstractmethod
     def grouped_mm(
         self,
         a: torch.Tensor,
@@ -77,9 +94,9 @@ class _GroupedMMBackend:
         offs: torch.Tensor,
         out_dtype: torch.dtype,
         block_size: int,
-    ) -> torch.Tensor:
-        raise NotImplementedError
+    ) -> torch.Tensor: ...
 
+    @abstractmethod
     def wgrad(
         self,
         padded_grad_output: torch.Tensor,
@@ -88,8 +105,7 @@ class _GroupedMMBackend:
         out_dtype: torch.dtype,
         block_size: int,
         dtype: torch.dtype,
-    ) -> torch.Tensor:
-        raise NotImplementedError
+    ) -> torch.Tensor: ...
 
 
 class _EmulatedGroupedMMBackend(_GroupedMMBackend):
@@ -97,34 +113,14 @@ class _EmulatedGroupedMMBackend(_GroupedMMBackend):
 
     kind = _GroupedMMBackendKind.EMULATED
 
-    def quantize_forward_rhs(
-        self,
-        B_t: torch.Tensor,
-        block_size: int,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # The emulated backend consumes TorchAO's grouped RHS layout:
-        # (E, K, N) data with (E, K_blocks, N_blocks) scales.
-        return triton_fp8_blockwise_weight_quant_grouped_transposed_rhs(
-            B_t,
-            block_size=block_size,
-            dtype=dtype,
-        )
-
-    def quantize_dgrad_rhs(
-        self,
-        B_t: torch.Tensor,
-        block_size: int,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # The emulated backend consumes TorchAO's grouped RHS layout for
-        # grad_output @ weight: (E, N, K) data with
-        # (E, N_blocks, K_blocks) scales.
-        return triton_fp8_blockwise_weight_quant_grouped_rhs(
-            B_t,
-            block_size=block_size,
-            dtype=dtype,
-        )
+    # Emulated backend consumes TorchAO's grouped RHS layout:
+    #   forward: (E, K, N) data with (E, K_blocks, N_blocks) scales
+    #   dgrad (grad_output @ weight): (E, N, K) data with
+    #     (E, N_blocks, K_blocks) scales
+    _rhs_quantizers = {
+        False: triton_fp8_blockwise_weight_quant_grouped_transposed_rhs,
+        True: triton_fp8_blockwise_weight_quant_grouped_rhs,
+    }
 
     def grouped_mm(
         self,
@@ -191,35 +187,14 @@ class _DeepGemmGroupedMMBackend(_GroupedMMBackend):
     kind = _GroupedMMBackendKind.DEEPGEMM
     offset_plan: DeepGemmGroupedOffsetPlan
 
-    def quantize_forward_rhs(
-        self,
-        B_t: torch.Tensor,
-        block_size: int,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # DeepGEMM forward consumes RHS as (E, N, K), with K contiguous and
-        # scales as (E, N_blocks, K_blocks). This quantizer writes that
-        # layout directly, avoiding a dispatch-time transpose/copy.
-        return triton_fp8_blockwise_weight_quant_grouped_transposed_rhs_deepgemm(
-            B_t,
-            block_size=block_size,
-            dtype=dtype,
-        )
-
-    def quantize_dgrad_rhs(
-        self,
-        B_t: torch.Tensor,
-        block_size: int,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # DeepGEMM dgrad consumes RHS as (E, K, N), with N contiguous and
-        # scales as (E, K_blocks, N_blocks). This quantizer writes that
-        # layout directly, avoiding a dispatch-time transpose/copy.
-        return triton_fp8_blockwise_weight_quant_grouped_rhs_deepgemm(
-            B_t,
-            block_size=block_size,
-            dtype=dtype,
-        )
+    # DeepGEMM writes each RHS layout directly, avoiding a dispatch-time
+    # transpose/copy:
+    #   forward: (E, N, K) with K contiguous, scales (E, N_blocks, K_blocks)
+    #   dgrad:   (E, K, N) with N contiguous, scales (E, K_blocks, N_blocks)
+    _rhs_quantizers = {
+        False: triton_fp8_blockwise_weight_quant_grouped_transposed_rhs_deepgemm,
+        True: triton_fp8_blockwise_weight_quant_grouped_rhs_deepgemm,
+    }
 
     def grouped_mm(
         self,

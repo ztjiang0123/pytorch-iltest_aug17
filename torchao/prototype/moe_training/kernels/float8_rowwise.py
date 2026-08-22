@@ -116,12 +116,15 @@ if has_triton():
         )
         return output_buffer, scales_buffer
 
-    @triton_fp8_rowwise_3d_transpose_rhs.register_fake
-    def _fake_triton_fp8_rowwise_3d_transpose_rhs(
+    def _fake_rowwise_3d_transpose_rhs(
         hp_tensor: torch.Tensor,  # (E, K, N)
-        output_dtype: torch.dtype = torch.float8_e4m3fn,
-        round_scales_to_power_of_2: bool = False,
+        output_dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Shared fake (meta) implementation for the 3D transpose RHS ops.
+
+        The atomic and fused-reduction custom ops produce identically shaped
+        outputs, so both ``register_fake`` implementations delegate here.
+        """
         assert hp_tensor.ndim == 3, "input tensor must be 3D"
         e, k, n = hp_tensor.shape
         output_buffer = torch.empty(
@@ -132,6 +135,14 @@ if has_triton():
             (e, k), dtype=torch.float32, device=hp_tensor.device
         )
         return output_buffer, scales_buffer
+
+    @triton_fp8_rowwise_3d_transpose_rhs.register_fake
+    def _fake_triton_fp8_rowwise_3d_transpose_rhs(
+        hp_tensor: torch.Tensor,  # (E, K, N)
+        output_dtype: torch.dtype = torch.float8_e4m3fn,
+        round_scales_to_power_of_2: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return _fake_rowwise_3d_transpose_rhs(hp_tensor, output_dtype)
 
     @triton.autotune(configs=atomic_kernel_configs_2D, key=["K", "N"])
     @triton.jit
@@ -455,16 +466,7 @@ if has_triton():
         output_dtype: torch.dtype = torch.float8_e4m3fn,
         round_scales_to_power_of_2: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert hp_tensor.ndim == 3, "input tensor must be 3D"
-        e, k, n = hp_tensor.shape
-        output_buffer = torch.empty(
-            (e, n, k), dtype=output_dtype, device=hp_tensor.device
-        ).as_strided((e, n, k), (n * k, 1, n))
-
-        scales_buffer = torch.empty(
-            (e, k), dtype=torch.float32, device=hp_tensor.device
-        )
-        return output_buffer, scales_buffer
+        return _fake_rowwise_3d_transpose_rhs(hp_tensor, output_dtype)
 
     # ── Fused 3D column-major axiswise scale+cast kernel ────────────────
     #

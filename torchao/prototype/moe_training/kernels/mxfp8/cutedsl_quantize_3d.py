@@ -16,6 +16,8 @@ from .cute_utils import (
     F8_MAX,
     compute_amax,
     compute_scale_from_amax,
+    issue_tma_load,
+    issue_tma_store,
     load_vals_chunk_full,
     load_vals_chunk_tail,
 )
@@ -385,71 +387,6 @@ def _compile_mxfp8_quantize_3d_cutedsl(
                     vals_chunk, inv_scale, sOUT_tile, sout_base, k_rel, USE_RCEIL
                 )
 
-        @cute.jit
-        def _issue_tma_load(
-            self,
-            tma_atom_in: cute.CopyAtom,
-            gIN_tile: cute.Tensor,
-            sIN_tile: cute.Tensor,
-            tma_mbar_ptr: cutlass.Int64,
-            warp_idx: cutlass.Int32,
-        ):
-            if warp_idx == 0:
-                cta_layout = cute.make_layout((1,))
-                sIN_for_tma_partition = cute.group_modes(sIN_tile, 0, 2)
-                gIN_for_tma_partition = cute.group_modes(gIN_tile, 0, 2)
-                tINs, tINg = cpasync.tma_partition(
-                    tma_atom_in,
-                    0,
-                    cta_layout,
-                    sIN_for_tma_partition,
-                    gIN_for_tma_partition,
-                )
-                tINg_stage0 = tINg[(None, 0)]
-                tINs_stage0 = tINs[(None, 0)]
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        tma_mbar_ptr, TILE_COPY_BYTES
-                    )
-                cute.copy(
-                    tma_atom_in,
-                    tINg_stage0,
-                    tINs_stage0,
-                    tma_bar_ptr=tma_mbar_ptr,
-                )
-
-        @cute.jit
-        def _issue_tma_store(
-            self,
-            tma_atom_out: cute.CopyAtom,
-            gOUT_tile: cute.Tensor,
-            sOUT_tile: cute.Tensor,
-            warp_idx: cutlass.Int32,
-        ):
-            cute.arch.fence_proxy(
-                "async.shared",
-                space="cta",
-            )
-            cute.arch.sync_threads()
-            if warp_idx == 0:
-                cta_layout = cute.make_layout((1,))
-                sOUT_for_tma_partition = cute.group_modes(sOUT_tile, 0, 2)
-                gOUT_for_tma_partition = cute.group_modes(gOUT_tile, 0, 2)
-                tOUTs, tOUTg = cpasync.tma_partition(
-                    tma_atom_out,
-                    0,
-                    cta_layout,
-                    sOUT_for_tma_partition,
-                    gOUT_for_tma_partition,
-                )
-                tOUTs_stage0 = tOUTs[(None, 0)]
-                tOUTg_stage0 = tOUTg[(None, 0)]
-                cute.copy(
-                    tma_atom_out,
-                    tOUTs_stage0,
-                    tOUTg_stage0,
-                )
-
         @cute.kernel
         def kernel(
             self,
@@ -570,12 +507,12 @@ def _compile_mxfp8_quantize_3d_cutedsl(
                     gIN_tile = cute.local_tile(
                         tma_tensor_in, (1, TILE_N, TILE_K), (e, n_tile, bidx_eff)
                     )
-                    self._issue_tma_load(
+                    issue_tma_load(
                         tma_atom_in,
-                        gIN_tile,
-                        sIN_tile,
+                        (gIN_tile, sIN_tile, 2),
                         tma_mbar_ptr,
                         warp_idx,
+                        TILE_COPY_BYTES,
                     )
 
                 if cutlass.const_expr(STAGE_COUNT > 1 and K_TILES_PER_CTA > 1):
@@ -593,12 +530,12 @@ def _compile_mxfp8_quantize_3d_cutedsl(
                         gIN_tile_next = cute.local_tile(
                             tma_tensor_in, (1, TILE_N, TILE_K), (e, n_tile, bidx_next)
                         )
-                        self._issue_tma_load(
+                        issue_tma_load(
                             tma_atom_in,
-                            gIN_tile_next,
-                            sIN_tile_next,
+                            (gIN_tile_next, sIN_tile_next, 2),
                             tma_mbar_ptr_next,
                             warp_idx,
+                            TILE_COPY_BYTES,
                         )
 
                 if warp_idx >= 1 and warp_idx <= compute_warps:
@@ -671,10 +608,9 @@ def _compile_mxfp8_quantize_3d_cutedsl(
                 gOUT_tile = cute.local_tile(
                     tma_tensor_out, (1, TILE_N, TILE_K), (e, n_tile, bidx_eff)
                 )
-                self._issue_tma_store(
+                issue_tma_store(
                     tma_atom_out,
-                    gOUT_tile,
-                    sOUT_tile,
+                    (gOUT_tile, sOUT_tile, 2),
                     warp_idx,
                 )
 
