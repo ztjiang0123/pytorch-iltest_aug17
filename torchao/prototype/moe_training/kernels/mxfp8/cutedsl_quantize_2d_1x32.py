@@ -16,8 +16,7 @@ from .cute_utils import (
     load_vals_chunk_full,
     load_vals_chunk_tail,
     make_tile_smem_layout,
-    run_2d_quant_consumer,
-    run_2d_tma_quant_pipeline,
+    run_2d_quant_kernel,
 )
 
 
@@ -474,66 +473,38 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                 Outputs: out_mk, scales_out_u8 (global memory)
                 Intermediate: shared memory for tiles, registers for computation
             """
-            tidx, _, _ = cute.arch.thread_idx()
-
-            smem_allocator = utils.SmemAllocator()
-            storage = smem_allocator.allocate(SharedStorage)
-            smem_layout_in, smem_layout_out = _make_tile_smem_layouts(TILE_M, TILE_K)
-
-            if cutlass.const_expr(BLOCKED_SCALE_OUTPUT_VALUE):
-                scales_tensor = cute.make_tensor(
-                    scales_out_u8.iterator,
-                    blocked_scale_layout,
-                )
-            else:
-                scales_tensor = scales_out_u8
-
-            # 1x32 quantizes along K: the pipelined tile axis is K (bidx groups
-            # K tiles) and the orthogonal axis is M (bidy).
-            def make_tile_coord(k_tile_eff, m_tile):
-                return (m_tile, k_tile_eff)
-
-            def consume(sIN_tile, sOUT_tile, k_tile_eff, m_tile, warp_idx):
-                # 1x32: outer axis = M (orthogonal), block axis = K (pipelined).
-                run_2d_quant_consumer(
-                    (
-                        M_ITERS_PER_LANE,
-                        M_THREADS,
-                        TILE_M,
-                        K_BLOCKS_PER_TILE,
-                        SCALE_DIM_K_VALUE,
-                        warp_idx,
-                        tidx,
-                    ),
-                    (self, sIN_tile, sOUT_tile),
-                    (
-                        USE_RCEIL,
-                        IS_FULL_K_TILES,
-                        BLOCKED_SCALE_OUTPUT_VALUE,
-                        scales_tensor,
-                        m_tile * TILE_M,
-                        M,
-                        k_tile_eff * TILE_K,
-                        k_tile_eff * K_BLOCKS_PER_TILE,
-                        k_blocks,
-                    ),
-                )
-
-            run_2d_tma_quant_pipeline(
+            # 1x32 quantizes along K: orthogonal axis = M, pipelined axis = K.
+            storage = utils.SmemAllocator().allocate(SharedStorage)
+            smem_layouts = _make_tile_smem_layouts(TILE_M, TILE_K)
+            run_2d_quant_kernel(
+                self,
                 (
                     storage,
-                    smem_layout_in,
-                    smem_layout_out,
+                    smem_layouts,
+                    (tma_atom_in, tma_tensor_in, tma_atom_out, tma_tensor_out),
+                    scales_out_u8,
+                    blocked_scale_layout,
                     offs,
+                    M,
+                    k_blocks,
+                ),
+                (
+                    True,  # orthogonal_is_m
                     (TILE_M, TILE_K),
+                    TILE_M,  # tile_orth
+                    TILE_K,  # tile_pipe
+                    M_ITERS_PER_LANE,
+                    M_THREADS,
+                    K_BLOCKS_PER_TILE,
+                    SCALE_DIM_K_VALUE,
                     TILE_COPY_BYTES,
                     K_TILES_PER_CTA,
                     STAGE_COUNT,
                     compute_warps,
+                    USE_RCEIL,
+                    IS_FULL_K_TILES,
+                    BLOCKED_SCALE_OUTPUT_VALUE,
                 ),
-                (tma_atom_in, tma_tensor_in, tma_atom_out, tma_tensor_out),
-                make_tile_coord,
-                consume,
             )
 
         @cute.jit
