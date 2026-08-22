@@ -32,28 +32,38 @@ BASE_QUANT_CONFIG = {
 }
 
 
-def bench_custom_kernel(
-    x,
-    W_q,
-    scales,
-    zeros,
-    group_size,
-    transposed=False,
-    kernel_type="max_autotune",
-    fp8_fast_accum=False,
-):
-    packed_w = pack_2xint4(W_q.T)
+@dataclass
+class QuantizedWeight:
+    """Bundles the packed weight tensors and grouping for the custom kernel."""
+
+    W_q: torch.Tensor
+    scales: torch.Tensor
+    zeros: torch.Tensor
+    group_size: int
+
+
+@dataclass
+class KernelOptions:
+    """Bundles the tunable options passed to ``triton_mixed_mm``."""
+
+    transposed: bool = False
+    kernel_type: str = "max_autotune"
+    fp8_fast_accum: bool = False
+
+
+def bench_custom_kernel(x, weight: QuantizedWeight, options: KernelOptions):
+    packed_w = pack_2xint4(weight.W_q.T)
 
     def fn():
         _ = triton_mixed_mm(
             x,
             packed_w,
-            scales.T,
-            zeros.T,
-            transposed=transposed,
-            group_size=group_size,
-            fp8_fast_accum=fp8_fast_accum,
-            kernel_type=kernel_type,
+            weight.scales.T,
+            weight.zeros.T,
+            transposed=options.transposed,
+            group_size=weight.group_size,
+            fp8_fast_accum=options.fp8_fast_accum,
+            kernel_type=options.kernel_type,
         )
 
     t = do_bench(fn)
@@ -130,7 +140,9 @@ def run_benchmark(config: BenchmarkConfig):
     scales = scales.reshape(N, -1)
     zeros = zeros.reshape(N, -1)
     tt_time = bench_custom_kernel(
-        x, W_q, scales, zeros, group_size, transposed=transposed
+        x,
+        QuantizedWeight(W_q=W_q, scales=scales, zeros=zeros, group_size=group_size),
+        KernelOptions(transposed=transposed),
     )
 
     should_run_tinygemm = dtype == torch.bfloat16 and not transposed
