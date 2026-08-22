@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -45,27 +46,28 @@ class _GroupedMMBackendKind(str, Enum):
     EMULATED = "emulated"
 
 
-class _GroupedMMBackend:
+class _GroupedMMBackend(ABC):
     """Backend-specific quantization and grouped GEMM implementation."""
 
     kind: _GroupedMMBackendKind
 
+    @abstractmethod
     def quantize_forward_rhs(
         self,
         B_t: torch.Tensor,
         block_size: int,
         dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
+    @abstractmethod
     def quantize_dgrad_rhs(
         self,
         B_t: torch.Tensor,
         block_size: int,
         dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
+    @abstractmethod
     def grouped_mm(
         self,
         a: torch.Tensor,
@@ -77,9 +79,9 @@ class _GroupedMMBackend:
         offs: torch.Tensor,
         out_dtype: torch.dtype,
         block_size: int,
-    ) -> torch.Tensor:
-        raise NotImplementedError
+    ) -> torch.Tensor: ...
 
+    @abstractmethod
     def wgrad(
         self,
         padded_grad_output: torch.Tensor,
@@ -88,8 +90,7 @@ class _GroupedMMBackend:
         out_dtype: torch.dtype,
         block_size: int,
         dtype: torch.dtype,
-    ) -> torch.Tensor:
-        raise NotImplementedError
+    ) -> torch.Tensor: ...
 
 
 class _EmulatedGroupedMMBackend(_GroupedMMBackend):

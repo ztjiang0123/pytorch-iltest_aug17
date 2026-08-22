@@ -15,8 +15,11 @@ from .cute_utils import (
     F8_MAX,
     compute_amax,
     compute_scale_from_amax,
+    issue_tma_load,
+    issue_tma_store,
     load_vals_chunk_full,
     load_vals_chunk_tail,
+    make_tile_smem_layout,
     validate_group_sizes,
 )
 
@@ -33,18 +36,10 @@ def _make_tile_smem_layouts(tile_m: int, tile_k: int):
     Returns:
         Tuple of (smem_layout_in, smem_layout_out) for shared memory
     """
-    import cutlass.cute as cute
-
-    # Input SMEM: Row-major layout
-    smem_layout_in = cute.make_layout(
-        (tile_m, tile_k),
-        stride=(tile_k, 1),
-    )
-    # Output SMEM: Column-major layout
-    smem_layout_out = cute.make_layout(
-        (tile_m, tile_k),
-        stride=(1, tile_m),
-    )
+    # Input SMEM: Row-major layout (K contiguous)
+    smem_layout_in = make_tile_smem_layout(tile_m, tile_k, column_major=False)
+    # Output SMEM: Column-major layout (M contiguous)
+    smem_layout_out = make_tile_smem_layout(tile_m, tile_k, column_major=True)
     return smem_layout_in, smem_layout_out
 
 
@@ -441,29 +436,15 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
                 Source: gIN_tile (global memory)
                 Destination: sIN_tile (shared memory)
             """
-            if warp_idx == 0:
-                cta_layout = cute.make_layout((1,))
-                sIN_for_tma_partition = cute.group_modes(sIN_tile, 0, 1)
-                gIN_for_tma_partition = cute.group_modes(gIN_tile, 0, 1)
-                tINs, tINg = cpasync.tma_partition(
-                    tma_atom_in,
-                    0,
-                    cta_layout,
-                    sIN_for_tma_partition,
-                    gIN_for_tma_partition,
-                )
-                tINg_stage0 = tINg[(None, 0)]
-                tINs_stage0 = tINs[(None, 0)]
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        tma_mbar_ptr, TILE_COPY_BYTES
-                    )
-                cute.copy(
-                    tma_atom_in,
-                    tINg_stage0,
-                    tINs_stage0,
-                    tma_bar_ptr=tma_mbar_ptr,
-                )
+            issue_tma_load(
+                tma_atom_in,
+                gIN_tile,
+                sIN_tile,
+                tma_mbar_ptr,
+                warp_idx,
+                TILE_COPY_BYTES,
+                1,
+            )
 
         @cute.jit
         def _issue_tma_store(
@@ -487,29 +468,13 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
                 Source: sOUT_tile (shared memory)
                 Destination: gOUT_tile (global memory)
             """
-            cute.arch.fence_proxy(
-                "async.shared",
-                space="cta",
+            issue_tma_store(
+                tma_atom_out,
+                gOUT_tile,
+                sOUT_tile,
+                warp_idx,
+                1,
             )
-            cute.arch.sync_threads()
-            if warp_idx == 0:
-                cta_layout = cute.make_layout((1,))
-                sOUT_for_tma_partition = cute.group_modes(sOUT_tile, 0, 1)
-                gOUT_for_tma_partition = cute.group_modes(gOUT_tile, 0, 1)
-                tOUTs, tOUTg = cpasync.tma_partition(
-                    tma_atom_out,
-                    0,
-                    cta_layout,
-                    sOUT_for_tma_partition,
-                    gOUT_for_tma_partition,
-                )
-                tOUTs_stage0 = tOUTs[(None, 0)]
-                tOUTg_stage0 = tOUTg[(None, 0)]
-                cute.copy(
-                    tma_atom_out,
-                    tOUTs_stage0,
-                    tOUTg_stage0,
-                )
 
         @cute.kernel
         def kernel(

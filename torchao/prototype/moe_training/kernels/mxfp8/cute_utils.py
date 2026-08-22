@@ -51,7 +51,120 @@ if _cutedsl_runtime_available():
     import cutlass.cute as cute
     from cutlass._mlir.dialects import llvm
     from cutlass.base_dsl._mlir_helpers import arith as _dsl_arith
+    from cutlass.cute.nvgpu import cpasync
     from cutlass.cutlass_dsl import T, dsl_user_op
+
+    def make_tile_smem_layout(tile_m: int, tile_k: int, column_major: bool):
+        """Create a 2D shared-memory tile layout.
+
+        Shared by the 2D CuTeDSL quantization kernels, whose tile layouts differ
+        only in whether a given operand is row-major (K contiguous) or
+        column-major (M contiguous).
+
+        Args:
+            tile_m: Tile size in the M dimension
+            tile_k: Tile size in the K dimension
+            column_major: If True, M is the fastest-changing dimension
+                (stride ``(1, tile_m)``); otherwise K is (stride ``(tile_k, 1)``)
+
+        Returns:
+            A ``cute`` layout for the tile in shared memory
+        """
+        stride = (1, tile_m) if column_major else (tile_k, 1)
+        return cute.make_layout((tile_m, tile_k), stride=stride)
+
+    @cute.jit
+    def issue_tma_load(
+        tma_atom_in: cute.CopyAtom,
+        gIN_tile: cute.Tensor,
+        sIN_tile: cute.Tensor,
+        tma_mbar_ptr: cutlass.Int64,
+        warp_idx: cutlass.Int32,
+        tile_copy_bytes: cutlass.Constexpr[int],
+        group_modes_end: cutlass.Constexpr[int],
+    ):
+        """Issue a TMA load from global to shared memory (producer warp only).
+
+        Shared across the 2D and 3D CuTeDSL quantization kernels. The only
+        per-kernel difference is ``group_modes_end`` (1 for 2D tiles, 2 for the
+        leading singleton mode of 3D tiles) and the tile byte count.
+
+        Args:
+            tma_atom_in: TMA copy atom for G2S
+            gIN_tile: Input tile in global memory
+            sIN_tile: Input tile in shared memory
+            tma_mbar_ptr: TMA barrier pointer
+            warp_idx: Warp index (only warp 0 issues the copy)
+            tile_copy_bytes: Number of bytes copied by the TMA transaction
+            group_modes_end: End mode index passed to ``cute.group_modes``
+        """
+        if warp_idx == 0:
+            cta_layout = cute.make_layout((1,))
+            sIN_for_tma_partition = cute.group_modes(sIN_tile, 0, group_modes_end)
+            gIN_for_tma_partition = cute.group_modes(gIN_tile, 0, group_modes_end)
+            tINs, tINg = cpasync.tma_partition(
+                tma_atom_in,
+                0,
+                cta_layout,
+                sIN_for_tma_partition,
+                gIN_for_tma_partition,
+            )
+            tINg_stage0 = tINg[(None, 0)]
+            tINs_stage0 = tINs[(None, 0)]
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(tma_mbar_ptr, tile_copy_bytes)
+            cute.copy(
+                tma_atom_in,
+                tINg_stage0,
+                tINs_stage0,
+                tma_bar_ptr=tma_mbar_ptr,
+            )
+
+    @cute.jit
+    def issue_tma_store(
+        tma_atom_out: cute.CopyAtom,
+        gOUT_tile: cute.Tensor,
+        sOUT_tile: cute.Tensor,
+        warp_idx: cutlass.Int32,
+        group_modes_end: cutlass.Constexpr[int],
+    ):
+        """Issue a TMA store from shared to global memory (producer warp only).
+
+        Shared across the 2D and 3D CuTeDSL quantization kernels. Synchronizes
+        threads before the store; the only per-kernel difference is
+        ``group_modes_end`` (1 for 2D tiles, 2 for the leading singleton mode of
+        3D tiles).
+
+        Args:
+            tma_atom_out: TMA copy atom for S2G
+            gOUT_tile: Output tile in global memory
+            sOUT_tile: Output tile in shared memory
+            warp_idx: Warp index (only warp 0 issues the copy)
+            group_modes_end: End mode index passed to ``cute.group_modes``
+        """
+        cute.arch.fence_proxy(
+            "async.shared",
+            space="cta",
+        )
+        cute.arch.sync_threads()
+        if warp_idx == 0:
+            cta_layout = cute.make_layout((1,))
+            sOUT_for_tma_partition = cute.group_modes(sOUT_tile, 0, group_modes_end)
+            gOUT_for_tma_partition = cute.group_modes(gOUT_tile, 0, group_modes_end)
+            tOUTs, tOUTg = cpasync.tma_partition(
+                tma_atom_out,
+                0,
+                cta_layout,
+                sOUT_for_tma_partition,
+                gOUT_for_tma_partition,
+            )
+            tOUTs_stage0 = tOUTs[(None, 0)]
+            tOUTg_stage0 = tOUTg[(None, 0)]
+            cute.copy(
+                tma_atom_out,
+                tOUTs_stage0,
+                tOUTg_stage0,
+            )
 
     # FP8 constants
     F8_MAX = cutlass.Float32(448.0)
