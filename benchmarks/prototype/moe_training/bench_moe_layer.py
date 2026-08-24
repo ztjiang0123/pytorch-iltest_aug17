@@ -14,7 +14,11 @@ import torch
 from torch.nn import functional as F
 
 from benchmarks.prototype.moe_training.bench_utils import make_moe_module_filter_fn
-from benchmarks.utils import bench_fwd_bwd_microseconds, profile_fwd_bwd
+from benchmarks.utils import (
+    ProfileConfig,
+    bench_fwd_bwd_microseconds,
+    profile_fwd_bwd,
+)
 from torchao.prototype.moe_training.config import (
     Float8TrainingRecipe,
     MXFP8TrainingOpConfig,
@@ -164,9 +168,11 @@ def bench_moe_training_fsdp(args: argparse.Namespace):
             ref_model,
             ref_x,
             labels=labels,
-            use_compile=True,
-            fullgraph=False,
-            profile_name="bf16_profile",
+            config=ProfileConfig(
+                use_compile=True,
+                fullgraph=False,
+                profile_name="bf16_profile",
+            ),
         )
 
     # Warmup quantized
@@ -187,9 +193,11 @@ def bench_moe_training_fsdp(args: argparse.Namespace):
             model,
             x,
             labels=labels,
-            use_compile=True,
-            fullgraph=False,
-            profile_name=f"{recipe_name}_profile",
+            config=ProfileConfig(
+                use_compile=True,
+                fullgraph=False,
+                profile_name=f"{recipe_name}_profile",
+            ),
         )
 
     print(f"total_M: {local_batch_size * seq_len}, N: {hidden_dim}, K: {dim}")
