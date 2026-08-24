@@ -11,6 +11,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 from torchao.quantization.qat import FakeQuantizeConfigBase
 from torchao.quantization.qat.utils import (
     _fake_quantized_linear_to_linear,
+    _init_fake_quantized_linear,
     _linear_to_fake_quantized_linear,
 )
 
@@ -139,19 +140,17 @@ class NVFP4FakeQuantizedLinear(torch.nn.Linear):
         *args,
         **kwargs,
     ):
-        super().__init__(
+        _init_fake_quantized_linear(
+            self,
             in_features,
             out_features,
             bias,
-            *args,
-            **kwargs,
+            activation_config,
+            weight_config,
+            "Weight only NVFP4 QAT not supported yet",
+            args,
+            kwargs,
         )
-        if weight_config is None:
-            raise ValueError("Must specify `weight_config`")
-        if activation_config is None:
-            raise ValueError("Weight only NVFP4 QAT not supported yet")
-        self.activation_config = activation_config
-        self.weight_config = weight_config
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 3:
