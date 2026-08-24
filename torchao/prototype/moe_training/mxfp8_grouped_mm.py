@@ -327,6 +327,45 @@ class _MXFP8GroupedMM(torch.autograd.Function):
         )
 
 
+def _dispatch_grouped_mm(
+    emulated_fn,
+    sm100_fn,
+    lhs: torch.Tensor,
+    weight_t: torch.Tensor,
+    group_end_offsets: torch.Tensor,
+    block_size: int,
+    out_dtype: torch.dtype,
+    scale_calculation_mode: ScaleCalculationMode,
+    kernel_preference: KernelPreference,
+) -> torch.Tensor:
+    """
+    Dispatch a grouped-mm computation to the EMULATED or AUTO (SM100) path.
+
+    Args:
+        emulated_fn: Implementation used when kernel_preference is EMULATED.
+        sm100_fn: Implementation used otherwise (SM100 kernels).
+        lhs: Left-hand-side operand (activations or grad_output), shape (M, K/N)
+        weight_t: Expert weights transposed, shape (E, K, N)
+        group_end_offsets: Group offsets for grouped mm
+        block_size: Block size for quantization
+        out_dtype: Output dtype
+        scale_calculation_mode: Mode for scale calculation
+        kernel_preference: If EMULATED, use EMULATED path (native PyTorch), else use AUTO (SM100 kernels)
+
+    Returns:
+        Output tensor.
+    """
+    impl = emulated_fn if kernel_preference == KernelPreference.EMULATED else sm100_fn
+    return impl(
+        lhs,
+        weight_t,
+        group_end_offsets,
+        block_size,
+        out_dtype,
+        scale_calculation_mode,
+    )
+
+
 def _compute_fwd(
     padded_input_act: torch.Tensor,
     weight_t: torch.Tensor,
@@ -351,24 +390,17 @@ def _compute_fwd(
     Returns:
         Output tensor, shape (M, N)
     """
-    if kernel_preference == KernelPreference.EMULATED:
-        return _compute_fwd_emulated(
-            padded_input_act,
-            weight_t,
-            padded_group_end_offsets,
-            block_size,
-            out_dtype,
-            scale_calculation_mode,
-        )
-    else:
-        return _compute_fwd_sm100(
-            padded_input_act,
-            weight_t,
-            padded_group_end_offsets,
-            block_size,
-            out_dtype,
-            scale_calculation_mode,
-        )
+    return _dispatch_grouped_mm(
+        _compute_fwd_emulated,
+        _compute_fwd_sm100,
+        padded_input_act,
+        weight_t,
+        padded_group_end_offsets,
+        block_size,
+        out_dtype,
+        scale_calculation_mode,
+        kernel_preference,
+    )
 
 
 def _compute_dgrad(
@@ -395,24 +427,17 @@ def _compute_dgrad(
     Returns:
         grad_input, shape (M, K)
     """
-    if kernel_preference == KernelPreference.EMULATED:
-        return _compute_dgrad_emulated(
-            grad_output,
-            weight_t,
-            group_end_offsets,
-            block_size,
-            out_dtype,
-            scale_calculation_mode,
-        )
-    else:
-        return _compute_dgrad_sm100(
-            grad_output,
-            weight_t,
-            group_end_offsets,
-            block_size,
-            out_dtype,
-            scale_calculation_mode,
-        )
+    return _dispatch_grouped_mm(
+        _compute_dgrad_emulated,
+        _compute_dgrad_sm100,
+        grad_output,
+        weight_t,
+        group_end_offsets,
+        block_size,
+        out_dtype,
+        scale_calculation_mode,
+        kernel_preference,
+    )
 
 
 def _compute_wgrad(

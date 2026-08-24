@@ -15,9 +15,29 @@ def sync_threads():
 
 
 @triton.jit
+def _signal_asm(addrs, asm: tl.constexpr):
+    """Run a CAS spin-loop PTX snippet against ``addrs``.
+
+    Shared implementation for :func:`send_signal` and :func:`wait_signal`; the
+    only thing that differs between signalling primitives and memory orderings
+    is the inline PTX ``asm`` block, so callers pass it as a constexpr literal
+    while the surrounding ``inline_asm_elementwise`` invocation stays identical.
+    """
+    tl.inline_asm_elementwise(
+        asm,
+        "=r, l",
+        [addrs],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def send_signal(addrs, sem: tl.constexpr):
     if sem == "relaxed":
-        tl.inline_asm_elementwise(
+        _signal_asm(
+            addrs,
             """
             {
                 .reg .u32   %tmp32_<1>;
@@ -29,14 +49,10 @@ def send_signal(addrs, sem: tl.constexpr):
                     @!%p0 bra send_signal;
             }
             """,
-            "=r, l",
-            [addrs],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
         )
     elif sem == "acq_rel":
-        tl.inline_asm_elementwise(
+        _signal_asm(
+            addrs,
             """
             {
                 .reg .u32   %tmp32_<1>;
@@ -48,11 +64,6 @@ def send_signal(addrs, sem: tl.constexpr):
                     @!%p0 bra send_signal;
             }
             """,
-            "=r, l",
-            [addrs],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
         )
     else:
         raise RuntimeError(f"Unrecognized sem: {sem}")
@@ -61,7 +72,8 @@ def send_signal(addrs, sem: tl.constexpr):
 @triton.jit
 def wait_signal(addrs, sem: tl.constexpr):
     if sem == "relaxed":
-        tl.inline_asm_elementwise(
+        _signal_asm(
+            addrs,
             """
             {
                 .reg .u32   %tmp32_<1>;
@@ -73,14 +85,10 @@ def wait_signal(addrs, sem: tl.constexpr):
                     @!%p0 bra wait_signal;
             }
             """,
-            "=r, l",
-            [addrs],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
         )
     elif sem == "acq_rel":
-        tl.inline_asm_elementwise(
+        _signal_asm(
+            addrs,
             """
             {
                 .reg .u32   %tmp32_<1>;
@@ -92,11 +100,6 @@ def wait_signal(addrs, sem: tl.constexpr):
                     @!%p0 bra wait_signal;
             }
             """,
-            "=r, l",
-            [addrs],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
         )
     else:
         raise RuntimeError(f"Unrecognized sem: {sem}")
