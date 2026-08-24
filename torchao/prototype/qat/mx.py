@@ -34,6 +34,11 @@ from torchao.prototype.mx_formats.mx_tensor import (
     _addmm_mx_dispatch,
 )
 from torchao.quantization.qat import FakeQuantizeConfigBase
+from torchao.quantization.qat.utils import (
+    _fake_quantized_linear_to_linear,
+    _FakeQuantizedLinearBase,
+    _linear_to_fake_quantized_linear,
+)
 from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 
 _DEFAULT_MX_DTYPE = torch.float4_e2m1fn_x2
@@ -154,7 +159,7 @@ class _MXQuantizedForwardFakeQuantizedBackward(torch.autograd.Function):
         return grad_input, grad_weight, None, None, None
 
 
-class MXFakeQuantizedLinear(torch.nn.Linear):
+class MXFakeQuantizedLinear(_FakeQuantizedLinearBase):
     """
     Linear module for fake quantized MX weights and/or activations.
 
@@ -181,29 +186,7 @@ class MXFakeQuantizedLinear(torch.nn.Linear):
         # Model contains `nn.Linear` with `MXTensor` weights now
     """
 
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = False,
-        activation_config: Optional[MXFakeQuantizeConfig] = None,
-        weight_config: Optional[MXFakeQuantizeConfig] = None,
-        *args,
-        **kwargs,
-    ):
-        super().__init__(
-            in_features,
-            out_features,
-            bias,
-            *args,
-            **kwargs,
-        )
-        if weight_config is None:
-            raise ValueError("Must specify `weight_config`")
-        if activation_config is None:
-            raise ValueError("Weight only MX QAT not supported yet")
-        self.activation_config = activation_config
-        self.weight_config = weight_config
+    _activation_required_msg = "Weight only MX QAT not supported yet"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         fq = _MXQuantizedForwardFakeQuantizedBackward.apply(
@@ -213,20 +196,7 @@ class MXFakeQuantizedLinear(torch.nn.Linear):
         return fq
 
     def to_linear(self) -> torch.nn.Linear:
-        new_linear = torch.nn.Linear(
-            self.in_features,
-            self.out_features,
-            self.bias is not None,
-            device=self.weight.device,
-            dtype=self.weight.dtype,
-        )
-        # In distributed training, the model may be instantiated
-        # on the meta device, in which case there is no need to
-        # copy the weights, and doing so will result in an error
-        if self.weight.device != torch.device("meta"):
-            new_linear.weight = self.weight
-            new_linear.bias = self.bias
-        return new_linear
+        return _fake_quantized_linear_to_linear(self)
 
     @classmethod
     def from_linear(
@@ -235,19 +205,9 @@ class MXFakeQuantizedLinear(torch.nn.Linear):
         activation_config: Optional[MXFakeQuantizeConfig] = None,
         weight_config: Optional[MXFakeQuantizeConfig] = None,
     ):
-        new_linear = MXFakeQuantizedLinear(
-            mod.in_features,
-            mod.out_features,
-            mod.bias is not None,
+        return _linear_to_fake_quantized_linear(
+            cls,
+            mod,
             activation_config=activation_config,
             weight_config=weight_config,
-            device=mod.weight.device,
-            dtype=mod.weight.dtype,
         )
-        # In distributed training, the model may be instantiated
-        # on the meta device, in which case there is no need to
-        # copy the weights, and doing so will result in an error
-        if mod.weight.device != torch.device("meta"):
-            new_linear.weight = mod.weight
-            new_linear.bias = mod.bias
-        return new_linear

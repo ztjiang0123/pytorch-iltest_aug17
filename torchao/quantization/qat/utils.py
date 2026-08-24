@@ -18,6 +18,105 @@ from torchao.quantization.utils import (
 )
 
 
+class _FakeQuantizedLinearBase(torch.nn.Linear):
+    """
+    Shared base for fake quantized linear modules that require both an
+    activation and a weight config (e.g. ``MXFakeQuantizedLinear``,
+    ``NVFP4FakeQuantizedLinear``).
+
+    Subclasses set ``_activation_required_msg`` to the format-specific error
+    raised when only weight quantization is provided. The constructor
+    initializes the underlying ``nn.Linear``, validates that both configs are
+    present, and stores them on the instance.
+
+    ``in_features``, ``out_features``, ``bias`` (and any other ``nn.Linear``
+    arguments such as ``device``/``dtype``) are forwarded through ``*args`` /
+    ``**kwargs``; ``activation_config`` and ``weight_config`` are keyword-only
+    since they are consumed here rather than passed to ``nn.Linear``.
+    """
+
+    # Format-specific error raised when only a weight config is provided.
+    _activation_required_msg: str = "Weight only QAT not supported yet"
+
+    def __init__(
+        self,
+        *args,
+        activation_config: Any = None,
+        weight_config: Any = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if weight_config is None:
+            raise ValueError("Must specify `weight_config`")
+        if activation_config is None:
+            raise ValueError(self._activation_required_msg)
+        self.activation_config = activation_config
+        self.weight_config = weight_config
+
+
+def _copy_fake_quantized_weights(
+    src: torch.nn.Linear,
+    dst: torch.nn.Linear,
+) -> None:
+    """
+    Copy the weight and bias from ``src`` to ``dst`` in place.
+
+    In distributed training, the model may be instantiated on the meta
+    device, in which case there is no need to copy the weights, and doing
+    so will result in an error.
+    """
+    if src.weight.device != torch.device("meta"):
+        dst.weight = src.weight
+        dst.bias = src.bias
+
+
+def _fake_quantized_linear_to_linear(mod: torch.nn.Linear) -> torch.nn.Linear:
+    """
+    Build a plain ``torch.nn.Linear`` mirroring the shape, device, and dtype
+    of a fake quantized linear module, copying over its weight and bias.
+
+    Shared by the ``to_linear`` conversion of the various fake quantized
+    linear modules (e.g. ``FakeQuantizedLinear``, ``MXFakeQuantizedLinear``,
+    ``NVFP4FakeQuantizedLinear``).
+    """
+    new_linear = torch.nn.Linear(
+        mod.in_features,
+        mod.out_features,
+        mod.bias is not None,
+        device=mod.weight.device,
+        dtype=mod.weight.dtype,
+    )
+    _copy_fake_quantized_weights(mod, new_linear)
+    return new_linear
+
+
+def _linear_to_fake_quantized_linear(
+    cls: type,
+    mod: torch.nn.Linear,
+    activation_config: Any = None,
+    weight_config: Any = None,
+) -> torch.nn.Linear:
+    """
+    Build a fake quantized linear of type ``cls`` mirroring the shape, device,
+    and dtype of ``mod``, copying over its weight and bias.
+
+    Shared by the ``from_linear`` conversion of the various fake quantized
+    linear modules (e.g. ``FakeQuantizedLinear``, ``MXFakeQuantizedLinear``,
+    ``NVFP4FakeQuantizedLinear``).
+    """
+    new_linear = cls(
+        mod.in_features,
+        mod.out_features,
+        mod.bias is not None,
+        activation_config=activation_config,
+        weight_config=weight_config,
+        device=mod.weight.device,
+        dtype=mod.weight.dtype,
+    )
+    _copy_fake_quantized_weights(mod, new_linear)
+    return new_linear
+
+
 def _fake_quantize_per_channel_group(
     input: torch.Tensor,
     scales: torch.Tensor,

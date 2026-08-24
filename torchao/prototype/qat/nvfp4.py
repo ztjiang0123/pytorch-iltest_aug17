@@ -9,6 +9,11 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
     per_tensor_amax_to_scale,
 )
 from torchao.quantization.qat import FakeQuantizeConfigBase
+from torchao.quantization.qat.utils import (
+    _fake_quantized_linear_to_linear,
+    _FakeQuantizedLinearBase,
+    _linear_to_fake_quantized_linear,
+)
 
 
 @dataclass
@@ -100,7 +105,7 @@ class _NVFP4QuantizedForwardFakeQuantizedBackward(torch.autograd.Function):
         return grad_input, grad_weight, None, None, None
 
 
-class NVFP4FakeQuantizedLinear(torch.nn.Linear):
+class NVFP4FakeQuantizedLinear(_FakeQuantizedLinearBase):
     """
     Linear module for fake quantized NVFP4 weights and/or activations.
 
@@ -125,29 +130,7 @@ class NVFP4FakeQuantizedLinear(torch.nn.Linear):
         # Model contains `nn.Linear` with `NVFP4Tensor` weights now
     """
 
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = False,
-        activation_config: Optional[NVFP4FakeQuantizeConfig] = None,
-        weight_config: Optional[NVFP4FakeQuantizeConfig] = None,
-        *args,
-        **kwargs,
-    ):
-        super().__init__(
-            in_features,
-            out_features,
-            bias,
-            *args,
-            **kwargs,
-        )
-        if weight_config is None:
-            raise ValueError("Must specify `weight_config`")
-        if activation_config is None:
-            raise ValueError("Weight only NVFP4 QAT not supported yet")
-        self.activation_config = activation_config
-        self.weight_config = weight_config
+    _activation_required_msg = "Weight only NVFP4 QAT not supported yet"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 3:
@@ -165,20 +148,7 @@ class NVFP4FakeQuantizedLinear(torch.nn.Linear):
             return fq
 
     def to_linear(self) -> torch.nn.Linear:
-        new_linear = torch.nn.Linear(
-            self.in_features,
-            self.out_features,
-            self.bias is not None,
-            device=self.weight.device,
-            dtype=self.weight.dtype,
-        )
-        # In distributed training, the model may be instantiated
-        # on the meta device, in which case there is no need to
-        # copy the weights, and doing so will result in an error
-        if self.weight.device != torch.device("meta"):
-            new_linear.weight = self.weight
-            new_linear.bias = self.bias
-        return new_linear
+        return _fake_quantized_linear_to_linear(self)
 
     @classmethod
     def from_linear(
@@ -187,19 +157,9 @@ class NVFP4FakeQuantizedLinear(torch.nn.Linear):
         activation_config: Optional[NVFP4FakeQuantizeConfig] = None,
         weight_config: Optional[NVFP4FakeQuantizeConfig] = None,
     ):
-        new_linear = NVFP4FakeQuantizedLinear(
-            mod.in_features,
-            mod.out_features,
-            mod.bias is not None,
+        return _linear_to_fake_quantized_linear(
+            cls,
+            mod,
             activation_config=activation_config,
             weight_config=weight_config,
-            device=mod.weight.device,
-            dtype=mod.weight.dtype,
         )
-        # In distributed training, the model may be instantiated
-        # on the meta device, in which case there is no need to
-        # copy the weights, and doing so will result in an error
-        if mod.weight.device != torch.device("meta"):
-            new_linear.weight = mod.weight
-            new_linear.bias = mod.bias
-        return new_linear

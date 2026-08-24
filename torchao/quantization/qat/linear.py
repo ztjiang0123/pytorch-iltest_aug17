@@ -35,7 +35,9 @@ from .fake_quantizer import (
 )
 from .two_step_quantizer import TwoStepQuantizer
 from .utils import (
+    _fake_quantized_linear_to_linear,
     _get_qmin_qmax,
+    _linear_to_fake_quantized_linear,
 )
 
 
@@ -115,20 +117,7 @@ class FakeQuantizedLinear(torch.nn.Linear):
         return F.linear(x, w, self.bias)
 
     def to_linear(self) -> torch.nn.Linear:
-        new_linear = torch.nn.Linear(
-            self.in_features,
-            self.out_features,
-            self.bias is not None,
-            device=self.weight.device,
-            dtype=self.weight.dtype,
-        )
-        # In distributed training, the model may be instantiated
-        # on the meta device, in which case there is no need to
-        # copy the weights, and doing so will result in an error
-        if self.weight.device != torch.device("meta"):
-            new_linear.weight = self.weight
-            new_linear.bias = self.bias
-        return new_linear
+        return _fake_quantized_linear_to_linear(self)
 
     @classmethod
     def from_linear(
@@ -137,22 +126,12 @@ class FakeQuantizedLinear(torch.nn.Linear):
         activation_config: Optional[FakeQuantizeConfigBase] = None,
         weight_config: Optional[FakeQuantizeConfigBase] = None,
     ):
-        new_linear = FakeQuantizedLinear(
-            mod.in_features,
-            mod.out_features,
-            mod.bias is not None,
+        return _linear_to_fake_quantized_linear(
+            cls,
+            mod,
             activation_config=activation_config,
             weight_config=weight_config,
-            device=mod.weight.device,
-            dtype=mod.weight.dtype,
         )
-        # In distributed training, the model may be instantiated
-        # on the meta device, in which case there is no need to
-        # copy the weights, and doing so will result in an error
-        if mod.weight.device != torch.device("meta"):
-            new_linear.weight = mod.weight
-            new_linear.bias = mod.bias
-        return new_linear
 
 
 def enable_linear_fake_quant(
