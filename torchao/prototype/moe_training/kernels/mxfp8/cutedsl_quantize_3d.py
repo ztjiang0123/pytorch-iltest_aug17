@@ -13,11 +13,11 @@ import torch
 from torchao.utils import ceil_div
 
 from .cute_utils import (
-    F8_MAX,
     compute_amax,
     compute_scale_from_amax,
-    load_vals_chunk_full,
-    load_vals_chunk_tail,
+    quantize_block_store_full,
+    quantize_block_store_tail,
+    quantize_chunk_to_fp8,
 )
 
 
@@ -332,13 +332,7 @@ def _compile_mxfp8_quantize_3d_cutedsl(
             k_rel: cutlass.Int32,
             USE_RCEIL: cutlass.Constexpr[bool],
         ):
-            q_vals4_vec = vals_chunk.load() * inv_scale
-            if not cutlass.const_expr(USE_RCEIL):
-                q_vals4_vec = cute.where(q_vals4_vec > F8_MAX, F8_MAX, q_vals4_vec)
-                q_vals4_vec = cute.where(q_vals4_vec < -F8_MAX, -F8_MAX, q_vals4_vec)
-            q_fp8_vec4 = q_vals4_vec.to(cutlass.Float8E4M3FN)
-            q_fp8_vals4 = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
-            q_fp8_vals4.store(q_fp8_vec4)
+            q_fp8_vals4 = quantize_chunk_to_fp8(vals_chunk, inv_scale, USE_RCEIL)
             self._store_q_fp8_chunk(q_fp8_vals4, sOUT_tile, sout_base, k_rel)
 
         @cute.jit
@@ -351,15 +345,19 @@ def _compile_mxfp8_quantize_3d_cutedsl(
             k_rel: cutlass.Int32,
             USE_RCEIL: cutlass.Constexpr[bool],
         ):
-            chunk_vec = 4
-            num_chunks = SCALE_DIM_N_VALUE // chunk_vec
-            for c in range(num_chunks):
-                local_base = c * chunk_vec
-                sout_base = n_base + local_base
-                vals_chunk = load_vals_chunk_full(vals_block, local_base)
+            def store_chunk_fn(vals_chunk, inv_scale, sout_base, USE_RCEIL):
                 self._quantize_store_chunk(
                     vals_chunk, inv_scale, sOUT_tile, sout_base, k_rel, USE_RCEIL
                 )
+
+            quantize_block_store_full(
+                SCALE_DIM_N_VALUE,
+                vals_block,
+                inv_scale,
+                n_base,
+                store_chunk_fn,
+                USE_RCEIL,
+            )
 
         @cute.jit
         def _quantize_store_tail(
@@ -373,17 +371,21 @@ def _compile_mxfp8_quantize_3d_cutedsl(
             N: cutlass.Int64,
             USE_RCEIL: cutlass.Constexpr[bool],
         ):
-            chunk_vec = 4
-            num_chunks = SCALE_DIM_N_VALUE // chunk_vec
-            for c in range(num_chunks):
-                local_base = c * chunk_vec
-                sout_base = n_base + local_base
-                vals_chunk = load_vals_chunk_tail(
-                    vals_block, n0, sout_base, local_base, N
-                )
+            def store_chunk_fn(vals_chunk, inv_scale, sout_base, USE_RCEIL):
                 self._quantize_store_chunk(
                     vals_chunk, inv_scale, sOUT_tile, sout_base, k_rel, USE_RCEIL
                 )
+
+            quantize_block_store_tail(
+                SCALE_DIM_N_VALUE,
+                vals_block,
+                inv_scale,
+                n0,
+                n_base,
+                N,
+                store_chunk_fn,
+                USE_RCEIL,
+            )
 
         @cute.jit
         def _issue_tma_load(

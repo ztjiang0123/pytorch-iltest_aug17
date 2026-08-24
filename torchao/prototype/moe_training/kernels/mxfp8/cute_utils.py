@@ -7,6 +7,36 @@
 """Shared utilities for CuTeDSL quantization kernels."""
 
 import importlib.util
+from typing import Dict, Tuple
+
+import torch
+
+
+def select_cutedsl_config(
+    input_dtype: torch.dtype,
+    configs: Dict[str, Tuple[int, int, int, int]],
+) -> Tuple[str, Tuple[int, int, int, int]]:
+    """Select a kernel configuration based on input dtype.
+
+    Chooses the ``"bf16_default"`` config for bfloat16 inputs and the
+    ``"fallback"`` config otherwise. Both the 1x32 and 32x1 2D kernels share
+    this selection logic; only the concrete config table differs between them.
+
+    Args:
+        input_dtype: Input dtype
+        configs: Mapping of config name to
+            ``(compute_warps, tile_m, tile_k, tiles_per_cta)`` tuples. Must
+            contain both ``"bf16_default"`` and ``"fallback"`` entries.
+
+    Returns:
+        Tuple of (config_name, (compute_warps, tile_a, tile_b, tiles_per_cta))
+    """
+    if input_dtype == torch.bfloat16:
+        config_name = "bf16_default"
+    else:
+        config_name = "fallback"
+    return config_name, configs[config_name]
+
 
 # Runtime package detection
 _CUTEDSL_RUNTIME_PACKAGES = {
@@ -225,6 +255,155 @@ if _cutedsl_runtime_available():
             else:
                 vals_chunk[j] = cutlass.Float32(0.0)
         return vals_chunk
+
+    @cute.jit
+    def quantize_chunk_to_fp8(
+        vals_chunk: cute.Tensor,
+        inv_scale: cutlass.Float32,
+        USE_RCEIL: cutlass.Constexpr[bool],
+    ):
+        """Quantize 4 input elements to FP8 in registers.
+
+        Applies the inverse scale, optional clamping (FLOOR mode clamps to
+        ±448, RCEIL relies on saturating conversion), and converts to FP8.
+        The caller is responsible for storing the returned values, since the
+        destination shared-memory layout differs between kernels.
+
+        Args:
+            vals_chunk: 4 input elements in register memory
+            inv_scale: Inverse scale in register memory
+            USE_RCEIL: Whether using RCEIL mode (no clamping) or FLOOR mode
+
+        Returns:
+            Register tensor of shape (4,) containing the FP8 quantized values
+        """
+        q_vals4_vec = vals_chunk.load() * inv_scale
+        if not cutlass.const_expr(USE_RCEIL):
+            q_vals4_vec = cute.where(q_vals4_vec > F8_MAX, F8_MAX, q_vals4_vec)
+            q_vals4_vec = cute.where(q_vals4_vec < -F8_MAX, -F8_MAX, q_vals4_vec)
+        q_fp8_vec4 = q_vals4_vec.to(cutlass.Float8E4M3FN)
+        q_fp8_vals4 = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
+        q_fp8_vals4.store(q_fp8_vec4)
+        return q_fp8_vals4
+
+    @cute.jit
+    def quantize_block_store_full(
+        scale_dim: cutlass.Constexpr[int],
+        vals_block: cute.Tensor,
+        inv_scale: cutlass.Float32,
+        base: cutlass.Int32,
+        store_chunk_fn,
+        USE_RCEIL: cutlass.Constexpr[bool],
+    ):
+        """Quantize and store a full ``scale_dim``-element block, 4 elements at a time.
+
+        Iterates over ``scale_dim // 4`` chunks and, for each, loads the chunk
+        from ``vals_block`` and hands it to ``store_chunk_fn`` along with the
+        absolute base offset for that chunk. The callback owns the actual store,
+        so this scaffolding is shared across the 1x32, 32x1, and 3D kernels
+        even though their shared-memory layouts differ.
+
+        Args:
+            scale_dim: Number of elements in the quantization block (constexpr)
+            vals_block: ``scale_dim`` input elements in register memory
+            inv_scale: Inverse scale in register memory
+            base: Absolute base offset for this block within the tile
+            store_chunk_fn: Callable ``(vals_chunk, inv_scale, sout_base, USE_RCEIL)``
+                that quantizes and stores one 4-element chunk
+            USE_RCEIL: Whether using RCEIL mode or FLOOR mode
+        """
+        chunk_vec = 4
+        num_chunks = scale_dim // chunk_vec
+        for c in range(num_chunks):
+            local_base = c * chunk_vec
+            sout_base = base + local_base
+            vals_chunk = load_vals_chunk_full(vals_block, local_base)
+            store_chunk_fn(vals_chunk, inv_scale, sout_base, USE_RCEIL)
+
+    @cute.jit
+    def quantize_block_store_tail(
+        scale_dim: cutlass.Constexpr[int],
+        vals_block: cute.Tensor,
+        inv_scale: cutlass.Float32,
+        dim0: cutlass.Int64,
+        base: cutlass.Int32,
+        dim_size: cutlass.Int64,
+        store_chunk_fn,
+        USE_RCEIL: cutlass.Constexpr[bool],
+    ):
+        """Quantize and store a ``scale_dim``-element block with bounds checking.
+
+        Like :func:`quantize_block_store_full`, but out-of-bounds elements are
+        zeroed during chunk loading using ``dim0``/``dim_size``.
+
+        Args:
+            scale_dim: Number of elements in the quantization block (constexpr)
+            vals_block: ``scale_dim`` input elements in register memory
+            inv_scale: Inverse scale in register memory
+            dim0: Global offset of this tile along the bounded dimension
+            base: Absolute base offset for this block within the tile
+            dim_size: Total size of the bounded dimension
+            store_chunk_fn: Callable ``(vals_chunk, inv_scale, sout_base, USE_RCEIL)``
+                that quantizes and stores one 4-element chunk
+            USE_RCEIL: Whether using RCEIL mode or FLOOR mode
+        """
+        chunk_vec = 4
+        num_chunks = scale_dim // chunk_vec
+        for c in range(num_chunks):
+            local_base = c * chunk_vec
+            sout_base = base + local_base
+            vals_chunk = load_vals_chunk_tail(
+                vals_block, dim0, sout_base, local_base, dim_size
+            )
+            store_chunk_fn(vals_chunk, inv_scale, sout_base, USE_RCEIL)
+
+    @cute.jit
+    def store_scales_reg_to_gmem_vec(
+        scales_tensor: cute.Tensor,
+        row: cutlass.Int64,
+        block_base: cutlass.Int64,
+        scale_buffer: cute.Tensor,
+        num_scales: cutlass.Int32,
+        BLOCKED_SCALE_OUTPUT: cutlass.Constexpr[bool],
+    ):
+        """Store scales from registers to global memory, vectorizing when possible.
+
+        Uses a single uint32 vectorized write for the common case of 4 scales
+        in blocked layout, and falls back to scalar writes otherwise. This is
+        shared by the 1x32 and 32x1 2D kernels, which only differ in which
+        logical axis ``row``/``block_base`` index.
+
+        Args:
+            scales_tensor: Output scales in global memory
+            row: Global coordinate of the fixed axis (M for 1x32, K for 32x1)
+            block_base: Starting block index along the scaled axis
+            scale_buffer: Buffer of scales in register memory (uint8)
+            num_scales: Number of scales to store
+            BLOCKED_SCALE_OUTPUT: Whether using blocked layout (enables vectorization)
+
+        Storage locations:
+            Input: scale_buffer (registers)
+            Output: scales_tensor (global memory)
+        """
+        if cutlass.const_expr(BLOCKED_SCALE_OUTPUT):
+            # Blocked layout with 4 contiguous scales - write as uint32
+            if num_scales == 4:
+                # Pack 4 uint8 scales into uint32 and write
+                scales_tensor_u32 = cute.recast_tensor(scales_tensor, cutlass.Uint32)
+                scale_buffer_u32 = cute.recast_tensor(scale_buffer, cutlass.Uint32)
+                scales_tensor_u32[row, block_base // cutlass.Int64(4)] = (
+                    scale_buffer_u32[0]
+                )
+            else:
+                # Fallback for non-4 cases (e.g., tail tiles)
+                for i in range(num_scales):
+                    block = block_base + i
+                    scales_tensor[row, block] = scale_buffer[i]
+        else:
+            # Row-major layout - scalar stores
+            for i in range(num_scales):
+                block = block_base + i
+                scales_tensor[row, block] = scale_buffer[i]
 
     @cute.jit
     def validate_group_sizes(offs: cute.Tensor):
