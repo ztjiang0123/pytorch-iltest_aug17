@@ -426,44 +426,45 @@ class nvfp4_col_parallel_mm(torch.autograd.Function):
         return dx, dw, grad_bias, None, None, None, None
 
 
-def _nvfp4_parallel_linear(
-    mm_fn,
-    name: str,
-    x: torch.Tensor,
-    w: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    sr_seed: Optional[torch.Tensor],
-    tp_group,
-    world_size: Optional[int],
-    sign_vector: tuple[int, ...] | list[int],
-) -> torch.Tensor:
-    """Shared body for the NVFP4 tensor-parallel linear wrappers.
+def _make_nvfp4_parallel_linear(mm_fn, name: str, doc: str):
+    """Build a convenience wrapper that dispatches to the autograd ``mm_fn``.
 
-    Validates the process group, fills in the TP world size and SR seed
-    defaults, and dispatches to the given autograd ``mm_fn``. ``name`` is only
-    used to make the missing-``tp_group`` error message specific to the caller.
+    The col- and row-parallel entry points differ only in the autograd function
+    they call, so both are produced from this single factory instead of two
+    near-identical hand-written wrappers. The returned wrapper validates the
+    process group, fills in the TP world size and SR seed defaults, then applies
+    ``mm_fn``.
     """
-    if tp_group is None:
-        raise ValueError(f"tp_group is required for {name}")
-    if world_size is None:
-        world_size = dist.get_world_size(tp_group)
-    if sr_seed is None:
-        sr_seed = torch.randint(
-            -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=x.device
-        )
-    return mm_fn.apply(x, w, bias, sr_seed, tp_group, world_size, sign_vector)
+
+    def _linear(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        sr_seed: Optional[torch.Tensor] = None,
+        tp_group=None,
+        world_size: Optional[int] = None,
+        *,
+        sign_vector: tuple[int, ...] | list[int],
+    ) -> torch.Tensor:
+        if tp_group is None:
+            raise ValueError(f"tp_group is required for {name}")
+        if world_size is None:
+            world_size = dist.get_world_size(tp_group)
+        if sr_seed is None:
+            sr_seed = torch.randint(
+                -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=x.device
+            )
+        return mm_fn.apply(x, w, bias, sr_seed, tp_group, world_size, sign_vector)
+
+    _linear.__name__ = name
+    _linear.__qualname__ = name
+    _linear.__doc__ = doc
+    return _linear
 
 
-def nvfp4_col_parallel_linear(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    sr_seed: Optional[torch.Tensor] = None,
-    tp_group=None,
-    world_size: Optional[int] = None,
-    *,
-    sign_vector: tuple[int, ...] | list[int],
-) -> torch.Tensor:
+nvfp4_col_parallel_linear = _make_nvfp4_parallel_linear(
+    nvfp4_col_parallel_mm,
+    "nvfp4_col_parallel_linear",
     """Convenience wrapper around nvfp4_col_parallel_mm.
 
     Args:
@@ -475,18 +476,8 @@ def nvfp4_col_parallel_linear(
         world_size: TP world size (inferred from group if None).
         sign_vector: RHT sign vector used for amax and quantization. Must
             match across TP ranks.
-    """
-    return _nvfp4_parallel_linear(
-        nvfp4_col_parallel_mm,
-        "nvfp4_col_parallel_linear",
-        x,
-        w,
-        bias,
-        sr_seed,
-        tp_group,
-        world_size,
-        sign_vector,
-    )
+    """,
+)
 
 
 @torch._dynamo.allow_in_graph
@@ -720,16 +711,9 @@ class nvfp4_row_parallel_mm(torch.autograd.Function):
         return dx, dw, grad_bias, None, None, None, None
 
 
-def nvfp4_row_parallel_linear(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    sr_seed: Optional[torch.Tensor] = None,
-    tp_group=None,
-    world_size: Optional[int] = None,
-    *,
-    sign_vector: tuple[int, ...] | list[int],
-) -> torch.Tensor:
+nvfp4_row_parallel_linear = _make_nvfp4_parallel_linear(
+    nvfp4_row_parallel_mm,
+    "nvfp4_row_parallel_linear",
     """Convenience wrapper around nvfp4_row_parallel_mm.
 
     Args:
@@ -741,18 +725,8 @@ def nvfp4_row_parallel_linear(
         world_size: TP world size (inferred from group if None).
         sign_vector: RHT sign vector used for amax and quantization. Must
             match across TP ranks.
-    """
-    return _nvfp4_parallel_linear(
-        nvfp4_row_parallel_mm,
-        "nvfp4_row_parallel_linear",
-        x,
-        w,
-        bias,
-        sr_seed,
-        tp_group,
-        world_size,
-        sign_vector,
-    )
+    """,
+)
 
 
 class NVFP4ColwiseParallel(ColwiseParallel):
