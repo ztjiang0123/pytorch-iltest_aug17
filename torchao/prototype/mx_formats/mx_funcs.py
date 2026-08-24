@@ -18,6 +18,7 @@ from torchao.prototype.mx_formats.mx_ops import _addmm_mx_dispatch
 from torchao.prototype.mx_formats.mx_tensor import (  # noqa: E501
     MXTensor,
 )
+from torchao.utils import _register_to_op_table
 
 aten = torch.ops.aten
 
@@ -26,13 +27,7 @@ MX_FUNC_TABLE: Dict[Any, Any] = {}
 
 def implements_func(torch_ops):
     """Register torch ops to the mx op table for torch function"""
-
-    def decorator(func):
-        for op in torch_ops:
-            MX_FUNC_TABLE[op] = func
-        return func
-
-    return decorator
+    return _register_to_op_table(MX_FUNC_TABLE, torch_ops)
 
 
 @implements_func([aten.linear.default])

@@ -429,6 +429,31 @@ def _implements(cls, aten_ops):
     return decorator
 
 
+def _register_to_op_table(op_table, ops):
+    """Return a decorator that registers a function into ``op_table`` for each op.
+
+    Shared helper for the module-level op-dispatch tables that map ops (aten ops
+    or torch ops) to their implementations. The returned decorator registers the
+    decorated function under every op in ``ops`` and returns the function
+    unchanged so it stays usable directly.
+
+    Examples::
+
+        MY_OPS_TABLE = {}
+
+        @_register_to_op_table(MY_OPS_TABLE, [aten.mm.default])
+        def my_mm(...):
+            ...
+    """
+
+    def decorator(func):
+        for op in ops:
+            op_table[op] = func
+        return func
+
+    return decorator
+
+
 def _implements_torch_function(cls, torch_fns):
     """Decorator for implementing torch functions / ops
     like ``torch.nn.functional.linear``, ``torch.Tensor.t`` for the tensor subclass

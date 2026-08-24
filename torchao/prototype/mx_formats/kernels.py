@@ -974,23 +974,34 @@ if _triton_kernels_available:
             col_scale.view(torch.float8_e8m0fnu).squeeze(-1),
         )
 
+    def _mxfp8_sharding_rule(out_dim_for_input_dim0, out_dim_for_input_dim1):
+        """Build the acceptable-sharding list for the triton_to_mxfp8 ops.
+
+        Both ``dim0`` and ``dim1`` variants accept replicate plus sharding the
+        input along dim0 or dim1; they differ only in which output dim the
+        sharded output/scale land on. The ``dim1`` op returns its data
+        transposed, so its output dims are flipped relative to the input dims.
+        """
+        replicate = ([Replicate(), Replicate()], [Replicate(), None])
+        shard_input_dim0 = (
+            [Shard(0), Shard(0)],
+            [Shard(out_dim_for_input_dim0), None],
+        )
+        shard_input_dim1 = (
+            [Shard(1), Shard(1)],
+            [Shard(out_dim_for_input_dim1), None],
+        )
+        return [replicate, shard_input_dim0, shard_input_dim1]
+
     @register_sharding(torch.ops.torchao.triton_to_mxfp8_dim0.default)
     def custom_triton_to_mxfp8_dim0_sharding(x, inner_block_size=32):
-        replicate = ([Replicate(), Replicate()], [Replicate(), None])
-        shard_dim0 = ([Shard(0), Shard(0)], [Shard(0), None])
-        shard_dim1 = ([Shard(1), Shard(1)], [Shard(1), None])
-        acceptable_shardings = [replicate, shard_dim0, shard_dim1]
-        return acceptable_shardings
+        return _mxfp8_sharding_rule(0, 1)
 
     @register_sharding(torch.ops.torchao.triton_to_mxfp8_dim1.default)
     def custom_triton_to_mxfp8_dim1_sharding(x, inner_block_size=32):
-        replicate = ([Replicate(), Replicate()], [Replicate(), None])
-        # Note that the data is returned transposed, which is why
-        # we flip the sharding dim below
-        shard_dim0 = ([Shard(1), Shard(1)], [Shard(0), None])
-        shard_dim1 = ([Shard(0), Shard(0)], [Shard(1), None])
-        acceptable_shardings = [replicate, shard_dim0, shard_dim1]
-        return acceptable_shardings
+        # The data is returned transposed, which is why the output sharding
+        # dims are flipped relative to the input dims.
+        return _mxfp8_sharding_rule(1, 0)
 
 else:
 

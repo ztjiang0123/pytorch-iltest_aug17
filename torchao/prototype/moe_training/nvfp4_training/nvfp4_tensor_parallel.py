@@ -16,7 +16,8 @@ The all-gather and reduce-scatter collectives are handled inside the autograd
 functions so the module forward signature stays identical to a plain nn.Linear.
 """
 
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -45,6 +46,28 @@ from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 _TP_STYLE_COLWISE = "colwise"
 _TP_STYLE_ROWWISE = "rowwise"
+
+
+@dataclass
+class NVFP4ParallelLinearConfig:
+    """Collective / quantization settings for the NVFP4 TP linear wrappers.
+
+    Grouping these values keeps the public wrapper signature small while
+    exposing the same knobs the caller previously passed as keyword arguments.
+
+    Attributes:
+        tp_group: ProcessGroup for TP collectives. Required.
+        sign_vector: RHT sign vector used for amax and quantization. Must match
+            across TP ranks.
+        world_size: TP world size (inferred from ``tp_group`` if None).
+        sr_seed: Fixed int64 seed tensor (size=(1,)) for the SR Philox key
+            (generated per call if None).
+    """
+
+    tp_group: object
+    sign_vector: Union[tuple[int, ...], list[int]]
+    world_size: Optional[int] = None
+    sr_seed: Optional[torch.Tensor] = None
 
 
 def _nvfp4_prepare_input_fn(
@@ -426,39 +449,55 @@ class nvfp4_col_parallel_mm(torch.autograd.Function):
         return dx, dw, grad_bias, None, None, None, None
 
 
-def nvfp4_col_parallel_linear(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    sr_seed: Optional[torch.Tensor] = None,
-    tp_group=None,
-    world_size: Optional[int] = None,
-    *,
-    sign_vector: tuple[int, ...] | list[int],
-) -> torch.Tensor:
+def _make_nvfp4_parallel_linear(mm_fn, name: str, doc: str):
+    """Build a convenience wrapper that dispatches to the autograd ``mm_fn``.
+
+    The col- and row-parallel entry points differ only in the autograd function
+    they call, so both are produced from this single factory instead of two
+    near-identical hand-written wrappers. The returned wrapper validates the
+    process group, fills in the TP world size and SR seed defaults, then applies
+    ``mm_fn``.
+    """
+
+    def _linear(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        config: "NVFP4ParallelLinearConfig",
+    ) -> torch.Tensor:
+        if config.tp_group is None:
+            raise ValueError(f"tp_group is required for {name}")
+        world_size = config.world_size
+        if world_size is None:
+            world_size = dist.get_world_size(config.tp_group)
+        sr_seed = config.sr_seed
+        if sr_seed is None:
+            sr_seed = torch.randint(
+                -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=x.device
+            )
+        return mm_fn.apply(
+            x, w, bias, sr_seed, config.tp_group, world_size, config.sign_vector
+        )
+
+    _linear.__name__ = name
+    _linear.__qualname__ = name
+    _linear.__doc__ = doc
+    return _linear
+
+
+nvfp4_col_parallel_linear = _make_nvfp4_parallel_linear(
+    nvfp4_col_parallel_mm,
+    "nvfp4_col_parallel_linear",
     """Convenience wrapper around nvfp4_col_parallel_mm.
 
     Args:
         x: Input [m/w, k] bfloat16.
         w: Weight shard [n/w, k] bfloat16.
         bias: Optional bias [n/w].
-        sr_seed: Fixed int64 seed tensor (size=(1,)) for SR Philox key.
-        tp_group: ProcessGroup for TP collectives.
-        world_size: TP world size (inferred from group if None).
-        sign_vector: RHT sign vector used for amax and quantization. Must
-            match across TP ranks.
-    """
-    if tp_group is None:
-        raise ValueError("tp_group is required for nvfp4_col_parallel_linear")
-    if world_size is None:
-        world_size = dist.get_world_size(tp_group)
-    if sr_seed is None:
-        sr_seed = torch.randint(
-            -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=x.device
-        )
-    return nvfp4_col_parallel_mm.apply(
-        x, w, bias, sr_seed, tp_group, world_size, sign_vector
-    )
+        config: NVFP4ParallelLinearConfig with the TP process group, sign
+            vector, and optional world size / SR seed.
+    """,
+)
 
 
 @torch._dynamo.allow_in_graph
@@ -692,39 +731,19 @@ class nvfp4_row_parallel_mm(torch.autograd.Function):
         return dx, dw, grad_bias, None, None, None, None
 
 
-def nvfp4_row_parallel_linear(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    sr_seed: Optional[torch.Tensor] = None,
-    tp_group=None,
-    world_size: Optional[int] = None,
-    *,
-    sign_vector: tuple[int, ...] | list[int],
-) -> torch.Tensor:
+nvfp4_row_parallel_linear = _make_nvfp4_parallel_linear(
+    nvfp4_row_parallel_mm,
+    "nvfp4_row_parallel_linear",
     """Convenience wrapper around nvfp4_row_parallel_mm.
 
     Args:
         x: Input [m, k/w] bfloat16.
         w: Weight shard [n, k/w] bfloat16.
         bias: Optional replicated bias [n].
-        sr_seed: Fixed int64 seed tensor (size=(1,)) for SR Philox key.
-        tp_group: ProcessGroup for TP collectives.
-        world_size: TP world size (inferred from group if None).
-        sign_vector: RHT sign vector used for amax and quantization. Must
-            match across TP ranks.
-    """
-    if tp_group is None:
-        raise ValueError("tp_group is required for nvfp4_row_parallel_linear")
-    if world_size is None:
-        world_size = dist.get_world_size(tp_group)
-    if sr_seed is None:
-        sr_seed = torch.randint(
-            -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=x.device
-        )
-    return nvfp4_row_parallel_mm.apply(
-        x, w, bias, sr_seed, tp_group, world_size, sign_vector
-    )
+        config: NVFP4ParallelLinearConfig with the TP process group, sign
+            vector, and optional world size / SR seed.
+    """,
+)
 
 
 class NVFP4ColwiseParallel(ColwiseParallel):

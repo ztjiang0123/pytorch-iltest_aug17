@@ -287,6 +287,21 @@ def _to_mxfp8_per_group_colwise(
     return A_mx, A_scales.view(torch.float8_e8m0fnu)
 
 
+def _is_contiguous_in_dim(x: torch.Tensor, dim: int) -> bool:
+    """
+    Check whether the input tensor is contiguous (stride 1) along ``dim``.
+
+    Args:
+        x (torch.Tensor): The input tensor to be checked.
+        dim (int): The dimension whose stride is compared against 1.
+
+    Returns:
+        A boolean indicating whether ``x`` has unit stride along ``dim``.
+    """
+    assert x.ndim == 2 or x.ndim == 3, "input tensor must be 2D or 3D"
+    return x.stride(dim) == 1
+
+
 def _is_column_major(x: torch.Tensor) -> bool:
     """
     This function checks if the input tensor is column-major.
@@ -297,8 +312,7 @@ def _is_column_major(x: torch.Tensor) -> bool:
     Returns:
         A boolean indicating whether the input tensor is column-major.
     """
-    assert x.ndim == 2 or x.ndim == 3, "input tensor must be 2D or 3D"
-    return x.stride(-2) == 1
+    return _is_contiguous_in_dim(x, -2)
 
 
 def _is_row_major(x: torch.Tensor) -> bool:
@@ -311,8 +325,7 @@ def _is_row_major(x: torch.Tensor) -> bool:
     Returns:
         A boolean indicating whether the input tensor is row-major.
     """
-    assert x.ndim == 2 or x.ndim == 3, "input tensor must be 2D or 3D"
-    return x.stride(-1) == 1
+    return _is_contiguous_in_dim(x, -1)
 
 
 def generate_jagged_offs(E, M, multiple_of=32, dtype=torch.int32, device="cuda"):
