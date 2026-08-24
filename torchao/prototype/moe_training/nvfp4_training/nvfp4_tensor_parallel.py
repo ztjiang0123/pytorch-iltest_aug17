@@ -47,6 +47,60 @@ _TP_STYLE_COLWISE = "colwise"
 _TP_STYLE_ROWWISE = "rowwise"
 
 
+def _nvfp4_prepare_input_fn(
+    input_layouts, desired_input_layouts, mod, inputs, device_mesh
+):
+    """Pass the local tensor shard through, unwrapping DTensor inputs.
+
+    Shared by NVFP4ColwiseParallel and NVFP4RowwiseParallel: the NVFP4
+    collectives run inside the autograd functions, so runtime hooks forward
+    local shards instead of redistributing BF16 activations.
+    """
+    input_tensor = inputs[0]
+    return (
+        input_tensor.to_local() if isinstance(input_tensor, DTensor) else input_tensor
+    )
+
+
+def _nvfp4_prepare_output_fn(
+    output_layouts, use_local_output, mod, outputs, device_mesh
+):
+    """Redistribute/unwrap the module output, shared by both TP styles."""
+    if isinstance(outputs, DTensor):
+        if outputs.placements != output_layouts:
+            outputs = outputs.redistribute(placements=output_layouts, async_op=True)
+        return outputs.to_local() if use_local_output else outputs
+    if use_local_output:
+        return outputs
+    return DTensor.from_local(outputs, device_mesh, output_layouts, run_check=False)
+
+
+def _nvfp4_apply(
+    parallel_style,
+    module: nn.Module,
+    device_mesh: DeviceMesh,
+    tensor_parallel_style: str,
+    style_name: str,
+) -> nn.Module:
+    """Inject the process group into an NVFP4Linear and delegate to the parent.
+
+    Shared by NVFP4ColwiseParallel and NVFP4RowwiseParallel; ``style_name`` is
+    used only for the error message and ``tensor_parallel_style`` selects the
+    forward dispatch path.
+    """
+    from torchao.prototype.moe_training.nvfp4_training.nvfp4_training import (
+        NVFP4Linear,
+    )
+
+    if not isinstance(module, NVFP4Linear):
+        raise ValueError(f"{style_name} requires NVFP4Linear, got {type(module)}")
+    module.process_group = device_mesh.get_group()
+    module.world_size = device_mesh.size()
+    module.tensor_parallel_style = tensor_parallel_style
+    _replicate_rht_sign_vector(module, device_mesh, parallel_style.src_data_rank)
+    return super(type(parallel_style), parallel_style)._apply(module, device_mesh)
+
+
 def _replicate_rht_sign_vector(
     module: nn.Module,
     device_mesh: DeviceMesh,
@@ -685,41 +739,17 @@ class NVFP4ColwiseParallel(ColwiseParallel):
     through instead of redistributing BF16 activations.
     """
 
-    @staticmethod
-    def _prepare_input_fn(
-        input_layouts, desired_input_layouts, mod, inputs, device_mesh
-    ):
-        input_tensor = inputs[0]
-        return (
-            input_tensor.to_local()
-            if isinstance(input_tensor, DTensor)
-            else input_tensor
-        )
-
-    @staticmethod
-    def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
-        if isinstance(outputs, DTensor):
-            if outputs.placements != output_layouts:
-                outputs = outputs.redistribute(placements=output_layouts, async_op=True)
-            return outputs.to_local() if use_local_output else outputs
-        if use_local_output:
-            return outputs
-        return DTensor.from_local(outputs, device_mesh, output_layouts, run_check=False)
+    _prepare_input_fn = staticmethod(_nvfp4_prepare_input_fn)
+    _prepare_output_fn = staticmethod(_nvfp4_prepare_output_fn)
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        from torchao.prototype.moe_training.nvfp4_training.nvfp4_training import (
-            NVFP4Linear,
+        return _nvfp4_apply(
+            self,
+            module,
+            device_mesh,
+            tensor_parallel_style=_TP_STYLE_COLWISE,
+            style_name="NVFP4ColwiseParallel",
         )
-
-        if not isinstance(module, NVFP4Linear):
-            raise ValueError(
-                f"NVFP4ColwiseParallel requires NVFP4Linear, got {type(module)}"
-            )
-        module.process_group = device_mesh.get_group()
-        module.world_size = device_mesh.size()
-        module.tensor_parallel_style = _TP_STYLE_COLWISE
-        _replicate_rht_sign_vector(module, device_mesh, self.src_data_rank)
-        return super()._apply(module, device_mesh)
 
 
 class NVFP4RowwiseParallel(RowwiseParallel):
@@ -735,38 +765,14 @@ class NVFP4RowwiseParallel(RowwiseParallel):
     through instead of redistributing BF16 activations.
     """
 
-    @staticmethod
-    def _prepare_input_fn(
-        input_layouts, desired_input_layouts, mod, inputs, device_mesh
-    ):
-        input_tensor = inputs[0]
-        return (
-            input_tensor.to_local()
-            if isinstance(input_tensor, DTensor)
-            else input_tensor
-        )
-
-    @staticmethod
-    def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
-        if isinstance(outputs, DTensor):
-            if outputs.placements != output_layouts:
-                outputs = outputs.redistribute(placements=output_layouts, async_op=True)
-            return outputs.to_local() if use_local_output else outputs
-        if use_local_output:
-            return outputs
-        return DTensor.from_local(outputs, device_mesh, output_layouts, run_check=False)
+    _prepare_input_fn = staticmethod(_nvfp4_prepare_input_fn)
+    _prepare_output_fn = staticmethod(_nvfp4_prepare_output_fn)
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        from torchao.prototype.moe_training.nvfp4_training.nvfp4_training import (
-            NVFP4Linear,
+        return _nvfp4_apply(
+            self,
+            module,
+            device_mesh,
+            tensor_parallel_style=_TP_STYLE_ROWWISE,
+            style_name="NVFP4RowwiseParallel",
         )
-
-        if not isinstance(module, NVFP4Linear):
-            raise ValueError(
-                f"NVFP4RowwiseParallel requires NVFP4Linear, got {type(module)}"
-            )
-        module.process_group = device_mesh.get_group()
-        module.world_size = device_mesh.size()
-        module.tensor_parallel_style = _TP_STYLE_ROWWISE
-        _replicate_rht_sign_vector(module, device_mesh, self.src_data_rank)
-        return super()._apply(module, device_mesh)
