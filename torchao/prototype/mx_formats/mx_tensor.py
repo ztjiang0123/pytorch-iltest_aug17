@@ -569,7 +569,16 @@ class MXTensor(TorchAOBaseTensor):
 
     def __repr__(self):
         # TODO better elem dtype print for fp4
-        return f"MXTensor: elem_dtype: {self.elem_dtype}, s_e8m0: {self.scale}, d: {self.qdata}, act_quant_kwargs: {self.act_quant_kwargs}, is_swizzled_scales={self.is_swizzled_scales}"  # noqa: E501
+        fields = self._fields_repr(
+            (
+                ("elem_dtype", self.elem_dtype),
+                ("s_e8m0", self.scale),
+                ("d", self.qdata),
+                ("act_quant_kwargs", self.act_quant_kwargs),
+            ),
+            sep=": ",
+        )
+        return f"MXTensor: {fields}, is_swizzled_scales={self.is_swizzled_scales}"
 
     def _quantization_type(self):
         return f"{self.elem_dtype=}, {self.block_size=}, {self.orig_dtype=}, {self.kernel_preference=}, {self.act_quant_kwargs=}"

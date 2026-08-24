@@ -102,6 +102,22 @@ def from_blocked(
     return padded[:original_rows, :original_cols]
 
 
+def _hp_data_dims_to_swizzled_scale_dims(
+    hp_data_M,
+    hp_data_K,
+    k_tile_size: int,
+) -> Tuple[int, int]:
+    """
+    Given the `M` and `K` dimensions of a high precision contiguous tensor and
+    the qdata tile width along `K`, returns a 2d tuple of the dims of the
+    corresponding swizzled scale. Each `128 x k_tile_size` qdata tile maps to a
+    swizzled 32x16 scale tile.
+    """
+    scale_M = ceil_div(hp_data_M, 128) * 32
+    scale_K = ceil_div(hp_data_K, k_tile_size) * 16
+    return scale_M, scale_K
+
+
 def hp_data_dims_to_swizzled_scale_dims_nvfp4(
     hp_data_M,
     hp_data_K,
@@ -113,9 +129,7 @@ def hp_data_dims_to_swizzled_scale_dims_nvfp4(
     """
     # a 128x64 unpacked or 128x32 packed qdata tile corresponds
     # to a swizzled 32x16 scale tile
-    scale_M = ceil_div(hp_data_M, 128) * 32
-    scale_K = ceil_div(hp_data_K, 64) * 16
-    return scale_M, scale_K
+    return _hp_data_dims_to_swizzled_scale_dims(hp_data_M, hp_data_K, 64)
 
 
 def hp_data_dims_to_swizzled_scale_dims_mx(
@@ -129,9 +143,7 @@ def hp_data_dims_to_swizzled_scale_dims_mx(
     """
     # a 128x128 unpacked or 128x64 packed qdata tile corresponds
     # to a swizzled 32x16 scale tile
-    scale_M = ceil_div(hp_data_M, 128) * 32
-    scale_K = ceil_div(hp_data_K, 128) * 16
-    return scale_M, scale_K
+    return _hp_data_dims_to_swizzled_scale_dims(hp_data_M, hp_data_K, 128)
 
 
 def _to_blocked_single(scales: Tensor) -> Tensor:

@@ -1006,6 +1006,16 @@ class TorchAOBaseTensor(torch.Tensor):
     def __init__(self, *args, **kwargs):
         torch._C._log_api_usage_once(str(type(self)))
 
+    def _fields_repr(self, fields, sep: str = "=") -> str:
+        """Render a flat ``label<sep>value`` descriptor string for this tensor.
+
+        ``fields`` is an iterable of ``(label, value)`` pairs. This centralizes
+        the single-line f-string field dumps that ``__repr__`` and
+        ``_quantization_type`` implementations would otherwise each hand-roll,
+        so the flat-string structure lives in exactly one place.
+        """
+        return ", ".join(f"{label}{sep}{value}" for label, value in fields)
+
     def __tensor_flatten__(self):
         if hasattr(self, "tensor_data_names") and hasattr(
             self, "tensor_attribute_names"

@@ -16,6 +16,7 @@ from torch.optim import Optimizer
 from torchao.quantization import quantize_
 from torchao.quantization.quant_api import _is_linear
 
+from ...optim_utils import BaseWrappedOptimizer
 from ..quant import Quantizer, UnifTorchaoQuantizer
 from ..quant.config_torchao import (
     _attach_hf_quantization_config,
@@ -31,7 +32,7 @@ if HAS_DTENSOR:
     from torch.distributed.tensor.placement_types import Shard
 
 
-class QuantOptimizer(Optimizer):
+class QuantOptimizer(BaseWrappedOptimizer):
     """QuantOptimizer assembles functionalities of the following objects:
     a base optimizer (e.g., SGD or AdamW)
         - update the latent variables for QAT
@@ -83,40 +84,12 @@ class QuantOptimizer(Optimizer):
         # NOTE: Filling state dict here cause Adam(W) error, which assumes
         # empty state[p] at first step() where optimizer states are initialized
 
-    def __getattribute__(self, name: str):
-        try:
-            attr = super(Optimizer, self).__getattribute__(name)
-        except AttributeError:
-            attr = self.base_optimizer.__getattribute__(name)
-        return attr
-
     def __repr__(self) -> str:
         base_optimizer = "\n    ".join(self.base_optimizer.__repr__().split("\n"))
         quantizer = self.quantizer.__class__.__name__
         prox_map = self.prox_map.__class__.__name__
         extra_repr = "\n  ".join(("(", base_optimizer, f"{quantizer=}", f"{prox_map=}"))
         return f"{self.__class__.__name__} {extra_repr}\n)"
-
-    @property
-    def state(self) -> defaultdict[Tensor, Any]:  # pyre-ignore[3]
-        return self._state if hasattr(self, "_state") else self.base_optimizer.state
-
-    @property
-    def num_steps(self) -> int:
-        for group in self.regularized_param_groups():
-            return group.setdefault("num_steps", 0)
-
-    @num_steps.setter
-    def num_steps(self, value: int) -> None:
-        for group in self.regularized_param_groups():
-            group["num_steps"] = value
-            return
-
-    @num_steps.deleter
-    def num_steps(self) -> None:
-        for group in self.regularized_param_groups():
-            group.pop("num_steps", None)
-            return
 
     @staticmethod
     def quantize_(
@@ -367,15 +340,6 @@ class QuantOptimizer(Optimizer):
 
         self.num_steps += 1
         return loss
-
-    @torch._disable_dynamo
-    @torch.no_grad()
-    def restore_latent_params(self) -> None:
-        """Restore latent parameters as optimizer parameters"""
-        for group in self.regularized_param_groups():
-            for p in group["params"]:
-                if p.requires_grad:
-                    p.copy_(self.state[p]["latent"])
 
     @torch._disable_dynamo
     @torch.no_grad()
