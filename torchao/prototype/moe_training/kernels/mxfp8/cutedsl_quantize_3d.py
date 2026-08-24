@@ -16,6 +16,8 @@ from .cute_utils import (
     F8_MAX,
     compute_amax,
     compute_scale_from_amax,
+    issue_tma_load,
+    issue_tma_store,
     load_vals_chunk_full,
     load_vals_chunk_tail,
 )
@@ -394,29 +396,20 @@ def _compile_mxfp8_quantize_3d_cutedsl(
             tma_mbar_ptr: cutlass.Int64,
             warp_idx: cutlass.Int32,
         ):
-            if warp_idx == 0:
-                cta_layout = cute.make_layout((1,))
-                sIN_for_tma_partition = cute.group_modes(sIN_tile, 0, 2)
-                gIN_for_tma_partition = cute.group_modes(gIN_tile, 0, 2)
-                tINs, tINg = cpasync.tma_partition(
-                    tma_atom_in,
-                    0,
-                    cta_layout,
-                    sIN_for_tma_partition,
-                    gIN_for_tma_partition,
-                )
-                tINg_stage0 = tINg[(None, 0)]
-                tINs_stage0 = tINs[(None, 0)]
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        tma_mbar_ptr, TILE_COPY_BYTES
-                    )
-                cute.copy(
-                    tma_atom_in,
-                    tINg_stage0,
-                    tINs_stage0,
-                    tma_bar_ptr=tma_mbar_ptr,
-                )
+            """Issue TMA load from global to shared memory (producer warp only).
+
+            Delegates to the shared ``issue_tma_load`` helper. Tiles are 3D, so
+            ``group_modes`` collapses two modes.
+            """
+            issue_tma_load(
+                tma_atom_in,
+                gIN_tile,
+                sIN_tile,
+                tma_mbar_ptr,
+                warp_idx,
+                tile_copy_bytes=TILE_COPY_BYTES,
+                group_modes_end=2,
+            )
 
         @cute.jit
         def _issue_tma_store(
@@ -426,29 +419,18 @@ def _compile_mxfp8_quantize_3d_cutedsl(
             sOUT_tile: cute.Tensor,
             warp_idx: cutlass.Int32,
         ):
-            cute.arch.fence_proxy(
-                "async.shared",
-                space="cta",
+            """Issue TMA store from shared to global memory (producer warp only).
+
+            Delegates to the shared ``issue_tma_store`` helper. Tiles are 3D, so
+            ``group_modes`` collapses two modes.
+            """
+            issue_tma_store(
+                tma_atom_out,
+                gOUT_tile,
+                sOUT_tile,
+                warp_idx,
+                group_modes_end=2,
             )
-            cute.arch.sync_threads()
-            if warp_idx == 0:
-                cta_layout = cute.make_layout((1,))
-                sOUT_for_tma_partition = cute.group_modes(sOUT_tile, 0, 2)
-                gOUT_for_tma_partition = cute.group_modes(gOUT_tile, 0, 2)
-                tOUTs, tOUTg = cpasync.tma_partition(
-                    tma_atom_out,
-                    0,
-                    cta_layout,
-                    sOUT_for_tma_partition,
-                    gOUT_for_tma_partition,
-                )
-                tOUTs_stage0 = tOUTs[(None, 0)]
-                tOUTg_stage0 = tOUTg[(None, 0)]
-                cute.copy(
-                    tma_atom_out,
-                    tOUTs_stage0,
-                    tOUTg_stage0,
-                )
 
         @cute.kernel
         def kernel(

@@ -15,35 +15,18 @@ from .cute_utils import (
     F8_MAX,
     compute_amax,
     compute_scale_from_amax,
+    issue_tma_load,
+    issue_tma_store,
     load_vals_chunk_full,
     load_vals_chunk_tail,
+    make_tile_smem_layouts,
     validate_group_sizes,
 )
 
 
 def _make_tile_smem_layouts(tile_m: int, tile_k: int):
-    """Create shared memory layouts for input and output tiles.
-
-    Both layouts use row-major format (K is fastest-changing dimension).
-
-    Args:
-        tile_m: Tile size in M dimension
-        tile_k: Tile size in K dimension
-
-    Returns:
-        Tuple of (smem_layout_in, smem_layout_out), both for shared memory
-    """
-    import cutlass.cute as cute
-
-    smem_layout_in = cute.make_layout(
-        (tile_m, tile_k),
-        stride=(tile_k, 1),
-    )
-    smem_layout_out = cute.make_layout(
-        (tile_m, tile_k),
-        stride=(tile_k, 1),
-    )
-    return smem_layout_in, smem_layout_out
+    """Create shared memory layouts for input and output tiles (row-major)."""
+    return make_tile_smem_layouts(tile_m, tile_k, output_col_major=False)
 
 
 # Config format:
@@ -433,44 +416,20 @@ def _compile_mxfp8_quantize_2d_cutedsl(
             tma_mbar_ptr: cutlass.Int64,
             warp_idx: cutlass.Int32,
         ):
-            """Issue TMA load from global memory to shared memory (producer warp only).
+            """Issue TMA load from global to shared memory (producer warp only).
 
-            Only warp 0 executes the TMA load and updates the barrier.
-
-            Args:
-                tma_atom_in: TMA copy atom for G2S
-                gIN_tile: Input tile in global memory (TILE_M, TILE_K)
-                sIN_tile: Input tile in shared memory (TILE_M, TILE_K)
-                tma_mbar_ptr: TMA barrier pointer
-                warp_idx: Warp index
-
-            Storage locations:
-                Source: gIN_tile (global memory)
-                Destination: sIN_tile (shared memory)
+            Delegates to the shared ``issue_tma_load`` helper. Tiles are 2D, so
+            ``group_modes`` collapses a single mode.
             """
-            if warp_idx == 0:
-                cta_layout = cute.make_layout((1,))
-                sIN_for_tma_partition = cute.group_modes(sIN_tile, 0, 1)
-                gIN_for_tma_partition = cute.group_modes(gIN_tile, 0, 1)
-                tINs, tINg = cpasync.tma_partition(
-                    tma_atom_in,
-                    0,
-                    cta_layout,
-                    sIN_for_tma_partition,
-                    gIN_for_tma_partition,
-                )
-                tINg_stage0 = tINg[(None, 0)]
-                tINs_stage0 = tINs[(None, 0)]
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        tma_mbar_ptr, TILE_COPY_BYTES
-                    )
-                cute.copy(
-                    tma_atom_in,
-                    tINg_stage0,
-                    tINs_stage0,
-                    tma_bar_ptr=tma_mbar_ptr,
-                )
+            issue_tma_load(
+                tma_atom_in,
+                gIN_tile,
+                sIN_tile,
+                tma_mbar_ptr,
+                warp_idx,
+                tile_copy_bytes=TILE_COPY_BYTES,
+                group_modes_end=1,
+            )
 
         @cute.jit
         def _issue_tma_store(
@@ -480,43 +439,18 @@ def _compile_mxfp8_quantize_2d_cutedsl(
             sOUT_tile: cute.Tensor,
             warp_idx: cutlass.Int32,
         ):
-            """Issue TMA store from shared memory to global memory (producer warp only).
+            """Issue TMA store from shared to global memory (producer warp only).
 
-            Synchronizes threads before store. Only warp 0 executes the TMA store.
-
-            Args:
-                tma_atom_out: TMA copy atom for S2G
-                gOUT_tile: Output tile in global memory (TILE_M, TILE_K)
-                sOUT_tile: Output tile in shared memory (TILE_M, TILE_K)
-                warp_idx: Warp index
-
-            Storage locations:
-                Source: sOUT_tile (shared memory)
-                Destination: gOUT_tile (global memory)
+            Delegates to the shared ``issue_tma_store`` helper. Tiles are 2D, so
+            ``group_modes`` collapses a single mode.
             """
-            cute.arch.fence_proxy(
-                "async.shared",
-                space="cta",
+            issue_tma_store(
+                tma_atom_out,
+                gOUT_tile,
+                sOUT_tile,
+                warp_idx,
+                group_modes_end=1,
             )
-            cute.arch.sync_threads()
-            if warp_idx == 0:
-                cta_layout = cute.make_layout((1,))
-                sOUT_for_tma_partition = cute.group_modes(sOUT_tile, 0, 1)
-                gOUT_for_tma_partition = cute.group_modes(gOUT_tile, 0, 1)
-                tOUTs, tOUTg = cpasync.tma_partition(
-                    tma_atom_out,
-                    0,
-                    cta_layout,
-                    sOUT_for_tma_partition,
-                    gOUT_for_tma_partition,
-                )
-                tOUTs_stage0 = tOUTs[(None, 0)]
-                tOUTg_stage0 = tOUTg[(None, 0)]
-                cute.copy(
-                    tma_atom_out,
-                    tOUTs_stage0,
-                    tOUTg_stage0,
-                )
 
         @cute.kernel
         def kernel(

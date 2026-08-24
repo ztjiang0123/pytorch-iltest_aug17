@@ -50,20 +50,21 @@ class _GroupedMMBackend:
 
     kind: _GroupedMMBackendKind
 
-    def quantize_forward_rhs(
+    def quantize_rhs(
         self,
         B_t: torch.Tensor,
         block_size: int,
         dtype: torch.dtype,
+        *,
+        is_dgrad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError
+        """Quantize the grouped RHS operand for a forward or dgrad GEMM.
 
-    def quantize_dgrad_rhs(
-        self,
-        B_t: torch.Tensor,
-        block_size: int,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        When ``is_dgrad`` is False this quantizes the forward-pass weight
+        (``input @ weight``); when True it quantizes the dgrad-pass weight
+        (``grad_output @ weight``). The two share a signature but write
+        different RHS layouts, so backends dispatch on ``is_dgrad``.
+        """
         raise NotImplementedError
 
     def grouped_mm(
@@ -97,30 +98,26 @@ class _EmulatedGroupedMMBackend(_GroupedMMBackend):
 
     kind = _GroupedMMBackendKind.EMULATED
 
-    def quantize_forward_rhs(
+    def quantize_rhs(
         self,
         B_t: torch.Tensor,
         block_size: int,
         dtype: torch.dtype,
+        *,
+        is_dgrad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if is_dgrad:
+            # The emulated backend consumes TorchAO's grouped RHS layout for
+            # grad_output @ weight: (E, N, K) data with
+            # (E, N_blocks, K_blocks) scales.
+            return triton_fp8_blockwise_weight_quant_grouped_rhs(
+                B_t,
+                block_size=block_size,
+                dtype=dtype,
+            )
         # The emulated backend consumes TorchAO's grouped RHS layout:
         # (E, K, N) data with (E, K_blocks, N_blocks) scales.
         return triton_fp8_blockwise_weight_quant_grouped_transposed_rhs(
-            B_t,
-            block_size=block_size,
-            dtype=dtype,
-        )
-
-    def quantize_dgrad_rhs(
-        self,
-        B_t: torch.Tensor,
-        block_size: int,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # The emulated backend consumes TorchAO's grouped RHS layout for
-        # grad_output @ weight: (E, N, K) data with
-        # (E, N_blocks, K_blocks) scales.
-        return triton_fp8_blockwise_weight_quant_grouped_rhs(
             B_t,
             block_size=block_size,
             dtype=dtype,
@@ -191,31 +188,27 @@ class _DeepGemmGroupedMMBackend(_GroupedMMBackend):
     kind = _GroupedMMBackendKind.DEEPGEMM
     offset_plan: DeepGemmGroupedOffsetPlan
 
-    def quantize_forward_rhs(
+    def quantize_rhs(
         self,
         B_t: torch.Tensor,
         block_size: int,
         dtype: torch.dtype,
+        *,
+        is_dgrad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if is_dgrad:
+            # DeepGEMM dgrad consumes RHS as (E, K, N), with N contiguous and
+            # scales as (E, K_blocks, N_blocks). This quantizer writes that
+            # layout directly, avoiding a dispatch-time transpose/copy.
+            return triton_fp8_blockwise_weight_quant_grouped_rhs_deepgemm(
+                B_t,
+                block_size=block_size,
+                dtype=dtype,
+            )
         # DeepGEMM forward consumes RHS as (E, N, K), with K contiguous and
         # scales as (E, N_blocks, K_blocks). This quantizer writes that
         # layout directly, avoiding a dispatch-time transpose/copy.
         return triton_fp8_blockwise_weight_quant_grouped_transposed_rhs_deepgemm(
-            B_t,
-            block_size=block_size,
-            dtype=dtype,
-        )
-
-    def quantize_dgrad_rhs(
-        self,
-        B_t: torch.Tensor,
-        block_size: int,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # DeepGEMM dgrad consumes RHS as (E, K, N), with N contiguous and
-        # scales as (E, K_blocks, N_blocks). This quantizer writes that
-        # layout directly, avoiding a dispatch-time transpose/copy.
-        return triton_fp8_blockwise_weight_quant_grouped_rhs_deepgemm(
             B_t,
             block_size=block_size,
             dtype=dtype,

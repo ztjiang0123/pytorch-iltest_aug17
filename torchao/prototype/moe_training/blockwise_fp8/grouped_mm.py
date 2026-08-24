@@ -142,10 +142,11 @@ class _Float8BlockwiseGroupedMM(torch.autograd.Function):
             block_size=block_size,
             dtype=float8_dtype,
         )
-        B_t_fp8, B_t_scale = backend.quantize_forward_rhs(
+        B_t_fp8, B_t_scale = backend.quantize_rhs(
             B_t,
             block_size,
             float8_dtype,
+            is_dgrad=False,
         )
         out = backend.grouped_mm(
             A_fp8,
@@ -212,10 +213,11 @@ class _Float8BlockwiseGroupedMM(torch.autograd.Function):
             block_size=block_size,
             dtype=float8_dtype,
         )
-        B_fp8, B_scale = backend.quantize_dgrad_rhs(
+        B_fp8, B_scale = backend.quantize_rhs(
             B_t,
             block_size,
             float8_dtype,
+            is_dgrad=True,
         )
         grad_A = backend.grouped_mm(
             grad_output_fp8,
