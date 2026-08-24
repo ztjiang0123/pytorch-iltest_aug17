@@ -28,6 +28,11 @@ class _FakeQuantizedLinearBase(torch.nn.Linear):
     raised when only weight quantization is provided. The constructor
     initializes the underlying ``nn.Linear``, validates that both configs are
     present, and stores them on the instance.
+
+    ``in_features``, ``out_features``, ``bias`` (and any other ``nn.Linear``
+    arguments such as ``device``/``dtype``) are forwarded through ``*args`` /
+    ``**kwargs``; ``activation_config`` and ``weight_config`` are keyword-only
+    since they are consumed here rather than passed to ``nn.Linear``.
     """
 
     # Format-specific error raised when only a weight config is provided.
@@ -35,21 +40,12 @@ class _FakeQuantizedLinearBase(torch.nn.Linear):
 
     def __init__(
         self,
-        in_features: int,
-        out_features: int,
-        bias: bool = False,
+        *args,
         activation_config: Any = None,
         weight_config: Any = None,
-        *args,
         **kwargs,
     ):
-        super().__init__(
-            in_features,
-            out_features,
-            bias,
-            *args,
-            **kwargs,
-        )
+        super().__init__(*args, **kwargs)
         if weight_config is None:
             raise ValueError("Must specify `weight_config`")
         if activation_config is None:
