@@ -17,6 +17,7 @@ from torch.distributed.tensor.placement_types import Partial, Shard
 from torch.optim import Optimizer
 from torch.optim.optimizer import StateDict
 
+from ...optim_utils import BaseWrappedOptimizer
 from ..distributed_utils import (
     _is_dtensor,
     _is_main_process,
@@ -28,7 +29,7 @@ from .group_lasso import ProxGroupLasso, ProxGroupLassoVectorized
 from .iterative_reweight import IterativeReweight
 
 
-class PruneOptimizer(Optimizer):
+class PruneOptimizer(BaseWrappedOptimizer):
     """Wraps a base optimizer to apply proximal updates that induce sparsity
     or low-rank structure during training.
 
@@ -91,13 +92,6 @@ class PruneOptimizer(Optimizer):
         # NOTE: Filling state dict here cause Adam(W) error, which assumes
         # empty state[p] at first step() where optimizer states are initialized
 
-    def __getattribute__(self, name: str):
-        try:
-            attr = super(Optimizer, self).__getattribute__(name)
-        except AttributeError:
-            attr = self.base_optimizer.__getattribute__(name)
-        return attr
-
     def __repr__(self) -> str:
         base_optimizer = "\n    ".join(self.base_optimizer.__repr__().split("\n"))
         extra_repr = "\n  ".join(("(", base_optimizer))
@@ -110,10 +104,6 @@ class PruneOptimizer(Optimizer):
             group.setdefault("reg_lambda", 0.0)
             if i == 0:
                 group.setdefault("num_steps", 0)
-
-    @property
-    def state(self) -> defaultdict[Tensor, Any]:  # pyre-ignore[3]
-        return self._state if hasattr(self, "_state") else self.base_optimizer.state
 
     @torch._disable_dynamo
     def state_dict(self) -> StateDict:
@@ -131,23 +121,6 @@ class PruneOptimizer(Optimizer):
             for k in ("reg_lambda", "num_steps", "gamma"):
                 if k in state_group:
                     group[k] = state_group[k]
-
-    @property
-    def num_steps(self) -> int:
-        for group in self.regularized_param_groups():
-            return group.get("num_steps", 0)
-
-    @num_steps.setter
-    def num_steps(self, value: int) -> None:
-        for group in self.regularized_param_groups():
-            group["num_steps"] = value
-            return
-
-    @num_steps.deleter
-    def num_steps(self) -> None:
-        for group in self.regularized_param_groups():
-            group.pop("num_steps", None)
-            return
 
     def regularized_param_groups(self):  # pyre-ignore[3]
         """Yield parameter groups that need to be pruned."""
@@ -609,14 +582,6 @@ class PruneOptimizer(Optimizer):
             )
 
         return loss
-
-    @torch._disable_dynamo
-    def restore_latent_params(self) -> None:
-        """Restore latent parameters as optimizer parameters"""
-        for group in self.regularized_param_groups():
-            for p in group["params"]:
-                if p.requires_grad:
-                    p.copy_(self.state[p]["latent"])
 
     @torch._disable_dynamo
     def save_latent_params(self) -> None:

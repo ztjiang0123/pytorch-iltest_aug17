@@ -69,7 +69,15 @@ class Int8LutTensor(TorchAOBaseTensor):
         self.packed_weights_has_bias = packed_weights_has_bias
 
     def _quantization_type(self):
-        return f"bit_width={self.bit_width}, block_size={self.block_size}, shape={self.shape}, dtype={self.dtype}, device={self.device}"
+        return self._fields_repr(
+            (
+                ("bit_width", self.bit_width),
+                ("block_size", self.block_size),
+                ("shape", self.shape),
+                ("dtype", self.dtype),
+                ("device", self.device),
+            )
+        )
 
     def to(self, *args, **kwargs):
         raise NotImplementedError("to() is not implemented for IntxOpaqueTensor")
