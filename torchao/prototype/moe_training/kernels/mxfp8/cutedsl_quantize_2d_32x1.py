@@ -15,38 +15,13 @@ from .cute_utils import (
     F8_MAX,
     compute_amax,
     compute_scale_from_amax,
+    issue_tma_load,
+    issue_tma_store,
     load_vals_chunk_full,
     load_vals_chunk_tail,
+    make_tile_smem_layouts,
     validate_group_sizes,
 )
-
-
-def _make_tile_smem_layouts(tile_m: int, tile_k: int):
-    """Create shared memory layouts for input and output tiles.
-
-    Input uses row-major format. Output uses column-major format.
-
-    Args:
-        tile_m: Tile size in M dimension
-        tile_k: Tile size in K dimension
-
-    Returns:
-        Tuple of (smem_layout_in, smem_layout_out) for shared memory
-    """
-    import cutlass.cute as cute
-
-    # Input SMEM: Row-major layout
-    smem_layout_in = cute.make_layout(
-        (tile_m, tile_k),
-        stride=(tile_k, 1),
-    )
-    # Output SMEM: Column-major layout
-    smem_layout_out = cute.make_layout(
-        (tile_m, tile_k),
-        stride=(1, tile_m),
-    )
-    return smem_layout_in, smem_layout_out
-
 
 # Config format:
 # (compute_warps, tile_m, tile_k, m_tiles_per_cta)
@@ -417,100 +392,6 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
                     vals_chunk, inv_scale, sOUT_tile, sout_m_base, k_rel, USE_RCEIL
                 )
 
-        @cute.jit
-        def _issue_tma_load(
-            self,
-            tma_atom_in: cute.CopyAtom,
-            gIN_tile: cute.Tensor,
-            sIN_tile: cute.Tensor,
-            tma_mbar_ptr: cutlass.Int64,
-            warp_idx: cutlass.Int32,
-        ):
-            """Issue TMA load from global memory to shared memory (producer warp only).
-
-            Only warp 0 executes the TMA load and updates the barrier.
-
-            Args:
-                tma_atom_in: TMA copy atom for G2S
-                gIN_tile: Input tile in global memory (TILE_M, TILE_K)
-                sIN_tile: Input tile in shared memory (TILE_M, TILE_K)
-                tma_mbar_ptr: TMA barrier pointer
-                warp_idx: Warp index
-
-            Storage locations:
-                Source: gIN_tile (global memory)
-                Destination: sIN_tile (shared memory)
-            """
-            if warp_idx == 0:
-                cta_layout = cute.make_layout((1,))
-                sIN_for_tma_partition = cute.group_modes(sIN_tile, 0, 1)
-                gIN_for_tma_partition = cute.group_modes(gIN_tile, 0, 1)
-                tINs, tINg = cpasync.tma_partition(
-                    tma_atom_in,
-                    0,
-                    cta_layout,
-                    sIN_for_tma_partition,
-                    gIN_for_tma_partition,
-                )
-                tINg_stage0 = tINg[(None, 0)]
-                tINs_stage0 = tINs[(None, 0)]
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        tma_mbar_ptr, TILE_COPY_BYTES
-                    )
-                cute.copy(
-                    tma_atom_in,
-                    tINg_stage0,
-                    tINs_stage0,
-                    tma_bar_ptr=tma_mbar_ptr,
-                )
-
-        @cute.jit
-        def _issue_tma_store(
-            self,
-            tma_atom_out: cute.CopyAtom,
-            gOUT_tile: cute.Tensor,
-            sOUT_tile: cute.Tensor,
-            warp_idx: cutlass.Int32,
-        ):
-            """Issue TMA store from shared memory to global memory (producer warp only).
-
-            Synchronizes threads before store. Only warp 0 executes the TMA store.
-
-            Args:
-                tma_atom_out: TMA copy atom for S2G
-                gOUT_tile: Output tile in global memory (TILE_M, TILE_K)
-                sOUT_tile: Output tile in shared memory (TILE_M, TILE_K)
-                warp_idx: Warp index
-
-            Storage locations:
-                Source: sOUT_tile (shared memory)
-                Destination: gOUT_tile (global memory)
-            """
-            cute.arch.fence_proxy(
-                "async.shared",
-                space="cta",
-            )
-            cute.arch.sync_threads()
-            if warp_idx == 0:
-                cta_layout = cute.make_layout((1,))
-                sOUT_for_tma_partition = cute.group_modes(sOUT_tile, 0, 1)
-                gOUT_for_tma_partition = cute.group_modes(gOUT_tile, 0, 1)
-                tOUTs, tOUTg = cpasync.tma_partition(
-                    tma_atom_out,
-                    0,
-                    cta_layout,
-                    sOUT_for_tma_partition,
-                    gOUT_for_tma_partition,
-                )
-                tOUTs_stage0 = tOUTs[(None, 0)]
-                tOUTg_stage0 = tOUTg[(None, 0)]
-                cute.copy(
-                    tma_atom_out,
-                    tOUTs_stage0,
-                    tOUTg_stage0,
-                )
-
         @cute.kernel
         def kernel(
             self,
@@ -587,7 +468,9 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
             if cutlass.const_expr(STAGE_COUNT_VALUE > 1):
                 tma_mbar_ptr1 = tma_mbar_ptr0 + 1
 
-            smem_layout_in, smem_layout_out = _make_tile_smem_layouts(TILE_M, TILE_K)
+            smem_layout_in, smem_layout_out = make_tile_smem_layouts(
+                TILE_M, TILE_K, output_col_major=True
+            )
             staged_layout_in = cute.make_layout(
                 (STAGE_COUNT_VALUE, TILE_M, TILE_K),
                 stride=(TILE_M * TILE_K, TILE_K, 1),
@@ -660,12 +543,12 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
                     gIN_tile = cute.local_tile(
                         tma_tensor_in, (TILE_M, TILE_K), (m_tile_eff, k_tile)
                     )
-                    self._issue_tma_load(
+                    issue_tma_load(
                         tma_atom_in,
-                        gIN_tile,
-                        sIN_tile,
+                        (gIN_tile, sIN_tile),
                         tma_mbar_ptr,
                         warp_idx,
+                        (TILE_COPY_BYTES, 1),
                     )
 
                 if cutlass.const_expr(STAGE_COUNT > 1 and M_TILES_PER_CTA > 1):
@@ -683,12 +566,12 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
                         gIN_tile_next = cute.local_tile(
                             tma_tensor_in, (TILE_M, TILE_K), (m_tile_next, k_tile)
                         )
-                        self._issue_tma_load(
+                        issue_tma_load(
                             tma_atom_in,
-                            gIN_tile_next,
-                            sIN_tile_next,
+                            (gIN_tile_next, sIN_tile_next),
                             tma_mbar_ptr_next,
                             warp_idx,
+                            (TILE_COPY_BYTES, 1),
                         )
 
                 if warp_idx >= 1 and warp_idx <= compute_warps:
@@ -797,11 +680,11 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
                 gOUT_tile = cute.local_tile(
                     tma_tensor_out, (TILE_M, TILE_K), (m_tile_eff, k_tile)
                 )
-                self._issue_tma_store(
+                issue_tma_store(
                     tma_atom_out,
-                    gOUT_tile,
-                    sOUT_tile,
+                    (gOUT_tile, sOUT_tile),
                     warp_idx,
+                    1,
                 )
 
         @cute.jit
@@ -835,7 +718,9 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
             Storage locations:
                 All tensors in global memory
             """
-            smem_layout_in, smem_layout_out = _make_tile_smem_layouts(TILE_M, TILE_K)
+            smem_layout_in, smem_layout_out = make_tile_smem_layouts(
+                TILE_M, TILE_K, output_col_major=True
+            )
             # Use tcgen05.CtaGroup.ONE for the optimised single-CTA Blackwell (SM 10.x) TMA load path.
             g2s_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
             tma_atom_in, tma_tensor_in = cpasync.make_tiled_tma_atom(
