@@ -12,11 +12,13 @@ import torch
 from torchao.utils import ceil_div
 
 from .cute_utils import (
-    F8_MAX,
     compute_amax,
     compute_scale_from_amax,
-    load_vals_chunk_full,
-    load_vals_chunk_tail,
+    quantize_block_store_full,
+    quantize_block_store_tail,
+    quantize_chunk_to_fp8,
+    select_cutedsl_config,
+    store_scales_reg_to_gmem_vec,
     validate_group_sizes,
 )
 
@@ -52,26 +54,6 @@ _CUTEDSL_CONFIGS = {
     "bf16_default": (4, 128, 32, 4),
     "fallback": (6, 128, 32, 2),
 }
-
-
-def _select_cutedsl_config(
-    input_dtype: torch.dtype,
-    scaling_mode: str,
-) -> Tuple[str, Tuple[int, int, int, int]]:
-    """Select kernel configuration based on input dtype.
-
-    Args:
-        input_dtype: Input dtype
-        scaling_mode: Scaling mode ("floor" or "rceil")
-
-    Returns:
-        Tuple of (config_name, (compute_warps, tile_m, tile_k, k_tiles_per_cta))
-    """
-    if input_dtype == torch.bfloat16:
-        config_name = "bf16_default"
-    else:
-        config_name = "fallback"
-    return config_name, _CUTEDSL_CONFIGS[config_name]
 
 
 @functools.cache
@@ -239,54 +221,6 @@ def _compile_mxfp8_quantize_2d_cutedsl(
             return vals_block
 
         @cute.jit
-        def _store_scales_reg_to_gmem_vec(
-            self,
-            scales_tensor: cute.Tensor,
-            m: cutlass.Int64,
-            k_block_base: cutlass.Int64,
-            scale_buffer: cute.Tensor,
-            num_scales: cutlass.Int32,
-            BLOCKED_SCALE_OUTPUT: cutlass.Constexpr[bool],
-        ):
-            """Store scales from registers to global memory using vectorized writes when possible.
-
-            Uses uint32 vectorized writes for 4 scales in blocked layout.
-
-            Args:
-                scales_tensor: Output scales in global memory
-                m: Global M coordinate
-                k_block_base: Starting K block index
-                scale_buffer: Buffer of scales in register memory (uint8)
-                num_scales: Number of scales to store
-                BLOCKED_SCALE_OUTPUT: Whether using blocked layout (enables vectorization)
-
-            Storage locations:
-                Input: scale_buffer (registers)
-                Output: scales_tensor (global memory)
-            """
-            if cutlass.const_expr(BLOCKED_SCALE_OUTPUT):
-                # Blocked layout with 4 contiguous scales - write as uint32
-                if num_scales == 4:
-                    # Pack 4 uint8 scales into uint32 and write
-                    scales_tensor_u32 = cute.recast_tensor(
-                        scales_tensor, cutlass.Uint32
-                    )
-                    scale_buffer_u32 = cute.recast_tensor(scale_buffer, cutlass.Uint32)
-                    scales_tensor_u32[m, k_block_base // cutlass.Int64(4)] = (
-                        scale_buffer_u32[0]
-                    )
-                else:
-                    # Fallback for non-4 cases (e.g., tail tiles)
-                    for i in range(num_scales):
-                        k_block = k_block_base + i
-                        scales_tensor[m, k_block] = scale_buffer[i]
-            else:
-                # Row-major layout - scalar stores
-                for i in range(num_scales):
-                    k_block = k_block_base + i
-                    scales_tensor[m, k_block] = scale_buffer[i]
-
-        @cute.jit
         def _store_q_fp8_reg_to_smem(
             self,
             q_fp8_vals4: cute.Tensor,
@@ -339,13 +273,7 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                 Inputs: vals_chunk, inv_scale (registers)
                 Output: sOUT_tile (shared memory)
             """
-            q_vals4_vec = vals_chunk.load() * inv_scale
-            if not cutlass.const_expr(USE_RCEIL):
-                q_vals4_vec = cute.where(q_vals4_vec > F8_MAX, F8_MAX, q_vals4_vec)
-                q_vals4_vec = cute.where(q_vals4_vec < -F8_MAX, -F8_MAX, q_vals4_vec)
-            q_fp8_vec4 = q_vals4_vec.to(cutlass.Float8E4M3FN)
-            q_fp8_vals4 = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
-            q_fp8_vals4.store(q_fp8_vec4)
+            q_fp8_vals4 = quantize_chunk_to_fp8(vals_chunk, inv_scale, USE_RCEIL)
             self._store_q_fp8_reg_to_smem(q_fp8_vals4, sOUT_tile, m_rel, sout_base)
 
         @cute.jit
@@ -372,15 +300,20 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                 Inputs: vals_block, inv_scale (registers)
                 Output: sOUT_tile (shared memory)
             """
-            chunk_vec = 4
-            num_chunks = SCALE_DIM_K_VALUE // chunk_vec
-            for c in range(num_chunks):
-                local_base = c * chunk_vec
-                sout_base = k_base + local_base
-                vals_chunk = load_vals_chunk_full(vals_block, local_base)
+
+            def store_chunk_fn(vals_chunk, inv_scale, sout_base, USE_RCEIL):
                 self._quantize_then_store_reg_to_smem(
                     vals_chunk, inv_scale, sOUT_tile, m_rel, sout_base, USE_RCEIL
                 )
+
+            quantize_block_store_full(
+                SCALE_DIM_K_VALUE,
+                vals_block,
+                inv_scale,
+                k_base,
+                store_chunk_fn,
+                USE_RCEIL,
+            )
 
         @cute.jit
         def _quantize_block_then_store_reg_to_smem_tail(
@@ -412,17 +345,22 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                 Inputs: vals_block, inv_scale (registers)
                 Output: sOUT_tile (shared memory)
             """
-            chunk_vec = 4
-            num_chunks = SCALE_DIM_K_VALUE // chunk_vec
-            for c in range(num_chunks):
-                local_base = c * chunk_vec
-                sout_base = k_base + local_base
-                vals_chunk = load_vals_chunk_tail(
-                    vals_block, k0, sout_base, local_base, K
-                )
+
+            def store_chunk_fn(vals_chunk, inv_scale, sout_base, USE_RCEIL):
                 self._quantize_then_store_reg_to_smem(
                     vals_chunk, inv_scale, sOUT_tile, m_rel, sout_base, USE_RCEIL
                 )
+
+            quantize_block_store_tail(
+                SCALE_DIM_K_VALUE,
+                vals_block,
+                inv_scale,
+                k0,
+                k_base,
+                K,
+                store_chunk_fn,
+                USE_RCEIL,
+            )
 
         @cute.jit
         def _issue_tma_load(
@@ -736,7 +674,7 @@ def _compile_mxfp8_quantize_2d_cutedsl(
 
                                 # Vectorized scale store
                                 k_block_base = k_tile_eff * K_BLOCKS_PER_TILE
-                                self._store_scales_reg_to_gmem_vec(
+                                store_scales_reg_to_gmem_vec(
                                     scales_tensor,
                                     m,
                                     k_block_base,
@@ -789,7 +727,7 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                                 # Vectorized scale store
                                 if num_valid_scales > 0:
                                     k_block_base = k_tile_eff * K_BLOCKS_PER_TILE
-                                    self._store_scales_reg_to_gmem_vec(
+                                    store_scales_reg_to_gmem_vec(
                                         scales_tensor,
                                         m,
                                         k_block_base,
@@ -1003,7 +941,7 @@ def mxfp8_quantize_cutedsl_2d_1x32(
         assert offs.dtype == torch.int32, "offs must be int32 tensor"
         assert offs.dim() == 1, "offs must be 1D tensor"
 
-    _, config = _select_cutedsl_config(x.dtype, scaling_mode)
+    _, config = select_cutedsl_config(x.dtype, _CUTEDSL_CONFIGS)
     compute_warps, tile_m, tile_k, k_tiles_per_cta = config
     # B200 sweeps over representative shapes showed no
     # measurable benefit above 2 stages. We keep this configurable for
