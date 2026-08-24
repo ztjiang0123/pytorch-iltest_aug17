@@ -23,12 +23,6 @@ from .cute_utils import (
     validate_group_sizes,
 )
 
-
-def _make_tile_smem_layouts(tile_m: int, tile_k: int):
-    """Create shared memory layouts for input and output tiles (row-major)."""
-    return make_tile_smem_layouts(tile_m, tile_k, output_col_major=False)
-
-
 # Config format:
 # (compute_warps, tile_m, tile_k, k_tiles_per_cta)
 _CUTEDSL_CONFIGS = {
@@ -407,51 +401,6 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                     vals_chunk, inv_scale, sOUT_tile, m_rel, sout_base, USE_RCEIL
                 )
 
-        @cute.jit
-        def _issue_tma_load(
-            self,
-            tma_atom_in: cute.CopyAtom,
-            gIN_tile: cute.Tensor,
-            sIN_tile: cute.Tensor,
-            tma_mbar_ptr: cutlass.Int64,
-            warp_idx: cutlass.Int32,
-        ):
-            """Issue TMA load from global to shared memory (producer warp only).
-
-            Delegates to the shared ``issue_tma_load`` helper. Tiles are 2D, so
-            ``group_modes`` collapses a single mode.
-            """
-            issue_tma_load(
-                tma_atom_in,
-                gIN_tile,
-                sIN_tile,
-                tma_mbar_ptr,
-                warp_idx,
-                tile_copy_bytes=TILE_COPY_BYTES,
-                group_modes_end=1,
-            )
-
-        @cute.jit
-        def _issue_tma_store(
-            self,
-            tma_atom_out: cute.CopyAtom,
-            gOUT_tile: cute.Tensor,
-            sOUT_tile: cute.Tensor,
-            warp_idx: cutlass.Int32,
-        ):
-            """Issue TMA store from shared to global memory (producer warp only).
-
-            Delegates to the shared ``issue_tma_store`` helper. Tiles are 2D, so
-            ``group_modes`` collapses a single mode.
-            """
-            issue_tma_store(
-                tma_atom_out,
-                gOUT_tile,
-                sOUT_tile,
-                warp_idx,
-                group_modes_end=1,
-            )
-
         @cute.kernel
         def kernel(
             self,
@@ -527,7 +476,9 @@ def _compile_mxfp8_quantize_2d_cutedsl(
             if cutlass.const_expr(STAGE_COUNT_VALUE > 1):
                 tma_mbar_ptr1 = tma_mbar_ptr0 + 1
 
-            smem_layout_in, smem_layout_out = _make_tile_smem_layouts(TILE_M, TILE_K)
+            smem_layout_in, smem_layout_out = make_tile_smem_layouts(
+                TILE_M, TILE_K, output_col_major=False
+            )
             staged_layout_in = cute.make_layout(
                 (STAGE_COUNT_VALUE, TILE_M, TILE_K),
                 stride=(TILE_M * TILE_K, TILE_K, 1),
@@ -598,12 +549,12 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                     gIN_tile = cute.local_tile(
                         tma_tensor_in, (TILE_M, TILE_K), (m_tile, k_tile_eff)
                     )
-                    self._issue_tma_load(
+                    issue_tma_load(
                         tma_atom_in,
-                        gIN_tile,
-                        sIN_tile,
+                        (gIN_tile, sIN_tile),
                         tma_mbar_ptr,
                         warp_idx,
+                        (TILE_COPY_BYTES, 1),
                     )
 
                 if cutlass.const_expr(STAGE_COUNT > 1 and K_TILES_PER_CTA > 1):
@@ -621,12 +572,12 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                         gIN_tile_next = cute.local_tile(
                             tma_tensor_in, (TILE_M, TILE_K), (m_tile, k_tile_next)
                         )
-                        self._issue_tma_load(
+                        issue_tma_load(
                             tma_atom_in,
-                            gIN_tile_next,
-                            sIN_tile_next,
+                            (gIN_tile_next, sIN_tile_next),
                             tma_mbar_ptr_next,
                             warp_idx,
+                            (TILE_COPY_BYTES, 1),
                         )
 
                 if warp_idx >= 1 and warp_idx <= compute_warps:
@@ -735,11 +686,11 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                 gOUT_tile = cute.local_tile(
                     tma_tensor_out, (TILE_M, TILE_K), (m_tile, k_tile_eff)
                 )
-                self._issue_tma_store(
+                issue_tma_store(
                     tma_atom_out,
-                    gOUT_tile,
-                    sOUT_tile,
+                    (gOUT_tile, sOUT_tile),
                     warp_idx,
+                    1,
                 )
 
         @cute.jit
@@ -773,7 +724,9 @@ def _compile_mxfp8_quantize_2d_cutedsl(
             Storage locations:
                 All tensors in global memory
             """
-            smem_layout_in, smem_layout_out = _make_tile_smem_layouts(TILE_M, TILE_K)
+            smem_layout_in, smem_layout_out = make_tile_smem_layouts(
+                TILE_M, TILE_K, output_col_major=False
+            )
             # Use tcgen05.CtaGroup.ONE for the optimised single-CTA Blackwell (SM 10.x) TMA load path.
             g2s_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
             tma_atom_in, tma_tensor_in = cpasync.make_tiled_tma_atom(
