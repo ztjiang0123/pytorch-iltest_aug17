@@ -9,6 +9,7 @@ import torch
 
 import torchao.ops
 from torchao.swizzle.swizzle_tensor import SwizzleTensor
+from torchao.utils import _register_to_op_table
 
 aten = torch.ops.aten
 SWIZZLE_OPS_TABLE: Dict[Any, Any] = {}
@@ -16,13 +17,7 @@ SWIZZLE_OPS_TABLE: Dict[Any, Any] = {}
 
 def implements(aten_ops):
     """Register aten ops to the swizzle op table"""
-
-    def decorator(func):
-        for op in aten_ops:
-            SWIZZLE_OPS_TABLE[op] = func
-        return func
-
-    return decorator
+    return _register_to_op_table(SWIZZLE_OPS_TABLE, aten_ops)
 
 
 @implements([aten.mm.default, aten.matmul.default])

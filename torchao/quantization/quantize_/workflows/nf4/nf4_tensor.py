@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from torch._prims_common import make_contiguous_strides_for
 from torch.distributed.device_mesh import DeviceMesh
 
-from torchao.utils import torch_version_at_least
+from torchao.utils import _register_to_op_table, torch_version_at_least
 
 aten = torch.ops.aten
 
@@ -96,13 +96,7 @@ def same_metadata(a: "NF4Tensor", b: "NF4Tensor"):
 
 def implements(aten_ops):
     """Use this decorator to implement a function for an aten op in __torch_dispatch__"""
-
-    def decorator(func):
-        for op in aten_ops:
-            NF4_OPS_TABLE[op] = func
-        return func
-
-    return decorator
+    return _register_to_op_table(NF4_OPS_TABLE, aten_ops)
 
 
 def construct_nf4_args(nf4tensor: "NF4Tensor", kwargs: Optional[Dict[str, Any]] = None):
