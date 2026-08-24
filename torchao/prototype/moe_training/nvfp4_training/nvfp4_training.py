@@ -162,6 +162,7 @@ class NVFP4Linear(nn.Linear):
             from torch.distributed.tensor import DTensor
 
             from torchao.prototype.moe_training.nvfp4_training.nvfp4_tensor_parallel import (
+                NVFP4ParallelLinearConfig,
                 nvfp4_col_parallel_linear,
                 nvfp4_row_parallel_linear,
             )
@@ -187,10 +188,12 @@ class NVFP4Linear(nn.Linear):
                 x,
                 w,
                 bias,
-                sr_seed=sr_seed,
-                tp_group=self.process_group,
-                world_size=ws,
-                sign_vector=self.rht_sign_vector,
+                NVFP4ParallelLinearConfig(
+                    tp_group=self.process_group,
+                    sign_vector=self.rht_sign_vector,
+                    world_size=ws,
+                    sr_seed=sr_seed,
+                ),
             )
         return nvfp4_linear(
             x,
