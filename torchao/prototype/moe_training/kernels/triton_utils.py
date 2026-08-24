@@ -15,94 +15,109 @@ def sync_threads():
 
 
 @triton.jit
-def _signal_asm(addrs, asm: tl.constexpr):
-    """Run a CAS spin-loop PTX snippet against ``addrs``.
+def _cas_spin(addrs, sem: tl.constexpr, op: tl.constexpr):
+    """Spin on a system-scoped CAS until it succeeds.
 
-    Shared implementation for :func:`send_signal` and :func:`wait_signal`; the
-    only thing that differs between signalling primitives and memory orderings
-    is the inline PTX ``asm`` block, so callers pass it as a constexpr literal
-    while the surrounding ``inline_asm_elementwise`` invocation stays identical.
+    Single implementation behind :func:`send_signal` (``op="send"``) and
+    :func:`wait_signal` (``op="wait"``). A send flips the flag 0 -> 1 with
+    release/relaxed ordering; a wait flips it 1 -> 0 with acquire/relaxed
+    ordering. ``sem`` selects the memory ordering. Keeping both the send and
+    wait variants in one function avoids two near-identical primitives.
     """
-    tl.inline_asm_elementwise(
-        asm,
-        "=r, l",
-        [addrs],
-        dtype=tl.int32,
-        is_pure=False,
-        pack=1,
-    )
+    if op == "send":
+        if sem == "relaxed":
+            tl.inline_asm_elementwise(
+                """
+                {
+                    .reg .u32   %tmp32_<1>;
+                    .reg .pred  %p<1>;
+
+                    signal:
+                        atom.global.relaxed.sys.cas.b32 %tmp32_0, [$1], 0, 1;
+                        setp.eq.u32 %p0, %tmp32_0, 0;
+                        @!%p0 bra signal;
+                }
+                """,
+                "=r, l",
+                [addrs],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            )
+        elif sem == "acq_rel":
+            tl.inline_asm_elementwise(
+                """
+                {
+                    .reg .u32   %tmp32_<1>;
+                    .reg .pred  %p<1>;
+
+                    signal:
+                        atom.global.release.sys.cas.b32 %tmp32_0, [$1], 0, 1;
+                        setp.eq.u32 %p0, %tmp32_0, 0;
+                        @!%p0 bra signal;
+                }
+                """,
+                "=r, l",
+                [addrs],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            )
+        else:
+            raise RuntimeError(f"Unrecognized sem: {sem}")
+    elif op == "wait":
+        if sem == "relaxed":
+            tl.inline_asm_elementwise(
+                """
+                {
+                    .reg .u32   %tmp32_<1>;
+                    .reg .pred  %p<1>;
+
+                    signal:
+                        atom.global.sys.relaxed.cas.b32 %tmp32_0, [$1], 1, 0;
+                        setp.eq.u32 %p0, %tmp32_0, 1;
+                        @!%p0 bra signal;
+                }
+                """,
+                "=r, l",
+                [addrs],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            )
+        elif sem == "acq_rel":
+            tl.inline_asm_elementwise(
+                """
+                {
+                    .reg .u32   %tmp32_<1>;
+                    .reg .pred  %p<1>;
+
+                    signal:
+                        atom.global.sys.acquire.cas.b32 %tmp32_0, [$1], 1, 0;
+                        setp.eq.u32 %p0, %tmp32_0, 1;
+                        @!%p0 bra signal;
+                }
+                """,
+                "=r, l",
+                [addrs],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            )
+        else:
+            raise RuntimeError(f"Unrecognized sem: {sem}")
+    else:
+        raise RuntimeError(f"Unrecognized op: {op}")
 
 
 @triton.jit
 def send_signal(addrs, sem: tl.constexpr):
-    if sem == "relaxed":
-        _signal_asm(
-            addrs,
-            """
-            {
-                .reg .u32   %tmp32_<1>;
-                .reg .pred  %p<1>;
-
-                send_signal:
-                    atom.global.relaxed.sys.cas.b32 %tmp32_0, [$1], 0, 1;
-                    setp.eq.u32 %p0, %tmp32_0, 0;
-                    @!%p0 bra send_signal;
-            }
-            """,
-        )
-    elif sem == "acq_rel":
-        _signal_asm(
-            addrs,
-            """
-            {
-                .reg .u32   %tmp32_<1>;
-                .reg .pred  %p<1>;
-
-                send_signal:
-                    atom.global.release.sys.cas.b32 %tmp32_0, [$1], 0, 1;
-                    setp.eq.u32 %p0, %tmp32_0, 0;
-                    @!%p0 bra send_signal;
-            }
-            """,
-        )
-    else:
-        raise RuntimeError(f"Unrecognized sem: {sem}")
+    _cas_spin(addrs, sem, "send")
 
 
 @triton.jit
 def wait_signal(addrs, sem: tl.constexpr):
-    if sem == "relaxed":
-        _signal_asm(
-            addrs,
-            """
-            {
-                .reg .u32   %tmp32_<1>;
-                .reg .pred  %p<1>;
-
-                wait_signal:
-                    atom.global.sys.relaxed.cas.b32 %tmp32_0, [$1], 1, 0;
-                    setp.eq.u32 %p0, %tmp32_0, 1;
-                    @!%p0 bra wait_signal;
-            }
-            """,
-        )
-    elif sem == "acq_rel":
-        _signal_asm(
-            addrs,
-            """
-            {
-                .reg .u32   %tmp32_<1>;
-                .reg .pred  %p<1>;
-
-                wait_signal:
-                    atom.global.sys.acquire.cas.b32 %tmp32_0, [$1], 1, 0;
-                    setp.eq.u32 %p0, %tmp32_0, 1;
-                    @!%p0 bra wait_signal;
-            }
-            """,
-        )
-    else:
-        raise RuntimeError(f"Unrecognized sem: {sem}")
+    _cas_spin(addrs, sem, "wait")
 
 
 @triton.jit

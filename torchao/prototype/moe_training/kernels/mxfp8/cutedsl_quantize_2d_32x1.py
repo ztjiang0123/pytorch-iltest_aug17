@@ -15,9 +15,12 @@ from .cute_utils import (
     F8_MAX,
     load_vals_chunk_full,
     load_vals_chunk_tail,
-    run_quantize_tile_loop,
-    setup_kernel_smem_and_barriers,
-    validate_group_sizes,
+    make_axis_spec,
+    make_kernel_io,
+    make_quant_opts,
+    make_tile_shape,
+    make_tma_handles,
+    run_quantize_2d_kernel,
 )
 
 
@@ -533,124 +536,64 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
             IS_FULL_M_TILES: cutlass.Constexpr[bool],
             STAGE_COUNT: cutlass.Constexpr[int],
         ):
-            """Main MXFP8 quantization kernel with warp specialization and TMA pipeline for 32x1 scaling.
+            """MXFP8 32x1 quantization kernel (scales along M, M//32 per column).
 
-            Warp roles:
-            - Warp 0: Producer (TMA loads/stores)
-            - Warps 1..compute_warps: Consumers (quantize in registers)
-
-            Pipeline stages:
-            - Stage 0: Load tile to shared memory, quantize, store to global
-            - Stage 1 (if enabled): Prefetch next tile while processing current
-
-            For 32x1 scaling, we quantize along the M dimension - each column has M//32 scales.
-
-            Args:
-                inp_mk: Input tensor in global memory (M, K)
-                tma_atom_in: TMA copy atom for G2S
-                tma_tensor_in: TMA tensor view for input
-                out_mk: Output tensor in global memory (M, K)
-                tma_atom_out: TMA copy atom for S2G
-                tma_tensor_out: TMA tensor view for output
-                scales_out_u8: Output scales tensor in global memory (M//32, K) or blocked layout
-                M: M dimension size
-                K: K dimension size
-                m_blocks: Number of 32-element blocks in M
-                m_cta_tiles: Number of tiles in M dimension
-                k_cta_tiles: Number of tile groups in K dimension
-                blocked_scale_layout: Layout for blocked scale output
-                offs: Tensor of group end offsets for validation
-                SCALE_DIM_M: Block size (32)
-                USE_RCEIL: Whether using RCEIL mode
-                IS_FULL_M_TILES: Whether M is perfectly tiled
-                STAGE_COUNT: Number of pipeline stages
-
-            Storage locations:
-                Inputs: inp_mk (global memory)
-                Outputs: out_mk, scales_out_u8 (global memory)
-                Intermediate: shared memory for tiles, registers for computation
+            This is the transpose of the 1x32 kernel: K indexes the fixed CTA
+            tile axis while M is the grouped, per-32-element-block scaling axis,
+            so each column carries M//32 scales. block_idx.x selects the grouped
+            M tile and block_idx.y the fixed K tile. The warp-specialized TMA
+            pipeline body is shared in ``run_quantize_2d_kernel``; ``_axis_32x1``
+            supplies this kernel's transposed axis mapping.
             """
-            tidx, _, _ = cute.arch.thread_idx()
-            warp_idx = cute.arch.warp_idx()
-            warp_idx = cute.arch.make_warp_uniform(warp_idx)
-            bidx, bidy, _ = cute.arch.block_idx()
-
-            # Validate group sizes are multiples of 128 if offs is provided
-            if cutlass.const_expr(offs is not None):
-                if tidx == 0:
-                    validate_group_sizes(offs)
-
             smem_allocator = utils.SmemAllocator()
             storage = smem_allocator.allocate(SharedStorage)
-
-            smem_layout_in, smem_layout_out = _make_tile_smem_layouts(TILE_M, TILE_K)
-            (
-                sIN_tile0,
-                sOUT_tile0,
-                sIN_tile1,
-                sOUT_tile1,
-                tma_mbar_ptr0,
-                tma_mbar_ptr1,
-            ) = setup_kernel_smem_and_barriers(
-                storage,
-                smem_layout_in,
-                smem_layout_out,
-                tidx,
-                tma_atom_in,
-                tma_atom_out,
-                STAGE_COUNT_VALUE,
-                TILE_M,
-                TILE_K,
+            shape = make_tile_shape(
+                tile_m=TILE_M, tile_k=TILE_K, stage_count=STAGE_COUNT_VALUE
             )
-
-            # For 32x1 scaling: bidx is M tile group, bidy is K tile
-            m_tile_group_idx = cutlass.Int64(bidx)
-            k_tile = cutlass.Int64(bidy)
-            if cutlass.const_expr(BLOCKED_SCALE_OUTPUT_VALUE):
-                scales_tensor = cute.make_tensor(
-                    scales_out_u8.iterator,
-                    blocked_scale_layout,
-                )
-            else:
-                scales_tensor = scales_out_u8
-
-            # 32x1 scaling: K is the fixed CTA tile axis, M is grouped per CTA
-            # and quantized into 32-element blocks (each column has M//32 scales).
-            run_quantize_tile_loop(
-                self,
-                warp_idx=warp_idx,
-                tidx=tidx,
-                compute_warps=compute_warps,
-                tma_atom_in=tma_atom_in,
-                tma_tensor_in=tma_tensor_in,
-                tma_atom_out=tma_atom_out,
-                tma_tensor_out=tma_tensor_out,
-                scales_tensor=scales_tensor,
-                sIN_tile0=sIN_tile0,
-                sOUT_tile0=sOUT_tile0,
-                sIN_tile1=sIN_tile1,
-                sOUT_tile1=sOUT_tile1,
-                tma_mbar_ptr0=tma_mbar_ptr0,
-                tile_m=TILE_M,
-                tile_k=TILE_K,
-                stage_count=STAGE_COUNT,
-                tiles_per_cta=M_TILES_PER_CTA,
-                group_tile_idx=m_tile_group_idx,
-                fixed_tile=k_tile,
-                group_is_first_coord=True,
-                lane_tile_size=TILE_K,
-                lane_iters=K_ITERS_PER_LANE,
-                lane_threads=K_THREADS,
-                lane_axis_size=K,
-                block_tile_size=TILE_M,
-                blocks_per_tile=M_BLOCKS_PER_TILE,
-                scale_dim=SCALE_DIM_M_VALUE,
-                block_axis_size=M,
-                num_blocks=m_blocks,
-                is_full_tiles=IS_FULL_M_TILES,
+            tma = make_tma_handles(
+                atom_in=tma_atom_in,
+                tensor_in=tma_tensor_in,
+                atom_out=tma_atom_out,
+                tensor_out=tma_tensor_out,
+            )
+            opts = make_quant_opts(
                 use_rceil=USE_RCEIL,
                 blocked_scale_output=BLOCKED_SCALE_OUTPUT_VALUE,
             )
+
+            def _axis_32x1(bidx, bidy):
+                # 32x1: K is the fixed CTA tile (bidy), M is grouped (bidx).
+                return make_axis_spec(
+                    shape=shape,
+                    tiles_per_cta=M_TILES_PER_CTA,
+                    group_tile_idx=cutlass.Int64(bidx),
+                    fixed_tile=cutlass.Int64(bidy),
+                    group_is_first_coord=True,
+                    lane_tile_size=TILE_K,
+                    lane_iters=K_ITERS_PER_LANE,
+                    lane_threads=K_THREADS,
+                    lane_axis_size=K,
+                    block_tile_size=TILE_M,
+                    blocks_per_tile=M_BLOCKS_PER_TILE,
+                    scale_dim=SCALE_DIM_M_VALUE,
+                    block_axis_size=M,
+                    num_blocks=m_blocks,
+                    is_full_tiles=IS_FULL_M_TILES,
+                )
+
+            io = make_kernel_io(
+                storage=storage,
+                smem_layouts=_make_tile_smem_layouts(TILE_M, TILE_K),
+                tma=tma,
+                shape=shape,
+                offs=offs,
+                scales_out_u8=scales_out_u8,
+                blocked_scale_output=BLOCKED_SCALE_OUTPUT_VALUE,
+                blocked_scale_layout=blocked_scale_layout,
+                opts=opts,
+                compute_warps=compute_warps,
+            )
+            run_quantize_2d_kernel(self, io, _axis_32x1)
 
         @cute.jit
         def __call__(

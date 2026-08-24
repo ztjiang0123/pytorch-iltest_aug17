@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -198,14 +199,14 @@ class _MXFP8GroupedMM(torch.autograd.Function):
             padded_group_end_offsets = group_end_offsets
 
         # Perform forward computation using appropriate path
-        output = _compute_fwd(
+        output = _compute_grouped_mm(
+            "fwd",
             padded_input_act,
             weight_t,
             padded_group_end_offsets,
-            block_size,
-            out_dtype,
-            scale_calculation_mode,
-            kernel_preference,
+            _GroupedMMParams(
+                block_size, out_dtype, scale_calculation_mode, kernel_preference
+            ),
         )
 
         # Unpad output if padding was used
@@ -281,14 +282,14 @@ class _MXFP8GroupedMM(torch.autograd.Function):
             padded_grad_output = grad_output
 
         # Compute gradient w.r.t. input activations
-        grad_input = _compute_dgrad(
+        grad_input = _compute_grouped_mm(
+            "dgrad",
             padded_grad_output,
             weight_t,
             padded_group_end_offsets,
-            block_size,
-            out_dtype,
-            scale_calculation_mode,
-            kernel_preference,
+            _GroupedMMParams(
+                block_size, out_dtype, scale_calculation_mode, kernel_preference
+            ),
         )
 
         # Compute gradient w.r.t. weights (high-precision or quantized)
@@ -327,116 +328,61 @@ class _MXFP8GroupedMM(torch.autograd.Function):
         )
 
 
-def _dispatch_grouped_mm(
-    emulated_fn,
-    sm100_fn,
+@dataclass(frozen=True)
+class _GroupedMMParams:
+    """Quantization/dispatch settings shared by every grouped-mm computation.
+
+    Bundling these fields keeps the dispatch helpers to a small argument list
+    and lets forward/backward reuse a single settings object.
+    """
+
+    block_size: int
+    out_dtype: torch.dtype
+    scale_calculation_mode: ScaleCalculationMode
+    kernel_preference: KernelPreference
+
+
+# For each computation "kind", the (EMULATED path, AUTO/SM100 path) pair. The
+# forward (`_compute_fwd_*`) and input-gradient (`_compute_dgrad_*`) paths share
+# an identical dispatch shape, so a single `_compute_grouped_mm` handles both.
+_GROUPED_MM_IMPLS = {
+    "fwd": (lambda: _compute_fwd_emulated, lambda: _compute_fwd_sm100),
+    "dgrad": (lambda: _compute_dgrad_emulated, lambda: _compute_dgrad_sm100),
+}
+
+
+def _compute_grouped_mm(
+    kind: str,
     lhs: torch.Tensor,
     weight_t: torch.Tensor,
     group_end_offsets: torch.Tensor,
-    block_size: int,
-    out_dtype: torch.dtype,
-    scale_calculation_mode: ScaleCalculationMode,
-    kernel_preference: KernelPreference,
+    params: _GroupedMMParams,
 ) -> torch.Tensor:
-    """
-    Dispatch a grouped-mm computation to the EMULATED or AUTO (SM100) path.
+    """Run a grouped-mm computation, dispatching to the EMULATED or AUTO path.
 
     Args:
-        emulated_fn: Implementation used when kernel_preference is EMULATED.
-        sm100_fn: Implementation used otherwise (SM100 kernels).
-        lhs: Left-hand-side operand (activations or grad_output), shape (M, K/N)
-        weight_t: Expert weights transposed, shape (E, K, N)
-        group_end_offsets: Group offsets for grouped mm
-        block_size: Block size for quantization
-        out_dtype: Output dtype
-        scale_calculation_mode: Mode for scale calculation
-        kernel_preference: If EMULATED, use EMULATED path (native PyTorch), else use AUTO (SM100 kernels)
+        kind: "fwd" (output = lhs @ weight_t) or "dgrad" (grad_input).
+        lhs: Left-hand-side operand (activations or grad_output), shape (M, K/N).
+        weight_t: Expert weights transposed, shape (E, K, N).
+        group_end_offsets: Group offsets for grouped mm (possibly padded).
+        params: Shared block size / dtype / scale mode / kernel preference.
 
     Returns:
-        Output tensor.
+        Output tensor (forward: (M, N); dgrad: (M, K)).
     """
-    impl = emulated_fn if kernel_preference == KernelPreference.EMULATED else sm100_fn
+    emulated_fn, sm100_fn = _GROUPED_MM_IMPLS[kind]
+    impl = (
+        emulated_fn()
+        if params.kernel_preference == KernelPreference.EMULATED
+        else sm100_fn()
+    )
     return impl(
         lhs,
         weight_t,
         group_end_offsets,
-        block_size,
-        out_dtype,
-        scale_calculation_mode,
-    )
-
-
-def _compute_fwd(
-    padded_input_act: torch.Tensor,
-    weight_t: torch.Tensor,
-    padded_group_end_offsets: torch.Tensor,
-    block_size: int,
-    out_dtype: torch.dtype,
-    scale_calculation_mode: ScaleCalculationMode,
-    kernel_preference: KernelPreference,
-) -> torch.Tensor:
-    """
-    Forward computation wrapper that dispatches to AUTO or EMULATED path.
-
-    Args:
-        padded_input_act: Input activations (possibly padded), shape (M, K)
-        weight_t: Expert weights transposed, shape (E, K, N)
-        padded_group_end_offsets: Group offsets (possibly padded)
-        block_size: Block size for quantization
-        out_dtype: Output dtype
-        scale_calculation_mode: Mode for scale calculation
-        kernel_preference: If EMULATED, use EMULATED path (native PyTorch), else use AUTO (SM100 kernels)
-
-    Returns:
-        Output tensor, shape (M, N)
-    """
-    return _dispatch_grouped_mm(
-        _compute_fwd_emulated,
-        _compute_fwd_sm100,
-        padded_input_act,
-        weight_t,
-        padded_group_end_offsets,
-        block_size,
-        out_dtype,
-        scale_calculation_mode,
-        kernel_preference,
-    )
-
-
-def _compute_dgrad(
-    grad_output: torch.Tensor,
-    weight_t: torch.Tensor,
-    group_end_offsets: torch.Tensor,
-    block_size: int,
-    out_dtype: torch.dtype,
-    scale_calculation_mode: ScaleCalculationMode,
-    kernel_preference: KernelPreference,
-) -> torch.Tensor:
-    """
-    Compute gradient w.r.t. input activations, dispatching to AUTO or EMULATED path.
-
-    Args:
-        grad_output: Gradient output, shape (M, N)
-        weight_t: Expert weights transposed, shape (E, K, N)
-        group_end_offsets: Group offsets for grouped mm
-        block_size: Block size for quantization
-        out_dtype: Output dtype
-        scale_calculation_mode: Mode for scale calculation
-        kernel_preference: If EMULATED, use EMULATED path (native PyTorch), else use AUTO (SM100 kernels)
-
-    Returns:
-        grad_input, shape (M, K)
-    """
-    return _dispatch_grouped_mm(
-        _compute_dgrad_emulated,
-        _compute_dgrad_sm100,
-        grad_output,
-        weight_t,
-        group_end_offsets,
-        block_size,
-        out_dtype,
-        scale_calculation_mode,
-        kernel_preference,
+        params.block_size,
+        params.out_dtype,
+        params.scale_calculation_mode,
     )
 
 
