@@ -25,7 +25,11 @@ from benchmarks.prototype.moe_training.bench_utils import (
     make_moe_module_filter_fn,
     setup_distributed,
 )
-from benchmarks.utils import bench_fwd_bwd_microseconds, profile_fwd_bwd
+from benchmarks.utils import (
+    ProfileConfig,
+    bench_fwd_bwd_microseconds,
+    profile_fwd_bwd,
+)
 from torchao.prototype.moe_training.config import (
     Float8TrainingRecipe,
     MXFP8TrainingOpConfig,
@@ -151,7 +155,12 @@ def bench_moe_training_fsdp(recipe_name: str, enable_profile: bool, use_compile:
     print(f"BF16 time: {bf16_us} us")
     if enable_profile:
         print("Profiling bf16 training")
-        profile_fwd_bwd(ref_model, ref_x, labels=labels, profile_name="bf16_profile")
+        profile_fwd_bwd(
+            ref_model,
+            ref_x,
+            labels=labels,
+            config=ProfileConfig(profile_name="bf16_profile"),
+        )
 
     scaled_us = bench_fwd_bwd_microseconds(
         model,
@@ -163,7 +172,12 @@ def bench_moe_training_fsdp(recipe_name: str, enable_profile: bool, use_compile:
     print(f"Scaled time: {scaled_us} us")
     if enable_profile:
         print("Profiling quantized training")
-        profile_fwd_bwd(model, x, labels=labels, profile_name=f"{recipe_name}_profile")
+        profile_fwd_bwd(
+            model,
+            x,
+            labels=labels,
+            config=ProfileConfig(profile_name=f"{recipe_name}_profile"),
+        )
 
     print(f"Speedup: {bf16_us / scaled_us:.3f}x")
     dist.destroy_process_group()

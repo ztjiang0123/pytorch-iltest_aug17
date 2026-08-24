@@ -4,10 +4,27 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import dataclass
+
 import torch
 from torch.nn import functional as F
 from tqdm import tqdm
 from triton.testing import do_bench
+
+
+@dataclass
+class ProfileConfig:
+    """Run-mode flags for :func:`profile_fwd_bwd`.
+
+    ``use_compile`` and ``fullgraph`` control ``torch.compile``, while
+    ``profile_name`` names the exported chrome trace. These values travel
+    together at every call site, so they are grouped here instead of being
+    passed as separate keyword arguments.
+    """
+
+    use_compile: bool = False
+    fullgraph: bool = True
+    profile_name: str = "profile"
 
 
 def bench_fwd_bwd_microseconds(fn, *args, use_compile=False, fullgraph=True, **kwargs):
@@ -48,17 +65,16 @@ def bench_fwd_microseconds(fn, *args, use_compile=False, fullgraph=True, **kwarg
 def profile_fwd_bwd(
     fn,
     *args,
-    use_compile=False,
-    fullgraph=True,
-    profile_name="profile",
+    config=None,
     **kwargs,
 ):
+    config = config or ProfileConfig()
     # Run once to get output shape for labels
     with torch.no_grad():
         out_sample = fn(*args, **kwargs)
     labels = torch.ones_like(out_sample)
 
-    fn = torch.compile(fn, fullgraph=fullgraph) if use_compile else fn
+    fn = torch.compile(fn, fullgraph=config.fullgraph) if config.use_compile else fn
     wait, warmup, active = 1, 3, 1
     total_steps = wait + warmup + active
     with torch.profiler.profile(
@@ -79,8 +95,8 @@ def profile_fwd_bwd(
             prof.step()
 
     # Save profiler results
-    prof.export_chrome_trace(f"{profile_name}.json")
-    print(f"Saved: {profile_name}.json")
+    prof.export_chrome_trace(f"{config.profile_name}.json")
+    print(f"Saved: {config.profile_name}.json")
 
 
 def profile_fn(fn, *args, profile_name="profile", distributed=False, **kwargs):

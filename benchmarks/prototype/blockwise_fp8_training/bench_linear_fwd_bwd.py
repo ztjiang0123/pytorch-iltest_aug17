@@ -18,6 +18,7 @@ from benchmarks.prototype.blockwise_fp8_training.bench_gemm_utils import (
     get_configs,
 )
 from benchmarks.utils import (
+    ProfileConfig,
     bench_fwd_bwd_microseconds,
     profile_fwd_bwd,
     run_experiments_and_print,
@@ -79,8 +80,10 @@ def run_experiment(
             bf16_linear,
             inputs,
             labels=labels,
-            profile_name="bf16_linear_profile",
-            use_compile=use_compile,
+            config=ProfileConfig(
+                use_compile=use_compile,
+                profile_name="bf16_linear_profile",
+            ),
         )
 
     # FP8 triton bench and profile
@@ -95,7 +98,7 @@ def run_experiment(
             fp8_triton_linear,
             inputs,
             labels=labels,
-            profile_name="fp8_triton_linear_profile",
+            config=ProfileConfig(profile_name="fp8_triton_linear_profile"),
         )
 
     # FP8 torch._scaled_mm bench and profile
@@ -111,8 +114,10 @@ def run_experiment(
             fp8_scaled_mm_linear,
             inputs,
             labels=labels,
-            profile_name="fp8_scaled_mm_linear_profile",
-            use_compile=use_compile,
+            config=ProfileConfig(
+                use_compile=use_compile,
+                profile_name="fp8_scaled_mm_linear_profile",
+            ),
         )
 
     return ExperimentResult(

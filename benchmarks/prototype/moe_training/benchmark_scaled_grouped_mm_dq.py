@@ -15,6 +15,7 @@ from tabulate import tabulate
 from tqdm import tqdm
 
 from benchmarks.utils import (
+    ProfileConfig,
     bench_fwd_bwd_microseconds,
     bench_fwd_microseconds,
     profile_fwd_bwd,
@@ -143,9 +144,11 @@ def run_experiment(
             A,
             B_t,
             offs,
-            use_compile=args.compile,
-            fullgraph=False,
-            profile_name="bf16_profile",
+            config=ProfileConfig(
+                use_compile=args.compile,
+                fullgraph=False,
+                profile_name="bf16_profile",
+            ),
         )
 
     # fwd_bwd scaled benchmark + profiling
@@ -165,9 +168,11 @@ def run_experiment(
             B_t,
             quant_config,
             padded_offs,
-            use_compile=args.compile,
-            profile_name="scaled_profile",
-            fullgraph=False,
+            config=ProfileConfig(
+                use_compile=args.compile,
+                fullgraph=False,
+                profile_name="scaled_profile",
+            ),
         )
 
     # Forward pass benchmarks
