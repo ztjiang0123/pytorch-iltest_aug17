@@ -18,6 +18,69 @@ from torchao.quantization.utils import (
 )
 
 
+def _copy_fake_quantized_weights(
+    src: torch.nn.Linear,
+    dst: torch.nn.Linear,
+) -> None:
+    """
+    Copy the weight and bias from ``src`` to ``dst`` in place.
+
+    In distributed training, the model may be instantiated on the meta
+    device, in which case there is no need to copy the weights, and doing
+    so will result in an error.
+    """
+    if src.weight.device != torch.device("meta"):
+        dst.weight = src.weight
+        dst.bias = src.bias
+
+
+def _fake_quantized_linear_to_linear(mod: torch.nn.Linear) -> torch.nn.Linear:
+    """
+    Build a plain ``torch.nn.Linear`` mirroring the shape, device, and dtype
+    of a fake quantized linear module, copying over its weight and bias.
+
+    Shared by the ``to_linear`` conversion of the various fake quantized
+    linear modules (e.g. ``FakeQuantizedLinear``, ``MXFakeQuantizedLinear``,
+    ``NVFP4FakeQuantizedLinear``).
+    """
+    new_linear = torch.nn.Linear(
+        mod.in_features,
+        mod.out_features,
+        mod.bias is not None,
+        device=mod.weight.device,
+        dtype=mod.weight.dtype,
+    )
+    _copy_fake_quantized_weights(mod, new_linear)
+    return new_linear
+
+
+def _linear_to_fake_quantized_linear(
+    cls: type,
+    mod: torch.nn.Linear,
+    activation_config: Any = None,
+    weight_config: Any = None,
+) -> torch.nn.Linear:
+    """
+    Build a fake quantized linear of type ``cls`` mirroring the shape, device,
+    and dtype of ``mod``, copying over its weight and bias.
+
+    Shared by the ``from_linear`` conversion of the various fake quantized
+    linear modules (e.g. ``FakeQuantizedLinear``, ``MXFakeQuantizedLinear``,
+    ``NVFP4FakeQuantizedLinear``).
+    """
+    new_linear = cls(
+        mod.in_features,
+        mod.out_features,
+        mod.bias is not None,
+        activation_config=activation_config,
+        weight_config=weight_config,
+        device=mod.weight.device,
+        dtype=mod.weight.dtype,
+    )
+    _copy_fake_quantized_weights(mod, new_linear)
+    return new_linear
+
+
 def _fake_quantize_per_channel_group(
     input: torch.Tensor,
     scales: torch.Tensor,

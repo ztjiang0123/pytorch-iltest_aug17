@@ -10,9 +10,13 @@ from .grouper import Grouper
 
 
 class DimGrouperMixin:
-    def __init__(self, start_dim: int = 1, end_dim: int = -1):
+    # Subclasses set the dimension along which parameters are grouped.
+    _in_dims: int
+
+    def __init__(self, p: Tensor, start_dim: int = 1, end_dim: int = -1):
         self.start_dim = start_dim
         self.end_dim = end_dim
+        super(DimGrouperMixin, self).__init__(p, in_dims=self._in_dims)
 
     def __enter__(self):
         if self.p.dim() > 2:
@@ -27,12 +31,8 @@ class DimGrouperMixin:
 
 
 class Dim0Grouper(DimGrouperMixin, Grouper):
-    def __init__(self, p: Tensor, start_dim: int = 1, end_dim: int = -1):
-        super().__init__(start_dim, end_dim)
-        super(DimGrouperMixin, self).__init__(p, in_dims=0)
+    _in_dims = 0
 
 
 class Dim1Grouper(DimGrouperMixin, Grouper):
-    def __init__(self, p: Tensor, start_dim: int = 1, end_dim: int = -1):
-        super().__init__(start_dim, end_dim)
-        super(DimGrouperMixin, self).__init__(p, in_dims=1)
+    _in_dims = 1

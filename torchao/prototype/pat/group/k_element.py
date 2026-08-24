@@ -18,10 +18,11 @@ class KElementGrouper(DimGrouperMixin, Grouper):
     each of size k (last group may be smaller if N % k != 0).
     """
 
+    _in_dims = 0
+
     def __init__(self, p: Tensor, k: int, start_dim: int = 1, end_dim: int = -1):
         assert k > 0, "k must be positive"
-        super().__init__(start_dim, end_dim)
-        super(DimGrouperMixin, self).__init__(p, in_dims=0)
+        super().__init__(p, start_dim, end_dim)
         self.k = k
 
     def __enter__(self):
