@@ -18,43 +18,44 @@ from torchao.quantization.utils import (
 )
 
 
-def _init_fake_quantized_linear(
-    self: torch.nn.Linear,
-    in_features: int,
-    out_features: int,
-    bias: bool,
-    activation_config: Any,
-    weight_config: Any,
-    activation_required_msg: str,
-    args: tuple,
-    kwargs: dict,
-) -> None:
+class _FakeQuantizedLinearBase(torch.nn.Linear):
     """
-    Shared constructor body for fake quantized linear modules that require
-    both an activation and a weight config (e.g. ``MXFakeQuantizedLinear``,
+    Shared base for fake quantized linear modules that require both an
+    activation and a weight config (e.g. ``MXFakeQuantizedLinear``,
     ``NVFP4FakeQuantizedLinear``).
 
-    Initializes the underlying ``nn.Linear``, validates that both configs are
-    present, and stores them on the instance. ``activation_required_msg`` is
-    the format-specific error raised when only weight quantization is given.
-
-    Both callers subclass ``torch.nn.Linear`` directly, so its ``__init__`` is
-    invoked explicitly here to match their original ``super().__init__(...)``.
+    Subclasses set ``_activation_required_msg`` to the format-specific error
+    raised when only weight quantization is provided. The constructor
+    initializes the underlying ``nn.Linear``, validates that both configs are
+    present, and stores them on the instance.
     """
-    torch.nn.Linear.__init__(
+
+    # Format-specific error raised when only a weight config is provided.
+    _activation_required_msg: str = "Weight only QAT not supported yet"
+
+    def __init__(
         self,
-        in_features,
-        out_features,
-        bias,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        activation_config: Any = None,
+        weight_config: Any = None,
         *args,
         **kwargs,
-    )
-    if weight_config is None:
-        raise ValueError("Must specify `weight_config`")
-    if activation_config is None:
-        raise ValueError(activation_required_msg)
-    self.activation_config = activation_config
-    self.weight_config = weight_config
+    ):
+        super().__init__(
+            in_features,
+            out_features,
+            bias,
+            *args,
+            **kwargs,
+        )
+        if weight_config is None:
+            raise ValueError("Must specify `weight_config`")
+        if activation_config is None:
+            raise ValueError(self._activation_required_msg)
+        self.activation_config = activation_config
+        self.weight_config = weight_config
 
 
 def _copy_fake_quantized_weights(

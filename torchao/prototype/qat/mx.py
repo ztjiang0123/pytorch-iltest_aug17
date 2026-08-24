@@ -36,7 +36,7 @@ from torchao.prototype.mx_formats.mx_tensor import (
 from torchao.quantization.qat import FakeQuantizeConfigBase
 from torchao.quantization.qat.utils import (
     _fake_quantized_linear_to_linear,
-    _init_fake_quantized_linear,
+    _FakeQuantizedLinearBase,
     _linear_to_fake_quantized_linear,
 )
 from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
@@ -159,7 +159,7 @@ class _MXQuantizedForwardFakeQuantizedBackward(torch.autograd.Function):
         return grad_input, grad_weight, None, None, None
 
 
-class MXFakeQuantizedLinear(torch.nn.Linear):
+class MXFakeQuantizedLinear(_FakeQuantizedLinearBase):
     """
     Linear module for fake quantized MX weights and/or activations.
 
@@ -186,27 +186,7 @@ class MXFakeQuantizedLinear(torch.nn.Linear):
         # Model contains `nn.Linear` with `MXTensor` weights now
     """
 
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = False,
-        activation_config: Optional[MXFakeQuantizeConfig] = None,
-        weight_config: Optional[MXFakeQuantizeConfig] = None,
-        *args,
-        **kwargs,
-    ):
-        _init_fake_quantized_linear(
-            self,
-            in_features,
-            out_features,
-            bias,
-            activation_config,
-            weight_config,
-            "Weight only MX QAT not supported yet",
-            args,
-            kwargs,
-        )
+    _activation_required_msg = "Weight only MX QAT not supported yet"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         fq = _MXQuantizedForwardFakeQuantizedBackward.apply(

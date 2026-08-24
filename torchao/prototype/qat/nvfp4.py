@@ -11,7 +11,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 from torchao.quantization.qat import FakeQuantizeConfigBase
 from torchao.quantization.qat.utils import (
     _fake_quantized_linear_to_linear,
-    _init_fake_quantized_linear,
+    _FakeQuantizedLinearBase,
     _linear_to_fake_quantized_linear,
 )
 
@@ -105,7 +105,7 @@ class _NVFP4QuantizedForwardFakeQuantizedBackward(torch.autograd.Function):
         return grad_input, grad_weight, None, None, None
 
 
-class NVFP4FakeQuantizedLinear(torch.nn.Linear):
+class NVFP4FakeQuantizedLinear(_FakeQuantizedLinearBase):
     """
     Linear module for fake quantized NVFP4 weights and/or activations.
 
@@ -130,27 +130,7 @@ class NVFP4FakeQuantizedLinear(torch.nn.Linear):
         # Model contains `nn.Linear` with `NVFP4Tensor` weights now
     """
 
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = False,
-        activation_config: Optional[NVFP4FakeQuantizeConfig] = None,
-        weight_config: Optional[NVFP4FakeQuantizeConfig] = None,
-        *args,
-        **kwargs,
-    ):
-        _init_fake_quantized_linear(
-            self,
-            in_features,
-            out_features,
-            bias,
-            activation_config,
-            weight_config,
-            "Weight only NVFP4 QAT not supported yet",
-            args,
-            kwargs,
-        )
+    _activation_required_msg = "Weight only NVFP4 QAT not supported yet"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 3:
