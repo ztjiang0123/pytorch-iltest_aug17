@@ -94,31 +94,64 @@ class Experiment:
         return self.float8_tops_sec / dtype_to_peak_tops[torch.float8_e4m3fn]
 
 
+@dataclass
+class RunConfig:
+    """Top-level knobs controlling how the benchmark sweep is executed."""
+
+    sweep_path: Optional[Path] = None
+    compile: bool = True
+    n_limit: Optional[int] = None
+    fast_accum_filter: Optional[bool] = None
+    shape_name_filter: Optional[str] = None
+
+
+@dataclass
+class ShapeSpec:
+    """Description of which shapes to sweep over."""
+
+    shape_gen_name: str = "llama"
+    M: Optional[int] = None
+    K: Optional[int] = None
+    N: Optional[int] = None
+
+
+@dataclass
+class ScalingSpec:
+    """Scaling types and granularity for the float8 casts."""
+
+    scaling_type_input: str = "dynamic"
+    scaling_type_weight: str = "dynamic"
+    scaling_type_grad_output: str = "dynamic"
+    scaling_granularity: str = "tensorwise"
+
+
 # TODO(future PR): add option to measure GPU kernel time, as in other
 # scripts in this folder
 def main(
-    sweep_path: Optional[Path] = None,
-    compile: bool = True,
-    n_limit: Optional[int] = None,
-    fast_accum_filter: Optional[bool] = None,
-    shape_name_filter: Optional[str] = None,
-    *,
-    shape_gen_name: str = "llama",
-    M: Optional[int] = None,
-    K: Optional[int] = None,
-    N: Optional[int] = None,
-    scaling_type_input: str = "dynamic",
-    scaling_type_weight: str = "dynamic",
-    scaling_type_grad_output: str = "dynamic",
-    scaling_granularity: str = "tensorwise",
+    run_config: Optional[RunConfig] = None,
+    shape_spec: Optional[ShapeSpec] = None,
+    scaling_spec: Optional[ScalingSpec] = None,
 ):
+    if run_config is None:
+        run_config = RunConfig()
+    if shape_spec is None:
+        shape_spec = ShapeSpec()
+    if scaling_spec is None:
+        scaling_spec = ScalingSpec()
+
+    sweep_path = run_config.sweep_path
+    compile = run_config.compile
+    n_limit = run_config.n_limit
+    fast_accum_filter = run_config.fast_accum_filter
+    shape_name_filter = run_config.shape_name_filter
+
     device = "cuda"
     print(f"Compile is set to             | {compile}")
 
-    scaling_type_input = ScalingType(scaling_type_input)
-    scaling_type_weight = ScalingType(scaling_type_weight)
-    scaling_type_grad_output = ScalingType(scaling_type_grad_output)
-    scaling_granularity = ScalingGranularity(scaling_granularity)
+    scaling_type_input = ScalingType(scaling_spec.scaling_type_input)
+    scaling_type_weight = ScalingType(scaling_spec.scaling_type_weight)
+    scaling_type_grad_output = ScalingType(scaling_spec.scaling_type_grad_output)
+    scaling_granularity = ScalingGranularity(scaling_spec.scaling_granularity)
 
     cast_config_input = CastConfig(
         scaling_type=scaling_type_input,
@@ -139,7 +172,9 @@ def main(
         cast_config_grad_output=cast_config_grad_output,
     )
 
-    name_to_shapes = get_name_to_shapes_iter(shape_gen_name, M, K, N)
+    name_to_shapes = get_name_to_shapes_iter(
+        shape_spec.shape_gen_name, shape_spec.M, shape_spec.K, shape_spec.N
+    )
     input_bias = False
     if fast_accum_filter is not None:
         use_fast_accum = [fast_accum_filter]
@@ -306,30 +341,41 @@ def invoke_main() -> None:
     parser.add_argument("--scaling_granularity", type=str, required=False)
     args = parser.parse_args()
     output_path = Path(args.output_path) if args.output_path is not None else None
-    kwargs = {}
+
+    shape_kwargs = {}
     if args.shape_gen_name is not None:
-        kwargs["shape_gen_name"] = args.shape_gen_name
+        shape_kwargs["shape_gen_name"] = args.shape_gen_name
     if args.M is not None:
-        kwargs["M"] = (args.M,)
+        shape_kwargs["M"] = (args.M,)
     if args.K is not None:
-        kwargs["K"] = (args.K,)
+        shape_kwargs["K"] = (args.K,)
     if args.N is not None:
-        kwargs["N"] = (args.N,)
+        shape_kwargs["N"] = (args.N,)
+    shape_spec = ShapeSpec(**shape_kwargs)
+
+    scaling_kwargs = {}
     if args.scaling_type_input is not None:
-        kwargs["scaling_type_input"] = args.scaling_type_input
+        scaling_kwargs["scaling_type_input"] = args.scaling_type_input
     if args.scaling_type_weight is not None:
-        kwargs["scaling_type_weight"] = args.scaling_type_weight
+        scaling_kwargs["scaling_type_weight"] = args.scaling_type_weight
     if args.scaling_type_grad_output is not None:
-        kwargs["scaling_type_grad_output"] = args.scaling_type_grad_output
+        scaling_kwargs["scaling_type_grad_output"] = args.scaling_type_grad_output
     if args.scaling_granularity is not None:
-        kwargs["scaling_granularity"] = args.scaling_granularity
+        scaling_kwargs["scaling_granularity"] = args.scaling_granularity
+    scaling_spec = ScalingSpec(**scaling_kwargs)
+
+    run_config = RunConfig(
+        sweep_path=output_path,
+        compile=not args.disable_compile,
+        n_limit=args.n_limit,
+        fast_accum_filter=args.fast_accum_filter,
+        shape_name_filter=args.shape_name_filter,
+    )
+
     main(
-        output_path,
-        not args.disable_compile,
-        args.n_limit,
-        args.fast_accum_filter,
-        args.shape_name_filter,
-        **kwargs,
+        run_config,
+        shape_spec=shape_spec,
+        scaling_spec=scaling_spec,
     )
 
 
