@@ -6,7 +6,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -45,10 +45,48 @@ class _GroupedMMBackendKind(str, Enum):
     EMULATED = "emulated"
 
 
+class _RhsQuantDirection(str, Enum):
+    """Which grouped GEMM the RHS operand is being quantized for.
+
+    ``FORWARD`` is the forward ``A @ B_t`` GEMM; ``DGRAD`` is the
+    ``grad_output @ weight`` GEMM. Forward and dgrad expect transposed RHS
+    layouts, so a backend picks the matching quantizer per direction.
+    """
+
+    FORWARD = "forward"
+    DGRAD = "dgrad"
+
+
+# Signature shared by every blockwise weight-quantizer used for an RHS operand.
+_RhsQuantizer = Callable[..., tuple[torch.Tensor, torch.Tensor]]
+
+
 class _GroupedMMBackend:
     """Backend-specific quantization and grouped GEMM implementation."""
 
     kind: _GroupedMMBackendKind
+
+    # Maps each grouped-GEMM direction to the backend's RHS weight quantizer.
+    # Subclasses populate this; the shared ``_quantize_rhs`` dispatch below
+    # picks the matching quantizer, so backends only declare *which* kernels to
+    # use, not the (identical) dispatch/argument-forwarding logic.
+    _rhs_quantizers: dict[_RhsQuantDirection, _RhsQuantizer] = {}
+
+    def _quantize_rhs(
+        self,
+        B_t: torch.Tensor,
+        block_size: int,
+        dtype: torch.dtype,
+        direction: _RhsQuantDirection,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize the RHS operand for ``direction``'s grouped GEMM."""
+        try:
+            quantizer = self._rhs_quantizers[direction]
+        except KeyError:
+            raise NotImplementedError(
+                f"{type(self).__name__} has no RHS quantizer for {direction}"
+            )
+        return quantizer(B_t, block_size=block_size, dtype=dtype)
 
     def quantize_forward_rhs(
         self,
@@ -56,7 +94,7 @@ class _GroupedMMBackend:
         block_size: int,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError
+        return self._quantize_rhs(B_t, block_size, dtype, _RhsQuantDirection.FORWARD)
 
     def quantize_dgrad_rhs(
         self,
@@ -64,7 +102,7 @@ class _GroupedMMBackend:
         block_size: int,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError
+        return self._quantize_rhs(B_t, block_size, dtype, _RhsQuantDirection.DGRAD)
 
     def grouped_mm(
         self,
@@ -97,34 +135,16 @@ class _EmulatedGroupedMMBackend(_GroupedMMBackend):
 
     kind = _GroupedMMBackendKind.EMULATED
 
-    def quantize_forward_rhs(
-        self,
-        B_t: torch.Tensor,
-        block_size: int,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # The emulated backend consumes TorchAO's grouped RHS layout:
-        # (E, K, N) data with (E, K_blocks, N_blocks) scales.
-        return triton_fp8_blockwise_weight_quant_grouped_transposed_rhs(
-            B_t,
-            block_size=block_size,
-            dtype=dtype,
-        )
-
-    def quantize_dgrad_rhs(
-        self,
-        B_t: torch.Tensor,
-        block_size: int,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # The emulated backend consumes TorchAO's grouped RHS layout for
-        # grad_output @ weight: (E, N, K) data with
-        # (E, N_blocks, K_blocks) scales.
-        return triton_fp8_blockwise_weight_quant_grouped_rhs(
-            B_t,
-            block_size=block_size,
-            dtype=dtype,
-        )
+    # FORWARD: TorchAO's grouped RHS layout, (E, K, N) data with
+    #          (E, K_blocks, N_blocks) scales.
+    # DGRAD:   TorchAO's grouped RHS layout for grad_output @ weight, (E, N, K)
+    #          data with (E, N_blocks, K_blocks) scales.
+    _rhs_quantizers = {
+        _RhsQuantDirection.FORWARD: (
+            triton_fp8_blockwise_weight_quant_grouped_transposed_rhs
+        ),
+        _RhsQuantDirection.DGRAD: triton_fp8_blockwise_weight_quant_grouped_rhs,
+    }
 
     def grouped_mm(
         self,
@@ -191,35 +211,18 @@ class _DeepGemmGroupedMMBackend(_GroupedMMBackend):
     kind = _GroupedMMBackendKind.DEEPGEMM
     offset_plan: DeepGemmGroupedOffsetPlan
 
-    def quantize_forward_rhs(
-        self,
-        B_t: torch.Tensor,
-        block_size: int,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # DeepGEMM forward consumes RHS as (E, N, K), with K contiguous and
-        # scales as (E, N_blocks, K_blocks). This quantizer writes that
-        # layout directly, avoiding a dispatch-time transpose/copy.
-        return triton_fp8_blockwise_weight_quant_grouped_transposed_rhs_deepgemm(
-            B_t,
-            block_size=block_size,
-            dtype=dtype,
-        )
-
-    def quantize_dgrad_rhs(
-        self,
-        B_t: torch.Tensor,
-        block_size: int,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # DeepGEMM dgrad consumes RHS as (E, K, N), with N contiguous and
-        # scales as (E, K_blocks, N_blocks). This quantizer writes that
-        # layout directly, avoiding a dispatch-time transpose/copy.
-        return triton_fp8_blockwise_weight_quant_grouped_rhs_deepgemm(
-            B_t,
-            block_size=block_size,
-            dtype=dtype,
-        )
+    # Both quantizers write DeepGEMM's expected layout directly, avoiding a
+    # dispatch-time transpose/copy.
+    # FORWARD: RHS as (E, N, K), K contiguous, scales (E, N_blocks, K_blocks).
+    # DGRAD:   RHS as (E, K, N), N contiguous, scales (E, K_blocks, N_blocks).
+    _rhs_quantizers = {
+        _RhsQuantDirection.FORWARD: (
+            triton_fp8_blockwise_weight_quant_grouped_transposed_rhs_deepgemm
+        ),
+        _RhsQuantDirection.DGRAD: (
+            triton_fp8_blockwise_weight_quant_grouped_rhs_deepgemm
+        ),
+    }
 
     def grouped_mm(
         self,
