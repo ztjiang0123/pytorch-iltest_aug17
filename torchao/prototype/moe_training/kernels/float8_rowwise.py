@@ -39,6 +39,28 @@ if has_triton():
         )
     ]
 
+    def _fake_3d_transpose_rhs_output(
+        hp_tensor: torch.Tensor,  # (E, K, N)
+        output_dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fake-tensor output for the (E, K, N) -> transposed-RHS FP8 ops.
+
+        Both the plain and fused-reduction transpose-RHS custom ops share this
+        output contract: a (E, N, K) column-major FP8 buffer plus (E, K) fp32
+        scales. Keep the ``register_fake`` implementations in sync by allocating
+        that shape/layout from a single place.
+        """
+        assert hp_tensor.ndim == 3, "input tensor must be 3D"
+        e, k, n = hp_tensor.shape
+        output_buffer = torch.empty(
+            (e, n, k), dtype=output_dtype, device=hp_tensor.device
+        ).as_strided((e, n, k), (n * k, 1, n))
+
+        scales_buffer = torch.empty(
+            (e, k), dtype=torch.float32, device=hp_tensor.device
+        )
+        return output_buffer, scales_buffer
+
     @torch.library.custom_op(
         "torchao::triton_fp8_rowwise_transpose_rhs", mutates_args={}
     )
@@ -122,16 +144,7 @@ if has_triton():
         output_dtype: torch.dtype = torch.float8_e4m3fn,
         round_scales_to_power_of_2: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert hp_tensor.ndim == 3, "input tensor must be 3D"
-        e, k, n = hp_tensor.shape
-        output_buffer = torch.empty(
-            (e, n, k), dtype=output_dtype, device=hp_tensor.device
-        ).as_strided((e, n, k), (n * k, 1, n))
-
-        scales_buffer = torch.empty(
-            (e, k), dtype=torch.float32, device=hp_tensor.device
-        )
-        return output_buffer, scales_buffer
+        return _fake_3d_transpose_rhs_output(hp_tensor, output_dtype)
 
     @triton.autotune(configs=atomic_kernel_configs_2D, key=["K", "N"])
     @triton.jit
@@ -455,16 +468,7 @@ if has_triton():
         output_dtype: torch.dtype = torch.float8_e4m3fn,
         round_scales_to_power_of_2: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert hp_tensor.ndim == 3, "input tensor must be 3D"
-        e, k, n = hp_tensor.shape
-        output_buffer = torch.empty(
-            (e, n, k), dtype=output_dtype, device=hp_tensor.device
-        ).as_strided((e, n, k), (n * k, 1, n))
-
-        scales_buffer = torch.empty(
-            (e, k), dtype=torch.float32, device=hp_tensor.device
-        )
-        return output_buffer, scales_buffer
+        return _fake_3d_transpose_rhs_output(hp_tensor, output_dtype)
 
     # ── Fused 3D column-major axiswise scale+cast kernel ────────────────
     #
