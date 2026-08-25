@@ -21,6 +21,7 @@ The YAML file should contain all necessary configuration parameters for the benc
 import argparse
 import json
 import platform
+from dataclasses import dataclass
 from typing import Any, Dict, List
 
 import torch
@@ -32,45 +33,57 @@ from benchmarks.microbenchmarks.benchmark_runner import (
 from benchmarks.microbenchmarks.utils import clean_caches
 
 
+@dataclass
+class BenchmarkRunContext:
+    """Shared context describing a single benchmark run.
+
+    These values stay constant across the individual metrics recorded for one
+    benchmark config, so they are grouped together and reused per metric.
+    """
+
+    benchmark_name: str
+    shape: List[int]
+    quant_type: str
+    device: str
+    torch_compile_mode: str
+
+
 def create_benchmark_result(
-    benchmark_name: str,
-    shape: List[int],
+    context: BenchmarkRunContext,
     metric_name: str,
     metric_values: List[float],
-    quant_type: str,
-    device: str,
-    torch_compile_mode: str,
     metric_extra_info: Dict[str, Any] = {},
 ) -> Dict[str, Any]:
     """Create a benchmark result in the PyTorch OSS benchmark database format.
 
     Args:
-        benchmark_name: Name of the benchmark
-        shape: List of shape dimensions [M, K, N]
+        context: Shared run context (benchmark name, shape, quant type, device,
+            torch compile mode)
         metric_name: Name of the metric
         metric_values: List of metric values
-        quant_type: Quantization type
-        device: Device type (cuda/cpu)
+        metric_extra_info: Optional extra info attached to the metric
 
     Returns:
         Dictionary containing the benchmark result in the required format
     """
     print(
-        f"Creating benchmark result for {benchmark_name} with shape {shape} and metric {metric_name}"
+        f"Creating benchmark result for {context.benchmark_name} with shape "
+        f"{context.shape} and metric {metric_name}"
     )
 
     # Map device to benchmark device name
     benchmark_device = (
         torch.cuda.get_device_name(0)
-        if device == "cuda"
+        if context.device == "cuda"
         else platform.processor()
-        if device == "cpu"
+        if context.device == "cpu"
         else "unknown"
     )
 
     # Format shape as quant-type-M-K-N
+    shape = context.shape
     mkn_name = (
-        f"{quant_type}-{shape[0]}-{shape[1]}-{shape[2]}"
+        f"{context.quant_type}-{shape[0]}-{shape[1]}-{shape[2]}"
         if len(shape) == 3
         else "unknown"
     )
@@ -79,11 +92,11 @@ def create_benchmark_result(
         "benchmark": {
             "name": "micro-benchmark api",
             "mode": "inference",
-            "dtype": quant_type,
+            "dtype": context.quant_type,
             "extra_info": {
-                "device": device,
+                "device": context.device,
                 "arch": benchmark_device,
-                "torch_compile_mode": torch_compile_mode,
+                "torch_compile_mode": context.torch_compile_mode,
             },
         },
         "model": {
@@ -124,51 +137,43 @@ def run_ci_benchmarks(config_path: str) -> List[Dict[str, Any]]:
         result = run_inference(config)
 
         if result is not None:
-            # Create benchmark result in OSS format
-            speedup_result = create_benchmark_result(
+            # Create benchmark result in OSS format. All metrics for this config
+            # share the same run context.
+            context = BenchmarkRunContext(
                 benchmark_name="TorchAO Quantization Benchmark",
                 shape=[config.m, config.k, config.n],
-                metric_name="Fwd Speedup (x)",
-                metric_values=[result.compile_speedup_on_baseline],
                 quant_type=config.quantization,
                 device=config.device,
                 torch_compile_mode=config.torch_compile_mode,
             )
+            speedup_result = create_benchmark_result(
+                context,
+                metric_name="Fwd Speedup (x)",
+                metric_values=[result.compile_speedup_on_baseline],
+            )
             results.append(speedup_result)
             baseline_time_result = create_benchmark_result(
-                benchmark_name="TorchAO Quantization Benchmark",
-                shape=[config.m, config.k, config.n],
+                context,
                 metric_name="Bfloat16 Fwd Time (ms)",
                 metric_values=[result.baseline_model_compiled_inference_time_in_ms],
-                quant_type=config.quantization,
-                device=config.device,
-                torch_compile_mode=config.torch_compile_mode,
                 metric_extra_info={
                     "unit": "ms",
                 },
             )
             results.append(baseline_time_result)
             quantize_time_result = create_benchmark_result(
-                benchmark_name="TorchAO Quantization Benchmark",
-                shape=[config.m, config.k, config.n],
+                context,
                 metric_name="Quantized Fwd Time (ms)",
                 metric_values=[result.quantized_model_compiled_inference_time_in_ms],
-                quant_type=config.quantization,
-                device=config.device,
-                torch_compile_mode=config.torch_compile_mode,
                 metric_extra_info={
                     "unit": "ms",
                 },
             )
             results.append(quantize_time_result)
             allocated_memory_result = create_benchmark_result(
-                benchmark_name="TorchAO Quantization Benchmark",
-                shape=[config.m, config.k, config.n],
+                context,
                 metric_name="Allocated Memory (MB)",
                 metric_values=[result.memory_stats["allocated_bytes.all.peak"]],
-                quant_type=config.quantization,
-                device=config.device,
-                torch_compile_mode=config.torch_compile_mode,
                 metric_extra_info={
                     "unit": "MB",
                 },
