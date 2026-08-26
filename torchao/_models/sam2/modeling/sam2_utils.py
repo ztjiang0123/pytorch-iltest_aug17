@@ -108,7 +108,7 @@ class DropPath(nn.Module):
 
 
 # Lightly adapted from
-# https://github.com/facebookresearch/MaskFormer/blob/main/mask_former/modeling/transformer/transformer_predictor.py # noqa
+# https://github.com/facebookresearch/MaskFormer/blob/main/mask_former/modeling/transformer/transformer_predictor.py
 class MLP(nn.Module):
     def __init__(
         self,
