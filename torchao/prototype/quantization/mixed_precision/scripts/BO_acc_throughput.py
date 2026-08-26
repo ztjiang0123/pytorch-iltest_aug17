@@ -3,7 +3,6 @@
 #
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
-import random
 import time
 from pathlib import Path
 from typing import Optional
@@ -15,6 +14,7 @@ from ax.service.ax_client import AxClient, ObjectiveProperties
 from transformers import AutoTokenizer
 from utils import (
     cal_wikitext_ppl,
+    get_initial_samples_from_sampling_plan,
     load_initial_samples,
     load_model,
     load_parameters_from_json,
@@ -334,54 +334,34 @@ def define_parameter_list():
 # add initial search points based on the sensitivity score
 # TODO: add default parameter list if not specified
 def get_initial_samples(num_BO_initial_samples=10):
-    initial_points_set = []
-
-    # auto sample the bit choices with random choice probability positive correlated to FIT score
-    for _ in range(num_BO_initial_samples):
-        initial_points = {}
-        for i in range(0, 3):
-            initial_points["bitwidth." + str(i) + "."] = 8
-            initial_points["groupsize." + str(i) + "."] = 32
-
-        for i in range(3, 18):
-            if i in [5, 6, 7, 10, 11, 12, 16]:
-                initial_points["bitwidth." + str(i) + "."] = random.choices(
-                    [8, 6, 5, 4], [25, 2, 2, 71]
-                )[0]
-                initial_points["groupsize." + str(i) + "."] = random.choices(
-                    [32, 64], [40, 60]
-                )[0]
-            else:
-                initial_points["bitwidth." + str(i) + "."] = random.choices(
-                    [8, 6, 5, 4], [30, 2, 2, 66]
-                )[0]
-                initial_points["groupsize." + str(i) + "."] = random.choices(
-                    [32, 64], [50, 50]
-                )[0]
-
-        for i in range(18, 30):
-            if i in [22, 23, 24]:
-                initial_points["bitwidth." + str(i) + "."] = random.choices(
-                    [8, 6, 5, 4], [10, 2, 2, 86]
-                )[0]
-                initial_points["groupsize." + str(i) + "."] = random.choices(
-                    [32, 64, 128, 256], [35, 45, 10, 10]
-                )[0]
-            else:
-                initial_points["bitwidth." + str(i) + "."] = random.choices(
-                    [8, 6, 5, 4], [20, 2, 2, 76]
-                )[0]
-                initial_points["groupsize." + str(i) + "."] = random.choices(
-                    [32, 64, 128, 256], [30, 40, 25, 5]
-                )[0]
-
-        for i in range(30, 32):
-            initial_points["bitwidth." + str(i) + "."] = 8
-            initial_points["groupsize." + str(i) + "."] = 32
-
-        initial_points_set.append(initial_points)
-
-    return initial_points_set
+    # per-layer-group (bitwidth_spec, groupsize_spec) sampling tuned for the
+    # throughput objective; a fixed scalar is used as-is, a (choices, weights)
+    # tuple is sampled with random.choices.
+    sampling_plan = [
+        (range(0, 3), lambda i: (8, 32)),
+        (
+            range(3, 18),
+            lambda i: (([8, 6, 5, 4], [25, 2, 2, 71]), ([32, 64], [40, 60]))
+            if i in [5, 6, 7, 10, 11, 12, 16]
+            else (([8, 6, 5, 4], [30, 2, 2, 66]), ([32, 64], [50, 50])),
+        ),
+        (
+            range(18, 30),
+            lambda i: (
+                ([8, 6, 5, 4], [10, 2, 2, 86]),
+                ([32, 64, 128, 256], [35, 45, 10, 10]),
+            )
+            if i in [22, 23, 24]
+            else (
+                ([8, 6, 5, 4], [20, 2, 2, 76]),
+                ([32, 64, 128, 256], [30, 40, 25, 5]),
+            ),
+        ),
+        (range(30, 32), lambda i: (8, 32)),
+    ]
+    return get_initial_samples_from_sampling_plan(
+        sampling_plan, num_BO_initial_samples
+    )
 
 
 """

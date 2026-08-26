@@ -28,7 +28,6 @@ from torchao.kernel.blockwise_quantization import (
 from torchao.quantization.granularity import PerRow, PerTensor
 from torchao.quantization.quant_primitives import (
     _choose_scale_float8,
-    _dequantize_affine_float8,
     _quantize_affine_float8,
 )
 from torchao.quantization.quantize_.common import (
@@ -37,6 +36,10 @@ from torchao.quantization.quantize_.common import (
 )
 from torchao.quantization.quantize_.workflows import (
     QuantizeTensorToFloat8Kwargs,
+)
+from torchao.quantization.quantize_.workflows.float8.float8_tensor import (
+    _float8_dequantize,
+    _float8_quantization_type,
 )
 from torchao.quantization.utils import get_block_size
 from torchao.utils import (
@@ -151,14 +154,10 @@ class PrototypeFloat8Tensor(TorchAOBaseTensor):
         )
 
     def _quantization_type(self):
-        return f"{self.act_quant_kwargs=}, {self.block_size=}, {self.mm_config=}, {self.scale.shape=}, {self.kernel_preference=}"
+        return _float8_quantization_type(self)
 
     def dequantize(self, output_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        if output_dtype is None:
-            output_dtype = self.dtype
-
-        qdata, scale = self.qdata, self.scale
-        return _dequantize_affine_float8(qdata, scale, output_dtype)
+        return _float8_dequantize(self, output_dtype)
 
     @classmethod
     def from_hp(
@@ -941,28 +940,38 @@ def _(func, types, args, kwargs):
     return return_and_correct_aliasing(func, args, kwargs, new)
 
 
+def _rebuild_like(tensor, qdata, scale, block_size):
+    """Build a new tensor of ``tensor``'s class with new ``qdata``/``scale``/``block_size``.
+
+    All other (optional) attributes are carried over from ``tensor`` unchanged.
+    """
+    return tensor.__class__(
+        qdata,
+        scale,
+        act_quant_scale=tensor.act_quant_scale,
+        output_act_quant_scale=tensor.output_act_quant_scale,
+        block_size=block_size,
+        mm_config=tensor.mm_config,
+        act_quant_kwargs=tensor.act_quant_kwargs,
+        kernel_preference=tensor.kernel_preference,
+        dtype=tensor.dtype,
+        output_act_quant_kwargs=tensor.output_act_quant_kwargs,
+    )
+
+
+def _rebuild_with_inferred_block_size(tensor, qdata, scale):
+    """Rebuild ``tensor`` with new ``qdata``/``scale``, inferring block_size from shapes."""
+    block_size = [qdata.shape[i] // scale.shape[i] for i in range(len(qdata.shape))]
+    return _rebuild_like(tensor, qdata, scale, block_size)
+
+
 @implements(aten.squeeze.dim)
 def _(func, types, args, kwargs):
     self, dim = args
     assert dim == 0, f"Only dim == 0 is supported, got: {dim}"
     qdata = self.qdata.squeeze(dim=dim)
     scale = self.scale.squeeze(dim=dim)
-    block_size = []
-    for i in range(len(qdata.shape)):
-        block_size.append(qdata.shape[i] // scale.shape[i])
-
-    new = self.__class__(
-        qdata,
-        scale,
-        act_quant_scale=self.act_quant_scale,
-        output_act_quant_scale=self.output_act_quant_scale,
-        block_size=block_size,
-        mm_config=self.mm_config,
-        act_quant_kwargs=self.act_quant_kwargs,
-        kernel_preference=self.kernel_preference,
-        dtype=self.dtype,
-        output_act_quant_kwargs=self.output_act_quant_kwargs,
-    )
+    new = _rebuild_with_inferred_block_size(self, qdata, scale)
     return return_and_correct_aliasing(func, args, kwargs, new)
 
 
@@ -998,42 +1007,26 @@ def _(func, types, args, kwargs):
     self, dim = args
     qdata = self.qdata.unsqueeze(dim=dim)
     scale = self.scale.unsqueeze(dim=dim)
-    block_size = []
-    for i in range(len(qdata.shape)):
-        block_size.append(qdata.shape[i] // scale.shape[i])
-
-    new = self.__class__(
-        qdata,
-        scale,
-        act_quant_scale=self.act_quant_scale,
-        output_act_quant_scale=self.output_act_quant_scale,
-        block_size=block_size,
-        mm_config=self.mm_config,
-        act_quant_kwargs=self.act_quant_kwargs,
-        kernel_preference=self.kernel_preference,
-        dtype=self.dtype,
-        output_act_quant_kwargs=self.output_act_quant_kwargs,
-    )
+    new = _rebuild_with_inferred_block_size(self, qdata, scale)
     return return_and_correct_aliasing(func, args, kwargs, new)
+
+
+def _transpose_2d(tensor):
+    """Transpose a 2D float8 tensor, swapping qdata/scale and block_size dims."""
+    assert len(tensor.block_size) == 2
+    return _rebuild_like(
+        tensor,
+        tensor.qdata.t(),
+        tensor.scale.t(),
+        (tensor.block_size[1], tensor.block_size[0]),
+    )
 
 
 @implements(aten.t.default)
 def _(func, types, args, kwargs):
     assert len(args) == 1
     self = args[0]
-    assert len(self.block_size) == 2
-    new_tensor = self.__class__(
-        self.qdata.t(),
-        self.scale.t(),
-        act_quant_scale=self.act_quant_scale,
-        output_act_quant_scale=self.output_act_quant_scale,
-        block_size=(self.block_size[1], self.block_size[0]),
-        mm_config=self.mm_config,
-        act_quant_kwargs=self.act_quant_kwargs,
-        kernel_preference=self.kernel_preference,
-        dtype=self.dtype,
-        output_act_quant_kwargs=self.output_act_quant_kwargs,
-    )
+    new_tensor = _transpose_2d(self)
     return return_and_correct_aliasing(func, args, kwargs, new_tensor)
 
 
@@ -1041,20 +1034,7 @@ def _(func, types, args, kwargs):
 def _(func, types, args, kwargs):
     assert len(args) == 1
     self = args[0]
-    assert len(self.block_size) == 2
-    new_tensor = self.__class__(
-        self.qdata.t(),
-        self.scale.t(),
-        act_quant_scale=self.act_quant_scale,
-        output_act_quant_scale=self.output_act_quant_scale,
-        block_size=(self.block_size[1], self.block_size[0]),
-        mm_config=self.mm_config,
-        act_quant_kwargs=self.act_quant_kwargs,
-        kernel_preference=self.kernel_preference,
-        dtype=self.dtype,
-        output_act_quant_kwargs=self.output_act_quant_kwargs,
-    )
-    return new_tensor
+    return _transpose_2d(self)
 
 
 @implements(aten.split.Tensor)
