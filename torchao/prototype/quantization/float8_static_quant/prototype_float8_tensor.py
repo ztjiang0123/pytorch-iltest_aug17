@@ -966,12 +966,19 @@ def _rebuild_with_inferred_block_size(tensor, qdata, scale):
 
 
 @implements(aten.squeeze.dim)
+@implements(aten.unsqueeze.default)
 def _(func, types, args, kwargs):
+    # squeeze and unsqueeze share the same rebuild logic; they differ only in
+    # which tensor method reshapes qdata/scale (and squeeze only supports dim 0).
     self, dim = args
-    assert dim == 0, f"Only dim == 0 is supported, got: {dim}"
-    qdata = self.qdata.squeeze(dim=dim)
-    scale = self.scale.squeeze(dim=dim)
-    new = _rebuild_with_inferred_block_size(self, qdata, scale)
+    if func is aten.squeeze.dim:
+        assert dim == 0, f"Only dim == 0 is supported, got: {dim}"
+        reshape = lambda t: t.squeeze(dim=dim)  # noqa: E731
+    else:
+        reshape = lambda t: t.unsqueeze(dim=dim)  # noqa: E731
+    new = _rebuild_with_inferred_block_size(
+        self, reshape(self.qdata), reshape(self.scale)
+    )
     return return_and_correct_aliasing(func, args, kwargs, new)
 
 
@@ -1002,15 +1009,6 @@ def _(func, types, args, kwargs):
     return return_and_correct_aliasing(func, args, kwargs, new_float8_tensor)
 
 
-@implements(aten.unsqueeze.default)
-def _(func, types, args, kwargs):
-    self, dim = args
-    qdata = self.qdata.unsqueeze(dim=dim)
-    scale = self.scale.unsqueeze(dim=dim)
-    new = _rebuild_with_inferred_block_size(self, qdata, scale)
-    return return_and_correct_aliasing(func, args, kwargs, new)
-
-
 def _transpose_2d(tensor):
     """Transpose a 2D float8 tensor, swapping qdata/scale and block_size dims."""
     assert len(tensor.block_size) == 2
@@ -1023,18 +1021,16 @@ def _transpose_2d(tensor):
 
 
 @implements(aten.t.default)
-def _(func, types, args, kwargs):
-    assert len(args) == 1
-    self = args[0]
-    new_tensor = _transpose_2d(self)
-    return return_and_correct_aliasing(func, args, kwargs, new_tensor)
-
-
 @implements_torch_function(torch.Tensor.t)
 def _(func, types, args, kwargs):
     assert len(args) == 1
     self = args[0]
-    return _transpose_2d(self)
+    new_tensor = _transpose_2d(self)
+    # The torch_function path (torch.Tensor.t) returns the tensor directly; the
+    # aten dispatch path (aten.t.default) must correct aliasing.
+    if func is torch.Tensor.t:
+        return new_tensor
+    return return_and_correct_aliasing(func, args, kwargs, new_tensor)
 
 
 @implements(aten.split.Tensor)
