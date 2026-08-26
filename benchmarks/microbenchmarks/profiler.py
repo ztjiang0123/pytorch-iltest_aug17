@@ -21,6 +21,15 @@ def _validate_pickle_file(file_path):
     return True
 
 
+def _run_inference_iterations(model, input_data, device, num_iters=3):
+    """Run the model for a fixed number of iterations, synchronizing on CUDA."""
+    with torch.no_grad():
+        for _ in range(num_iters):
+            _ = model(input_data)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+
+
 def generate_model_profile(model, input_data, profile_file_path):
     """Function to benchmark model evaluation with profiling.
 
@@ -42,11 +51,7 @@ def generate_model_profile(model, input_data, profile_file_path):
         activities.append(ProfilerActivity.CUDA)
 
     # Warm up
-    with torch.no_grad():
-        for _ in range(3):
-            _ = model(input_data)
-            if device.type == "cuda":
-                torch.cuda.synchronize()
+    _run_inference_iterations(model, input_data, device)
 
     # Run profiler with minimal settings to ensure compatibility
     with torch.profiler.profile(
@@ -56,11 +61,7 @@ def generate_model_profile(model, input_data, profile_file_path):
         profile_memory=True,
         with_flops=True,  # Experimental; might be unreliable for some layers
     ) as prof:
-        with torch.no_grad():
-            for _ in range(3):
-                _ = model(input_data)
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
+        _run_inference_iterations(model, input_data, device)
 
     # Save profiling details
     prof.export_chrome_trace(profile_file_path)
