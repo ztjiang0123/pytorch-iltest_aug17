@@ -312,15 +312,16 @@ Tensor pack_weights_with_lut_cpu(
       uk,
       packed_weights.mutable_data_ptr<int8_t>() +
           torchao::ops::PackedWeightsHeader::size(),
-      n,
-      k,
-      group_size,
-      weight_qval_idxs.const_data_ptr<int8_t>(),
-      n_luts,
-      luts.const_data_ptr<int8_t>(),
-      weight_scales.const_data_ptr<float>(),
-      /*weight_zeros*/nullptr,
-      bias_ptr);
+      torchao::ops::linear_8bit_act_xbit_weight::LutWeightData{
+          /*n=*/n,
+          /*k=*/k,
+          /*group_size=*/group_size,
+          /*weight_qval_idxs=*/weight_qval_idxs.const_data_ptr<int8_t>(),
+          /*n_luts=*/n_luts,
+          /*luts=*/luts.const_data_ptr<int8_t>(),
+          /*weight_scales=*/weight_scales.const_data_ptr<float>(),
+          /*weight_zeros=*/nullptr,
+          /*bias=*/bias_ptr});
 
   return packed_weights;
 }

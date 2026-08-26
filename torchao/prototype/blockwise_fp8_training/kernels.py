@@ -126,15 +126,15 @@ def _two_output_quant_shardings(
 
 def _blockwise_gemm_shardings():
     # Op returns a single tensor and takes:
-    # (a, b, a_s, b_s, block_size, out_dtype)
+    # (a, b, a_s, b_s, out_dtype)
     return [
         (
             [Replicate()],
-            [Replicate(), Replicate(), Replicate(), Replicate(), None, None],
+            [Replicate(), Replicate(), Replicate(), Replicate(), None],
         ),
-        ([Shard(0)], [Shard(0), Replicate(), Shard(0), Replicate(), None, None]),
-        ([Shard(1)], [Replicate(), Shard(1), Replicate(), Shard(1), None, None]),
-        ([Partial()], [Shard(1), Shard(0), Shard(1), Shard(0), None, None]),
+        ([Shard(0)], [Shard(0), Replicate(), Shard(0), Replicate(), None]),
+        ([Shard(1)], [Replicate(), Shard(1), Replicate(), Shard(1), None]),
+        ([Partial()], [Shard(1), Shard(0), Shard(1), Shard(0), None]),
     ]
 
 
@@ -280,6 +280,13 @@ def triton_fp8_gemm_1x128_128x128_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+# The 1x128-scaled FP8 GEMMs are defined for a fixed 128-element K scaling
+# block (it is baked into their names and the layouts their inputs must have).
+# Keeping it a module constant rather than a per-call parameter removes a value
+# that never varies at any call site.
+_FP8_GEMM_1X128_BLOCK_SIZE = 128
+
+
 @dataclass(frozen=True)
 class _Fp8Gemm1x128Operands:
     """The four tensors consumed by a 1x128-LHS-scaled FP8 GEMM."""
@@ -363,7 +370,6 @@ def triton_fp8_gemm_1x128_128x128(
     b: torch.Tensor,  # (K, N)
     a_s: torch.Tensor,  # (M, K // block_size)
     b_s: torch.Tensor,  # (K // block_size, N // block_size)
-    block_size: int = 128,
     out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     variant = _Fp8Gemm1x128Variant(
@@ -374,7 +380,10 @@ def triton_fp8_gemm_1x128_128x128(
         pass_out_dtype=True,
     )
     return _run_fp8_gemm_1x128(
-        variant, _Fp8Gemm1x128Operands(a, b, a_s, b_s), block_size, out_dtype
+        variant,
+        _Fp8Gemm1x128Operands(a, b, a_s, b_s),
+        _FP8_GEMM_1X128_BLOCK_SIZE,
+        out_dtype,
     )
 
 
@@ -450,7 +459,6 @@ def triton_fp8_gemm_1x128_128x1(
     b: torch.Tensor,  # (K, N)
     a_s: torch.Tensor,  # (M, K // block_size) reciprocals of scales
     b_s: torch.Tensor,  # (K // block_size, N) reciprocals of scales
-    block_size: int = 128,
     out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     variant = _Fp8Gemm1x128Variant(
@@ -461,7 +469,10 @@ def triton_fp8_gemm_1x128_128x1(
         pass_out_dtype=False,
     )
     return _run_fp8_gemm_1x128(
-        variant, _Fp8Gemm1x128Operands(a, b, a_s, b_s), block_size, out_dtype
+        variant,
+        _Fp8Gemm1x128Operands(a, b, a_s, b_s),
+        _FP8_GEMM_1X128_BLOCK_SIZE,
+        out_dtype,
     )
 
 
@@ -471,7 +482,6 @@ def custom_sharding_for_triton_fp8_gemm_1x128_128x128(
     b: torch.Tensor,
     a_s: torch.Tensor,
     b_s: torch.Tensor,
-    block_size: int = 128,
     out_dtype: torch.dtype = torch.float32,
 ):
     return _blockwise_gemm_shardings()
@@ -483,7 +493,6 @@ def custom_sharding_for_triton_fp8_gemm_1x128_128x1(
     b: torch.Tensor,
     a_s: torch.Tensor,
     b_s: torch.Tensor,
-    block_size: int = 128,
     out_dtype: torch.dtype = torch.float32,
 ):
     return _blockwise_gemm_shardings()

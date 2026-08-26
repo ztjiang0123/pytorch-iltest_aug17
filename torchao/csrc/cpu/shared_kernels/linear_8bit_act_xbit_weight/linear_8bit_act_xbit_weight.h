@@ -27,20 +27,27 @@ void pack_weights_operator(
     const int8_t* weight_zeros,
     const float* bias);
 
+// Groups the LUT-quantized weight source arrays and their shape so that
+// pack_weights_with_lut_operator takes a single descriptor for "the weights to
+// pack" instead of a long list of parallel pointers.
+struct LutWeightData {
+  int n;
+  int k;
+  int group_size;
+  const int8_t* weight_qval_idxs;
+  int n_luts;
+  const int8_t* luts;
+  const float* weight_scales;
+  const int8_t* weight_zeros;
+  const float* bias;
+};
+
 void pack_weights_with_lut_operator(
     const UKernelConfig& uk,
     // Outputs
     void* packed_weights,
     // Inputs
-    int n,
-    int k,
-    int group_size,
-    const int8_t* weight_qval_idxs,
-    int n_luts,
-    const int8_t* luts,
-    const float* weight_scales,
-    const int8_t* weight_zeros,
-    const float* bias);
+    const LutWeightData& weights);
 
 // Linear functions
 struct LinearTilingParams {

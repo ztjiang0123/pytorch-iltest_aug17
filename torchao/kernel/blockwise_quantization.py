@@ -9,6 +9,14 @@ from typing import Tuple
 
 import torch
 
+# Block size (in elements) of the BLOCK_SIZE x BLOCK_SIZE tiles used by the
+# weight dequantization kernel. It is fixed at 128 across every call site in the
+# blockwise FP8 stack, so it is baked into the kernel as a compile-time constant
+# rather than threaded through as a per-launch parameter. ``block_size`` remains
+# a public argument of ``fp8_blockwise_weight_dequant`` for API compatibility and
+# is validated against this value.
+_WEIGHT_DEQUANT_BLOCK_SIZE = 128
+
 # Lazy initialization state
 _triton_initialized = False
 _triton_available = None
@@ -196,11 +204,13 @@ def _lazy_init_triton():
     _fp8_blockwise_weight_quant_kernel = _fp8_blockwise_weight_quant_kernel_impl
 
     @triton.jit
-    def _fp8_blockwise_weight_dequant_kernel_impl(
-        x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr
-    ):
+    def _fp8_blockwise_weight_dequant_kernel_impl(x_ptr, s_ptr, y_ptr, M, N):
         """
         Dequantizes weights using the provided scaling factors and stores the result.
+
+        The tile size is the module-level compile-time constant
+        ``_WEIGHT_DEQUANT_BLOCK_SIZE``, so it does not need to be passed at launch
+        time.
 
         Args:
             x_ptr (tl.pointer): Pointer to the quantized weights.
@@ -208,11 +218,11 @@ def _lazy_init_triton():
             y_ptr (tl.pointer): Pointer to the output buffer for dequantized weights.
             M (int): Number of rows in the weight matrix.
             N (int): Number of columns in the weight matrix.
-            BLOCK_SIZE (tl.constexpr): Size of the block for tiling.
 
         Returns:
             None
         """
+        BLOCK_SIZE: tl.constexpr = _WEIGHT_DEQUANT_BLOCK_SIZE
         pid_m = tl.program_id(axis=0)
         pid_n = tl.program_id(axis=1)
         n = tl.cdiv(N, BLOCK_SIZE)
@@ -346,11 +356,15 @@ def fp8_blockwise_weight_dequant(
 
     assert x.is_contiguous() and s.is_contiguous(), "Input tensors must be contiguous"
     assert x.dim() == 2 and s.dim() == 2, "Input tensors must have 2 dimensions"
+    assert block_size == _WEIGHT_DEQUANT_BLOCK_SIZE, (
+        f"block_size must be {_WEIGHT_DEQUANT_BLOCK_SIZE} "
+        f"(got block_size={block_size})"
+    )
     M, N = x.size()
     y = torch.empty_like(x, dtype=torch.get_default_dtype())
     grid = lambda meta: (
-        triton.cdiv(M, meta["BLOCK_SIZE"]),
-        triton.cdiv(N, meta["BLOCK_SIZE"]),
+        triton.cdiv(M, _WEIGHT_DEQUANT_BLOCK_SIZE),
+        triton.cdiv(N, _WEIGHT_DEQUANT_BLOCK_SIZE),
     )
-    _fp8_blockwise_weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
+    _fp8_blockwise_weight_dequant_kernel[grid](x, s, y, M, N)
     return y

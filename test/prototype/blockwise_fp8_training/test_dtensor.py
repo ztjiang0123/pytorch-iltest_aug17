@@ -319,7 +319,6 @@ class TestBlockwiseFP8DTensorSharding(DTensorTestBase):
                 global_b,
                 global_a_s,
                 global_b_s,
-                block_size=self.block_size,
                 out_dtype=out_dtype,
             )
 
@@ -361,7 +360,6 @@ class TestBlockwiseFP8DTensorSharding(DTensorTestBase):
                         dist_b,
                         dist_a_s,
                         dist_b_s,
-                        block_size=self.block_size,
                         out_dtype=out_dtype,
                     )
 
@@ -380,7 +378,6 @@ class TestBlockwiseFP8DTensorSharding(DTensorTestBase):
                         local_b,
                         local_a_s,
                         local_b_s,
-                        block_size=self.block_size,
                         out_dtype=out_dtype,
                     )
 
