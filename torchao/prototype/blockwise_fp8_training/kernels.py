@@ -288,7 +288,7 @@ _FP8_GEMM_1X128_BLOCK_SIZE = 128
 
 
 @dataclass(frozen=True)
-class _Fp8Gemm1x128Operands:
+class Fp8Gemm1x128Operands:
     """The four tensors consumed by a 1x128-LHS-scaled FP8 GEMM."""
 
     a: torch.Tensor  # (M, K)
@@ -310,7 +310,7 @@ class _Fp8Gemm1x128Variant:
 
 def _run_fp8_gemm_1x128(
     variant: _Fp8Gemm1x128Variant,
-    operands: _Fp8Gemm1x128Operands,
+    operands: Fp8Gemm1x128Operands,
     block_size: int,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -368,7 +368,7 @@ def _run_fp8_gemm_1x128(
 
 
 @torch.library.custom_op("torchao::triton_fp8_gemm_1x128_128x128", mutates_args=())
-def triton_fp8_gemm_1x128_128x128(
+def _triton_fp8_gemm_1x128_128x128_op(
     a: torch.Tensor,  # (M, K)
     b: torch.Tensor,  # (K, N)
     a_s: torch.Tensor,  # (M, K // block_size)
@@ -384,13 +384,13 @@ def triton_fp8_gemm_1x128_128x128(
     )
     return _run_fp8_gemm_1x128(
         variant,
-        _Fp8Gemm1x128Operands(a, b, a_s, b_s),
+        Fp8Gemm1x128Operands(a, b, a_s, b_s),
         _FP8_GEMM_1X128_BLOCK_SIZE,
         out_dtype,
     )
 
 
-@triton_fp8_gemm_1x128_128x128.register_fake
+@_triton_fp8_gemm_1x128_128x128_op.register_fake
 def _(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -399,6 +399,22 @@ def _(
     out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     return a.new_empty(a.size(0), b.size(1), dtype=out_dtype)
+
+
+def triton_fp8_gemm_1x128_128x128(
+    operands: Fp8Gemm1x128Operands,
+    out_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """1x128-LHS / 128x128-RHS scaled FP8 GEMM.
+
+    The four tensor operands travel together as a single
+    :class:`Fp8Gemm1x128Operands`; dispatch (including DTensor sharding
+    propagation) goes through the registered
+    ``torchao::triton_fp8_gemm_1x128_128x128`` op.
+    """
+    return _triton_fp8_gemm_1x128_128x128_op(
+        operands.a, operands.b, operands.a_s, operands.b_s, out_dtype
+    )
 
 
 @triton.autotune(
@@ -468,7 +484,7 @@ def triton_fp8_gemm_1x128_128x1_kernel(
 
 
 @torch.library.custom_op("torchao::triton_fp8_gemm_1x128_128x1", mutates_args=())
-def triton_fp8_gemm_1x128_128x1(
+def _triton_fp8_gemm_1x128_128x1_op(
     a: torch.Tensor,  # (M, K)
     b: torch.Tensor,  # (K, N)
     a_s: torch.Tensor,  # (M, K // block_size) reciprocals of scales
@@ -484,13 +500,13 @@ def triton_fp8_gemm_1x128_128x1(
     )
     return _run_fp8_gemm_1x128(
         variant,
-        _Fp8Gemm1x128Operands(a, b, a_s, b_s),
+        Fp8Gemm1x128Operands(a, b, a_s, b_s),
         _FP8_GEMM_1X128_BLOCK_SIZE,
         out_dtype,
     )
 
 
-@triton_fp8_gemm_1x128_128x1.register_fake
+@_triton_fp8_gemm_1x128_128x1_op.register_fake
 def _(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -499,6 +515,22 @@ def _(
     out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     return a.new_empty(a.size(0), b.size(1), dtype=out_dtype)
+
+
+def triton_fp8_gemm_1x128_128x1(
+    operands: Fp8Gemm1x128Operands,
+    out_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """1x128-LHS / 128x1-RHS scaled FP8 GEMM.
+
+    The four tensor operands travel together as a single
+    :class:`Fp8Gemm1x128Operands`; dispatch (including DTensor sharding
+    propagation) goes through the registered
+    ``torchao::triton_fp8_gemm_1x128_128x1`` op.
+    """
+    return _triton_fp8_gemm_1x128_128x1_op(
+        operands.a, operands.b, operands.a_s, operands.b_s, out_dtype
+    )
 
 
 @register_sharding(torch.ops.torchao.triton_fp8_gemm_1x128_128x128.default)

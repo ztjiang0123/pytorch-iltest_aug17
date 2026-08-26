@@ -13,6 +13,7 @@ from packaging import version
 from torchao.float8.config import e4m3_dtype
 from torchao.float8.float8_utils import compute_error
 from torchao.prototype.blockwise_fp8_training.kernels import (
+    Fp8Gemm1x128Operands,
     torch_blockwise_scale_act_quant_lhs,
     torch_blockwise_scale_act_quant_rhs,
     torch_blockwise_scale_weight_quant,
@@ -57,7 +58,8 @@ def test_triton_fp8_gemm_1x128_128x128(M, N, K, dtype):
     A_q, A_s = triton_fp8_blockwise_act_quant_lhs(A, dtype=dtype)
     B_t_q, B_t_s = triton_fp8_blockwise_weight_quant_transposed_rhs(B, dtype=dtype)
     C_q = triton_fp8_gemm_1x128_128x128(
-        A_q, B_t_q, A_s, B_t_s, out_dtype=torch.bfloat16
+        Fp8Gemm1x128Operands(a=A_q, b=B_t_q, a_s=A_s, b_s=B_t_s),
+        out_dtype=torch.bfloat16,
     )
     assert not C_q.isnan().any(), "C_q must not contain NaNs"
 
@@ -84,7 +86,10 @@ def test_triton_fp8_gemm_1x128_128x1(M, N, K, dtype):
     C = A.T @ B
     A_t_q, A_t_s = triton_fp8_blockwise_act_quant_transposed_lhs(A, dtype=dtype)
     B_q, B_s = triton_fp8_blockwise_act_quant_rhs(B, dtype=dtype)
-    C_q = triton_fp8_gemm_1x128_128x1(A_t_q, B_q, A_t_s, B_s, out_dtype=torch.bfloat16)
+    C_q = triton_fp8_gemm_1x128_128x1(
+        Fp8Gemm1x128Operands(a=A_t_q, b=B_q, a_s=A_t_s, b_s=B_s),
+        out_dtype=torch.bfloat16,
+    )
 
     assert not C_q.isnan().any(), "C_q must not contain NaNs"
     assert C.dtype == torch.bfloat16

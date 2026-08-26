@@ -32,6 +32,7 @@ triton = pytest.importorskip("triton", reason="Triton required to run this test"
 
 from torchao.float8.config import e4m3_dtype
 from torchao.prototype.blockwise_fp8_training.kernels import (
+    Fp8Gemm1x128Operands,
     triton_fp8_blockwise_act_quant_lhs,
     triton_fp8_blockwise_act_quant_rhs,
     triton_fp8_blockwise_act_quant_transposed_lhs,
@@ -315,10 +316,12 @@ class TestBlockwiseFP8DTensorSharding(DTensorTestBase):
                 dtype=e4m3_dtype,
             )
             expected_global_output = gemm_op(
-                global_a,
-                global_b,
-                global_a_s,
-                global_b_s,
+                Fp8Gemm1x128Operands(
+                    a=global_a,
+                    b=global_b,
+                    a_s=global_a_s,
+                    b_s=global_b_s,
+                ),
                 out_dtype=out_dtype,
             )
 
@@ -356,10 +359,12 @@ class TestBlockwiseFP8DTensorSharding(DTensorTestBase):
                         dtype=e4m3_dtype,
                     )
                     dist_output = gemm_op(
-                        dist_a,
-                        dist_b,
-                        dist_a_s,
-                        dist_b_s,
+                        Fp8Gemm1x128Operands(
+                            a=dist_a,
+                            b=dist_b,
+                            a_s=dist_a_s,
+                            b_s=dist_b_s,
+                        ),
                         out_dtype=out_dtype,
                     )
 
@@ -374,10 +379,12 @@ class TestBlockwiseFP8DTensorSharding(DTensorTestBase):
                         dtype=e4m3_dtype,
                     )
                     expected_local_output = gemm_op(
-                        local_a,
-                        local_b,
-                        local_a_s,
-                        local_b_s,
+                        Fp8Gemm1x128Operands(
+                            a=local_a,
+                            b=local_b,
+                            a_s=local_a_s,
+                            b_s=local_b_s,
+                        ),
                         out_dtype=out_dtype,
                     )
 
