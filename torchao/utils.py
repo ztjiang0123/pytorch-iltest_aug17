@@ -395,6 +395,36 @@ and dispatching to these implementations.
 """
 
 
+def _implements_dispatch(cls, table_attr, keys):
+    """Return a decorator that registers a function into a per-class dispatch table.
+
+    Shared helper for :func:`_implements` and :func:`_implements_torch_function`.
+    ``table_attr`` is the name of the class attribute holding the ``{cls: {key: impl}}``
+    dispatch table (e.g. ``"_ATEN_OP_TABLE"`` or ``"_TORCH_FN_TABLE"``). The returned
+    decorator wraps the decorated function and registers it under every key in ``keys``
+    for ``cls``, then returns the function unchanged so it stays usable directly.
+    """
+    if not hasattr(cls, table_attr):
+        setattr(cls, table_attr, {})
+    table = getattr(cls, table_attr)
+    if cls not in table:
+        table[cls] = {}
+    if not isinstance(keys, (list, tuple)):
+        keys = [keys]
+
+    def decorator(func):
+        for key in keys:
+
+            @functools.wraps(func)
+            def wrapper(f, types, args, kwargs, _func=func):
+                return _func(f, types, args, kwargs)
+
+            table[cls][key] = wrapper
+        return func
+
+    return decorator
+
+
 def _implements(cls, aten_ops):
     """Decorator for implementing aten ops like `torch.ops.aten.linear.default` for
     tensor subclass, the implemented functions are called in ``__torch_dispatch__`` callback
@@ -409,24 +439,7 @@ def _implements(cls, aten_ops):
             ...
 
     """
-    if not hasattr(cls, "_ATEN_OP_TABLE"):
-        cls._ATEN_OP_TABLE = {}
-    if cls not in cls._ATEN_OP_TABLE:
-        cls._ATEN_OP_TABLE[cls] = {}
-    if not isinstance(aten_ops, (list, tuple)):
-        aten_ops = [aten_ops]
-
-    def decorator(func):
-        for op in aten_ops:
-
-            @functools.wraps(func)
-            def wrapper(f, types, args, kwargs, _func=func):
-                return _func(f, types, args, kwargs)
-
-            cls._ATEN_OP_TABLE[cls][op] = wrapper
-        return func
-
-    return decorator
+    return _implements_dispatch(cls, "_ATEN_OP_TABLE", aten_ops)
 
 
 def _register_to_op_table(op_table, ops):
@@ -469,24 +482,7 @@ def _implements_torch_function(cls, torch_fns):
             ...
 
     """
-    if not hasattr(cls, "_TORCH_FN_TABLE"):
-        cls._TORCH_FN_TABLE = {}
-    if cls not in cls._TORCH_FN_TABLE:
-        cls._TORCH_FN_TABLE[cls] = {}
-    if not isinstance(torch_fns, (list, tuple)):
-        torch_fns = [torch_fns]
-
-    def decorator(func):
-        for fn in torch_fns:
-
-            @functools.wraps(func)
-            def wrapper(f, types, args, kwargs, _func=func):
-                return _func(f, types, args, kwargs)
-
-            cls._TORCH_FN_TABLE[cls][fn] = wrapper
-        return func
-
-    return decorator
+    return _implements_dispatch(cls, "_TORCH_FN_TABLE", torch_fns)
 
 
 def _implements_common_tensor_ops(cls):

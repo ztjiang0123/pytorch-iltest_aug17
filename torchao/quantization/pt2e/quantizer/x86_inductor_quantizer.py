@@ -508,16 +508,18 @@ class X86InductorQuantizer(Quantizer):
         function_type: Callable,
         quantization_config: Optional[QuantizationConfig],
     ) -> "X86InductorQuantizer":
-        if function_type in X86InductorQuantizer.module_function_to_aten_operator_type:
+        # Resolve against the concrete class so subclasses (e.g.
+        # ``ArmInductorQuantizer``) that override
+        # ``module_function_to_aten_operator_type`` reuse this implementation.
+        cls = type(self)
+        if function_type in cls.module_function_to_aten_operator_type:
             self._set_aten_operator_qconfig(
-                X86InductorQuantizer.module_function_to_aten_operator_type[
-                    function_type
-                ],
+                cls.module_function_to_aten_operator_type[function_type],
                 quantization_config,
             )
         else:
             warnings.warn(
-                f"function: Unable to customize quantization config for {function_type} by X86InductorQuantizer."
+                f"function: Unable to customize quantization config for {function_type} by {cls.__name__}."
             )
         return self
 

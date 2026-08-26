@@ -227,25 +227,6 @@ class ArmInductorQuantizer(X86InductorQuantizer):
         return self.global_config
 
     @_config_checker
-    def set_function_type_qconfig(
-        self,
-        function_type: Callable,
-        quantization_config: Optional[QuantizationConfig],
-    ) -> "ArmInductorQuantizer":
-        if function_type in ArmInductorQuantizer.module_function_to_aten_operator_type:
-            self._set_aten_operator_qconfig(
-                ArmInductorQuantizer.module_function_to_aten_operator_type[
-                    function_type
-                ],
-                quantization_config,
-            )
-        else:
-            warnings.warn(
-                f"function: Unable to customize quantization config for {function_type} by ArmInductorQuantizer."
-            )
-        return self
-
-    @_config_checker
     def set_module_type_qconfig(
         self,
         module_type: torch.nn.Module,

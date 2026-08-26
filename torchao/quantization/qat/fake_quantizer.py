@@ -52,6 +52,20 @@ class FakeQuantizerBase(torch.nn.Module):
 
     config: FakeQuantizeConfigBase
 
+    def _init_config(self, config: FakeQuantizeConfigBase) -> None:
+        """Store ``config`` and record API usage for this fake quantizer subclass.
+
+        Shared setup for subclass ``__init__`` methods, which otherwise duplicate
+        the ``super().__init__()`` / ``self.config = config`` /
+        ``_log_api_usage_once`` sequence. The usage name is derived from the
+        concrete subclass so each subclass keeps its distinct telemetry name.
+        """
+        super().__init__()
+        self.config = config
+        torch._C._log_api_usage_once(
+            f"torchao.quantization.qat.{type(self).__name__}"
+        )
+
     def __repr__(self) -> str:
         """
         Return a human readable representation of this `FakeQuantizer` with config details.
@@ -76,9 +90,7 @@ class Float8FakeQuantizer(FakeQuantizerBase):
     """
 
     def __init__(self, config: Float8FakeQuantizeConfig):
-        super().__init__()
-        self.config = config
-        torch._C._log_api_usage_once("torchao.quantization.qat.Float8FakeQuantizer")
+        self._init_config(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         original_dtype = x.dtype
@@ -105,9 +117,7 @@ class Int4WeightFakeQuantizer(FakeQuantizerBase):
     """
 
     def __init__(self, config: Int4WeightFakeQuantizeConfig):
-        super().__init__()
-        self.config = config
-        torch._C._log_api_usage_once("torchao.quantization.qat.Int4WeightFakeQuantizer")
+        self._init_config(config)
 
     def forward(self, w: torch.Tensor) -> torch.Tensor:
         if self.config.activation_dtype == torch.float8_e4m3fn:

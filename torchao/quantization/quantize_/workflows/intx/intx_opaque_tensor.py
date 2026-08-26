@@ -103,7 +103,17 @@ class IntxOpaqueTensor(TorchAOBaseTensor):
         self.intx_packing_format = intx_packing_format
 
     def _quantization_type(self):
-        return f"bit_width={self.bit_width}, block_size={self.block_size}, shape={self.shape}, dtype={self.dtype}, device={self.device} intx_packing_format={self.intx_packing_format}"
+        # Note: the original layout omits the comma before intx_packing_format.
+        head = self._fields_repr(
+            [
+                ("bit_width", self.bit_width),
+                ("block_size", self.block_size),
+                ("shape", self.shape),
+                ("dtype", self.dtype),
+                ("device", self.device),
+            ]
+        )
+        return f"{head} intx_packing_format={self.intx_packing_format}"
 
     def to(self, *args, **kwargs):
         raise NotImplementedError("to() is not implemented for IntxOpaqueTensor")
