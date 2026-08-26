@@ -21,6 +21,7 @@ a certain % of machine peak memory bandwidth when performing these reads and wri
 """
 
 import copy
+from dataclasses import dataclass, field
 from typing import Optional
 
 import fire
@@ -63,6 +64,96 @@ from torchao.utils import _is_mslk_available, is_MI300, is_sm_at_least_100
 # Import mslk.conv to register the fp8 conv operator
 if _is_mslk_available():
     import mslk.conv  # noqa: F401
+
+
+@dataclass(frozen=True)
+class ConvGeometry:
+    """Geometry describing a single conv (or its implicit-GEMM equivalent).
+
+    These values always travel together through the conv helpers, so they are
+    grouped into one object instead of being passed as a long parameter list.
+    ``batch``/``in_channels``/``out_channels`` correspond to the GEMM
+    ``M``/``K``/``N`` used elsewhere in this script.
+    """
+
+    op_name: str
+    batch: int
+    in_channels: int
+    out_channels: int
+    kernel_size: Optional[int]
+    D: Optional[int] = None
+    H: Optional[int] = None
+    W: Optional[int] = None
+    stride: int = 1
+    padding: int = 0
+
+
+@dataclass(frozen=True)
+class ShapeConfig:
+    """Selects how benchmark shapes are generated.
+
+    ``shape_gen_name`` picks the generator and ``M``/``K``/``N`` override the
+    generated dimensions when the ``custom`` generator is used.
+    """
+
+    shape_gen_name: str = "pow2"
+    M: Optional[int] = None
+    K: Optional[int] = None
+    N: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ConvConfig:
+    """Conv-specific op selection and geometry shared across a run.
+
+    ``batch``/``in_channels``/``out_channels`` are supplied per shape from the
+    shape iterator, so only the op name and spatial/kernel geometry live here.
+    """
+
+    op_name: str = "linear"
+    D: Optional[int] = None
+    H: Optional[int] = None
+    W: Optional[int] = None
+    kernel_size: Optional[int] = None
+    stride: int = 1
+    padding: int = 0
+
+
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    """Controls benchmarking behavior and result reporting for a run."""
+
+    do_benchmarks: bool = True
+    enable_fusion_modeling: bool = False
+    n_limit: Optional[int] = None
+    save_profile_traces: bool = False
+    skip_printing_detailed_metrics: bool = False
+    outfile: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    """All options for a single ``float8_inference_roofline`` run.
+
+    These values form one benchmark configuration, so they are grouped into a
+    single value object (with cohesive sub-configs) instead of a long
+    parameter list.
+
+    * ``recipe_name``: quantization recipe (tensorwise, rowwise, mxfp8*,
+      mxfp4*, nvfp4*).
+    * ``shapes``: shape generation config (`ShapeConfig`).
+    * ``conv``: op selection and conv geometry (`ConvConfig`).
+    * ``bench``: benchmarking and reporting config (`BenchmarkConfig`).
+    """
+
+    recipe_name: str = "tensorwise"
+    shapes: ShapeConfig = field(default_factory=ShapeConfig)
+    conv: ConvConfig = field(default_factory=ConvConfig)
+    bench: BenchmarkConfig = field(default_factory=BenchmarkConfig)
+
+
+# Frozen (immutable) instances are safe to share as default arguments.
+_DEFAULT_RUN_CONFIG = RunConfig()
 
 
 @torch.no_grad()
@@ -189,16 +280,7 @@ def get_gemm_times(
 
 
 def get_conv_times(
-    op_name: str,
-    batch: int,
-    in_channels: int,
-    out_channels: int,
-    kernel_size: int,
-    D: Optional[int],
-    H: int,
-    W: int,
-    stride: int = 1,
-    padding: int = 0,
+    geometry: ConvGeometry,
     fast_accum: bool = True,
     recipe_name: Optional[str] = None,
 ):
@@ -208,6 +290,14 @@ def get_conv_times(
 
     This measures only the conv kernel time itself, without quantization overhead.
     """
+    op_name = geometry.op_name
+    batch = geometry.batch
+    in_channels = geometry.in_channels
+    out_channels = geometry.out_channels
+    kernel_size = geometry.kernel_size
+    D, H, W = geometry.D, geometry.H, geometry.W
+    stride, padding = geometry.stride, geometry.padding
+
     device = torch.device("cuda")
 
     # Create input tensors
@@ -329,18 +419,7 @@ def get_conv_times(
     return bf16_time_s, f8_time_s
 
 
-def get_conv_equivalent_gemm_dims(
-    op_name: str,
-    batch: int,
-    in_channels: int,
-    out_channels: int,
-    kernel_size: int,
-    D: Optional[int],
-    H: int,
-    W: int,
-    stride: int = 1,
-    padding: int = 0,
-):
+def get_conv_equivalent_gemm_dims(geometry: ConvGeometry):
     """
     Get equivalent GEMM dimensions for a conv operation using analytical calculation.
 
@@ -348,16 +427,8 @@ def get_conv_equivalent_gemm_dims(
     the equivalent GEMM dimensions without creating any tensors.
 
     Args:
-        op_name: "conv2d" or "conv3d"
-        batch: Batch size
-        in_channels: Number of input channels
-        out_channels: Number of output channels
-        kernel_size: Kernel size (assumes square/cubic kernel)
-        D: Depth dimension (required for conv3d)
-        H: Height dimension
-        W: Width dimension
-        stride: Stride value
-        padding: Padding value
+        geometry: Conv geometry (op name, batch, channels, kernel size, spatial
+            dimensions, stride, and padding).
 
     Returns:
         Tuple[int, int, int]: (gemm_M, gemm_K, gemm_N)
@@ -365,6 +436,14 @@ def get_conv_equivalent_gemm_dims(
             gemm_K: Size of each filter (in_channels * kernel_volume)
             gemm_N: Number of filters (out_channels)
     """
+    op_name = geometry.op_name
+    batch = geometry.batch
+    in_channels = geometry.in_channels
+    out_channels = geometry.out_channels
+    kernel_size = geometry.kernel_size
+    D, H, W = geometry.D, geometry.H, geometry.W
+    stride, padding = geometry.stride, geometry.padding
+
     if op_name == "conv2d":
         # Output spatial dimensions
         H_out = (H + 2 * padding - kernel_size) // stride + 1
@@ -391,21 +470,19 @@ def get_conv_equivalent_gemm_dims(
 
 
 def _create_model_and_input(
-    op_name: str,
-    batch: int,
-    in_channels: int,
-    out_channels: int,
-    D: Optional[int],
-    H: Optional[int],
-    W: Optional[int],
-    kernel_size: Optional[int],
-    stride: int,
-    padding: int,
+    geometry: ConvGeometry,
     enable_fusion_modeling: bool,
 ) -> tuple[nn.Module, torch.Tensor]:
     """
     Build the model and its corresponding input tensor for benchmarking.
     """
+    op_name = geometry.op_name
+    batch = geometry.batch
+    in_channels = geometry.in_channels
+    out_channels = geometry.out_channels
+    kernel_size = geometry.kernel_size
+    D, H, W = geometry.D, geometry.H, geometry.W
+    stride, padding = geometry.stride, geometry.padding
 
     def _stack_layers_conv(
         core_layer: nn.Module, add_post_relu: bool = False
@@ -465,43 +542,47 @@ def _create_model_and_input(
     return m_orig, x
 
 
-def run(
-    recipe_name: str,
-    outfile: str | None = None,
-    do_benchmarks: bool = True,
-    shape_gen_name: str = "pow2",
-    M: Optional[int] = None,
-    K: Optional[int] = None,
-    N: Optional[int] = None,
-    n_limit: Optional[int] = None,
-    save_profile_traces: bool = False,
-    enable_fusion_modeling: bool = False,
-    op_name: str = "linear",
-    D: Optional[int] = None,
-    H: Optional[int] = None,
-    W: Optional[int] = None,
-    kernel_size: Optional[int] = None,
-    stride: int = 1,
-    padding: int = 0,
-    skip_printing_detailed_metrics: bool = False,
-):
+def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
     """
     Args:
-    * `recipe_name`: quantization recipe (tensorwise, rowwise, mxfp8*, mxfp4*, nvfp4*)
-    * `do_benchmarks`: if True, gemm and e2e fwd+bwd of LNLinearSigmoid are benchmarked
-    * `shape_gen_name`: `llama`, `pow2`, `pow2_extended`, `sweep`, or `custom`
-    * `M|K|N`: if shape_gen_name is `custom`, then these values are used for MKN
-    * `n_limit (optional)`: if specified, only runs `n_limit` iterations
-    * `save_profile_traces (optional)`: if True, saves profiling traces
-    * `enable_fusion_modeling`: if True, models activation -> gemm instead of just gemm
-    * `op_name`: linear, conv2d or conv3d, decides which op to benchmark
-    * `D`, `H`, `W`: spatial dimensions for conv3d / conv2d
-    * `kernel_size`: kernel_size for conv3d / conv2d
-    * `stride`: stride for conv ops (default: 1)
-    * `padding`: padding for conv ops (default: 0)
-    * `skip_printing_detailed_metrics`: if True, prints e2e roofline
-      and observed speedups only, skipping all other intermediate metrics
+    * `config`: run configuration (`RunConfig`), grouping the cohesive options:
+      * `recipe_name`: quantization recipe (tensorwise, rowwise, mxfp8*, mxfp4*, nvfp4*)
+      * `shapes` (`ShapeConfig`):
+        * `shape_gen_name`: `llama`, `pow2`, `pow2_extended`, `sweep`, or `custom`
+        * `M|K|N`: if shape_gen_name is `custom`, then these values are used for MKN
+      * `conv` (`ConvConfig`):
+        * `op_name`: linear, conv2d or conv3d, decides which op to benchmark
+        * `D`, `H`, `W`: spatial dimensions for conv3d / conv2d
+        * `kernel_size`: kernel_size for conv3d / conv2d
+        * `stride`: stride for conv ops (default: 1)
+        * `padding`: padding for conv ops (default: 0)
+      * `bench` (`BenchmarkConfig`):
+        * `do_benchmarks`: if True, gemm and e2e fwd+bwd of LNLinearSigmoid are benchmarked
+        * `enable_fusion_modeling`: if True, models activation -> gemm instead of just gemm
+        * `n_limit (optional)`: if specified, only runs `n_limit` iterations
+        * `save_profile_traces (optional)`: if True, saves profiling traces
+        * `skip_printing_detailed_metrics`: if True, prints e2e roofline
+          and observed speedups only, skipping all other intermediate metrics
+        * `outfile`: if specified, writes results to this CSV file
     """
+    recipe_name = config.recipe_name
+    shapes = config.shapes
+    conv = config.conv
+    bench = config.bench
+
+    shape_gen_name = shapes.shape_gen_name
+    M, K, N = shapes.M, shapes.K, shapes.N
+    op_name = conv.op_name
+    D, H, W = conv.D, conv.H, conv.W
+    kernel_size = conv.kernel_size
+    stride, padding = conv.stride, conv.padding
+    outfile = bench.outfile
+    do_benchmarks = bench.do_benchmarks
+    n_limit = bench.n_limit
+    save_profile_traces = bench.save_profile_traces
+    enable_fusion_modeling = bench.enable_fusion_modeling
+    skip_printing_detailed_metrics = bench.skip_printing_detailed_metrics
+
     _SUPPORTED_OPS = ["linear", "conv2d", "conv3d"]
     assert op_name in _SUPPORTED_OPS, (
         f"Unsupported op: {op_name}, supported are: {_SUPPORTED_OPS}"
@@ -673,7 +754,7 @@ def run(
         else:
             # For conv ops, compute equivalent GEMM dimensions
             # M_val=batch, K_val=in_channels, N_val=out_channels
-            gemm_M, gemm_K, gemm_N = get_conv_equivalent_gemm_dims(
+            conv_geometry = ConvGeometry(
                 op_name=op_name,
                 batch=M_val,
                 in_channels=K_val,
@@ -685,6 +766,7 @@ def run(
                 stride=stride,
                 padding=padding,
             )
+            gemm_M, gemm_K, gemm_N = get_conv_equivalent_gemm_dims(conv_geometry)
 
             # use roofline model to estimate gemm time using equivalent GEMM dims
             r_bf16_gemm_time_s = float(
@@ -710,16 +792,7 @@ def run(
             rb_fp8_gemm_ratio = -1
             if do_benchmarks:
                 bf16_c1, f8_c1 = get_conv_times(
-                    op_name=op_name,
-                    batch=M_val,
-                    in_channels=K_val,
-                    out_channels=N_val,
-                    kernel_size=kernel_size,
-                    D=D,
-                    H=H,
-                    W=W,
-                    stride=stride,
-                    padding=padding,
+                    conv_geometry,
                     fast_accum=True,
                     recipe_name=recipe_name,
                 )
@@ -741,17 +814,20 @@ def run(
                     f"Roofline model estimates are still valid."
                 )
             else:
+                model_geometry = ConvGeometry(
+                    op_name=op_name,
+                    batch=M_val,
+                    in_channels=K_val,
+                    out_channels=N_val,
+                    kernel_size=kernel_size,
+                    D=D,
+                    H=H,
+                    W=W,
+                    stride=stride,
+                    padding=padding,
+                )
                 m_orig, x = _create_model_and_input(
-                    op_name,
-                    M_val,
-                    K_val,
-                    N_val,
-                    D,
-                    H,
-                    W,
-                    kernel_size,
-                    stride,
-                    padding,
+                    model_geometry,
                     enable_fusion_modeling,
                 )
 

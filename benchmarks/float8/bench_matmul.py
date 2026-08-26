@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 import itertools
+from dataclasses import dataclass
 from typing import Optional
 
 import fire
@@ -23,17 +24,44 @@ from torchao.testing.training.roofline_utils import get_specs
 from torchao.utils import is_MI300
 
 
+@dataclass(frozen=True)
+class MatmulBenchConfig:
+    """All options for a single ``bench_matmul`` run.
+
+    The parameters of this benchmark all travel together as one benchmark
+    configuration, so they are grouped into a single value object instead of a
+    long parameter list.
+
+    * ``shape_gen_name``/``M``/``K``/``N``: shape generation (``M``/``K``/``N``
+      override the generated dimensions when the ``custom`` generator is used).
+    * ``recipe``: quantization recipe to benchmark.
+    * ``use_gpu_kernel_time``: measure GPU kernel time instead of wall time.
+    * ``n_limit``: if set, only run this many shape iterations.
+    * ``out_filename``: if set, write results to this CSV file.
+    """
+
+    shape_gen_name: str = "pow2_extended"
+    M: Optional[int] = None
+    K: Optional[int] = None
+    N: Optional[int] = None
+    recipe: str = "tensorwise"
+    use_gpu_kernel_time: bool = True
+    n_limit: Optional[int] = None
+    out_filename: Optional[str] = None
+
+
+# A frozen (immutable) instance is safe to share as a default argument.
+_DEFAULT_CONFIG = MatmulBenchConfig()
+
+
 @torch.inference_mode()
-def run(
-    n_limit: Optional[int] = None,
-    shape_gen_name: str = "pow2_extended",
-    out_filename: Optional[str] = None,
-    M: Optional[int] = None,
-    K: Optional[int] = None,
-    N: Optional[int] = None,
-    use_gpu_kernel_time: bool = True,
-    recipe: str = "tensorwise",
-):
+def run(config: MatmulBenchConfig = _DEFAULT_CONFIG):
+    shape_gen_name = config.shape_gen_name
+    M, K, N = config.M, config.K, config.N
+    recipe = config.recipe
+    use_gpu_kernel_time = config.use_gpu_kernel_time
+    n_limit = config.n_limit
+    out_filename = config.out_filename
     device = "cuda"
     # TODO(future PR): this is ugly
     assert recipe in (
