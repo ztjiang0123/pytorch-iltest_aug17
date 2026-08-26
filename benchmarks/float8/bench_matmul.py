@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 import itertools
+from dataclasses import dataclass
 from typing import Optional
 
 import fire
@@ -23,17 +24,35 @@ from torchao.testing.training.roofline_utils import get_specs
 from torchao.utils import is_MI300
 
 
+@dataclass(frozen=True)
+class ShapeConfig:
+    """Describes how matmul shapes are generated for a benchmark run.
+
+    ``shape_gen_name`` selects the shape generator; ``M``/``K``/``N`` override
+    the generated dimensions when the ``custom`` generator is used. These
+    values always travel together, so they are grouped into a single object.
+    """
+
+    shape_gen_name: str = "pow2_extended"
+    M: Optional[int] = None
+    K: Optional[int] = None
+    N: Optional[int] = None
+
+
+# A frozen (immutable) instance is safe to share as a default argument.
+_DEFAULT_SHAPE_CONFIG = ShapeConfig()
+
+
 @torch.inference_mode()
 def run(
     n_limit: Optional[int] = None,
-    shape_gen_name: str = "pow2_extended",
     out_filename: Optional[str] = None,
-    M: Optional[int] = None,
-    K: Optional[int] = None,
-    N: Optional[int] = None,
     use_gpu_kernel_time: bool = True,
     recipe: str = "tensorwise",
+    shapes: ShapeConfig = _DEFAULT_SHAPE_CONFIG,
 ):
+    shape_gen_name = shapes.shape_gen_name
+    M, K, N = shapes.M, shapes.K, shapes.N
     device = "cuda"
     # TODO(future PR): this is ugly
     assert recipe in (
