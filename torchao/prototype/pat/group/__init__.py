@@ -4,17 +4,32 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-from .attention import (  # noqa: F401
+from .attention import (
     AttentionHeadGrouperDim0,
     AttentionHeadGrouperDim1,
     QKGrouper,
 )
-from .conv import ConvFilterGrouper  # noqa: F401
-from .dim import Dim0Grouper, Dim1Grouper  # noqa: F401
-from .grouper import (  # noqa: F401
+from .conv import ConvFilterGrouper
+from .dim import Dim0Grouper, Dim1Grouper
+from .grouper import (
     ElemGrouper,
     Grouper,
     LayerGrouper,
 )
-from .k_element import KElementGrouper  # noqa: F401
-from .low_rank import PackedSVDGrouper, SVDGrouper  # noqa: F401
+from .k_element import KElementGrouper
+from .low_rank import PackedSVDGrouper, SVDGrouper
+
+__all__ = [
+    "AttentionHeadGrouperDim0",
+    "AttentionHeadGrouperDim1",
+    "QKGrouper",
+    "ConvFilterGrouper",
+    "Dim0Grouper",
+    "Dim1Grouper",
+    "ElemGrouper",
+    "Grouper",
+    "LayerGrouper",
+    "KElementGrouper",
+    "PackedSVDGrouper",
+    "SVDGrouper",
+]
