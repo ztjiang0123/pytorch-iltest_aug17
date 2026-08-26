@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 import time
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -331,26 +332,26 @@ def define_parameter_list():
     return parameters_list
 
 
-# add initial search points based on the sensitivity score
+# sampling distributions used for the throughput objective; see
+# utils.get_initial_samples for the shared band structure.
 # TODO: add default parameter list if not specified
-def get_initial_samples(num_BO_initial_samples=10):
-    # sampling distributions used for the throughput objective; see
-    # utils.get_initial_samples for the shared band structure.
-    sampling_spec = {
-        "fixed_low_bitwidth": 8,
-        "fixed_high_bitwidth": 8,
-        "mid_sensitive": (([8, 6, 5, 4], [25, 2, 2, 71]), ([32, 64], [40, 60])),
-        "mid_default": (([8, 6, 5, 4], [30, 2, 2, 66]), ([32, 64], [50, 50])),
-        "late_sensitive": (
-            ([8, 6, 5, 4], [10, 2, 2, 86]),
-            ([32, 64, 128, 256], [35, 45, 10, 10]),
-        ),
-        "late_default": (
-            ([8, 6, 5, 4], [20, 2, 2, 76]),
-            ([32, 64, 128, 256], [30, 40, 25, 5]),
-        ),
-    }
-    return get_initial_samples_shared(sampling_spec, num_BO_initial_samples)
+THROUGHPUT_SAMPLING_SPEC = {
+    "fixed_low_bitwidth": 8,
+    "fixed_high_bitwidth": 8,
+    "mid_sensitive": (([8, 6, 5, 4], [25, 2, 2, 71]), ([32, 64], [40, 60])),
+    "mid_default": (([8, 6, 5, 4], [30, 2, 2, 66]), ([32, 64], [50, 50])),
+    "late_sensitive": (
+        ([8, 6, 5, 4], [10, 2, 2, 86]),
+        ([32, 64, 128, 256], [35, 45, 10, 10]),
+    ),
+    "late_default": (
+        ([8, 6, 5, 4], [20, 2, 2, 76]),
+        ([32, 64, 128, 256], [30, 40, 25, 5]),
+    ),
+}
+
+# add initial search points based on the sensitivity score
+get_initial_samples = partial(get_initial_samples_shared, THROUGHPUT_SAMPLING_SPEC)
 
 
 """

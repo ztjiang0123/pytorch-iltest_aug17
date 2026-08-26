@@ -3,6 +3,8 @@
 #
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
+from functools import partial
+
 import torch
 import torch.multiprocessing as mp
 from ax.service.ax_client import AxClient, ObjectiveProperties
@@ -26,26 +28,26 @@ def eval(model, tokenizer, num_PPL_eval_samples, fqn_to_config):
     }
 
 
-# add initial search points based on the sensitivity score
+# sampling distributions used for the model-size objective; see
+# utils.get_initial_samples for the shared band structure.
 # TODO: add random initial samples if no sensitivity prior
-def get_initial_samples(num_BO_initial_samples=10):
-    # sampling distributions used for the model-size objective; see
-    # utils.get_initial_samples for the shared band structure.
-    sampling_spec = {
-        "fixed_low_bitwidth": 5,
-        "fixed_high_bitwidth": 5,
-        "mid_sensitive": (([5, 4], [20, 80]), ([32, 64], [30, 70])),
-        "mid_default": (([5, 4], [30, 70]), ([32, 64], [40, 60])),
-        "late_sensitive": (
-            ([5, 4, 3, 2], [20, 55, 20, 5]),
-            ([32, 64, 128, 256], [30, 40, 25, 5]),
-        ),
-        "late_default": (
-            ([5, 4, 3, 2], [30, 55, 10, 5]),
-            ([32, 64, 128, 256], [40, 40, 15, 5]),
-        ),
-    }
-    return get_initial_samples_shared(sampling_spec, num_BO_initial_samples)
+MODEL_SIZE_SAMPLING_SPEC = {
+    "fixed_low_bitwidth": 5,
+    "fixed_high_bitwidth": 5,
+    "mid_sensitive": (([5, 4], [20, 80]), ([32, 64], [30, 70])),
+    "mid_default": (([5, 4], [30, 70]), ([32, 64], [40, 60])),
+    "late_sensitive": (
+        ([5, 4, 3, 2], [20, 55, 20, 5]),
+        ([32, 64, 128, 256], [30, 40, 25, 5]),
+    ),
+    "late_default": (
+        ([5, 4, 3, 2], [30, 55, 10, 5]),
+        ([32, 64, 128, 256], [40, 40, 15, 5]),
+    ),
+}
+
+# add initial search points based on the sensitivity score
+get_initial_samples = partial(get_initial_samples_shared, MODEL_SIZE_SAMPLING_SPEC)
 
 
 """
