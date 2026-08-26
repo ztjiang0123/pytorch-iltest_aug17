@@ -21,7 +21,7 @@ a certain % of machine peak memory bandwidth when performing these reads and wri
 """
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import fire
@@ -131,10 +131,29 @@ class BenchmarkConfig:
     outfile: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class RunConfig:
+    """All options for a single ``float8_inference_roofline`` run.
+
+    These values form one benchmark configuration, so they are grouped into a
+    single value object (with cohesive sub-configs) instead of a long
+    parameter list.
+
+    * ``recipe_name``: quantization recipe (tensorwise, rowwise, mxfp8*,
+      mxfp4*, nvfp4*).
+    * ``shapes``: shape generation config (`ShapeConfig`).
+    * ``conv``: op selection and conv geometry (`ConvConfig`).
+    * ``bench``: benchmarking and reporting config (`BenchmarkConfig`).
+    """
+
+    recipe_name: str = "tensorwise"
+    shapes: ShapeConfig = field(default_factory=ShapeConfig)
+    conv: ConvConfig = field(default_factory=ConvConfig)
+    bench: BenchmarkConfig = field(default_factory=BenchmarkConfig)
+
+
 # Frozen (immutable) instances are safe to share as default arguments.
-_DEFAULT_SHAPE_CONFIG = ShapeConfig()
-_DEFAULT_CONV_CONFIG = ConvConfig()
-_DEFAULT_BENCHMARK_CONFIG = BenchmarkConfig()
+_DEFAULT_RUN_CONFIG = RunConfig()
 
 
 @torch.no_grad()
@@ -523,33 +542,34 @@ def _create_model_and_input(
     return m_orig, x
 
 
-def run(
-    recipe_name: str,
-    shapes: ShapeConfig = _DEFAULT_SHAPE_CONFIG,
-    conv: ConvConfig = _DEFAULT_CONV_CONFIG,
-    bench: BenchmarkConfig = _DEFAULT_BENCHMARK_CONFIG,
-):
+def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
     """
     Args:
-    * `recipe_name`: quantization recipe (tensorwise, rowwise, mxfp8*, mxfp4*, nvfp4*)
-    * `shapes`: shape generation config (`ShapeConfig`)
-      * `shape_gen_name`: `llama`, `pow2`, `pow2_extended`, `sweep`, or `custom`
-      * `M|K|N`: if shape_gen_name is `custom`, then these values are used for MKN
-    * `conv`: op selection and conv geometry (`ConvConfig`)
-      * `op_name`: linear, conv2d or conv3d, decides which op to benchmark
-      * `D`, `H`, `W`: spatial dimensions for conv3d / conv2d
-      * `kernel_size`: kernel_size for conv3d / conv2d
-      * `stride`: stride for conv ops (default: 1)
-      * `padding`: padding for conv ops (default: 0)
-    * `bench`: benchmarking and reporting config (`BenchmarkConfig`)
-      * `do_benchmarks`: if True, gemm and e2e fwd+bwd of LNLinearSigmoid are benchmarked
-      * `enable_fusion_modeling`: if True, models activation -> gemm instead of just gemm
-      * `n_limit (optional)`: if specified, only runs `n_limit` iterations
-      * `save_profile_traces (optional)`: if True, saves profiling traces
-      * `skip_printing_detailed_metrics`: if True, prints e2e roofline
-        and observed speedups only, skipping all other intermediate metrics
-      * `outfile`: if specified, writes results to this CSV file
+    * `config`: run configuration (`RunConfig`), grouping the cohesive options:
+      * `recipe_name`: quantization recipe (tensorwise, rowwise, mxfp8*, mxfp4*, nvfp4*)
+      * `shapes` (`ShapeConfig`):
+        * `shape_gen_name`: `llama`, `pow2`, `pow2_extended`, `sweep`, or `custom`
+        * `M|K|N`: if shape_gen_name is `custom`, then these values are used for MKN
+      * `conv` (`ConvConfig`):
+        * `op_name`: linear, conv2d or conv3d, decides which op to benchmark
+        * `D`, `H`, `W`: spatial dimensions for conv3d / conv2d
+        * `kernel_size`: kernel_size for conv3d / conv2d
+        * `stride`: stride for conv ops (default: 1)
+        * `padding`: padding for conv ops (default: 0)
+      * `bench` (`BenchmarkConfig`):
+        * `do_benchmarks`: if True, gemm and e2e fwd+bwd of LNLinearSigmoid are benchmarked
+        * `enable_fusion_modeling`: if True, models activation -> gemm instead of just gemm
+        * `n_limit (optional)`: if specified, only runs `n_limit` iterations
+        * `save_profile_traces (optional)`: if True, saves profiling traces
+        * `skip_printing_detailed_metrics`: if True, prints e2e roofline
+          and observed speedups only, skipping all other intermediate metrics
+        * `outfile`: if specified, writes results to this CSV file
     """
+    recipe_name = config.recipe_name
+    shapes = config.shapes
+    conv = config.conv
+    bench = config.bench
+
     shape_gen_name = shapes.shape_gen_name
     M, K, N = shapes.M, shapes.K, shapes.N
     op_name = conv.op_name

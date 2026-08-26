@@ -25,34 +25,43 @@ from torchao.utils import is_MI300
 
 
 @dataclass(frozen=True)
-class ShapeConfig:
-    """Describes how matmul shapes are generated for a benchmark run.
+class MatmulBenchConfig:
+    """All options for a single ``bench_matmul`` run.
 
-    ``shape_gen_name`` selects the shape generator; ``M``/``K``/``N`` override
-    the generated dimensions when the ``custom`` generator is used. These
-    values always travel together, so they are grouped into a single object.
+    The parameters of this benchmark all travel together as one benchmark
+    configuration, so they are grouped into a single value object instead of a
+    long parameter list.
+
+    * ``shape_gen_name``/``M``/``K``/``N``: shape generation (``M``/``K``/``N``
+      override the generated dimensions when the ``custom`` generator is used).
+    * ``recipe``: quantization recipe to benchmark.
+    * ``use_gpu_kernel_time``: measure GPU kernel time instead of wall time.
+    * ``n_limit``: if set, only run this many shape iterations.
+    * ``out_filename``: if set, write results to this CSV file.
     """
 
     shape_gen_name: str = "pow2_extended"
     M: Optional[int] = None
     K: Optional[int] = None
     N: Optional[int] = None
+    recipe: str = "tensorwise"
+    use_gpu_kernel_time: bool = True
+    n_limit: Optional[int] = None
+    out_filename: Optional[str] = None
 
 
 # A frozen (immutable) instance is safe to share as a default argument.
-_DEFAULT_SHAPE_CONFIG = ShapeConfig()
+_DEFAULT_CONFIG = MatmulBenchConfig()
 
 
 @torch.inference_mode()
-def run(
-    n_limit: Optional[int] = None,
-    out_filename: Optional[str] = None,
-    use_gpu_kernel_time: bool = True,
-    recipe: str = "tensorwise",
-    shapes: ShapeConfig = _DEFAULT_SHAPE_CONFIG,
-):
-    shape_gen_name = shapes.shape_gen_name
-    M, K, N = shapes.M, shapes.K, shapes.N
+def run(config: MatmulBenchConfig = _DEFAULT_CONFIG):
+    shape_gen_name = config.shape_gen_name
+    M, K, N = config.M, config.K, config.N
+    recipe = config.recipe
+    use_gpu_kernel_time = config.use_gpu_kernel_time
+    n_limit = config.n_limit
+    out_filename = config.out_filename
     device = "cuda"
     # TODO(future PR): this is ugly
     assert recipe in (
