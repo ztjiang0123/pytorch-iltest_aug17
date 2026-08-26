@@ -26,31 +26,19 @@ _fp8_blockwise_weight_quant_kernel = None
 _fp8_blockwise_weight_dequant_kernel = None
 
 
-def _lazy_init_triton():
-    global _triton_initialized, _triton_available
-    global _blockwise_fp8_gemm_impl
-    global _fp8_blockwise_act_quant_kernel
-    global _fp8_blockwise_weight_quant_kernel
-    global _fp8_blockwise_weight_dequant_kernel
+def _build_blockwise_fp8_gemm():
+    """Define and return the blockwise FP8 GEMM custom op.
 
-    if _triton_initialized:
-        return
+    Kept separate from :func:`_lazy_init_triton` so that function stays small;
+    the caller is responsible for importing Triton and confirming availability
+    before invoking this helper.
 
-    _triton_initialized = True
-
-    from torch.utils._triton import has_triton
-
-    if not has_triton():
-        _triton_available = False
-        return
-
-    _triton_available = True
-
+    Original implementation at
+    https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/kernel.py
+    """
     import triton
     import triton.language as tl
     from triton import Config
-
-    # Original implementation at https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/kernel.py
 
     fp8_gemm_configs = [
         Config(
@@ -143,7 +131,33 @@ def _lazy_init_triton():
         c = a.new_empty(*a.size()[:-1], N, dtype=torch.bfloat16)
         return c
 
-    _blockwise_fp8_gemm_impl = _blockwise_fp8_gemm_op
+    return _blockwise_fp8_gemm_op
+
+
+def _lazy_init_triton():
+    global _triton_initialized, _triton_available
+    global _blockwise_fp8_gemm_impl
+    global _fp8_blockwise_act_quant_kernel
+    global _fp8_blockwise_weight_quant_kernel
+    global _fp8_blockwise_weight_dequant_kernel
+
+    if _triton_initialized:
+        return
+
+    _triton_initialized = True
+
+    from torch.utils._triton import has_triton
+
+    if not has_triton():
+        _triton_available = False
+        return
+
+    _triton_available = True
+
+    import triton
+    import triton.language as tl
+
+    _blockwise_fp8_gemm_impl = _build_blockwise_fp8_gemm()
 
     @triton.jit
     def _fp8_blockwise_act_quant_kernel_impl(
