@@ -15,6 +15,7 @@ from iopath.common.file_io import g_pathmgr
 
 from torchao._models.sam2.modeling.backbones.utils import (
     PatchEmbed,
+    PatchEmbedConfig,
     window_partition,
     window_unpartition,
 )
@@ -226,7 +227,7 @@ class Hiera(nn.Module):
         self.return_interm_layers = return_interm_layers
 
         self.patch_embed = PatchEmbed(
-            embed_dim=embed_dim,
+            PatchEmbedConfig(embed_dim=embed_dim),
         )
         # Which blocks have global att?
         self.global_att_blocks = global_att_blocks

@@ -13,6 +13,7 @@ from torchao.core.config import AOBaseConfig
 from torchao.prototype.blockwise_fp8_training.kernels import (
     BLOCKWISE_1X128_SCALING_TYPE,
     BLOCKWISE_128X128_SCALING_TYPE,
+    Fp8Gemm1x128Operands,
     _prepare_blockwise_scaled_mm_rhs_scale,
     _scaling_type_value,
     blockwise_scaled_mm,
@@ -78,10 +79,12 @@ def _run_blockwise_mm(
 ) -> torch.Tensor:
     if use_triton:
         return triton_kernel(
-            mat_a,
-            mat_b,
-            scale_a,
-            scale_b if triton_scale_b is None else triton_scale_b,
+            Fp8Gemm1x128Operands(
+                a=mat_a,
+                b=mat_b,
+                a_s=scale_a,
+                b_s=scale_b if triton_scale_b is None else triton_scale_b,
+            ),
             out_dtype=out_dtype,
         )
     return _scaled_mm(

@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Optional
 
 import sympy
@@ -28,6 +29,33 @@ op_qsdpa = ExternKernelChoice(
 quantize_dtypes = [torch.uint8, torch.float8_e4m3fn]
 
 
+@dataclass
+class QSDPAOptions:
+    """Non-tensor options for the quantized SDPA lowering.
+
+    ``torch.ops.torchao.qscaled_dot_product`` takes the query/key/value/mask
+    tensors followed by a long tail of scalar options: the SDPA controls
+    (``dropout``, ``is_causal``, ``scale``) and the per-tensor
+    (scale, zero-point) quantization parameters for query/key/value/attention/
+    output. Those scalars always travel together, so they are grouped here
+    instead of being passed as thirteen separate arguments.
+    """
+
+    dropout: float = 0.0
+    is_causal: bool = False
+    scale: Optional[float] = None
+    q_scale: Optional[float] = 1.0
+    q_zp: Optional[int] = 0
+    k_scale: Optional[float] = 1.0
+    k_zp: Optional[int] = 0
+    v_scale: Optional[float] = 1.0
+    v_zp: Optional[int] = 0
+    a_scale: Optional[float] = 1.0
+    a_zp: Optional[int] = 0
+    o_scale: Optional[float] = 1.0
+    o_zp: Optional[int] = 0
+
+
 def register_qsdpa():
     @register_lowering(
         torch.ops.torchao.qscaled_dot_product.default, type_promotion_kind=None
@@ -37,20 +65,27 @@ def register_qsdpa():
         key: TensorBox,
         value: TensorBox,
         attn_mask: Optional[TensorBox],
-        dropout: float,
-        is_causal: bool,
-        scale: Optional[float] = None,
-        q_scale: Optional[float] = 1.0,
-        q_zp: Optional[int] = 0,
-        k_scale: Optional[float] = 1.0,
-        k_zp: Optional[int] = 0,
-        v_scale: Optional[float] = 1.0,
-        v_zp: Optional[int] = 0,
-        a_scale: Optional[float] = 1.0,
-        a_zp: Optional[int] = 0,
-        o_scale: Optional[float] = 1.0,
-        o_zp: Optional[int] = 0,
+        # Inductor lowers this op by replaying the aten schema's positional
+        # arguments. The trailing scalar options (SDPA controls followed by the
+        # per-tensor quantization scales/zero-points) are captured here and
+        # immediately grouped into ``QSDPAOptions``.
+        *options_args,
     ) -> TensorBox:
+        options = QSDPAOptions(*options_args)
+        # dropout / is_causal are part of the op schema but are not consumed by
+        # this lowering (the template and fallback derive causality elsewhere).
+        scale = options.scale
+        q_scale = options.q_scale
+        q_zp = options.q_zp
+        k_scale = options.k_scale
+        k_zp = options.k_zp
+        v_scale = options.v_scale
+        v_zp = options.v_zp
+        a_scale = options.a_scale
+        a_zp = options.a_zp
+        o_scale = options.o_scale
+        o_zp = options.o_zp
+
         choices: list[ChoiceCaller] = []
 
         (

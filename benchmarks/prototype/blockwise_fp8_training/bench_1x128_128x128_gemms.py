@@ -18,6 +18,7 @@ from benchmarks.prototype.blockwise_fp8_training.bench_gemm_utils import (
 )
 from benchmarks.utils import run_experiments_and_print
 from torchao.prototype.blockwise_fp8_training.kernels import (
+    Fp8Gemm1x128Operands,
     triton_fp8_blockwise_act_quant_lhs,
     triton_fp8_blockwise_weight_quant_transposed_rhs,
     triton_fp8_gemm_1x128_128x128,
@@ -67,21 +68,21 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
     bf16_mm_us = benchmark_cuda_function_in_microseconds(torch.mm, A, B.t())
 
     # Warm up then run triton bench
+    triton_operands = Fp8Gemm1x128Operands(
+        a=A_q,
+        b=B_t_q,
+        a_s=1.0 / A_s,
+        b_s=1.0 / B_t_s,
+    )
     warmup(
         triton_fp8_gemm_1x128_128x128,
-        A_q,
-        B_t_q,
-        1.0 / A_s,
-        1.0 / B_t_s,
+        triton_operands,
         out_dtype=config.out_dtype,
     )
 
     fp8_triton_us = benchmark_cuda_function_in_microseconds(
         triton_fp8_gemm_1x128_128x128,
-        A_q,
-        B_t_q,
-        1.0 / A_s,
-        1.0 / B_t_s,
+        triton_operands,
         out_dtype=config.out_dtype,
     )
 

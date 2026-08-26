@@ -6,6 +6,7 @@
 
 """Some utilities for backbones, in particular for windowing"""
 
+from dataclasses import dataclass
 from typing import Tuple
 
 import torch
@@ -62,30 +63,45 @@ def window_unpartition(windows, window_size, pad_hw, hw):
     return x
 
 
+@dataclass
+class PatchEmbedConfig:
+    """Geometry of the ``PatchEmbed`` projection convolution.
+
+    Grouping these values that always travel together keeps ``PatchEmbed``'s
+    constructor to a single argument.
+
+    Args:
+        kernel_size (Tuple): kernel size of the projection layer.
+        stride (Tuple): stride of the projection layer.
+        padding (Tuple): padding size of the projection layer.
+        in_chans (int): Number of input image channels.
+        embed_dim (int): Patch embedding dimension.
+    """
+
+    kernel_size: Tuple[int, ...] = (7, 7)
+    stride: Tuple[int, ...] = (4, 4)
+    padding: Tuple[int, ...] = (3, 3)
+    in_chans: int = 3
+    embed_dim: int = 768
+
+
 class PatchEmbed(nn.Module):
     """
     Image to Patch Embedding.
     """
 
-    def __init__(
-        self,
-        kernel_size: Tuple[int, ...] = (7, 7),
-        stride: Tuple[int, ...] = (4, 4),
-        padding: Tuple[int, ...] = (3, 3),
-        in_chans: int = 3,
-        embed_dim: int = 768,
-    ):
+    def __init__(self, config: PatchEmbedConfig = PatchEmbedConfig()):
         """
         Args:
-            kernel_size (Tuple): kernel size of the projection layer.
-            stride (Tuple): stride of the projection layer.
-            padding (Tuple): padding size of the projection layer.
-            in_chans (int): Number of input image channels.
-            embed_dim (int):  embed_dim (int): Patch embedding dimension.
+            config (PatchEmbedConfig): geometry of the projection layer.
         """
         super().__init__()
         self.proj = nn.Conv2d(
-            in_chans, embed_dim, kernel_size=kernel_size, stride=stride, padding=padding
+            config.in_chans,
+            config.embed_dim,
+            kernel_size=config.kernel_size,
+            stride=config.stride,
+            padding=config.padding,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

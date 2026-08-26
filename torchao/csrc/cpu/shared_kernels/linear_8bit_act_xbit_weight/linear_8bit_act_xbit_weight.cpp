@@ -81,15 +81,10 @@ void pack_weights_with_lut_operator(
     // Outputs
     void* packed_weights,
     // Inputs
-    int n,
-    int k,
-    int group_size,
-    const int8_t* weight_qval_idxs,
-    int n_luts,
-    const int8_t* luts,
-    const float* weight_scales,
-    const int8_t* weight_zeros,
-    const float* bias) {
+    const LutWeightData& weights) {
+  const int n = weights.n;
+  const int k = weights.k;
+  const int group_size = weights.group_size;
   int n_step = uk.n_step;
   int nc = std::min(n, n_step);
   int num_nc_panels = (n + nc - 1) / nc;
@@ -117,14 +112,14 @@ void pack_weights_with_lut_operator(
         /*n=*/nc_tile_size,
         k,
         group_size,
-        weight_qval_idxs + weight_qval_idxs_offset,
-        n_luts,
-        luts,
-        weight_scales + weight_scales_and_zeros_offset,
-        (weight_zeros == nullptr)
+        weights.weight_qval_idxs + weight_qval_idxs_offset,
+        weights.n_luts,
+        weights.luts,
+        weights.weight_scales + weight_scales_and_zeros_offset,
+        (weights.weight_zeros == nullptr)
             ? nullptr
-            : (weight_zeros + weight_scales_and_zeros_offset),
-        (bias == nullptr) ? nullptr : (bias + n_idx),
+            : (weights.weight_zeros + weight_scales_and_zeros_offset),
+        (weights.bias == nullptr) ? nullptr : (weights.bias + n_idx),
         uk.nr,
         uk.kr,
         uk.sr);

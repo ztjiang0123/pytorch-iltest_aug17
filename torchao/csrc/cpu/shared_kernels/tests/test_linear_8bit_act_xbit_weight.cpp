@@ -156,15 +156,16 @@ void test_linear_8bit_act_xbit_weight(
       pack_weights_with_lut_operator(
           ukernel_config,
           packed_weights.get(),
-          n,
-          k,
-          group_size,
-          weight_qval_idxs.data(),
-          /*n_luts*/ 1,
-          lut.data(),
-          test_case.weight_scales.data(),
-          weight_zeros_ptr,
-          bias_ptr);
+          LutWeightData{
+              /*n=*/n,
+              /*k=*/k,
+              /*group_size=*/group_size,
+              /*weight_qval_idxs=*/weight_qval_idxs.data(),
+              /*n_luts=*/1,
+              /*luts=*/lut.data(),
+              /*weight_scales=*/test_case.weight_scales.data(),
+              /*weight_zeros=*/weight_zeros_ptr,
+              /*bias=*/bias_ptr});
     } else {
     pack_weights_operator(
         ukernel_config,
