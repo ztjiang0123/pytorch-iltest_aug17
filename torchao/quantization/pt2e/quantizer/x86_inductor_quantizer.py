@@ -432,28 +432,42 @@ class X86InductorQuantizer(Quantizer):
             + list(self.operator_type_qconfig.values())
             + [self.global_config]
         ):
-            if qconfig is not None:
-                # Query the `is_qat` state
-                if qat_state is None:
-                    qat_state = qconfig.is_qat
-                else:
-                    assert qat_state == qconfig.is_qat, (
-                        f"All non-None quantization configs should have the same `is_qat`,"
-                        f"but got {qat_state} and {qconfig.is_qat}."
-                    )
-                # Query the `is_dynamic` state
-                input_activation_spec = qconfig.input_activation
-                if input_activation_spec is not None:
-                    if dynamic_state is None:
-                        dynamic_state = input_activation_spec.is_dynamic
-                    else:
-                        assert dynamic_state == input_activation_spec.is_dynamic, (
-                            f"All non-None `input_activation_spec` should have the same `is_dynamic`,"
-                            f"but got {dynamic_state} and {input_activation_spec.is_dynamic}."
-                        )
+            if qconfig is None:
+                continue
+            qat_state = self._reconcile_qat_state(qat_state, qconfig)
+            dynamic_state = self._reconcile_dynamic_state(dynamic_state, qconfig)
         return _CurrentQuantizationMode(
             qat_state=qat_state, dynamic_state=dynamic_state
         )
+
+    @staticmethod
+    def _reconcile_qat_state(
+        qat_state: Optional[bool], qconfig: QuantizationConfig
+    ) -> Optional[bool]:
+        """Query and validate the `is_qat` state against the accumulated one."""
+        if qat_state is None:
+            return qconfig.is_qat
+        assert qat_state == qconfig.is_qat, (
+            f"All non-None quantization configs should have the same `is_qat`,"
+            f"but got {qat_state} and {qconfig.is_qat}."
+        )
+        return qat_state
+
+    @staticmethod
+    def _reconcile_dynamic_state(
+        dynamic_state: Optional[bool], qconfig: QuantizationConfig
+    ) -> Optional[bool]:
+        """Query and validate the `is_dynamic` state against the accumulated one."""
+        input_activation_spec = qconfig.input_activation
+        if input_activation_spec is None:
+            return dynamic_state
+        if dynamic_state is None:
+            return input_activation_spec.is_dynamic
+        assert dynamic_state == input_activation_spec.is_dynamic, (
+            f"All non-None `input_activation_spec` should have the same `is_dynamic`,"
+            f"but got {dynamic_state} and {input_activation_spec.is_dynamic}."
+        )
+        return dynamic_state
 
     def _need_skip_config(
         self, quantization_config: Optional[QuantizationConfig]

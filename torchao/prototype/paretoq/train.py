@@ -21,6 +21,32 @@ from transformers import default_data_collator, Trainer
 log = utils.get_logger("clm")
 
 
+def _compute_weight_clip_scale(weight_param, w_bits):
+    """Compute the initial weight clipping scale for the given bit width."""
+    if w_bits == 1:
+        return torch.mean(weight_param.abs(), dim=-1, keepdim=True).detach()
+    if w_bits == 0 or w_bits == 2:
+        scale, _ = torch.max(torch.abs(weight_param), dim=-1, keepdim=True)
+        return scale
+    if w_bits == 3 or w_bits == 4:
+        xmax, _ = torch.max(torch.abs(weight_param), dim=-1, keepdim=True)
+        maxq = 2 ** (w_bits - 1) - 1
+        return xmax / maxq
+    raise NotImplementedError
+
+
+def _init_weight_clip_vals(model, w_bits):
+    """Initialize weight_clip_val parameters from their associated weights."""
+    named_params = dict(model.named_parameters())
+    for name, param in model.named_parameters():
+        if "weight_clip_val" not in name:
+            continue
+        weight_name = name.replace("weight_clip_val", "weight")
+        weight_param = named_params.get(weight_name, None)
+        scale = _compute_weight_clip_scale(weight_param, w_bits)
+        param.data.copy_(scale)
+
+
 def train():
     dist.init_process_group(backend="nccl")
     model_args, data_args, training_args = process_args()
@@ -40,23 +66,7 @@ def train():
     )
 
     if not model_args.contain_weight_clip_val:
-        for name, param in model.named_parameters():
-            if "weight_clip_val" in name:
-                weight_name = name.replace("weight_clip_val", "weight")
-                weight_param = dict(model.named_parameters()).get(weight_name, None)
-
-                if model_args.w_bits == 1:
-                    scale = torch.mean(weight_param.abs(), dim=-1, keepdim=True).detach()
-                elif model_args.w_bits == 0 or model_args.w_bits == 2:
-                    scale, _ = torch.max(torch.abs(weight_param), dim=-1, keepdim=True)
-                elif model_args.w_bits == 3 or model_args.w_bits == 4:
-                    xmax, _ = torch.max(torch.abs(weight_param), dim=-1, keepdim=True)
-                    maxq = 2 ** (model_args.w_bits - 1) - 1
-                    scale = xmax / maxq
-                else:
-                    raise NotImplementedError
-
-                param.data.copy_(scale)
+        _init_weight_clip_vals(model, model_args.w_bits)
 
     model.cuda()
     log.info("Complete model loading...")

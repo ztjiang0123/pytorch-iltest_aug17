@@ -178,33 +178,12 @@ def _replace_linear_int4(
 ):
     for name, child in module.named_children():
         # TODO: support linear bias
-        if (
+        is_replaceable_linear = (
             isinstance(child, nn.Linear)
             and child.bias is None
             and (skip_layer_func is None or not skip_layer_func(child.weight))
-        ):
-            if (
-                _check_linear_int4_k(child.in_features, groupsize, inner_k_tiles)
-                or padding_allowed
-            ):
-                new_linear = linear_class(
-                    child.in_features,
-                    child.out_features,
-                    bias=False,
-                    device=child.weight.device,
-                    groupsize=groupsize,
-                    inner_k_tiles=inner_k_tiles,
-                    precision=precision,
-                    scales_precision=scales_precision,
-                )
-                # TODO: merge with 8da4w?
-                # In distributed training, the model may be instantiated
-                # on the meta device, in which case there is no need to
-                # copy the weights, and doing so will result in an error
-                if copy_weights and child.weight.device != torch.device("meta"):
-                    new_linear.weight = child.weight
-                setattr(module, name, new_linear)
-        else:
+        )
+        if not is_replaceable_linear:
             _replace_linear_int4(
                 child,
                 groupsize,
@@ -216,6 +195,31 @@ def _replace_linear_int4(
                 linear_class,
                 copy_weights,
             )
+            continue
+
+        if not (
+            _check_linear_int4_k(child.in_features, groupsize, inner_k_tiles)
+            or padding_allowed
+        ):
+            continue
+
+        new_linear = linear_class(
+            child.in_features,
+            child.out_features,
+            bias=False,
+            device=child.weight.device,
+            groupsize=groupsize,
+            inner_k_tiles=inner_k_tiles,
+            precision=precision,
+            scales_precision=scales_precision,
+        )
+        # TODO: merge with 8da4w?
+        # In distributed training, the model may be instantiated
+        # on the meta device, in which case there is no need to
+        # copy the weights, and doing so will result in an error
+        if copy_weights and child.weight.device != torch.device("meta"):
+            new_linear.weight = child.weight
+        setattr(module, name, new_linear)
 
 
 def replace_linear_int4(
