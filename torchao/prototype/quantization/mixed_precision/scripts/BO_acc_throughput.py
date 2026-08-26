@@ -3,7 +3,6 @@
 #
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
-import random
 import time
 from pathlib import Path
 from typing import Optional
@@ -21,6 +20,7 @@ from utils import (
     quantize_by_fqn_to_config,
     write_history_to_csv,
 )
+from utils import get_initial_samples as get_initial_samples_shared
 
 import torchao
 from torchao._models.llama.generate import (
@@ -334,54 +334,23 @@ def define_parameter_list():
 # add initial search points based on the sensitivity score
 # TODO: add default parameter list if not specified
 def get_initial_samples(num_BO_initial_samples=10):
-    initial_points_set = []
-
-    # auto sample the bit choices with random choice probability positive correlated to FIT score
-    for _ in range(num_BO_initial_samples):
-        initial_points = {}
-        for i in range(0, 3):
-            initial_points["bitwidth." + str(i) + "."] = 8
-            initial_points["groupsize." + str(i) + "."] = 32
-
-        for i in range(3, 18):
-            if i in [5, 6, 7, 10, 11, 12, 16]:
-                initial_points["bitwidth." + str(i) + "."] = random.choices(
-                    [8, 6, 5, 4], [25, 2, 2, 71]
-                )[0]
-                initial_points["groupsize." + str(i) + "."] = random.choices(
-                    [32, 64], [40, 60]
-                )[0]
-            else:
-                initial_points["bitwidth." + str(i) + "."] = random.choices(
-                    [8, 6, 5, 4], [30, 2, 2, 66]
-                )[0]
-                initial_points["groupsize." + str(i) + "."] = random.choices(
-                    [32, 64], [50, 50]
-                )[0]
-
-        for i in range(18, 30):
-            if i in [22, 23, 24]:
-                initial_points["bitwidth." + str(i) + "."] = random.choices(
-                    [8, 6, 5, 4], [10, 2, 2, 86]
-                )[0]
-                initial_points["groupsize." + str(i) + "."] = random.choices(
-                    [32, 64, 128, 256], [35, 45, 10, 10]
-                )[0]
-            else:
-                initial_points["bitwidth." + str(i) + "."] = random.choices(
-                    [8, 6, 5, 4], [20, 2, 2, 76]
-                )[0]
-                initial_points["groupsize." + str(i) + "."] = random.choices(
-                    [32, 64, 128, 256], [30, 40, 25, 5]
-                )[0]
-
-        for i in range(30, 32):
-            initial_points["bitwidth." + str(i) + "."] = 8
-            initial_points["groupsize." + str(i) + "."] = 32
-
-        initial_points_set.append(initial_points)
-
-    return initial_points_set
+    # sampling distributions used for the throughput objective; see
+    # utils.get_initial_samples for the shared band structure.
+    sampling_spec = {
+        "fixed_low_bitwidth": 8,
+        "fixed_high_bitwidth": 8,
+        "mid_sensitive": (([8, 6, 5, 4], [25, 2, 2, 71]), ([32, 64], [40, 60])),
+        "mid_default": (([8, 6, 5, 4], [30, 2, 2, 66]), ([32, 64], [50, 50])),
+        "late_sensitive": (
+            ([8, 6, 5, 4], [10, 2, 2, 86]),
+            ([32, 64, 128, 256], [35, 45, 10, 10]),
+        ),
+        "late_default": (
+            ([8, 6, 5, 4], [20, 2, 2, 76]),
+            ([32, 64, 128, 256], [30, 40, 25, 5]),
+        ),
+    }
+    return get_initial_samples_shared(sampling_spec, num_BO_initial_samples)
 
 
 """

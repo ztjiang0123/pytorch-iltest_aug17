@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 import csv
 import json
+import random
 
 import torch
 from lm_eval.evaluator import evaluate
@@ -14,6 +15,74 @@ from naive_intNwo import intN_weight_only
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from torchao.quantization import quantize_
+
+
+def get_initial_samples(sampling_spec, num_BO_initial_samples=10):
+    """Generate initial BO search points based on a sampling specification.
+
+    The layer indices are grouped into four bands that share the same
+    structure across the different BO objectives (model size, throughput, ...);
+    only the concrete bitwidth/groupsize choices and their sampling weights
+    differ. ``sampling_spec`` describes those per-band choices so this single
+    implementation can be reused by every caller.
+
+    Args:
+        sampling_spec (dict): mapping with the keys below. Each ``*_choices``
+            entry is a ``(choices, weights)`` tuple passed to
+            ``random.choices``.
+
+            - ``fixed_low_bitwidth``: bitwidth used for layers 0-2.
+            - ``fixed_high_bitwidth``: bitwidth used for layers 30-31.
+            - ``mid_sensitive``: choices for the sensitive layers in 3-17.
+            - ``mid_default``: choices for the remaining layers in 3-17.
+            - ``late_sensitive``: choices for the sensitive layers in 18-29.
+            - ``late_default``: choices for the remaining layers in 18-29.
+
+            ``fixed_groupsize`` (default 32) is the groupsize for the fixed
+            bands.
+        num_BO_initial_samples (int): number of initial samples to generate.
+    """
+    fixed_groupsize = sampling_spec.get("fixed_groupsize", 32)
+    initial_points_set = []
+
+    # auto sample the bit choices with random choice probability positive
+    # correlated to the sensitivity (FIT) score
+    for _ in range(num_BO_initial_samples):
+        initial_points = {}
+        for i in range(0, 3):
+            initial_points["bitwidth." + str(i) + "."] = sampling_spec[
+                "fixed_low_bitwidth"
+            ]
+            initial_points["groupsize." + str(i) + "."] = fixed_groupsize
+
+        for i in range(3, 18):
+            band = "mid_sensitive" if i in [5, 6, 7, 10, 11, 12, 16] else "mid_default"
+            (bw_choices, bw_weights), (gs_choices, gs_weights) = sampling_spec[band]
+            initial_points["bitwidth." + str(i) + "."] = random.choices(
+                bw_choices, bw_weights
+            )[0]
+            initial_points["groupsize." + str(i) + "."] = random.choices(
+                gs_choices, gs_weights
+            )[0]
+
+        for i in range(18, 30):
+            band = "late_sensitive" if i in [22, 23, 24] else "late_default"
+            (bw_choices, bw_weights), (gs_choices, gs_weights) = sampling_spec[band]
+            initial_points["bitwidth." + str(i) + "."] = random.choices(
+                bw_choices, bw_weights
+            )[0]
+            initial_points["groupsize." + str(i) + "."] = random.choices(
+                gs_choices, gs_weights
+            )[0]
+
+        for i in range(30, 32):
+            initial_points["bitwidth." + str(i) + "."] = sampling_spec[
+                "fixed_high_bitwidth"
+            ]
+            initial_points["groupsize." + str(i) + "."] = fixed_groupsize
+
+        initial_points_set.append(initial_points)
+    return initial_points_set
 
 
 def write_history_to_csv(history, output_file, keyword):

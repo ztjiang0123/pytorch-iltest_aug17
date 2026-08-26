@@ -3,8 +3,6 @@
 #
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
-import random
-
 import torch
 import torch.multiprocessing as mp
 from ax.service.ax_client import AxClient, ObjectiveProperties
@@ -17,6 +15,7 @@ from utils import (
     quantize_by_fqn_to_config,
     write_history_to_csv,
 )
+from utils import get_initial_samples as get_initial_samples_shared
 
 
 # return evaluation results to complete BO trials
@@ -30,53 +29,23 @@ def eval(model, tokenizer, num_PPL_eval_samples, fqn_to_config):
 # add initial search points based on the sensitivity score
 # TODO: add random initial samples if no sensitivity prior
 def get_initial_samples(num_BO_initial_samples=10):
-    initial_points_set = []
-
-    # auto sample the bit choices with random choice probability positive correlated to FIT score
-    for _ in range(num_BO_initial_samples):
-        initial_points = {}
-        for i in range(0, 3):
-            initial_points["bitwidth." + str(i) + "."] = 5
-            initial_points["groupsize." + str(i) + "."] = 32
-
-        for i in range(3, 18):
-            if i in [5, 6, 7, 10, 11, 12, 16]:
-                initial_points["bitwidth." + str(i) + "."] = random.choices(
-                    [5, 4], [20, 80]
-                )[0]
-                initial_points["groupsize." + str(i) + "."] = random.choices(
-                    [32, 64], [30, 70]
-                )[0]
-            else:
-                initial_points["bitwidth." + str(i) + "."] = random.choices(
-                    [5, 4], [30, 70]
-                )[0]
-                initial_points["groupsize." + str(i) + "."] = random.choices(
-                    [32, 64], [40, 60]
-                )[0]
-
-        for i in range(18, 30):
-            if i in [22, 23, 24]:
-                initial_points["bitwidth." + str(i) + "."] = random.choices(
-                    [5, 4, 3, 2], [20, 55, 20, 5]
-                )[0]
-                initial_points["groupsize." + str(i) + "."] = random.choices(
-                    [32, 64, 128, 256], [30, 40, 25, 5]
-                )[0]
-            else:
-                initial_points["bitwidth." + str(i) + "."] = random.choices(
-                    [5, 4, 3, 2], [30, 55, 10, 5]
-                )[0]
-                initial_points["groupsize." + str(i) + "."] = random.choices(
-                    [32, 64, 128, 256], [40, 40, 15, 5]
-                )[0]
-
-        for i in range(30, 32):
-            initial_points["bitwidth." + str(i) + "."] = 5
-            initial_points["groupsize." + str(i) + "."] = 32
-
-        initial_points_set.append(initial_points)
-    return initial_points_set
+    # sampling distributions used for the model-size objective; see
+    # utils.get_initial_samples for the shared band structure.
+    sampling_spec = {
+        "fixed_low_bitwidth": 5,
+        "fixed_high_bitwidth": 5,
+        "mid_sensitive": (([5, 4], [20, 80]), ([32, 64], [30, 70])),
+        "mid_default": (([5, 4], [30, 70]), ([32, 64], [40, 60])),
+        "late_sensitive": (
+            ([5, 4, 3, 2], [20, 55, 20, 5]),
+            ([32, 64, 128, 256], [30, 40, 25, 5]),
+        ),
+        "late_default": (
+            ([5, 4, 3, 2], [30, 55, 10, 5]),
+            ([32, 64, 128, 256], [40, 40, 15, 5]),
+        ),
+    }
+    return get_initial_samples_shared(sampling_spec, num_BO_initial_samples)
 
 
 """
