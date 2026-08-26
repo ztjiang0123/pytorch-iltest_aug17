@@ -107,6 +107,53 @@ def _build_concat_buffers(gm, users, with_bias: bool):
     return names, out_feature_size_list
 
 
+def _create_node_after(graph, anchor, *create_args, **create_kwargs):
+    """Create a node inserted immediately after ``anchor`` and return it."""
+    with graph.inserting_after(anchor):
+        return graph.create_node(*create_args, **create_kwargs)
+
+
+def _create_concat_get_attr_nodes(graph, names, anchor):
+    """Create the chained get_attr nodes for the concatenated buffers.
+
+    Returns (weight_node, {scales/qzeros/compensation nodes}, bias_node, last_node).
+    ``bias_node`` is None when there is no bias.
+    """
+    weight_node = _create_node_after(graph, anchor, "get_attr", names["weight"], (), {})
+    prev = weight_node
+    get_attr_nodes = {}
+    for key in ("scales", "qzeros", "compensation"):
+        prev = _create_node_after(graph, prev, "get_attr", names[key], (), {})
+        get_attr_nodes[key] = prev
+
+    bias_node = None
+    if names["bias"] is not None:
+        bias_node = _create_node_after(graph, prev, "get_attr", names["bias"], (), {})
+        prev = bias_node
+
+    return weight_node, get_attr_nodes, bias_node, prev
+
+
+def _replace_users_with_split(graph, split_node, users):
+    """Replace each original linear ``user`` with getitem(split, i) + clone."""
+    anchor = split_node
+    for gemm_idx, user in enumerate(users):
+        get_item = _create_node_after(
+            graph, anchor, "call_function", operator.getitem, (split_node, gemm_idx)
+        )
+        clone_node = _create_node_after(
+            graph,
+            get_item,
+            "call_function",
+            torch.ops.aten.clone.default,
+            (get_item,),
+            {"memory_format": torch.contiguous_format},
+        )
+        user.replace_all_uses_with(clone_node)
+        graph.erase_node(user)
+        anchor = clone_node
+
+
 def _fuse_da8w4_users(graph, node, users):
     """Replace the group of da8w4 linear ``users`` sharing ``node``'s activation
     with a single concatenated linear followed by a split.
@@ -119,66 +166,42 @@ def _fuse_da8w4_users(graph, node, users):
 
     with graph.inserting_before(node):
         names, out_feature_size_list = _build_concat_buffers(gm, users, with_bias)
-
-        # Create the get_attr nodes for the concatenated buffers in order, each
-        # inserted after the previous one.
         concat_w_node = graph.create_node("get_attr", names["weight"], (), {})
-        prev = concat_w_node
-        get_attr_nodes = {}
-        for key in ("scales", "qzeros", "compensation"):
-            with graph.inserting_after(prev):
-                prev = graph.create_node("get_attr", names[key], (), {})
-            get_attr_nodes[key] = prev
 
-        if with_bias:
-            with graph.inserting_after(prev):
-                concat_bias_node = graph.create_node("get_attr", names["bias"], (), {})
-            prev = concat_bias_node
-        else:
-            concat_bias_node = None
-
-        with graph.inserting_after(prev):
-            new_linear_node = graph.create_node(
-                "call_function",
-                computation_op,
-                (
-                    act,
-                    act_scales,
-                    act_qzeros,
-                    concat_w_node,
-                    get_attr_nodes["scales"],
-                    get_attr_nodes["qzeros"],
-                    get_attr_nodes["compensation"],
-                    concat_bias_node,
-                    output_dtype,
-                ),
-            )
-        with graph.inserting_after(new_linear_node):
-            split_node = graph.create_node(
-                "call_function",
-                torch.ops.aten.split_with_sizes.default,
-                (
-                    new_linear_node,
-                    out_feature_size_list,
-                    -1,  # split along the out feature dimension
-                ),
-            )
-        with graph.inserting_after(split_node):
-            for gemm_idx, user in enumerate(users):
-                get_item = graph.create_node(
-                    "call_function",
-                    operator.getitem,
-                    (split_node, gemm_idx),
-                )
-                with graph.inserting_after(get_item):
-                    clone_node = graph.create_node(
-                        "call_function",
-                        torch.ops.aten.clone.default,
-                        (get_item,),
-                        {"memory_format": torch.contiguous_format},
-                    )
-                    user.replace_all_uses_with(clone_node)
-                    graph.erase_node(user)
+    # Create the get_attr nodes for the concatenated buffers in order, each
+    # inserted after the previous one, then the concat linear + split.
+    _, get_attr_nodes, concat_bias_node, last_attr = _create_concat_get_attr_nodes(
+        graph, names, concat_w_node
+    )
+    new_linear_node = _create_node_after(
+        graph,
+        last_attr,
+        "call_function",
+        computation_op,
+        (
+            act,
+            act_scales,
+            act_qzeros,
+            concat_w_node,
+            get_attr_nodes["scales"],
+            get_attr_nodes["qzeros"],
+            get_attr_nodes["compensation"],
+            concat_bias_node,
+            output_dtype,
+        ),
+    )
+    split_node = _create_node_after(
+        graph,
+        new_linear_node,
+        "call_function",
+        torch.ops.aten.split_with_sizes.default,
+        (
+            new_linear_node,
+            out_feature_size_list,
+            -1,  # split along the out feature dimension
+        ),
+    )
+    _replace_users_with_split(graph, split_node, users)
 
 
 def _concat_linear_dq8w4_cpu(graph: torch.fx.Graph):
