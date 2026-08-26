@@ -56,33 +56,49 @@ def _maybe_duplicate_dq(
         user.kwargs = new_kwargs  # type: ignore[assignment]
 
 
+def _is_call_function(node, target) -> bool:
+    return (
+        isinstance(node, torch.fx.node.Node)
+        and node.op == "call_function"
+        and node.target == target
+    )
+
+
+def _is_dynamic_quant_dq(dq_node: torch.fx.Node) -> bool:
+    """Detect the dynamic quantization pattern: choose_qparam - getitem - q - dq.
+
+    dq for dynamic quantization must not be duplicated.
+    """
+    q_node = dq_node.args[0]
+    if not (
+        isinstance(q_node, torch.fx.node.Node)
+        and q_node.op == "call_function"
+        and q_node.target in _QUANTIZE_OPS
+    ):
+        return False
+    getitem_node = q_node.args[1]
+    if not _is_call_function(getitem_node, operator.getitem):
+        return False
+    choose_qparam_node = getitem_node.args[0]
+    return _is_call_function(
+        choose_qparam_node,
+        torch.ops.quantized_decomposed.choose_qparams.tensor,
+    )
+
+
 class DuplicateDQPass(PassBase):
     def call(self, graph_module: torch.fx.GraphModule) -> PassResult:
         for node in graph_module.graph.nodes:
-            if node.op == "call_function" and node.target in _DEQUANTIZE_OPS:
-                dq_users = _filter_sym_size_users(node)
-                if len(dq_users) <= 1:
-                    continue
-                # Do not duplicate dq for dynamic quantization
-                # Pattern: choose_qparam - getitem - q - dq
-                q_node = node.args[0]
-                if q_node.op == "call_function" and q_node.target in _QUANTIZE_OPS:
-                    getitem_node = q_node.args[1]
-                    if (
-                        isinstance(getitem_node, torch.fx.node.Node)
-                        and getitem_node.op == "call_function"
-                        and getitem_node.target == operator.getitem
-                    ):
-                        choose_qparam_node = getitem_node.args[0]
-                        if (
-                            isinstance(choose_qparam_node, torch.fx.node.Node)
-                            and choose_qparam_node.op == "call_function"
-                            and choose_qparam_node.target
-                            == torch.ops.quantized_decomposed.choose_qparams.tensor
-                        ):
-                            continue
-                for user in dq_users:
-                    _maybe_duplicate_dq(graph_module, node, user)
+            is_dq_node = node.op == "call_function" and node.target in _DEQUANTIZE_OPS
+            if not is_dq_node:
+                continue
+            dq_users = _filter_sym_size_users(node)
+            if len(dq_users) <= 1:
+                continue
+            if _is_dynamic_quant_dq(node):
+                continue
+            for user in dq_users:
+                _maybe_duplicate_dq(graph_module, node, user)
         graph_module.graph.eliminate_dead_code()
         graph_module.recompile()
         return PassResult(graph_module, True)

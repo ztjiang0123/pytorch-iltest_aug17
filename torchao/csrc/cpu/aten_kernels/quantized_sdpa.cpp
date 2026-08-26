@@ -252,6 +252,83 @@ inline void _dequant_max_fusion_kernel(
   }
 }
 
+// For one KV slice of a row: subtract the row max, exponentiate, store into
+// `tmp_out`, and return the partial sum of the exponentials.
+inline float _exp_reduce_slice(
+    const float* tmp_in,
+    float* tmp_out,
+    int64_t kvBlockSize,
+    const at::vec::Vectorized<float>& vec_max,
+    int32_t vec_size) {
+  auto vec_tmp_sum = at::vec::Vectorized<float>(0.0f);
+  long col = 0;
+  for (; col < vec_size * (kvBlockSize / vec_size); col += vec_size) {
+    auto tmp0 = at::vec::Vectorized<float>::loadu(tmp_in + col);
+    auto tmp2 = (tmp0 - vec_max).exp_u20();
+    vec_tmp_sum += tmp2;
+    _store(tmp_out + col, tmp2);
+  }
+  if (col < kvBlockSize) {
+    auto tmp0 = at::vec::Vectorized<float>::loadu(tmp_in + col, kvBlockSize - col);
+    auto tmp2 = (tmp0 - vec_max).exp_u20();
+    _store(tmp_out + col, tmp2, kvBlockSize - col);
+    vec_tmp_sum = at::vec::Vectorized<float>::set(vec_tmp_sum, vec_tmp_sum + tmp2, kvBlockSize - col);
+  }
+  return vec_tmp_sum.reduce_add();
+}
+
+// Vectorized constants for the uint8 quantization of one slice. These are
+// invariant across a row's KV slices, so they are computed once and passed by
+// reference.
+template <typename scalar_t>
+struct QuantSliceConsts {
+  at::vec::Vectorized<float> sum_scale;
+  at::vec::Vectorized<float> beta1;
+  at::vec::Vectorized<float> min_val;
+  at::vec::Vectorized<float> max_val;
+  at::vec::Vectorized<scalar_t> zero;
+  int32_t vec_size;
+};
+
+// For one KV slice of a row: scale, round, add zero point, clamp to uint8 range,
+// store into `tmp_out`, zero-fill the remainder up to av_gemm_K, and return the
+// partial int32 sum of the quantized values.
+template <typename scalar_t>
+inline int32_t _quant_and_zero_fill_slice(
+    const float* tmp_in,
+    scalar_t* tmp_out,
+    int64_t kvBlockSize,
+    int av_gemm_K,
+    const QuantSliceConsts<scalar_t>& c) {
+  const int32_t vec_size = c.vec_size;
+  auto vec_tmp_sum = at::vec::Vectorized<int32_t>(0);
+  long col = 0;
+  for (; col < vec_size * (kvBlockSize / vec_size); col += vec_size) {
+    auto tmp0 = at::vec::Vectorized<float>::loadu(tmp_in + col);
+    auto tmp3 = tmp0 * c.sum_scale + c.beta1;
+    auto tmp4 = at::vec::clamp(tmp3.round(), c.min_val, c.max_val);
+    _store(tmp_out + col, tmp4);
+    vec_tmp_sum += at::vec::convert<int32_t>(tmp4);
+  }
+  if (col < kvBlockSize) {
+    auto tmp0 = at::vec::Vectorized<float>::loadu(tmp_in + col, kvBlockSize - col);
+    auto tmp3 = tmp0 * c.sum_scale + c.beta1;
+    auto tmp4 = at::vec::clamp(tmp3.round(), c.min_val, c.max_val);
+    _store(tmp_out + col, tmp4, kvBlockSize - col);
+    auto tmp6 = at::vec::convert<int32_t>(tmp4);
+    vec_tmp_sum = at::vec::Vectorized<int32_t>::set(vec_tmp_sum, vec_tmp_sum + tmp6, kvBlockSize - col);
+  }
+  // set zero for the padded tail
+  col = kvBlockSize;
+  for (; col < vec_size * (av_gemm_K / vec_size); col += vec_size) {
+    _store(tmp_out + col, c.zero);
+  }
+  if (col < av_gemm_K) {
+    _store(tmp_out + col, c.zero, av_gemm_K - col);
+  }
+  return vec_tmp_sum.reduce_add();
+}
+
 /*
 1. Softmax: sub max, exp, sum reduce, div sum
 2. quant
@@ -286,75 +363,35 @@ inline void _sub_exp_sum_div_quant_sum_fusion_kernel(
   float beta1_float = (float) beta1;
   auto vec_beta1 = at::vec::Vectorized<float>(beta1_float);
   for (int64_t row = 0; row < M; ++row) {
-    auto sfm_max = sfm_max_ptr[row];
-    auto vec_max = at::vec::Vectorized<float>(sfm_max);
+    auto vec_max = at::vec::Vectorized<float>(sfm_max_ptr[row]);
     // sub max, exp, sum reduce
     const float* qk_block_data = in + row * rndkvSplitSize;
     for (int64_t l = 0; l < NSlice; l ++) {
       int64_t n = l * N_step;
       int64_t kvBlockSize = std::min(N_step, kvSize - n);
-      const float* tmp_in = qk_block_data + l * ldi;
-      float tmp_sum = 0;
-      auto vec_tmp_sum = at::vec::Vectorized<float>(tmp_sum);
-      float* tmp_out = local + n;
-      long col = 0;
-      for (; col < vec_size * (kvBlockSize / vec_size); col += vec_size) {
-        auto tmp0 = at::vec::Vectorized<float>::loadu(tmp_in + col);
-        auto tmp1 = tmp0 - vec_max;
-        auto tmp2 = tmp1.exp_u20();
-        vec_tmp_sum += tmp2;
-        _store(tmp_out + col, tmp2);
-      }
-      if (col < kvBlockSize) {
-        auto tmp0 = at::vec::Vectorized<float>::loadu(tmp_in + col, kvBlockSize - col);
-        auto tmp1 = tmp0 - vec_max;
-        auto tmp2 = tmp1.exp_u20();
-        _store(tmp_out + col, tmp2, kvBlockSize - col);
-        vec_tmp_sum = at::vec::Vectorized<float>::set(vec_tmp_sum, vec_tmp_sum + tmp2, kvBlockSize - col);
-      }
-      sfm_sum_ptr[row] += vec_tmp_sum.reduce_add();
+      sfm_sum_ptr[row] += _exp_reduce_slice(
+          qk_block_data + l * ldi, local + n, kvBlockSize, vec_max, vec_size);
     }
     // div sum, sum for attention
     auto sum_scale = 1 / sfm_sum_ptr[row] / alpha;
-    auto vec_sum_scale = at::vec::Vectorized<float>(sum_scale);
+    QuantSliceConsts<scalar_t> quant_consts{
+        at::vec::Vectorized<float>(sum_scale),
+        vec_beta1,
+        vec_min_val,
+        vec_max_val,
+        vec_zero,
+        vec_size};
     scalar_t* qk_reduced_block_data = out + row * av_gemm_K;
     for (int64_t l = 0; l < NSlice; l ++) {
       int64_t n = l * N_step;
       int64_t kvBlockSize = std::min(N_step, kvSize - n);
-      int32_t tmp_sum = 0;
-      auto vec_tmp_sum = at::vec::Vectorized<int32_t>(tmp_sum);
-      float* tmp_in = local + n;
-      scalar_t* tmp_out = qk_reduced_block_data + l * ldo;
-      long col = 0;
-      for (; col < vec_size * (kvBlockSize / vec_size); col += vec_size) {
-        auto tmp0 = at::vec::Vectorized<float>::loadu(tmp_in + col);
-        auto tmp1 = tmp0 * vec_sum_scale;
-        auto tmp2 = tmp1.round();
-        auto tmp3 = tmp2 + vec_beta1;
-        auto tmp4 = at::vec::clamp(tmp3, vec_min_val, vec_max_val);
-        _store(tmp_out + col, tmp4);
-        auto tmp6 = at::vec::convert<int32_t>(tmp4);
-        vec_tmp_sum += tmp6;
-      }
-      if (col < kvBlockSize) {
-        auto tmp0 = at::vec::Vectorized<float>::loadu(tmp_in + col, kvBlockSize - col);
-        auto tmp1 = tmp0 * vec_sum_scale;
-        auto tmp2 = tmp1.round();
-        auto tmp3 = tmp2 + vec_beta1;
-        auto tmp4 = at::vec::clamp(tmp3, vec_min_val, vec_max_val);
-        _store(tmp_out + col, tmp4, kvBlockSize - col);
-        auto tmp6 = at::vec::convert<int32_t>(tmp4);
-        vec_tmp_sum = at::vec::Vectorized<int32_t>::set(vec_tmp_sum, vec_tmp_sum + tmp6, kvBlockSize - col);
-      }
-      sum_a_ptr[row] += vec_tmp_sum.reduce_add() * beta2;
-      // set zero
-      col = kvBlockSize;
-      for (; col <  vec_size * (av_gemm_K / vec_size); col += vec_size) {
-        _store(tmp_out + col, vec_zero);
-      }
-      if (col < av_gemm_K) {
-        _store(tmp_out + col, vec_zero, av_gemm_K - col);
-      }
+      int32_t quant_sum = _quant_and_zero_fill_slice(
+          local + n,
+          qk_reduced_block_data + l * ldo,
+          kvBlockSize,
+          av_gemm_K,
+          quant_consts);
+      sum_a_ptr[row] += quant_sum * beta2;
     }
   }
 }

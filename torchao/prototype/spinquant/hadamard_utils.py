@@ -94,74 +94,35 @@ def is_pow2(n):
     return (n & (n - 1) == 0) and (n > 0)
 
 
+# Supported Hadamard block sizes K, in the order they must be tried (each K's
+# getter builds the K x K Hadamard matrix). n is decomposed as K * 2^m, so the
+# first K that divides n and leaves a power-of-2 quotient is selected.
+_HADK_GETTERS = {
+    172: get_had172,  # llama-2-7b up
+    156: get_had156,  # llama-1-30b 3x hidden
+    140: get_had140,  # llama-1-30b intermediate
+    108: get_had108,  # llama-1-13b intermediate
+    60: get_had60,  # llama-1-13b 3x hidden
+    52: get_had52,  # llama-1-13b 1x hidden
+    36: get_had36,
+    28: get_had28,
+    44: get_had44,
+    40: get_had40,
+    20: get_had20,
+    12: get_had12,
+}
+
+
 def get_hadK(n, transpose=False):
-    hadK, K = None, None
-    if n % 172 == 0:  # llama-2-7b up
-        assert is_pow2(n // 172)
+    for K, get_hadamard in _HADK_GETTERS.items():
+        if n % K == 0:
+            assert is_pow2(n // K)
+            hadK = get_hadamard()
+            return (hadK.T if transpose else hadK), K
 
-        K = 172
-        hadK = get_had172().T if transpose else get_had172()
-    elif n % 156 == 0:  # llama-1-30b 3x hidden
-        assert is_pow2(n // 156)
-
-        K = 156
-        hadK = get_had156().T if transpose else get_had156()
-    elif n % 140 == 0:  # llama-1-30b intermediate
-        assert is_pow2(n // 140)
-
-        K = 140
-        hadK = get_had140().T if transpose else get_had140()
-    elif n % 108 == 0:  # llama-1-13b intermediate
-        assert is_pow2(n // 108)
-
-        K = 108
-        hadK = get_had108().T if transpose else get_had108()
-    elif n % 60 == 0:  # llama-1-13b 3x hidden
-        assert is_pow2(n // 60)
-
-        K = 60
-        hadK = get_had60().T if transpose else get_had60()
-    elif n % 52 == 0:  # llama-1-13b 1x hidden
-        assert is_pow2(n // 52)
-
-        K = 52
-        hadK = get_had52().T if transpose else get_had52()
-    elif n % 36 == 0:
-        assert is_pow2(n // 36)
-
-        K = 36
-        hadK = get_had36().T if transpose else get_had36()
-    elif n % 28 == 0:
-        assert is_pow2(n // 28)
-
-        K = 28
-        hadK = get_had28().T if transpose else get_had28()
-    elif n % 44 == 0:
-        assert is_pow2(n // 44)
-
-        K = 44
-        hadK = get_had44().T if transpose else get_had44()
-    elif n % 40 == 0:
-        assert is_pow2(n // 40)
-
-        K = 40
-        hadK = get_had40().T if transpose else get_had40()
-    elif n % 20 == 0:
-        assert is_pow2(n // 20)
-
-        K = 20
-        hadK = get_had20().T if transpose else get_had20()
-    elif n % 12 == 0:
-        assert is_pow2(n // 12)
-
-        K = 12
-        hadK = get_had12().T if transpose else get_had12()
-    else:
-        assert is_pow2(n)
-        hadK = torch.FloatTensor([[1]])
-        K = 1
-
-    return hadK, K
+    # n itself is a power of 2: no Hadamard block factor needed.
+    assert is_pow2(n)
+    return torch.FloatTensor([[1]]), 1
 
 
 def matmul_hadU_slow(X, hadK, K):
