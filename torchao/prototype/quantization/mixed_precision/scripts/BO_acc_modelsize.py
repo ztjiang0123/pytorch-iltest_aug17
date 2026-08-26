@@ -3,19 +3,21 @@
 #
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
+import functools
+
 import torch
 import torch.multiprocessing as mp
 from ax.service.ax_client import AxClient, ObjectiveProperties
 from utils import (
     cal_model_size,
     cal_wikitext_ppl,
-    get_initial_samples_from_sampling_plan,
     load_initial_samples,
     load_model,
     load_parameters_from_json,
     quantize_by_fqn_to_config,
     write_history_to_csv,
 )
+from utils import get_initial_samples as _get_initial_samples
 
 
 # return evaluation results to complete BO trials
@@ -26,37 +28,40 @@ def eval(model, tokenizer, num_PPL_eval_samples, fqn_to_config):
     }
 
 
+# per-layer-group (bitwidth_spec, groupsize_spec) sampling tuned for the
+# model-size objective; a fixed scalar is used as-is, a (choices, weights) tuple
+# is sampled with random.choices. See utils.get_initial_samples for the schema.
+_MODEL_SIZE_SAMPLING_PLAN = [
+    (range(0, 3), {"default": (5, 32)}),
+    (
+        range(3, 18),
+        {
+            "default": (([5, 4], [30, 70]), ([32, 64], [40, 60])),
+            "overrides": [
+                ([5, 6, 7, 10, 11, 12, 16], (([5, 4], [20, 80]), ([32, 64], [30, 70]))),
+            ],
+        },
+    ),
+    (
+        range(18, 30),
+        {
+            "default": (([5, 4, 3, 2], [30, 55, 10, 5]), ([32, 64, 128, 256], [40, 40, 15, 5])),
+            "overrides": [
+                (
+                    [22, 23, 24],
+                    (([5, 4, 3, 2], [20, 55, 20, 5]), ([32, 64, 128, 256], [30, 40, 25, 5])),
+                ),
+            ],
+        },
+    ),
+    (range(30, 32), {"default": (5, 32)}),
+]
+
 # add initial search points based on the sensitivity score
 # TODO: add random initial samples if no sensitivity prior
-def get_initial_samples(num_BO_initial_samples=10):
-    # per-layer-group (bitwidth_spec, groupsize_spec) sampling tuned for the
-    # model-size objective; a fixed scalar is used as-is, a (choices, weights)
-    # tuple is sampled with random.choices.
-    sampling_plan = [
-        (range(0, 3), lambda i: (5, 32)),
-        (
-            range(3, 18),
-            lambda i: (([5, 4], [20, 80]), ([32, 64], [30, 70]))
-            if i in [5, 6, 7, 10, 11, 12, 16]
-            else (([5, 4], [30, 70]), ([32, 64], [40, 60])),
-        ),
-        (
-            range(18, 30),
-            lambda i: (
-                ([5, 4, 3, 2], [20, 55, 20, 5]),
-                ([32, 64, 128, 256], [30, 40, 25, 5]),
-            )
-            if i in [22, 23, 24]
-            else (
-                ([5, 4, 3, 2], [30, 55, 10, 5]),
-                ([32, 64, 128, 256], [40, 40, 15, 5]),
-            ),
-        ),
-        (range(30, 32), lambda i: (5, 32)),
-    ]
-    return get_initial_samples_from_sampling_plan(
-        sampling_plan, num_BO_initial_samples
-    )
+get_initial_samples = functools.partial(
+    _get_initial_samples, _MODEL_SIZE_SAMPLING_PLAN
+)
 
 
 """

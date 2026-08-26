@@ -180,15 +180,29 @@ def _sample_one(spec):
     return spec
 
 
-def get_initial_samples_from_sampling_plan(sampling_plan, num_BO_initial_samples=10):
+def _resolve_group_spec(group, i):
+    """Resolve the ``(bitwidth_spec, groupsize_spec)`` pair for layer index ``i``.
+
+    ``group`` is a plain-data entry with a ``"default"`` ``(bitwidth_spec,
+    groupsize_spec)`` pair and optional ``"overrides"`` -- a list of
+    ``(index_container, pair)`` tuples that take precedence when ``i`` is in the
+    container. Each spec is either a fixed value or a ``(choices, weights)``
+    tuple (see ``_sample_one``).
+    """
+    for index_container, pair in group.get("overrides", ()):
+        if i in index_container:
+            return pair
+    return group["default"]
+
+
+def get_initial_samples(sampling_plan, num_BO_initial_samples=10):
     """Build BO initial search points from a sensitivity-aware ``sampling_plan``.
 
-    ``sampling_plan`` is a list of ``(index_range, selector)`` entries. For each
-    layer index in ``index_range``, ``selector(i)`` returns a
-    ``(bitwidth_spec, groupsize_spec)`` pair, where each spec is either a fixed
-    value or a ``(choices, weights)`` tuple (see ``_sample_one``). This captures
-    the per-objective sampling probabilities that positively correlate with the
-    FIT sensitivity score.
+    ``sampling_plan`` is pure data: a list of ``(index_range, group)`` entries,
+    where ``group`` is resolved per layer index by :func:`_resolve_group_spec`.
+    This captures the per-objective sampling probabilities that positively
+    correlate with the FIT sensitivity score without duplicating any control
+    flow across the individual benchmark scripts.
     """
     initial_points_set = []
 
@@ -196,9 +210,9 @@ def get_initial_samples_from_sampling_plan(sampling_plan, num_BO_initial_samples
     # correlated to FIT score
     for _ in range(num_BO_initial_samples):
         initial_points = {}
-        for index_range, selector in sampling_plan:
+        for index_range, group in sampling_plan:
             for i in index_range:
-                bitwidth_spec, groupsize_spec = selector(i)
+                bitwidth_spec, groupsize_spec = _resolve_group_spec(group, i)
                 initial_points["bitwidth." + str(i) + "."] = _sample_one(bitwidth_spec)
                 initial_points["groupsize." + str(i) + "."] = _sample_one(
                     groupsize_spec

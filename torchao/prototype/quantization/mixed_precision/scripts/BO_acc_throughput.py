@@ -3,6 +3,7 @@
 #
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
+import functools
 import time
 from pathlib import Path
 from typing import Optional
@@ -14,13 +15,13 @@ from ax.service.ax_client import AxClient, ObjectiveProperties
 from transformers import AutoTokenizer
 from utils import (
     cal_wikitext_ppl,
-    get_initial_samples_from_sampling_plan,
     load_initial_samples,
     load_model,
     load_parameters_from_json,
     quantize_by_fqn_to_config,
     write_history_to_csv,
 )
+from utils import get_initial_samples as _get_initial_samples
 
 import torchao
 from torchao._models.llama.generate import (
@@ -331,37 +332,43 @@ def define_parameter_list():
     return parameters_list
 
 
+# per-layer-group (bitwidth_spec, groupsize_spec) sampling tuned for the
+# throughput objective; a fixed scalar is used as-is, a (choices, weights) tuple
+# is sampled with random.choices. See utils.get_initial_samples for the schema.
+_THROUGHPUT_SAMPLING_PLAN = [
+    (range(0, 3), {"default": (8, 32)}),
+    (
+        range(3, 18),
+        {
+            "default": (([8, 6, 5, 4], [30, 2, 2, 66]), ([32, 64], [50, 50])),
+            "overrides": [
+                (
+                    [5, 6, 7, 10, 11, 12, 16],
+                    (([8, 6, 5, 4], [25, 2, 2, 71]), ([32, 64], [40, 60])),
+                ),
+            ],
+        },
+    ),
+    (
+        range(18, 30),
+        {
+            "default": (([8, 6, 5, 4], [20, 2, 2, 76]), ([32, 64, 128, 256], [30, 40, 25, 5])),
+            "overrides": [
+                (
+                    [22, 23, 24],
+                    (([8, 6, 5, 4], [10, 2, 2, 86]), ([32, 64, 128, 256], [35, 45, 10, 10])),
+                ),
+            ],
+        },
+    ),
+    (range(30, 32), {"default": (8, 32)}),
+]
+
 # add initial search points based on the sensitivity score
 # TODO: add default parameter list if not specified
-def get_initial_samples(num_BO_initial_samples=10):
-    # per-layer-group (bitwidth_spec, groupsize_spec) sampling tuned for the
-    # throughput objective; a fixed scalar is used as-is, a (choices, weights)
-    # tuple is sampled with random.choices.
-    sampling_plan = [
-        (range(0, 3), lambda i: (8, 32)),
-        (
-            range(3, 18),
-            lambda i: (([8, 6, 5, 4], [25, 2, 2, 71]), ([32, 64], [40, 60]))
-            if i in [5, 6, 7, 10, 11, 12, 16]
-            else (([8, 6, 5, 4], [30, 2, 2, 66]), ([32, 64], [50, 50])),
-        ),
-        (
-            range(18, 30),
-            lambda i: (
-                ([8, 6, 5, 4], [10, 2, 2, 86]),
-                ([32, 64, 128, 256], [35, 45, 10, 10]),
-            )
-            if i in [22, 23, 24]
-            else (
-                ([8, 6, 5, 4], [20, 2, 2, 76]),
-                ([32, 64, 128, 256], [30, 40, 25, 5]),
-            ),
-        ),
-        (range(30, 32), lambda i: (8, 32)),
-    ]
-    return get_initial_samples_from_sampling_plan(
-        sampling_plan, num_BO_initial_samples
-    )
+get_initial_samples = functools.partial(
+    _get_initial_samples, _THROUGHPUT_SAMPLING_PLAN
+)
 
 
 """
