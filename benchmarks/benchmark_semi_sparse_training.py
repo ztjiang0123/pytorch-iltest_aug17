@@ -42,87 +42,88 @@ class BenchmarkConfig:
     blocked_autorange: bool = False
 
 
-def benchmark_helper(functions, cases, config: BenchmarkConfig):
-    fw = config.fw
-    bw = config.bw
-    cuda_graph = config.cuda_graph
-    compile = config.compile
-    blocked_autorange = config.blocked_autorange
+def _make_runner(benchmark_object, config: BenchmarkConfig):
+    """Build the callable that performs one fw/bw pass for a benchmark object."""
 
-    assert fw or bw
-    assert not (cuda_graph and compile)
+    def run_one():
+        if config.fw:
+            benchmark_object.fw()
+        if config.bw:
+            benchmark_object.bw()
+
+    return run_one
+
+
+def _measure_time_and_memory(run_one, blocked_autorange: bool) -> dict:
+    """Time ``run_one`` and report its median latency (ms) and peak memory (GB)."""
+    torch.cuda.reset_peak_memory_stats()
+    timer = benchmark.Timer(
+        stmt="fn()",
+        globals={"fn": run_one},
+        label="benchmark",
+    )
+    if blocked_autorange:
+        res = timer.blocked_autorange()
+    else:
+        res = timer.adaptive_autorange(0.03, min_run_time=0.2, max_run_time=20)
+    return {
+        "time": res.median * 1e3,
+        "memory": torch.cuda.max_memory_allocated() / 1e9,
+    }
+
+
+def _run_single_benchmark(benchmark_cls, case: dict, config: BenchmarkConfig) -> dict:
+    """Run one benchmark case, returning its timing/memory metrics.
+
+    Raises on unexpected errors; CUDA OOM is reported as ``"OOM"`` metrics.
+    """
+    benchmark_object = None
+    graph = None
+    try:
+        benchmark_object = benchmark_cls(**case)
+        run_one = _make_runner(benchmark_object, config)
+
+        if config.cuda_graph:
+            run_one()
+            benchmark_object = benchmark_cls(**case)
+            run_one = _make_runner(benchmark_object, config)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run_one()
+            run_one = graph.replay
+
+        if config.compile:
+            benchmark_object.model = torch.compile(
+                benchmark_object.model, mode="max-autotune"
+            )
+
+        return _measure_time_and_memory(run_one, config.blocked_autorange)
+    except Exception as e:
+        if "CUDA out of memory" not in str(e):
+            raise
+        return {"time": "OOM", "memory": "OOM"}
+    finally:
+        del benchmark_object
+        del graph
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def benchmark_helper(functions, cases, config: BenchmarkConfig):
+    assert config.fw or config.bw
+    assert not (config.cuda_graph and config.compile)
     print(
-        f"Running benchmarks with: fw={fw}, bw={bw}, cuda_graph={cuda_graph}, compile={compile}: "
+        f"Running benchmarks with: fw={config.fw}, bw={config.bw}, "
+        f"cuda_graph={config.cuda_graph}, compile={config.compile}: "
     )
 
     results = []
-
-    def handle_case(**case):
-        for sparsity_config, benchmark_cls in functions.items():
-            result = {
-                "sparsity_config": sparsity_config,
-            }
-            result.update(**case)
-            try:
-                benchmark_object = benchmark_cls(**case)
-
-                def run_one():
-                    if fw:
-                        benchmark_object.fw()
-                    if bw:
-                        benchmark_object.bw()
-
-                if cuda_graph:
-                    run_one()
-                    benchmark_object = benchmark_cls(**case)
-                    g = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(g):
-                        run_one()
-
-                    def run_one():
-                        g.replay()
-
-                if compile:
-                    benchmark_object.model = torch.compile(
-                        benchmark_object.model, mode="max-autotune"
-                    )
-
-                # benchmark
-                torch.cuda.reset_peak_memory_stats()
-                t0 = benchmark.Timer(
-                    stmt="fn()",
-                    globals={
-                        "fn": run_one,
-                    },
-                    label="benchmark",
-                )
-                if blocked_autorange:
-                    res = t0.blocked_autorange()
-                else:
-                    res = t0.adaptive_autorange(0.03, min_run_time=0.2, max_run_time=20)
-                result.update(
-                    {
-                        "time": res.median * 1e3,
-                        "memory": torch.cuda.max_memory_allocated() / 1e9,
-                    }
-                )
-            except Exception as e:
-                if "CUDA out of memory" not in str(e):
-                    raise
-                else:
-                    result.update({"time": "OOM", "memory": "OOM"})
-            finally:
-                # clean up
-                if "benchmark_object" in locals():
-                    del benchmark_object
-                if "g" in locals():
-                    del g
-                gc.collect()
-                torch.cuda.empty_cache()
-                results.append(result)
-
     for case in cases:
-        handle_case(**case)
+        for sparsity_config, benchmark_cls in functions.items():
+            result = {"sparsity_config": sparsity_config}
+            result.update(**case)
+            result.update(_run_single_benchmark(benchmark_cls, case, config))
+            results.append(result)
     return pd.DataFrame(results)
 
 
@@ -261,9 +262,7 @@ if __name__ == "__main__":
         df = benchmark_helper(
             functions,
             cases,
-            BenchmarkConfig(
-                fw=True, bw=True, cuda_graph=True, blocked_autorange=True
-            ),
+            BenchmarkConfig(fw=True, bw=True, cuda_graph=True, blocked_autorange=True),
         )
     elif args.mode == "llama3-8b":
         functions = {
@@ -289,9 +288,7 @@ if __name__ == "__main__":
         df = benchmark_helper(
             functions,
             cases,
-            BenchmarkConfig(
-                fw=True, bw=False, cuda_graph=True, blocked_autorange=True
-            ),
+            BenchmarkConfig(fw=True, bw=False, cuda_graph=True, blocked_autorange=True),
         )
 
     elif args.mode == "vit":

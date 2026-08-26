@@ -122,30 +122,37 @@ def clean_release_notes():
     commit_start = False
     with open(input_file, "r") as in_f, open(output_file, "a") as out_f:
         for line in in_f.readlines():
-            if line.startswith("## What's Changed"):
+            is_header = line.startswith("## What's Changed")
+            is_commit = commit_start and line.startswith("*")
+            is_end_of_commits = commit_start and not is_commit and not is_header
+
+            if is_header:
                 commit_start = True
-            elif commit_start and line.startswith("*"):
+            elif is_commit:
                 commit_lines.append(line)
-            elif commit_start:
-                # End of commits, fetch PR labels based on commits collected so far
+            elif is_end_of_commits:
+                # End of commits: sort collected commits by category and flush.
                 commit_start = False
-                pr_number_to_labels = fetch_pr_labels(commit_lines)
-
-                # Discover all module labels and build categories
-                commits_by_category = build_module_categories(
-                    commit_lines, pr_number_to_labels
-                )
-
-                # Write all commits to the output file by category
-                for category, commits in commits_by_category.items():
-                    out_f.write("## %s\n\n" % category)
-                    for commit_line in commits:
-                        out_f.write(format_commit(commit_line))
-                    out_f.write("\n")
+                write_commits_by_category(out_f, commit_lines)
             else:
                 # Not a commit, just copy to the output file
                 out_f.write(line)
     print("Wrote to %s." % output_file)
+
+
+def write_commits_by_category(out_f, commit_lines: List[str]) -> None:
+    """
+    Fetch PR labels for the collected commits, group them by module category,
+    and write each category and its formatted commits to ``out_f``.
+    """
+    pr_number_to_labels = fetch_pr_labels(commit_lines)
+    commits_by_category = build_module_categories(commit_lines, pr_number_to_labels)
+
+    for category, commits in commits_by_category.items():
+        out_f.write("## %s\n\n" % category)
+        for commit_line in commits:
+            out_f.write(format_commit(commit_line))
+        out_f.write("\n")
 
 
 def parse_pr_number(commit_line: str) -> int:
