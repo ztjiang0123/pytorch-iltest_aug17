@@ -783,7 +783,7 @@ class PerChannelMinMaxObserver(UniformQuantizationObserverBase):
         max_val = self.max_val
         x_dim = x.size()
 
-        new_axis_list = [i for i in range(len(x_dim))]  # noqa: C416
+        new_axis_list = [i for i in range(len(x_dim))]
         new_axis_list[self.ch_axis] = 0
         new_axis_list[0] = self.ch_axis
         y = x.permute(new_axis_list)
@@ -976,7 +976,7 @@ class MovingAveragePerChannelMinMaxObserver(PerChannelMinMaxObserver):
         max_val = self.max_val
         x_dim = x.size()
 
-        new_axis_list = [i for i in range(len(x_dim))]  # noqa: C416
+        new_axis_list = [i for i in range(len(x_dim))]
         new_axis_list[self.ch_axis] = 0
         new_axis_list[0] = self.ch_axis
         y = x.permute(new_axis_list)
@@ -1535,7 +1535,7 @@ class PlaceholderObserver(ObserverBase):
 
     @torch.jit.export
     def calculate_qparams(self):
-        raise Exception(  # noqa: TRY002
+        raise Exception(
             "calculate_qparams should not be called for PlaceholderObserver"
         )
 
@@ -1562,9 +1562,7 @@ class RecordingObserver(ObserverBase):
 
     @torch.jit.export
     def calculate_qparams(self):
-        raise Exception(  # noqa: TRY002
-            "calculate_qparams should not be called for RecordingObserver"
-        )
+        raise Exception("calculate_qparams should not be called for RecordingObserver")
 
     @torch.jit.export
     def get_tensor_value(self):
@@ -1595,9 +1593,7 @@ class NoopObserver(ObserverBase):
 
     @torch.jit.export
     def calculate_qparams(self):
-        raise Exception(  # noqa: TRY002
-            "calculate_qparams should not be called for NoopObserver"
-        )
+        raise Exception("calculate_qparams should not be called for NoopObserver")
 
 
 class ReuseInputObserver(ObserverBase):
@@ -1622,9 +1618,7 @@ class ReuseInputObserver(ObserverBase):
 
     @torch.jit.export
     def calculate_qparams(self):
-        raise Exception(  # noqa: TRY002
-            "calculate_qparams should not be called for ReuseInputObserver"
-        )
+        raise Exception("calculate_qparams should not be called for ReuseInputObserver")
 
 
 """
@@ -1855,14 +1849,10 @@ def load_observer_state_dict(mod, obs_dict):
                 )
     for k in missing_keys:
         if "observer" in k or "activation_post_process" in k:
-            raise Exception(  # noqa: TRY002
-                f"Missing keys for observer {k} in state_dict"
-            )
+            raise Exception(f"Missing keys for observer {k} in state_dict")
     for k in unexpected_keys:
         if "observer" in k or "activation_post_process" in k:
-            raise Exception(  # noqa: TRY002
-                f"Unexpected keys for observer {k} in state_dict"
-            )
+            raise Exception(f"Unexpected keys for observer {k} in state_dict")
 
 
 # Restrict activations to be in the range (0,127)

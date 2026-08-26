@@ -139,7 +139,7 @@ class BlockSparseTensor(TorchAOBaseTensor):
     __slots__ = ["bsr_crow_indices", "bsr_col_indices", "bsr_values"]
 
     @staticmethod
-    def __new__(  # noqa: PYI034
+    def __new__(
         cls,
         shape: torch.Size,
         blocksize: int,
