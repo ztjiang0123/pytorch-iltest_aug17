@@ -922,85 +922,80 @@ def _dequantize_affine_no_zero_point_no_dtype_check(
     return dequant.view(original_shape).to(output_dtype)
 
 
-def _dequantize_affine_validate_and_delegate(
-    no_dtype_check_impl: Callable[..., torch.Tensor],
-    input: torch.Tensor,
-    block_size: Tuple[int, ...],
-    scale: torch.Tensor,
-    zero_point: Optional[torch.Tensor],
-    input_dtype: torch.dtype,
-    quant_min: Optional[Union[int, float]],
-    quant_max: Optional[Union[int, float]],
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-    """Validate dtype/qmin/qmax args then delegate to a ``*_no_dtype_check`` impl.
+def _make_dequantize_affine(no_dtype_check_impl: Callable[..., torch.Tensor]):
+    """Build a public ``_dequantize_affine_*`` entry point around a raw impl.
 
-    Shared driver for the public ``_dequantize_affine_*`` entry points, which
-    otherwise duplicate the same input-dtype assertion, output-dtype check,
-    qmin/qmax derivation, and delegation. ``no_dtype_check_impl`` is the
-    variant-specific dequant routine (e.g. no-zero-point or tinygemm).
-    """
-    # TODO: validate scale/zero_point dimensions are compatible with block_size
-    if input_dtype not in _SUB_BYTE_UINT_BOUNDS:
-        assert input.dtype == input_dtype, (
-            f"Expected: {input_dtype}, got: {input.dtype}"
-        )
-    assert output_dtype in [
-        torch.float32,
-        torch.float16,
-        torch.bfloat16,
-    ], f"Unsupported output dtype: {output_dtype}"
-    quant_min, quant_max = _get_and_check_qmin_qmax(input_dtype, quant_min, quant_max)
-    return no_dtype_check_impl(
-        input,
-        block_size,
-        scale,
-        zero_point,
-        quant_min,
-        quant_max,
-        output_dtype,
-    )
+    The public no-zero-point and tinygemm dequant entry points share the same
+    body: validate the input dtype, check the output dtype, derive qmin/qmax,
+    then delegate to a variant-specific ``*_no_dtype_check`` routine. Rather than
+    repeat that body per variant, this factory returns a fully-formed entry point
+    for ``no_dtype_check_impl``. See the wrapped impls for the actual math.
 
-
-def _dequantize_affine_no_zero_point(
-    input: torch.Tensor,
-    block_size: Tuple[int, ...],
-    scale: torch.Tensor,
-    zero_point: Optional[torch.Tensor],
-    input_dtype: torch.dtype,
-    quant_min: Optional[Union[int, float]] = None,
-    quant_max: Optional[Union[int, float]] = None,
-    *,
-    output_dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    """
     Args:
       input (torch.Tensor): quantized tensor, should match the dtype `dtype` argument
       block_size: (List[int]): granularity of quantization, this means the size of the tensor elements that's sharing the same qparam
                                e.g. when size is the same as the input tensor dimension, we are using per tensor quantization
       scale (Tensor): quantization parameter for affine quantization
-      zero_point (Tensor): quantization parameter for affine quantization, no zero point is used for this op
+      zero_point (Tensor): quantization parameter for affine quantization
       input_dtype (torch.dtype): requested dtype (e.g. torch.uint8) for output Tensor
       quant_min (Optional[int]): minimum quantized value for input Tensor
       quant_max (Optional[int]): maximum quantized value for input Tensor
       output_dtype (torch.dtype): dtype for output Tensor, default is fp32
 
-      Default value for zero_point is in integer domain, zero point is added to the quantized integer value during quantization
-
     Output:
       dequantized Tensor, with requested dtype or fp32
     """
-    return _dequantize_affine_validate_and_delegate(
-        _dequantize_affine_no_zero_point_no_dtype_check,
-        input,
-        block_size,
-        scale,
-        zero_point,
-        input_dtype,
-        quant_min,
-        quant_max,
-        output_dtype,
-    )
+
+    def _dequantize_affine(
+        input: torch.Tensor,
+        block_size: Tuple[int, ...],
+        scale: torch.Tensor,
+        zero_point: Optional[torch.Tensor],
+        input_dtype: torch.dtype,
+        quant_min: Optional[Union[int, float]] = None,
+        quant_max: Optional[Union[int, float]] = None,
+        *,
+        output_dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        # TODO: validate scale/zero_point dimensions are compatible with block_size
+        if input_dtype not in _SUB_BYTE_UINT_BOUNDS:
+            assert input.dtype == input_dtype, (
+                f"Expected: {input_dtype}, got: {input.dtype}"
+            )
+        assert output_dtype in [
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+        ], f"Unsupported output dtype: {output_dtype}"
+        quant_min, quant_max = _get_and_check_qmin_qmax(
+            input_dtype, quant_min, quant_max
+        )
+        return no_dtype_check_impl(
+            input,
+            block_size,
+            scale,
+            zero_point,
+            quant_min,
+            quant_max,
+            output_dtype,
+        )
+
+    return _dequantize_affine
+
+
+# Public no-zero-point dequant entry point.
+#
+# Default value for zero_point is in integer domain, zero point is added to the
+# quantized integer value during quantization (no zero point is used for this op).
+_dequantize_affine_no_zero_point = _make_dequantize_affine(
+    _dequantize_affine_no_zero_point_no_dtype_check
+)
+_dequantize_affine_no_zero_point.__name__ = "_dequantize_affine_no_zero_point"
+_dequantize_affine_no_zero_point.__qualname__ = "_dequantize_affine_no_zero_point"
+
+
+# NOTE: the tinygemm public entry point is defined immediately after its
+# ``*_no_dtype_check`` impl below.
 
 
 def _dequantize_affine_tinygemm_no_dtype_check(
@@ -1048,45 +1043,15 @@ def _dequantize_affine_tinygemm_no_dtype_check(
     return dequant.view(original_shape).to(output_dtype)
 
 
-def _dequantize_affine_tinygemm(
-    input: torch.Tensor,
-    block_size: Tuple[int, ...],
-    scale: torch.Tensor,
-    zero_point: Optional[torch.Tensor],
-    input_dtype: torch.dtype,
-    quant_min: Optional[Union[int, float]] = None,
-    quant_max: Optional[Union[int, float]] = None,
-    *,
-    output_dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    """
-    Args:
-      input (torch.Tensor): quantized tensor, should match the dtype `dtype` argument
-      block_size: (List[int]): granularity of quantization, this means the size of the tensor elements that's sharing the same qparam
-                               e.g. when size is the same as the input tensor dimension, we are using per tensor quantization
-      scale (Tensor): quantization parameter for affine quantization
-      zero_point (Tensor): quantization parameter for affine quantization
-      input_dtype (torch.dtype): requested dtype (e.g. torch.uint8) for output Tensor
-      quant_min (Optional[int]): minimum quantized value for input Tensor
-      quant_max (Optional[int]): maximum quantized value for input Tensor
-      output_dtype (torch.dtype): dtype for output Tensor, default is fp32
-
-      Default value for zero_point is in floating point domain, zero point is subtracted from the floating point (unquantized)
-
-    Output:
-      dequantized Tensor, with requested dtype or fp32
-    """
-    return _dequantize_affine_validate_and_delegate(
-        _dequantize_affine_tinygemm_no_dtype_check,
-        input,
-        block_size,
-        scale,
-        zero_point,
-        input_dtype,
-        quant_min,
-        quant_max,
-        output_dtype,
-    )
+# Public tinygemm dequant entry point.
+#
+# Default value for zero_point is in floating point domain, zero point is
+# subtracted from the floating point (unquantized) value.
+_dequantize_affine_tinygemm = _make_dequantize_affine(
+    _dequantize_affine_tinygemm_no_dtype_check
+)
+_dequantize_affine_tinygemm.__name__ = "_dequantize_affine_tinygemm"
+_dequantize_affine_tinygemm.__qualname__ = "_dequantize_affine_tinygemm"
 
 
 def _fake_quantize_affine(
