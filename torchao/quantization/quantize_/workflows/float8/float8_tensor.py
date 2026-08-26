@@ -60,6 +60,28 @@ __all__ = [
 aten = torch.ops.aten
 
 
+def _float8_quantization_type(tensor) -> str:
+    """Shared ``_quantization_type`` string for float8 quantized tensors.
+
+    Used by both ``Float8Tensor`` and the prototype float8 tensor so the
+    representation stays consistent across the two implementations.
+    """
+    return f"{tensor.act_quant_kwargs=}, {tensor.block_size=}, {tensor.mm_config=}, {tensor.scale.shape=}, {tensor.kernel_preference=}"
+
+
+def _float8_dequantize(tensor, output_dtype: Optional[torch.dtype] = None):
+    """Shared ``dequantize`` implementation for float8 quantized tensors.
+
+    Used by both ``Float8Tensor`` and the prototype float8 tensor so the
+    dequantization path cannot drift between the two implementations.
+    """
+    if output_dtype is None:
+        output_dtype = tensor.dtype
+
+    qdata, scale = tensor.qdata, tensor.scale
+    return _dequantize_affine_float8(qdata, scale, output_dtype)
+
+
 @dataclass
 class QuantizeTensorToFloat8Kwargs(QuantizeTensorKwargs):
     """Tensor kwargs for creating float8 tensor (either activation or weight)
@@ -155,14 +177,10 @@ class Float8Tensor(TorchAOBaseTensor):
         )
 
     def _quantization_type(self):
-        return f"{self.act_quant_kwargs=}, {self.block_size=}, {self.mm_config=}, {self.scale.shape=}, {self.kernel_preference=}"
+        return _float8_quantization_type(self)
 
     def dequantize(self, output_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        if output_dtype is None:
-            output_dtype = self.dtype
-
-        qdata, scale = self.qdata, self.scale
-        return _dequantize_affine_float8(qdata, scale, output_dtype)
+        return _float8_dequantize(self, output_dtype)
 
     @classmethod
     def from_hp(
