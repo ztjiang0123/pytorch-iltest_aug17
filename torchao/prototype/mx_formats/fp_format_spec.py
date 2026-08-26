@@ -82,7 +82,7 @@ dtype_to_interesting_values = {
         (float("nan"), "0", "1" * 8, "1" + "0" * 22, "nan"),
         (float("inf"), "0", "1" * 8, "0" * 23, "inf"),
         (float("-inf"), "1", "1" * 8, "0" * 23, "inf_neg"),
-        # values below verified with from https://www.h-schmidt.net/FloatConverter/IEEE754.html  # noqa: E501
+        # values below verified with from https://www.h-schmidt.net/FloatConverter/IEEE754.html
         # largest normal
         (
             3.402823466385288598117042e38,
@@ -90,7 +90,7 @@ dtype_to_interesting_values = {
             "1" * 7 + "0",
             "1" * 23,
             "largest_norm",
-        ),  # noqa: E501
+        ),
         (
             -3.402823466385288598117042e38,
             "1",
@@ -105,7 +105,7 @@ dtype_to_interesting_values = {
             "0" * 7 + "1",
             "0" * 23,
             "smallest_norm",
-        ),  # noqa: E501
+        ),
         (
             -1.175494350822287507968737e-38,
             "1",
@@ -120,14 +120,14 @@ dtype_to_interesting_values = {
             "0" * 8,
             "1" * 23,
             "largest_denorm",
-        ),  # noqa: E501
+        ),
         (
             -1.175494210692441075487029e-38,
             "1",
             "0" * 8,
             "1" * 23,
             "largest_denorm_neg",
-        ),  # noqa: E501
+        ),
         # smallest denormal
         (
             1.401298464324817070923730e-45,
@@ -180,7 +180,7 @@ dtype_to_interesting_values = {
         (float("nan"), "0", "1" * 5, "1" + "0" * 9, "nan"),
         (float("inf"), "0", "1" * 5, "0" * 10, "inf"),
         (float("-inf"), "1", "1" * 5, "0" * 10, "inf_neg"),
-        # values below checked with https://en.wikipedia.org/wiki/Half-precision_floating-point_format  # noqa: E501
+        # values below checked with https://en.wikipedia.org/wiki/Half-precision_floating-point_format
         # largest normal
         (65504, "0", "1" * 4 + "0", "1" * 10, "largest_normal"),
         (-65504, "1", "1" * 4 + "0", "1" * 10, "largest_normal_neg"),
@@ -192,7 +192,7 @@ dtype_to_interesting_values = {
             "0" * 4 + "1",
             "0" * 10,
             "smallest_normal_neg",
-        ),  # noqa: E501
+        ),
         # largest denormal
         (0.000060975552, "0", "0" * 5, "1" * 10, "largest_denorm"),
         (-0.000060975552, "1", "0" * 5, "1" * 10, "largest_denorm_neg"),
@@ -204,7 +204,7 @@ dtype_to_interesting_values = {
             "0" * 5,
             "0" * 9 + "1",
             "smallest_denorm_neg",
-        ),  # noqa: E501
+        ),
         # positive and negative value
         (30.0, "0", "10011", "1" * 3 + "0" * 7, "random_pos"),
         (-24.0, "1", "10011", "1" + "0" * 9, "random_neg"),
@@ -216,7 +216,7 @@ dtype_to_interesting_values = {
         # special values
         # note: no pos or neg inf
         (float("nan"), "0", "1111", "111", "nan"),
-        # values below checked with https://arxiv.org/pdf/2209.05433.pdf, Table 1  # noqa: E501
+        # values below checked with https://arxiv.org/pdf/2209.05433.pdf, Table 1
         # largest normal
         (448.0, "0", "1111", "110", "largest_normal"),
         (-448.0, "1", "1111", "110", "largest_normal_neg"),
@@ -241,7 +241,7 @@ dtype_to_interesting_values = {
         (float("nan"), "0", "11111", "11", "nan"),
         (float("inf"), "0", "11111", "00", "inf"),
         (float("-inf"), "1", "11111", "00", "inf_neg"),
-        # values below checked with https://arxiv.org/pdf/2209.05433.pdf, Table 1  # noqa: E501
+        # values below checked with https://arxiv.org/pdf/2209.05433.pdf, Table 1
         # largest normal
         (57344.0, "0", "11110", "11", "largest_normal"),
         (-57344.0, "1", "11110", "11", "largest_normal_neg"),
@@ -276,7 +276,7 @@ float4_e2m1_interesting_values = [
         "00",
         "1",
         "smallest_denormal",
-    ),  # 2**0 * 0.5  # noqa: E501
+    ),  # 2**0 * 0.5
     (1.0, "1.0 * 2^0 * 1.0", "0", "01", "0", "smallest_normal"),  # 2**0 * 1.0
     (1.5, "1.0 * 2^0 * 1.5", "0", "01", "1", "val3"),  # 2**0 * 1.5
     (2.0, "1.0 * 2^1 * 1.0", "0", "10", "0", "val4"),  # 2**1 * 1.0
@@ -286,11 +286,11 @@ float4_e2m1_interesting_values = [
 ]
 float4_e2m1_neg = []
 for fp32_ref, formula, _s, e, m, label in float4_e2m1_interesting_values:
-    float4_e2m1_neg.append([-1 * fp32_ref, "-" + formula, "1", e, m, label + "_neg"])  # noqa: E501
+    float4_e2m1_neg.append([-1 * fp32_ref, "-" + formula, "1", e, m, label + "_neg"])
 float4_e2m1_interesting_values.extend(float4_e2m1_neg)
 del float4_e2m1_neg
 
-# https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf, section 5.3.2  # noqa: E501
+# https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf, section 5.3.2
 float6_e3m2_interesting_values = [
     (0, "1.0 * 2^-2 * 0.0", "0", "000", "00", "zero"),
     (0.0625, "1.0 * 2^-2 * 0.25", "0", "000", "01", "smallest_denormal"),
@@ -300,11 +300,11 @@ float6_e3m2_interesting_values = [
 ]
 float6_e3m2_neg = []
 for fp32_ref, formula, _s, e, m, label in float6_e3m2_interesting_values:
-    float6_e3m2_neg.append([-1 * fp32_ref, "-" + formula, "1", e, m, label + "_neg"])  # noqa: E501
+    float6_e3m2_neg.append([-1 * fp32_ref, "-" + formula, "1", e, m, label + "_neg"])
 float6_e3m2_interesting_values.extend(float6_e3m2_neg)
 del float6_e3m2_neg
 
-# https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf, section 5.3.2  # noqa: E501
+# https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf, section 5.3.2
 float6_e2m3_interesting_values = [
     (0, "1.0 * 2^0 * 0.0", "0", "00", "000", "zero"),
     (0.125, "1.0 * 2^0 * 0.125", "0", "00", "001", "smallest_denormal"),
@@ -366,14 +366,14 @@ def get_sem_bits(x: torch.Tensor, bitwidth: int) -> Tuple[str, str, str]:
         offset = 4
         s, e, m = (
             np_res[offset],
-            np_res[offset + s_len : (offset + s_len + e_len)],  # noqa: E203
-            np_res[(offset + s_len + e_len) :],  # noqa: E203
+            np_res[offset + s_len : (offset + s_len + e_len)],
+            np_res[(offset + s_len + e_len) :],
         )
     else:
         s, e, m = (
             np_res[0],
-            np_res[s_len : (s_len + e_len)],  # noqa: E203
-            np_res[(s_len + e_len) :],  # noqa: E203
+            np_res[s_len : (s_len + e_len)],
+            np_res[(s_len + e_len) :],
         )
     assert len(s) == s_len
     assert len(e) == e_len
