@@ -360,11 +360,14 @@ def _run_fp8_gemm_1x128(
     if variant.pass_out_dtype:
         kwargs["out_dtype"] = out_dtype
 
-    wrap_triton(variant.kernel)[grid](*args, **kwargs)
+    # These GEMMs are registered as opaque ``torch.library.custom_op``s, so the
+    # autotuned Triton kernel is launched directly (no ``wrap_triton``, which is
+    # only needed to make a kernel visible inside a ``triton_op``).
+    variant.kernel[grid](*args, **kwargs)
     return c
 
 
-@triton_op("torchao::triton_fp8_gemm_1x128_128x128", mutates_args={})
+@torch.library.custom_op("torchao::triton_fp8_gemm_1x128_128x128", mutates_args=())
 def triton_fp8_gemm_1x128_128x128(
     a: torch.Tensor,  # (M, K)
     b: torch.Tensor,  # (K, N)
@@ -385,6 +388,17 @@ def triton_fp8_gemm_1x128_128x128(
         _FP8_GEMM_1X128_BLOCK_SIZE,
         out_dtype,
     )
+
+
+@triton_fp8_gemm_1x128_128x128.register_fake
+def _(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_s: torch.Tensor,
+    b_s: torch.Tensor,
+    out_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    return a.new_empty(a.size(0), b.size(1), dtype=out_dtype)
 
 
 @triton.autotune(
@@ -453,7 +467,7 @@ def triton_fp8_gemm_1x128_128x1_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton_op("torchao::triton_fp8_gemm_1x128_128x1", mutates_args={})
+@torch.library.custom_op("torchao::triton_fp8_gemm_1x128_128x1", mutates_args=())
 def triton_fp8_gemm_1x128_128x1(
     a: torch.Tensor,  # (M, K)
     b: torch.Tensor,  # (K, N)
@@ -474,6 +488,17 @@ def triton_fp8_gemm_1x128_128x1(
         _FP8_GEMM_1X128_BLOCK_SIZE,
         out_dtype,
     )
+
+
+@triton_fp8_gemm_1x128_128x1.register_fake
+def _(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_s: torch.Tensor,
+    b_s: torch.Tensor,
+    out_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    return a.new_empty(a.size(0), b.size(1), dtype=out_dtype)
 
 
 @register_sharding(torch.ops.torchao.triton_fp8_gemm_1x128_128x128.default)
