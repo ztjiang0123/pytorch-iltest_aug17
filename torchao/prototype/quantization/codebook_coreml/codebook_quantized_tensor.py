@@ -15,7 +15,7 @@ from torchao.prototype.quantization.codebook_coreml.codebook_ops import (
 from torchao.quantization.quant_primitives import (
     _DTYPE_TO_BIT_WIDTH,
 )
-from torchao.utils import TorchAOBaseTensor
+from torchao.utils import TorchAOBaseTensor, _quantized_tensor_repr
 
 aten = torch.ops.aten
 
@@ -77,9 +77,8 @@ class CodebookQuantizedTensor(TorchAOBaseTensor):
         self.block_size = block_size
 
     def __repr__(self):
-        return (
-            f"{self.__class__.__name__}(codes={self.codes}, codebook={self.codebook}, code_dtype={self.code_dtype}, block_size={self.block_size} "
-            f"shape={self.shape}, device={self.device}, dtype={self.dtype}, requires_grad={self.requires_grad})"
+        return _quantized_tensor_repr(
+            self, ["codes", "codebook", "code_dtype", "block_size"]
         )
 
     def _quantization_type(self):

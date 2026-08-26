@@ -60,6 +60,55 @@ __all__ = [
 aten = torch.ops.aten
 
 
+def _dispatch_float8_addmm_(args, kwargs, addmm_impl):
+    """Shared body for the in-place ``aten.addmm_`` dispatch on float8 tensors.
+
+    Unpacks ``bias, input, weight`` from ``args``, delegates the matmul to
+    ``addmm_impl`` (the module's ``_float8_addmm_impl``), and accumulates the
+    result into ``bias`` in place. Shared by the stable and prototype float8
+    tensors, which pass their own ``addmm_impl``.
+    """
+    bias_tensor, input_tensor, weight_tensor = (
+        args[0],
+        args[1],
+        args[2],
+    )
+    assert kwargs.get("alpha", 1) == 1, "only alpha=1 is supported"
+    assert kwargs.get("beta", 1) == 1, "only beta=1 is supported"
+    out = addmm_impl(input_tensor, weight_tensor)
+    return bias_tensor.add_(out)
+
+
+def _dispatch_conv3d(args, kwargs, conv3d_impl):
+    """Shared body for the ``aten.conv3d`` dispatch on float8 tensors.
+
+    The semantics of ``memory_format`` match the high precision counterparts:
+    if any of input or weight are in channels_last_3d format the output will be
+    in channels_last_3d format, otherwise the output will be contiguous.
+
+    Fills in conv3d argument defaults and delegates to ``conv3d_impl`` (the
+    module's ``_quantize_and_scaled_conv3d``). Shared by the stable and
+    prototype float8 tensors, which pass their own ``conv3d_impl``.
+    """
+    (
+        input_tensor,
+        weight_tensor,
+        bias,
+        stride,
+        padding,
+        dilation,
+        groups,
+    ) = fill_defaults(args, 7, [None, [1, 1, 1], [0, 0, 0], [1, 1, 1], 1])
+    return conv3d_impl(
+        input_tensor,
+        weight_tensor,
+        bias,
+        stride,
+        padding,
+        dilation,
+    )
+
+
 @dataclass
 class QuantizeTensorToFloat8Kwargs(QuantizeTensorKwargs):
     """Tensor kwargs for creating float8 tensor (either activation or weight)
@@ -288,11 +337,6 @@ def _(func, types, args, kwargs):
 
 @implements(aten.matmul.default)
 @implements_torch_function(torch.matmul)
-def _(func, types, args, kwargs):
-    input_tensor, weight_tensor = args[0], args[1]
-    return _float8_addmm_impl(input_tensor, weight_tensor)
-
-
 @implements(aten.mm.default)
 @implements_torch_function(torch.mm)
 def _(func, types, args, kwargs):
@@ -302,15 +346,7 @@ def _(func, types, args, kwargs):
 
 @implements(aten.addmm_.default)
 def _(func, types, args, kwargs):
-    bias_tensor, input_tensor, weight_tensor = (
-        args[0],
-        args[1],
-        args[2],
-    )
-    assert kwargs.get("alpha", 1) == 1, "only alpha=1 is supported"
-    assert kwargs.get("beta", 1) == 1, "only beta=1 is supported"
-    out = _float8_addmm_impl(input_tensor, weight_tensor)
-    return bias_tensor.add_(out)
+    return _dispatch_float8_addmm_(args, kwargs, _float8_addmm_impl)
 
 
 @implements(aten.is_pinned.default)
@@ -668,29 +704,7 @@ def _(func, types, args, kwargs):
 
 @implements(aten.conv3d.default)
 def _(func, types, args, kwargs):
-    """The semantics of memory_format will match high precision counterparts
-    i.e. if any of input or weight are in channels_last_3d format
-    the output will be in channels_last_3d format, otherwise the output
-    will be contiguous
-    """
-    (
-        input_tensor,
-        weight_tensor,
-        bias,
-        stride,
-        padding,
-        dilation,
-        groups,
-    ) = fill_defaults(args, 7, [None, [1, 1, 1], [0, 0, 0], [1, 1, 1], 1])
-    conv3d_output = _quantize_and_scaled_conv3d(
-        input_tensor,
-        weight_tensor,
-        bias,
-        stride,
-        padding,
-        dilation,
-    )
-    return conv3d_output
+    return _dispatch_conv3d(args, kwargs, _quantize_and_scaled_conv3d)
 
 
 @implements(aten.conv2d.default)

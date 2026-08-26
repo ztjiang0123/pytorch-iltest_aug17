@@ -22,20 +22,28 @@ from torchao.utils import TorchAOBaseTensor
 # --- C++ Op Accessor Functions ---
 
 
+def _get_groupwise_lut_op(op_kind: str, label: str, weight_nbit: int):
+    """Gets a C++ groupwise LUT op from the 'torchao' namespace.
+
+    Args:
+        op_kind: The op family, e.g. ``"pack"`` or ``"linear"``.
+        label: Human-readable name used in the error message, e.g. ``"Packing"``.
+        weight_nbit: The weight bit width the op is specialized for.
+    """
+    op_name = f"_{op_kind}_groupwise_{weight_nbit}bit_weight_with_lut"
+    if not hasattr(torch.ops.torchao, op_name):
+        raise NotImplementedError(f"{label} op for {weight_nbit}-bit not found.")
+    return getattr(torch.ops.torchao, op_name)
+
+
 def get_pack_op(weight_nbit: int):
     """Gets the C++ packing function from the 'torchao' namespace."""
-    op_name = f"_pack_groupwise_{weight_nbit}bit_weight_with_lut"
-    if not hasattr(torch.ops.torchao, op_name):
-        raise NotImplementedError(f"Packing op for {weight_nbit}-bit not found.")
-    return getattr(torch.ops.torchao, op_name)
+    return _get_groupwise_lut_op("pack", "Packing", weight_nbit)
 
 
 def get_linear_op(weight_nbit: int):
     """Gets the C++ fused linear function from the 'torchao' namespace."""
-    op_name = f"_linear_groupwise_{weight_nbit}bit_weight_with_lut"
-    if not hasattr(torch.ops.torchao, op_name):
-        raise NotImplementedError(f"Linear op for {weight_nbit}-bit not found.")
-    return getattr(torch.ops.torchao, op_name)
+    return _get_groupwise_lut_op("linear", "Linear", weight_nbit)
 
 
 aten = torch.ops.aten

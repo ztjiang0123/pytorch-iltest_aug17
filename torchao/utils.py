@@ -362,6 +362,25 @@ def unwrap_tensor_subclass(model, filter_fn=None):
     return model
 
 
+def _quantized_tensor_repr(tensor, fields: list) -> str:
+    """Builds a ``__repr__`` string for a quantized tensor subclass.
+
+    Renders the subclass-specific attributes named in ``fields`` (in order),
+    followed by the common ``shape``/``device``/``dtype``/``requires_grad`` tail.
+
+    Args:
+        tensor: The tensor subclass instance to represent.
+        fields: Names of the subclass-specific attributes to include, e.g.
+            ``["codes", "codebook", "block_size", "scales"]``.
+    """
+    field_str = ", ".join(f"{name}={getattr(tensor, name)}" for name in fields)
+    return (
+        f"{tensor.__class__.__name__}({field_str}, "
+        f"shape={tensor.shape}, device={tensor.device}, dtype={tensor.dtype}, "
+        f"requires_grad={tensor.requires_grad})"
+    )
+
+
 def _is_float8_type(dtype: torch.dtype) -> bool:
     fp8_types = {
         torch.float8_e4m3fn,
