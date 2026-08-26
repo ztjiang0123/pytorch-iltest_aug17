@@ -749,6 +749,24 @@ class X86InductorQuantizer(Quantizer):
             model, quantization_config, filter_fn
         )
 
+    def _run_annotators(
+        self,
+        annotator_names: list[str],
+        model: torch.fx.GraphModule,
+        quantization_config: Optional[QuantizationConfig],
+        filter_fn: Optional[FilterFn] = None,
+    ) -> None:
+        """Run a sequence of ``_annotate_*`` sub-annotators in order.
+
+        The fusion-pattern entry points differ only in *which* sub-annotators
+        they invoke; every call passes the same ``(model, quantization_config,
+        filter_fn)`` triple. Centralizing the dispatch here keeps those entry
+        points to a single declarative list and lets ``ArmInductorQuantizer``
+        reuse the same driver via inheritance.
+        """
+        for name in annotator_names:
+            getattr(self, name)(model, quantization_config, filter_fn)
+
     def _annotate_qat_conv2d_fusion_pattern(
         self,
         model: torch.fx.GraphModule,
@@ -756,10 +774,17 @@ class X86InductorQuantizer(Quantizer):
         filter_fn: Optional[FilterFn] = None,
     ):
         # Annotate QAT Specific patterns
-        self._annotate_qat_conv2d_bn_binary_unary(model, quantization_config, filter_fn)
-        self._annotate_qat_conv2d_bn_binary(model, quantization_config, filter_fn)
-        self._annotate_qat_conv2d_bn_unary(model, quantization_config, filter_fn)
-        self._annotate_qat_conv2d_bn(model, quantization_config, filter_fn)
+        self._run_annotators(
+            [
+                "_annotate_qat_conv2d_bn_binary_unary",
+                "_annotate_qat_conv2d_bn_binary",
+                "_annotate_qat_conv2d_bn_unary",
+                "_annotate_qat_conv2d_bn",
+            ],
+            model,
+            quantization_config,
+            filter_fn,
+        )
 
     def _annotate_qat_conv2d_bn_binary_unary(
         self,
@@ -1021,9 +1046,16 @@ class X86InductorQuantizer(Quantizer):
         quantization_config: Optional[QuantizationConfig],
         filter_fn: Optional[FilterFn] = None,
     ):
-        self._annotate_linear_binary_unary(model, quantization_config, filter_fn)
-        self._annotate_linear_unary(model, quantization_config, filter_fn)
-        self._annotate_linear(model, quantization_config, filter_fn)
+        self._run_annotators(
+            [
+                "_annotate_linear_binary_unary",
+                "_annotate_linear_unary",
+                "_annotate_linear",
+            ],
+            model,
+            quantization_config,
+            filter_fn,
+        )
 
     def _annotate_matmul(
         self,

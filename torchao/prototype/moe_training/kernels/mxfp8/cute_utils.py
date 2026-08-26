@@ -229,6 +229,54 @@ if _cutedsl_runtime_available():
         return vals_chunk
 
     @cute.jit
+    def store_scales_reg_to_gmem_vec(
+        scales_tensor: cute.Tensor,
+        lane_coord: cutlass.Int64,
+        block_base: cutlass.Int64,
+        scale_buffer: cute.Tensor,
+        num_scales: cutlass.Int32,
+        BLOCKED_SCALE_OUTPUT: cutlass.Constexpr[bool],
+    ):
+        """Store scales from registers to global memory using vectorized writes.
+
+        Shared by the 1x32 and 32x1 MXFP8 kernels. The two kernels quantize
+        along transposed axes, but both index the scale tensor as
+        ``scales_tensor[lane_coord, block]`` (1x32: lane=M, block=K-block;
+        32x1: lane=K, block=M-block), so the store body is identical. Uses a
+        uint32 vectorized write for 4 scales in blocked layout, falling back to
+        scalar stores otherwise.
+
+        Args:
+            scales_tensor: Output scales in global memory
+            lane_coord: Global coordinate of the lane axis (M for 1x32, K for 32x1)
+            block_base: Starting block index along the quantized axis
+            scale_buffer: Buffer of scales in register memory (uint8)
+            num_scales: Number of scales to store
+            BLOCKED_SCALE_OUTPUT: Whether using blocked layout (enables vectorization)
+
+        Storage locations:
+            Input: scale_buffer (registers)
+            Output: scales_tensor (global memory)
+        """
+        if cutlass.const_expr(BLOCKED_SCALE_OUTPUT):
+            # Blocked layout with 4 contiguous scales - write as uint32
+            if num_scales == 4:
+                # Pack 4 uint8 scales into uint32 and write
+                scales_tensor_u32 = cute.recast_tensor(scales_tensor, cutlass.Uint32)
+                scale_buffer_u32 = cute.recast_tensor(scale_buffer, cutlass.Uint32)
+                scales_tensor_u32[lane_coord, block_base // cutlass.Int64(4)] = (
+                    scale_buffer_u32[0]
+                )
+            else:
+                # Fallback for non-4 cases (e.g., tail tiles)
+                for i in range(num_scales):
+                    scales_tensor[lane_coord, block_base + i] = scale_buffer[i]
+        else:
+            # Row-major layout - scalar stores
+            for i in range(num_scales):
+                scales_tensor[lane_coord, block_base + i] = scale_buffer[i]
+
+    @cute.jit
     def validate_group_sizes(offs: cute.Tensor):
         # Only first thread validates to avoid redundant work
         num_groups = offs.shape[0]
@@ -430,7 +478,7 @@ if _cutedsl_runtime_available():
             kernel._quantize_block_then_store_reg_to_smem_full(
                 vals_block, inv_scale, sOUT_tile, lane_rel, block_base, opts.use_rceil
             )
-        kernel._store_scales_reg_to_gmem_vec(
+        store_scales_reg_to_gmem_vec(
             state.scales_tensor,
             lane_global,
             tile_eff * axis.blocks_per_tile,
@@ -476,7 +524,7 @@ if _cutedsl_runtime_available():
                     opts.use_rceil,
                 )
         if num_valid_scales > 0:
-            kernel._store_scales_reg_to_gmem_vec(
+            store_scales_reg_to_gmem_vec(
                 state.scales_tensor,
                 lane_global,
                 tile_eff * axis.blocks_per_tile,

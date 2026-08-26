@@ -320,15 +320,8 @@ def _(func, types, args, kwargs):
     return result
 
 
-@implements(aten.matmul.default)
-@implements_torch_function(torch.matmul)
-def _(func, types, args, kwargs):
-    input_tensor, weight_tensor = args[0], args[1]
-    return _float8_addmm_impl(input_tensor, weight_tensor)
-
-
-@implements(aten.mm.default)
-@implements_torch_function(torch.mm)
+@implements([aten.matmul.default, aten.mm.default])
+@implements_torch_function([torch.matmul, torch.mm])
 def _(func, types, args, kwargs):
     input_tensor, weight_tensor = args[0], args[1]
     return _float8_addmm_impl(input_tensor, weight_tensor)

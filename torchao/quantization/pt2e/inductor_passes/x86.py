@@ -242,12 +242,16 @@ def get_qconv_pt2e_pattern(x_scale_zp_are_tensors=False, users=1):
     )
 
 
-def get_qlinear_pt2e_pattern(x_scale_zp_are_tensors, users=1):
-    qlinear_op = (
-        torch.ops.onednn.qlinear_pointwise.tensor
-        if x_scale_zp_are_tensors
-        else torch.ops.onednn.qlinear_pointwise.default
-    )
+def _get_qlinear_pt2e_pattern(qlinear_op, extra_input_args, trailing_args, users):
+    """Build a qlinear ``onednn.qlinear_pointwise`` match pattern.
+
+    The pointwise and binary qlinear patterns share the same leading operands
+    (``x``/``x_scale``/``x_zp``/``packed_weight``/``w_scale``/``w_zp``); the
+    binary variant inserts an extra ``x_2`` input before the bias and carries a
+    different tail of post-op arguments. ``extra_input_args`` are the args to
+    splice in before ``b``, and ``trailing_args`` are the post-op args that
+    follow ``output_dtype``.
+    """
     return CallFunction(
         qlinear_op,
         KeywordArg("x"),
@@ -256,14 +260,31 @@ def get_qlinear_pt2e_pattern(x_scale_zp_are_tensors, users=1):
         KeywordArg("packed_weight"),
         KeywordArg("w_scale"),
         KeywordArg("w_zp"),
+        *extra_input_args,
         KeywordArg("b"),
         KeywordArg("output_scale"),
         KeywordArg("output_zero_point"),
         KeywordArg("output_dtype"),
-        KeywordArg("postop_name"),
-        KeywordArg("postop_args"),
-        KeywordArg("postop_algorithm"),
+        *trailing_args,
         _users=users,
+    )
+
+
+def get_qlinear_pt2e_pattern(x_scale_zp_are_tensors, users=1):
+    qlinear_op = (
+        torch.ops.onednn.qlinear_pointwise.tensor
+        if x_scale_zp_are_tensors
+        else torch.ops.onednn.qlinear_pointwise.default
+    )
+    return _get_qlinear_pt2e_pattern(
+        qlinear_op,
+        extra_input_args=(),
+        trailing_args=(
+            KeywordArg("postop_name"),
+            KeywordArg("postop_args"),
+            KeywordArg("postop_algorithm"),
+        ),
+        users=users,
     )
 
 
@@ -273,27 +294,19 @@ def get_qlinear_binary_pt2e_pattern(x_scale_zp_are_tensors, users=1):
         if x_scale_zp_are_tensors
         else torch.ops.onednn.qlinear_pointwise.binary
     )
-    return CallFunction(
+    return _get_qlinear_pt2e_pattern(
         qlinear_op,
-        KeywordArg("x"),
-        KeywordArg("x_scale"),
-        KeywordArg("x_zp"),
-        KeywordArg("packed_weight"),
-        KeywordArg("w_scale"),
-        KeywordArg("w_zp"),
-        KeywordArg("x_2"),
-        KeywordArg("b"),
-        KeywordArg("output_scale"),
-        KeywordArg("output_zero_point"),
-        KeywordArg("output_dtype"),
-        KeywordArg("x2_scale"),
-        KeywordArg("x2_zp"),
-        KeywordArg("binary_op_name"),
-        KeywordArg("alpha"),
-        KeywordArg("unary_op_name"),
-        KeywordArg("unary_op_args"),
-        KeywordArg("unary_op_algorithm"),
-        _users=users,
+        extra_input_args=(KeywordArg("x_2"),),
+        trailing_args=(
+            KeywordArg("x2_scale"),
+            KeywordArg("x2_zp"),
+            KeywordArg("binary_op_name"),
+            KeywordArg("alpha"),
+            KeywordArg("unary_op_name"),
+            KeywordArg("unary_op_args"),
+            KeywordArg("unary_op_algorithm"),
+        ),
+        users=users,
     )
 
 

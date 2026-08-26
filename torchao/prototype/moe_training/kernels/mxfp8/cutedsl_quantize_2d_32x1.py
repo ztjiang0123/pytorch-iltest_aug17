@@ -232,55 +232,6 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
             return vals_block
 
         @cute.jit
-        def _store_scales_reg_to_gmem_vec(
-            self,
-            scales_tensor: cute.Tensor,
-            k: cutlass.Int64,
-            m_block_base: cutlass.Int64,
-            scale_buffer: cute.Tensor,
-            num_scales: cutlass.Int32,
-            BLOCKED_SCALE_OUTPUT: cutlass.Constexpr[bool],
-        ):
-            """Store scales from registers to global memory using vectorized writes when possible.
-
-            Uses uint32 vectorized writes for 4 scales in blocked layout.
-            For 32x1 scaling, we store scales along the M dimension for each K.
-
-            Args:
-                scales_tensor: Output scales in global memory
-                k: Global K coordinate
-                m_block_base: Starting M block index
-                scale_buffer: Buffer of scales in register memory (uint8)
-                num_scales: Number of scales to store
-                BLOCKED_SCALE_OUTPUT: Whether using blocked layout (enables vectorization)
-
-            Storage locations:
-                Input: scale_buffer (registers)
-                Output: scales_tensor (global memory)
-            """
-            if cutlass.const_expr(BLOCKED_SCALE_OUTPUT):
-                # Blocked layout with 4 contiguous scales - write as uint32
-                if num_scales == 4:
-                    # Pack 4 uint8 scales into uint32 and write
-                    scales_tensor_u32 = cute.recast_tensor(
-                        scales_tensor, cutlass.Uint32
-                    )
-                    scale_buffer_u32 = cute.recast_tensor(scale_buffer, cutlass.Uint32)
-                    scales_tensor_u32[k, m_block_base // cutlass.Int64(4)] = (
-                        scale_buffer_u32[0]
-                    )
-                else:
-                    # Fallback for non-4 cases (e.g., tail tiles)
-                    for i in range(num_scales):
-                        m_block = m_block_base + i
-                        scales_tensor[k, m_block] = scale_buffer[i]
-            else:
-                # Row-major layout - scalar stores
-                for i in range(num_scales):
-                    m_block = m_block_base + i
-                    scales_tensor[k, m_block] = scale_buffer[i]
-
-        @cute.jit
         def _store_q_fp8_reg_to_smem(
             self,
             q_fp8_vals4: cute.Tensor,
