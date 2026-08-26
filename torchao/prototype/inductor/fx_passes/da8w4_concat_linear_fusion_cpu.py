@@ -56,6 +56,131 @@ def _is_valid_concat_linear_da8w4_fusion(computation_nodes):
     )
 
 
+def _is_fusable_da8w4_node(node: torch.fx.Node) -> bool:
+    """A da8w4 linear node is fusable only if it is a live CPU tensor op."""
+    return (
+        not node._erased
+        and isinstance(node.meta.get("val"), torch.Tensor)
+        and node.meta["val"].device.type == "cpu"
+    )
+
+
+def _register_concat_buffer(gm, name: str, tensor: torch.Tensor) -> None:
+    gm.register_buffer(name, tensor)
+    setattr(gm, name, tensor)
+
+
+def _build_concat_buffers(gm, users, with_bias: bool):
+    """Concat the per-linear constant weights/scales/qzeros/compensation (and
+    optionally bias) along N/block_n, register them as buffers on ``gm``, and
+    return the buffer names plus the resulting out-feature split sizes.
+    """
+    computation_node_0 = users[0]
+
+    def gather(arg_idx):
+        return [getattr(gm, user.args[arg_idx].target) for user in users]
+
+    def concat_name(arg_idx):
+        return computation_node_0.args[arg_idx].target + "_concat"
+
+    # Shape of packed weight: [N/block_n, K/block_k, block_k, block_n/2]
+    # Shape of weight scales/qzeros: [N/block_n, G, block_n]
+    # Shape of compensation: [N/block_n, K/block_k, block_n]
+    # Concat them along N/block_n
+    packed_wgts = gather(3)
+    out_feature_size_list = [(w.size(0) * w.size(-1) * 2) for w in packed_wgts]
+
+    names = {
+        "weight": concat_name(3),
+        "scales": concat_name(4),
+        "qzeros": concat_name(5),
+        "compensation": concat_name(6),
+        "bias": concat_name(7) if with_bias else None,
+    }
+    _register_concat_buffer(gm, names["weight"], torch.cat(packed_wgts, dim=0))
+    _register_concat_buffer(gm, names["scales"], torch.cat(gather(4), dim=0))
+    _register_concat_buffer(gm, names["qzeros"], torch.cat(gather(5), dim=0))
+    _register_concat_buffer(gm, names["compensation"], torch.cat(gather(6), dim=0))
+    if with_bias:
+        _register_concat_buffer(gm, names["bias"], torch.cat(gather(7), dim=0))
+
+    return names, out_feature_size_list
+
+
+def _fuse_da8w4_users(graph, node, users):
+    """Replace the group of da8w4 linear ``users`` sharing ``node``'s activation
+    with a single concatenated linear followed by a split.
+    """
+    gm = graph.owning_module
+    computation_op = torch.ops.torchao.da8w4_linear_cpu.default
+    act, act_scales, act_qzeros = node.args[0], node.args[1], node.args[2]
+    output_dtype = node.args[-1]
+    with_bias = users[0].args[7] is not None
+
+    with graph.inserting_before(node):
+        names, out_feature_size_list = _build_concat_buffers(gm, users, with_bias)
+
+        # Create the get_attr nodes for the concatenated buffers in order, each
+        # inserted after the previous one.
+        concat_w_node = graph.create_node("get_attr", names["weight"], (), {})
+        prev = concat_w_node
+        get_attr_nodes = {}
+        for key in ("scales", "qzeros", "compensation"):
+            with graph.inserting_after(prev):
+                prev = graph.create_node("get_attr", names[key], (), {})
+            get_attr_nodes[key] = prev
+
+        if with_bias:
+            with graph.inserting_after(prev):
+                concat_bias_node = graph.create_node("get_attr", names["bias"], (), {})
+            prev = concat_bias_node
+        else:
+            concat_bias_node = None
+
+        with graph.inserting_after(prev):
+            new_linear_node = graph.create_node(
+                "call_function",
+                computation_op,
+                (
+                    act,
+                    act_scales,
+                    act_qzeros,
+                    concat_w_node,
+                    get_attr_nodes["scales"],
+                    get_attr_nodes["qzeros"],
+                    get_attr_nodes["compensation"],
+                    concat_bias_node,
+                    output_dtype,
+                ),
+            )
+        with graph.inserting_after(new_linear_node):
+            split_node = graph.create_node(
+                "call_function",
+                torch.ops.aten.split_with_sizes.default,
+                (
+                    new_linear_node,
+                    out_feature_size_list,
+                    -1,  # split along the out feature dimension
+                ),
+            )
+        with graph.inserting_after(split_node):
+            for gemm_idx, user in enumerate(users):
+                get_item = graph.create_node(
+                    "call_function",
+                    operator.getitem,
+                    (split_node, gemm_idx),
+                )
+                with graph.inserting_after(get_item):
+                    clone_node = graph.create_node(
+                        "call_function",
+                        torch.ops.aten.clone.default,
+                        (get_item,),
+                        {"memory_format": torch.contiguous_format},
+                    )
+                    user.replace_all_uses_with(clone_node)
+                    graph.erase_node(user)
+
+
 def _concat_linear_dq8w4_cpu(graph: torch.fx.Graph):
     """
     Concat Linear optimization pass for DA8W4 on CPU
@@ -75,136 +200,17 @@ def _concat_linear_dq8w4_cpu(graph: torch.fx.Graph):
     if not inductor_config.cpp.enable_concat_linear:
         # only concat linear if the flag is set
         return
-    gm = graph.owning_module
     computation_op = torch.ops.torchao.da8w4_linear_cpu.default
     # OP schema:
     # da8w4_linear_cpu(Tensor input, Tensor input_scales, Tensor input_qzeros, Tensor weight, Tensor weight_scales, Tensor weight_qzeros, Tensor compensation, Tensor? bias, ScalarType output_dtype) -> Tensor
     for node in graph.find_nodes(op="call_function", target=computation_op):
-        if (
-            not node._erased
-            and isinstance(node.meta.get("val"), torch.Tensor)
-            and node.meta["val"].device.type == "cpu"
-        ):
-            act = node.args[0]
-            act_scales = node.args[1]
-            act_qzeros = node.args[2]
-            users = list(act.users)
-            if _is_valid_concat_linear_da8w4_fusion(users):
-                with graph.inserting_before(node):
-                    computation_node_0 = users[0]
-                    packed_wgts = [getattr(gm, user.args[3].target) for user in users]
-                    out_feature_size_list = [
-                        (w.size(0) * w.size(-1) * 2) for w in packed_wgts
-                    ]
-                    wgt_scales = [getattr(gm, user.args[4].target) for user in users]
-                    wgt_qzeros = [getattr(gm, user.args[5].target) for user in users]
-                    compensations = [getattr(gm, user.args[6].target) for user in users]
-                    bias = []
-                    with_bias = users[0].args[7] is not None
-                    if with_bias:
-                        bias = [getattr(gm, user.args[7].target) for user in users]
-                    output_dtype = node.args[-1]
-                    # Shape of packed weight: [N/block_n, K/block_k, block_k, block_n/2]
-                    # Shape of weight scales/qzeros: [N/block_n, G, block_n]
-                    # Shape of compensation: [N/block_n, K/block_k, block_n]
-                    # Concat them along N/block_n
-                    concat_wgt = torch.cat(packed_wgts, dim=0)
-                    concat_w_node_name = computation_node_0.args[3].target + "_concat"
-                    concat_wgt_scales = torch.cat(wgt_scales, dim=0)
-                    concat_ws_node_name = computation_node_0.args[4].target + "_concat"
-                    concat_wgt_qzeros = torch.cat(wgt_qzeros, dim=0)
-                    concat_wz_node_name = computation_node_0.args[5].target + "_concat"
-                    concat_compensation = torch.cat(compensations, dim=0)
-                    concat_comp_node_name = (
-                        computation_node_0.args[6].target + "_concat"
-                    )
-                    concat_bias = torch.cat(bias, dim=0) if with_bias else None
-                    concat_bias_node_name = (
-                        computation_node_0.args[7].target + "_concat"
-                        if with_bias
-                        else None
-                    )
-                    gm.register_buffer(concat_w_node_name, concat_wgt)
-                    setattr(gm, concat_w_node_name, concat_wgt)
-                    gm.register_buffer(concat_ws_node_name, concat_wgt_scales)
-                    setattr(gm, concat_ws_node_name, concat_wgt_scales)
-                    gm.register_buffer(concat_wz_node_name, concat_wgt_qzeros)
-                    setattr(gm, concat_wz_node_name, concat_wgt_qzeros)
-                    gm.register_buffer(concat_comp_node_name, concat_compensation)
-                    setattr(gm, concat_comp_node_name, concat_compensation)
-                    if with_bias:
-                        gm.register_buffer(concat_bias_node_name, concat_bias)
-                        setattr(gm, concat_bias_node_name, concat_bias)
-
-                    concat_w_node = graph.create_node(
-                        "get_attr", concat_w_node_name, (), {}
-                    )
-                    with graph.inserting_after(concat_w_node):
-                        concat_wgt_scales_node = graph.create_node(
-                            "get_attr", concat_ws_node_name, (), {}
-                        )
-                    with graph.inserting_after(concat_wgt_scales_node):
-                        concat_wgt_qzeros_node = graph.create_node(
-                            "get_attr", concat_wz_node_name, (), {}
-                        )
-                    with graph.inserting_after(concat_wgt_qzeros_node):
-                        concat_compensation_node = graph.create_node(
-                            "get_attr", concat_comp_node_name, (), {}
-                        )
-                    node_before_linear = concat_compensation_node
-                    if with_bias:
-                        with graph.inserting_after(concat_compensation_node):
-                            concat_bias_node = graph.create_node(
-                                "get_attr", concat_bias_node_name, (), {}
-                            )
-                        node_before_linear = concat_bias_node
-                    else:
-                        concat_bias_node = None
-                    with graph.inserting_after(node_before_linear):
-                        new_linear_node = graph.create_node(
-                            "call_function",
-                            computation_op,
-                            (
-                                act,
-                                act_scales,
-                                act_qzeros,
-                                concat_w_node,
-                                concat_wgt_scales_node,
-                                concat_wgt_qzeros_node,
-                                concat_compensation_node,
-                                concat_bias_node,
-                                output_dtype,
-                            ),
-                        )
-                    with graph.inserting_after(new_linear_node):
-                        split_node = graph.create_node(
-                            "call_function",
-                            torch.ops.aten.split_with_sizes.default,
-                            (
-                                new_linear_node,
-                                out_feature_size_list,
-                                -1,  # split along the out feature dimension
-                            ),
-                        )
-                    with graph.inserting_after(split_node):
-                        for gemm_idx, user in enumerate(users):
-                            get_item = graph.create_node(
-                                "call_function",
-                                operator.getitem,
-                                (
-                                    split_node,
-                                    gemm_idx,
-                                ),
-                            )
-                            with graph.inserting_after(get_item):
-                                clone_node = graph.create_node(
-                                    "call_function",
-                                    torch.ops.aten.clone.default,
-                                    (get_item,),
-                                    {"memory_format": torch.contiguous_format},
-                                )
-                                user.replace_all_uses_with(clone_node)
-                                graph.erase_node(user)
+        if not _is_fusable_da8w4_node(node):
+            continue
+        act = node.args[0]
+        users = list(act.users)
+        if not _is_valid_concat_linear_da8w4_fusion(users):
+            continue
+        _fuse_da8w4_users(graph, node, users)
 
 
 # Define and register a custom pass for concat linear

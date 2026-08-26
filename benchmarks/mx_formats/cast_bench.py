@@ -97,6 +97,469 @@ def benchmark_cuda_function_in_microseconds(f, *args):
     return do_bench(lambda: f(*args), return_mode="median") * 1e3
 
 
+def _bytes_rw_bf16(*tensors):
+    return sum(t.numel() for t in tensors) * bytes_per_el_bf16
+
+
+def _bytes_rw_quant(x, y, s):
+    # bf16 input read + fp8-packed output (data + scale) written
+    bytes_r = x.numel() * bytes_per_el_bf16
+    bytes_w = (y.numel() + s.numel()) * bytes_per_el_fp8
+    return bytes_r + bytes_w
+
+
+def _bench_memcpy(x, BLOCK_SIZE):
+    # Baseline memcpy benchmark to establish max achievable bandwidth
+    y = torch.randn_like(x)
+
+    # Warmup
+    for _ in range(2):
+        y.copy_(x)
+
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda src, dst: dst.copy_(src),
+        x,
+        y,
+    )
+
+    # bytes_read + bytes_written
+    bytes_rw = 2 * x.numel() * bytes_per_el_bf16
+    return time_us, bytes_rw
+
+
+def _bench_dim0(x, BLOCK_SIZE):
+    scale_dim0_reference_c = torch.compile(scale_dim0_reference)
+    y_d0, s_d0 = scale_dim0_reference_c(x, BLOCK_SIZE)
+
+    for _ in range(2):
+        __ = scale_dim0_reference_c(x, BLOCK_SIZE)
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x, b: scale_dim0_reference_c(x, BLOCK_SIZE),
+        x,
+        BLOCK_SIZE,
+    )
+
+    assert y_d0.dtype == torch.bfloat16
+    assert s_d0.dtype == torch.bfloat16
+    return time_us, _bytes_rw_bf16(x, y_d0, s_d0)
+
+
+def _bench_dim1(x, BLOCK_SIZE):
+    scale_dim1_reference_c = torch.compile(scale_dim1_reference)
+    y_d1, s_d1 = scale_dim1_reference_c(x, BLOCK_SIZE)
+
+    for _ in range(2):
+        __ = scale_dim1_reference_c(x, BLOCK_SIZE)
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x, b: scale_dim1_reference_c(x, BLOCK_SIZE),
+        x,
+        BLOCK_SIZE,
+    )
+
+    assert y_d1.dtype == torch.bfloat16
+    assert s_d1.dtype == torch.bfloat16
+    return time_us, _bytes_rw_bf16(x, y_d1, s_d1)
+
+
+def _bench_dim0_dim1(x, BLOCK_SIZE):
+    scale_dim0_dim1_reference_c = torch.compile(scale_dim0_dim1_reference)
+    y_d0, y_d1, s_d0, s_d1 = scale_dim0_dim1_reference_c(x, BLOCK_SIZE)
+
+    for _ in range(2):
+        __ = scale_dim0_dim1_reference_c(x, BLOCK_SIZE)
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x, b: scale_dim0_dim1_reference_c(x, BLOCK_SIZE),
+        x,
+        BLOCK_SIZE,
+    )
+
+    assert y_d0.dtype == torch.bfloat16
+    assert s_d0.dtype == torch.bfloat16
+    assert y_d1.dtype == torch.bfloat16
+    assert s_d1.dtype == torch.bfloat16
+    return time_us, _bytes_rw_bf16(x, y_d0, y_d1, s_d0, s_d1)
+
+
+def _bench_dim0_mxfp8_floor(x, BLOCK_SIZE):
+    to_mx_dim0_reference_c = torch.compile(to_mx_dim0_reference)
+    y_d0, s_d0 = to_mx_dim0_reference_c(x, BLOCK_SIZE)
+
+    for _ in range(2):
+        __ = to_mx_dim0_reference_c(x, BLOCK_SIZE)
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x, b: to_mx_dim0_reference_c(x, BLOCK_SIZE),
+        x,
+        BLOCK_SIZE,
+    )
+
+    assert y_d0.dtype == torch.float8_e4m3fn
+    assert s_d0.dtype == torch.float8_e8m0fnu
+    return time_us, _bytes_rw_quant(x, y_d0, s_d0)
+
+
+def _bench_dim0_mxfp4_floor(x, BLOCK_SIZE):
+    to_mx_dim0_reference_c = torch.compile(to_mx_dim0_reference)
+    y_d0, s_d0 = to_mx_dim0_reference_c(
+        x, BLOCK_SIZE, target_dtype=torch.float4_e2m1fn_x2
+    )
+
+    for _ in range(2):
+        __ = to_mx_dim0_reference_c(x, BLOCK_SIZE, target_dtype=torch.float4_e2m1fn_x2)
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x, b: to_mx_dim0_reference_c(
+            x, BLOCK_SIZE, target_dtype=torch.float4_e2m1fn_x2
+        ),
+        x,
+        BLOCK_SIZE,
+    )
+
+    # TODO(future PR): make to_mx return float4 directly
+    assert y_d0.dtype == torch.uint8
+    assert s_d0.dtype == torch.float8_e8m0fnu
+    return time_us, _bytes_rw_quant(x, y_d0, s_d0)
+
+
+def _bench_dim0_mxfp8_rceil(x, BLOCK_SIZE):
+    to_mx_dim0_reference_c = torch.compile(to_mx_dim0_reference)
+    y_d0, s_d0 = to_mx_dim0_reference_c(x, BLOCK_SIZE, ScaleCalculationMode.RCEIL)
+
+    for _ in range(2):
+        __ = to_mx_dim0_reference_c(x, BLOCK_SIZE, ScaleCalculationMode.RCEIL)
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x, b: to_mx_dim0_reference_c(x, BLOCK_SIZE, ScaleCalculationMode.RCEIL),
+        x,
+        BLOCK_SIZE,
+    )
+
+    assert y_d0.dtype == torch.float8_e4m3fn
+    assert s_d0.dtype == torch.float8_e8m0fnu
+    return time_us, _bytes_rw_quant(x, y_d0, s_d0)
+
+
+def _bench_dim0_mxfp8_triton_floor(x, BLOCK_SIZE):
+    y_d0, s_d0 = triton_to_mxfp8_dim0(x, inner_block_size=BLOCK_SIZE)
+
+    for _ in range(2):
+        __ = triton_to_mxfp8_dim0(x, inner_block_size=BLOCK_SIZE, scaling_mode="floor")
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x, b: triton_to_mxfp8_dim0(
+            x, inner_block_size=BLOCK_SIZE, scaling_mode="floor"
+        ),
+        x,
+        BLOCK_SIZE,
+    )
+    assert y_d0.dtype == torch.float8_e4m3fn
+    assert s_d0.dtype == torch.float8_e8m0fnu
+    return time_us, _bytes_rw_quant(x, y_d0, s_d0)
+
+
+def _bench_dim0_mxfp8_triton_rceil(x, BLOCK_SIZE):
+    y_d0, s_d0 = triton_to_mxfp8_dim0(x, inner_block_size=BLOCK_SIZE)
+
+    for _ in range(2):
+        __ = triton_to_mxfp8_dim0(x, inner_block_size=BLOCK_SIZE, scaling_mode="rceil")
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x, b: triton_to_mxfp8_dim0(
+            x, inner_block_size=BLOCK_SIZE, scaling_mode="rceil"
+        ),
+        x,
+        BLOCK_SIZE,
+    )
+    assert y_d0.dtype == torch.float8_e4m3fn
+    assert s_d0.dtype == torch.float8_e8m0fnu
+    return time_us, _bytes_rw_quant(x, y_d0, s_d0)
+
+
+def _bench_dim0_nvfp4(x, BLOCK_SIZE):
+    to_nvfp4_reference_c = torch.compile(to_nvfp4_reference)
+    y_d0, s_d0 = to_nvfp4_reference_c(x, use_triton_kernel=False)
+
+    for _ in range(2):
+        __ = to_nvfp4_reference_c(x, use_triton_kernel=False)
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x: to_nvfp4_reference_c(x, use_triton_kernel=False),
+        x,
+    )
+    assert y_d0.dtype == torch.uint8
+    assert s_d0.dtype == torch.float8_e4m3fn
+    return time_us, _bytes_rw_quant(x, y_d0, s_d0)
+
+
+def _bench_dim0_nvfp4_triton_swizzle(x, BLOCK_SIZE):
+    y_d0, s_d0 = to_nvfp4_reference_triton_swizzle(x)
+
+    for _ in range(2):
+        __ = to_nvfp4_reference_triton_swizzle(x)
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x: to_nvfp4_reference_triton_swizzle(x),
+        x,
+    )
+    assert y_d0.dtype == torch.uint8
+    assert s_d0.dtype == torch.float8_e4m3fn
+    return time_us, _bytes_rw_quant(x, y_d0, s_d0)
+
+
+def _bench_dim1_mxfp8_floor(x, BLOCK_SIZE):
+    to_mx_dim1_reference_c = torch.compile(to_mx_dim1_reference)
+    y_d1, s_d1 = to_mx_dim1_reference_c(x, BLOCK_SIZE)
+
+    for _ in range(2):
+        __ = to_mx_dim1_reference_c(x, BLOCK_SIZE)
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x, b: to_mx_dim1_reference_c(x, BLOCK_SIZE),
+        x,
+        BLOCK_SIZE,
+    )
+
+    assert y_d1.dtype == torch.float8_e4m3fn
+    assert s_d1.dtype == torch.float8_e8m0fnu
+    return time_us, _bytes_rw_quant(x, y_d1, s_d1)
+
+
+def _bench_dim1_mxfp8_rceil(x, BLOCK_SIZE):
+    to_mx_dim1_reference_c = torch.compile(to_mx_dim1_reference)
+    y_d1, s_d1 = to_mx_dim1_reference_c(x, BLOCK_SIZE, ScaleCalculationMode.RCEIL)
+
+    for _ in range(2):
+        __ = to_mx_dim1_reference_c(x, BLOCK_SIZE)
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x, b: to_mx_dim1_reference_c(x, BLOCK_SIZE),
+        x,
+        BLOCK_SIZE,
+    )
+
+    assert y_d1.dtype == torch.float8_e4m3fn
+    assert s_d1.dtype == torch.float8_e8m0fnu
+    return time_us, _bytes_rw_quant(x, y_d1, s_d1)
+
+
+def _bench_dim1_mxfp8_triton_floor(x, BLOCK_SIZE):
+    y_d1, s_d1 = triton_to_mxfp8_dim1(
+        x, inner_block_size=BLOCK_SIZE, scaling_mode="floor"
+    )
+
+    for _ in range(2):
+        __ = triton_to_mxfp8_dim1(x, inner_block_size=BLOCK_SIZE, scaling_mode="floor")
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x, b: triton_to_mxfp8_dim1(
+            x, inner_block_size=BLOCK_SIZE, scaling_mode="floor"
+        ),
+        x,
+        BLOCK_SIZE,
+    )
+
+    assert y_d1.dtype == torch.float8_e4m3fn
+    assert s_d1.dtype == torch.float8_e8m0fnu
+    return time_us, _bytes_rw_quant(x, y_d1, s_d1)
+
+
+def _bench_dim1_mxfp8_triton_rceil(x, BLOCK_SIZE):
+    y_d1, s_d1 = triton_to_mxfp8_dim1(
+        x, inner_block_size=BLOCK_SIZE, scaling_mode="rceil"
+    )
+
+    for _ in range(2):
+        __ = triton_to_mxfp8_dim1(x, inner_block_size=BLOCK_SIZE, scaling_mode="rceil")
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x, b: triton_to_mxfp8_dim1(
+            x, inner_block_size=BLOCK_SIZE, scaling_mode="rceil"
+        ),
+        x,
+        BLOCK_SIZE,
+    )
+
+    assert y_d1.dtype == torch.float8_e4m3fn
+    assert s_d1.dtype == torch.float8_e8m0fnu
+    return time_us, _bytes_rw_quant(x, y_d1, s_d1)
+
+
+def _bench_dim1_mxfp8_cuda_floor(x, BLOCK_SIZE):
+    from torchao.prototype.mx_formats.kernels import mxfp8_quantize_cuda
+
+    _, y_d1, _, s_d1 = mxfp8_quantize_cuda(
+        x, rowwise=False, colwise=True, scaling_mode="floor"
+    )
+
+    for _ in range(2):
+        __ = mxfp8_quantize_cuda(x, rowwise=False, colwise=True, scaling_mode="floor")
+
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x: mxfp8_quantize_cuda(
+            x, rowwise=False, colwise=True, scaling_mode="floor"
+        ),
+        x,
+    )
+
+    assert y_d1.dtype == torch.float8_e4m3fn
+    assert s_d1.dtype == torch.float8_e8m0fnu
+    return time_us, _bytes_rw_quant(x, y_d1, s_d1)
+
+
+def _bench_dim1_mxfp8_cuda_rceil(x, BLOCK_SIZE):
+    from torchao.prototype.mx_formats.kernels import mxfp8_quantize_cuda
+
+    _, y_d1, _, s_d1 = mxfp8_quantize_cuda(
+        x, rowwise=False, colwise=True, scaling_mode="rceil"
+    )
+
+    for _ in range(2):
+        __ = mxfp8_quantize_cuda(x, rowwise=False, colwise=True, scaling_mode="rceil")
+
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x: mxfp8_quantize_cuda(
+            x, rowwise=False, colwise=True, scaling_mode="rceil"
+        ),
+        x,
+    )
+
+    assert y_d1.dtype == torch.float8_e4m3fn
+    assert s_d1.dtype == torch.float8_e8m0fnu
+    return time_us, _bytes_rw_quant(x, y_d1, s_d1)
+
+
+def _bench_dim0_mxfp8_cutedsl_2d_floor(x, BLOCK_SIZE):
+    from torchao.prototype.moe_training.kernels.mxfp8 import (
+        mxfp8_quantize_2d_1x32_cutedsl,
+    )
+
+    y_d0, s_d0 = mxfp8_quantize_2d_1x32_cutedsl(
+        x, block_size=BLOCK_SIZE, scaling_mode="floor"
+    )
+
+    for _ in range(2):
+        __ = mxfp8_quantize_2d_1x32_cutedsl(
+            x, block_size=BLOCK_SIZE, scaling_mode="floor"
+        )
+
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x: mxfp8_quantize_2d_1x32_cutedsl(
+            x, block_size=BLOCK_SIZE, scaling_mode="floor"
+        ),
+        x,
+    )
+
+    assert y_d0.dtype == torch.float8_e4m3fn
+    assert s_d0.dtype == torch.float8_e8m0fnu
+    return time_us, _bytes_rw_quant(x, y_d0, s_d0)
+
+
+def _bench_dim0_mxfp8_cutedsl_2d_rceil(x, BLOCK_SIZE):
+    from torchao.prototype.moe_training.kernels.mxfp8 import (
+        mxfp8_quantize_2d_1x32_cutedsl,
+    )
+
+    y_d0, s_d0 = mxfp8_quantize_2d_1x32_cutedsl(
+        x, block_size=BLOCK_SIZE, scaling_mode="rceil"
+    )
+
+    for _ in range(2):
+        __ = mxfp8_quantize_2d_1x32_cutedsl(
+            x, block_size=BLOCK_SIZE, scaling_mode="rceil"
+        )
+
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x: mxfp8_quantize_2d_1x32_cutedsl(
+            x, block_size=BLOCK_SIZE, scaling_mode="rceil"
+        ),
+        x,
+    )
+
+    assert y_d0.dtype == torch.float8_e4m3fn
+    assert s_d0.dtype == torch.float8_e8m0fnu
+    return time_us, _bytes_rw_quant(x, y_d0, s_d0)
+
+
+def _bench_dim1_mxfp8_cutedsl_2d_floor(x, BLOCK_SIZE):
+    from torchao.prototype.moe_training.kernels.mxfp8 import (
+        mxfp8_quantize_2d_32x1_cutedsl,
+    )
+
+    y_d0, s_d0 = mxfp8_quantize_2d_32x1_cutedsl(
+        x, block_size=BLOCK_SIZE, scaling_mode="floor", blocked_scale_output=True
+    )
+
+    for _ in range(2):
+        __ = mxfp8_quantize_2d_32x1_cutedsl(
+            x,
+            block_size=BLOCK_SIZE,
+            scaling_mode="floor",
+            blocked_scale_output=True,
+        )
+
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x: mxfp8_quantize_2d_32x1_cutedsl(
+            x,
+            block_size=BLOCK_SIZE,
+            scaling_mode="floor",
+            blocked_scale_output=True,
+        ),
+        x,
+    )
+
+    assert y_d0.dtype == torch.float8_e4m3fn
+    assert s_d0.dtype == torch.float8_e8m0fnu
+    return time_us, _bytes_rw_quant(x, y_d0, s_d0)
+
+
+def _bench_dim1_mxfp8_cutedsl_2d_rceil(x, BLOCK_SIZE):
+    from torchao.prototype.moe_training.kernels.mxfp8 import (
+        mxfp8_quantize_2d_32x1_cutedsl,
+    )
+
+    y_d0, s_d0 = mxfp8_quantize_2d_32x1_cutedsl(
+        x, block_size=BLOCK_SIZE, scaling_mode="rceil", blocked_scale_output=True
+    )
+
+    for _ in range(2):
+        __ = mxfp8_quantize_2d_32x1_cutedsl(
+            x,
+            block_size=BLOCK_SIZE,
+            scaling_mode="rceil",
+            blocked_scale_output=True,
+        )
+
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda x: mxfp8_quantize_2d_32x1_cutedsl(
+            x,
+            block_size=BLOCK_SIZE,
+            scaling_mode="rceil",
+            blocked_scale_output=True,
+        ),
+        x,
+    )
+
+    assert y_d0.dtype == torch.float8_e4m3fn
+    assert s_d0.dtype == torch.float8_e8m0fnu
+    return time_us, _bytes_rw_quant(x, y_d0, s_d0)
+
+
+# Maps each supported mode to the function that runs its benchmark. Each handler
+# takes (x, BLOCK_SIZE) and returns (time_us, bytes_read_plus_written).
+_MODE_TO_BENCH = {
+    "memcpy": _bench_memcpy,
+    "dim0": _bench_dim0,
+    "dim1": _bench_dim1,
+    "dim0_dim1": _bench_dim0_dim1,
+    "dim0_mxfp8_floor": _bench_dim0_mxfp8_floor,
+    "dim0_mxfp4_floor": _bench_dim0_mxfp4_floor,
+    "dim0_mxfp8_rceil": _bench_dim0_mxfp8_rceil,
+    "dim0_mxfp8_triton_floor": _bench_dim0_mxfp8_triton_floor,
+    "dim0_mxfp8_triton_rceil": _bench_dim0_mxfp8_triton_rceil,
+    "dim0_nvfp4": _bench_dim0_nvfp4,
+    "dim0_nvfp4_triton_swizzle": _bench_dim0_nvfp4_triton_swizzle,
+    "dim1_mxfp8_floor": _bench_dim1_mxfp8_floor,
+    "dim1_mxfp8_rceil": _bench_dim1_mxfp8_rceil,
+    "dim1_mxfp8_triton_floor": _bench_dim1_mxfp8_triton_floor,
+    "dim1_mxfp8_triton_rceil": _bench_dim1_mxfp8_triton_rceil,
+    "dim1_mxfp8_cuda_floor": _bench_dim1_mxfp8_cuda_floor,
+    "dim1_mxfp8_cuda_rceil": _bench_dim1_mxfp8_cuda_rceil,
+    "dim0_mxfp8_cutedsl_2d_floor": _bench_dim0_mxfp8_cutedsl_2d_floor,
+    "dim0_mxfp8_cutedsl_2d_rceil": _bench_dim0_mxfp8_cutedsl_2d_rceil,
+    "dim1_mxfp8_cutedsl_2d_floor": _bench_dim1_mxfp8_cutedsl_2d_floor,
+    "dim1_mxfp8_cutedsl_2d_rceil": _bench_dim1_mxfp8_cutedsl_2d_rceil,
+}
+
+
 def run(
     M: int = 16384,
     K: int = 16384,
@@ -108,497 +571,12 @@ def run(
     print(f"torch version: {torch.__version__}")
     print(f"triton version: {triton.__version__}")
     print(f"mode: {mode}")
-    assert mode in (
-        "memcpy",
-        "dim0",
-        "dim1",
-        "dim0_dim1",
-        "dim0_mxfp8_floor",
-        "dim0_mxfp4_floor",
-        "dim0_mxfp8_rceil",
-        "dim0_mxfp8_triton_floor",
-        "dim0_mxfp8_triton_rceil",
-        "dim0_nvfp4",
-        "dim0_nvfp4_triton_swizzle",
-        "dim1_mxfp8_floor",
-        "dim1_mxfp8_rceil",
-        "dim1_mxfp8_triton_floor",
-        "dim1_mxfp8_triton_rceil",
-        "dim1_mxfp8_cuda_floor",
-        "dim1_mxfp8_cuda_rceil",
-        "dim0_mxfp8_cutedsl_2d_floor",
-        "dim0_mxfp8_cutedsl_2d_rceil",
-        "dim1_mxfp8_cutedsl_2d_floor",
-        "dim1_mxfp8_cutedsl_2d_rceil",
-    )
+    assert mode in _MODE_TO_BENCH, f"unknown mode {mode}"
 
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 1000
 
-    if mode == "memcpy":
-        # Baseline memcpy benchmark to establish max achievable bandwidth
-        y = torch.randn_like(x)
-
-        # Warmup
-        for _ in range(2):
-            y.copy_(x)
-
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda src, dst: dst.copy_(src),
-            x,
-            y,
-        )
-
-        # bytes_read + bytes_written
-        bytes_rw = 2 * x.numel() * bytes_per_el_bf16
-        bps = bytes_rw / (time_us / 1e6)
-
-    elif mode == "dim0":
-        scale_dim0_reference_c = torch.compile(scale_dim0_reference)
-        y_d0, s_d0 = scale_dim0_reference_c(x, BLOCK_SIZE)
-
-        for _ in range(2):
-            __ = scale_dim0_reference_c(x, BLOCK_SIZE)
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x, b: scale_dim0_reference_c(x, BLOCK_SIZE),
-            x,
-            BLOCK_SIZE,
-        )
-
-        assert y_d0.dtype == torch.bfloat16
-        assert s_d0.dtype == torch.bfloat16
-        bytes_rw = sum(t.numel() for t in [x, y_d0, s_d0]) * bytes_per_el_bf16
-        bps = bytes_rw / (time_us / 1e6)
-
-    elif mode == "dim1":
-        scale_dim1_reference_c = torch.compile(scale_dim1_reference)
-        y_d1, s_d1 = scale_dim1_reference_c(x, BLOCK_SIZE)
-
-        for _ in range(2):
-            __ = scale_dim1_reference_c(x, BLOCK_SIZE)
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x, b: scale_dim1_reference_c(x, BLOCK_SIZE),
-            x,
-            BLOCK_SIZE,
-        )
-
-        assert y_d1.dtype == torch.bfloat16
-        assert s_d1.dtype == torch.bfloat16
-        bytes_rw = sum(t.numel() for t in [x, y_d1, s_d1]) * bytes_per_el_bf16
-        bps = bytes_rw / (time_us / 1e6)
-
-    elif mode == "dim0_dim1":
-        scale_dim0_dim1_reference_c = torch.compile(scale_dim0_dim1_reference)
-        y_d0, y_d1, s_d0, s_d1 = scale_dim0_dim1_reference_c(x, BLOCK_SIZE)
-
-        for _ in range(2):
-            __ = scale_dim0_dim1_reference_c(x, BLOCK_SIZE)
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x, b: scale_dim0_dim1_reference_c(x, BLOCK_SIZE),
-            x,
-            BLOCK_SIZE,
-        )
-
-        assert y_d0.dtype == torch.bfloat16
-        assert s_d0.dtype == torch.bfloat16
-        assert y_d1.dtype == torch.bfloat16
-        assert s_d1.dtype == torch.bfloat16
-        bytes_rw = (
-            sum(t.numel() for t in [x, y_d0, y_d1, s_d0, s_d1]) * bytes_per_el_bf16
-        )
-        bps = bytes_rw / (time_us / 1e6)
-
-    elif mode == "dim0_mxfp8_floor":
-        to_mx_dim0_reference_c = torch.compile(to_mx_dim0_reference)
-        y_d0, s_d0 = to_mx_dim0_reference_c(x, BLOCK_SIZE)
-
-        for _ in range(2):
-            __ = to_mx_dim0_reference_c(x, BLOCK_SIZE)
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x, b: to_mx_dim0_reference_c(x, BLOCK_SIZE),
-            x,
-            BLOCK_SIZE,
-        )
-
-        assert y_d0.dtype == torch.float8_e4m3fn
-        assert s_d0.dtype == torch.float8_e8m0fnu
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d0.numel() + s_d0.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-
-    elif mode == "dim0_mxfp4_floor":
-        to_mx_dim0_reference_c = torch.compile(to_mx_dim0_reference)
-        y_d0, s_d0 = to_mx_dim0_reference_c(
-            x, BLOCK_SIZE, target_dtype=torch.float4_e2m1fn_x2
-        )
-
-        for _ in range(2):
-            __ = to_mx_dim0_reference_c(
-                x, BLOCK_SIZE, target_dtype=torch.float4_e2m1fn_x2
-            )
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x, b: to_mx_dim0_reference_c(
-                x, BLOCK_SIZE, target_dtype=torch.float4_e2m1fn_x2
-            ),
-            x,
-            BLOCK_SIZE,
-        )
-
-        # TODO(future PR): make to_mx return float4 directly
-        assert y_d0.dtype == torch.uint8
-        assert s_d0.dtype == torch.float8_e8m0fnu
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d0.numel() + s_d0.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-
-    elif mode == "dim0_mxfp8_rceil":
-        to_mx_dim0_reference_c = torch.compile(to_mx_dim0_reference)
-        y_d0, s_d0 = to_mx_dim0_reference_c(x, BLOCK_SIZE, ScaleCalculationMode.RCEIL)
-
-        for _ in range(2):
-            __ = to_mx_dim0_reference_c(x, BLOCK_SIZE, ScaleCalculationMode.RCEIL)
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x, b: to_mx_dim0_reference_c(
-                x, BLOCK_SIZE, ScaleCalculationMode.RCEIL
-            ),
-            x,
-            BLOCK_SIZE,
-        )
-
-        assert y_d0.dtype == torch.float8_e4m3fn
-        assert s_d0.dtype == torch.float8_e8m0fnu
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d0.numel() + s_d0.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-
-    elif mode == "dim0_mxfp8_triton_floor":
-        y_d0, s_d0 = triton_to_mxfp8_dim0(x, inner_block_size=BLOCK_SIZE)
-
-        for _ in range(2):
-            __ = triton_to_mxfp8_dim0(
-                x, inner_block_size=BLOCK_SIZE, scaling_mode="floor"
-            )
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x, b: triton_to_mxfp8_dim0(
-                x, inner_block_size=BLOCK_SIZE, scaling_mode="floor"
-            ),
-            x,
-            BLOCK_SIZE,
-        )
-        assert y_d0.dtype == torch.float8_e4m3fn
-        assert s_d0.dtype == torch.float8_e8m0fnu
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d0.numel() + s_d0.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-
-    elif mode == "dim0_mxfp8_triton_rceil":
-        y_d0, s_d0 = triton_to_mxfp8_dim0(x, inner_block_size=BLOCK_SIZE)
-
-        for _ in range(2):
-            __ = triton_to_mxfp8_dim0(
-                x, inner_block_size=BLOCK_SIZE, scaling_mode="rceil"
-            )
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x, b: triton_to_mxfp8_dim0(
-                x, inner_block_size=BLOCK_SIZE, scaling_mode="rceil"
-            ),
-            x,
-            BLOCK_SIZE,
-        )
-        assert y_d0.dtype == torch.float8_e4m3fn
-        assert s_d0.dtype == torch.float8_e8m0fnu
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d0.numel() + s_d0.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-
-    elif mode == "dim0_nvfp4":
-        to_nvfp4_reference_c = torch.compile(to_nvfp4_reference)
-        y_d0, s_d0 = to_nvfp4_reference_c(x, use_triton_kernel=False)
-
-        for _ in range(2):
-            __ = to_nvfp4_reference_c(x, use_triton_kernel=False)
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x: to_nvfp4_reference_c(x, use_triton_kernel=False),
-            x,
-        )
-        assert y_d0.dtype == torch.uint8
-        assert s_d0.dtype == torch.float8_e4m3fn
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d0.numel() + s_d0.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-
-    elif mode == "dim0_nvfp4_triton_swizzle":
-        y_d0, s_d0 = to_nvfp4_reference_triton_swizzle(x)
-
-        for _ in range(2):
-            __ = to_nvfp4_reference_triton_swizzle(x)
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x: to_nvfp4_reference_triton_swizzle(x),
-            x,
-        )
-        assert y_d0.dtype == torch.uint8
-        assert s_d0.dtype == torch.float8_e4m3fn
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d0.numel() + s_d0.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-
-    elif mode == "dim1_mxfp8_floor":
-        to_mx_dim1_reference_c = torch.compile(to_mx_dim1_reference)
-        y_d1, s_d1 = to_mx_dim1_reference_c(x, BLOCK_SIZE)
-
-        for _ in range(2):
-            __ = to_mx_dim1_reference_c(x, BLOCK_SIZE)
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x, b: to_mx_dim1_reference_c(x, BLOCK_SIZE),
-            x,
-            BLOCK_SIZE,
-        )
-
-        assert y_d1.dtype == torch.float8_e4m3fn
-        assert s_d1.dtype == torch.float8_e8m0fnu
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d1.numel() + s_d1.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-
-    elif mode == "dim1_mxfp8_rceil":
-        to_mx_dim1_reference_c = torch.compile(to_mx_dim1_reference)
-        y_d1, s_d1 = to_mx_dim1_reference_c(x, BLOCK_SIZE, ScaleCalculationMode.RCEIL)
-
-        for _ in range(2):
-            __ = to_mx_dim1_reference_c(x, BLOCK_SIZE)
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x, b: to_mx_dim1_reference_c(x, BLOCK_SIZE),
-            x,
-            BLOCK_SIZE,
-        )
-
-        assert y_d1.dtype == torch.float8_e4m3fn
-        assert s_d1.dtype == torch.float8_e8m0fnu
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d1.numel() + s_d1.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-
-    elif mode == "dim1_mxfp8_triton_floor":
-        y_d1, s_d1 = triton_to_mxfp8_dim1(
-            x, inner_block_size=BLOCK_SIZE, scaling_mode="floor"
-        )
-
-        for _ in range(2):
-            __ = triton_to_mxfp8_dim1(
-                x, inner_block_size=BLOCK_SIZE, scaling_mode="floor"
-            )
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x, b: triton_to_mxfp8_dim1(
-                x, inner_block_size=BLOCK_SIZE, scaling_mode="floor"
-            ),
-            x,
-            BLOCK_SIZE,
-        )
-
-        assert y_d1.dtype == torch.float8_e4m3fn
-        assert s_d1.dtype == torch.float8_e8m0fnu
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d1.numel() + s_d1.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-
-    elif mode == "dim1_mxfp8_triton_rceil":
-        y_d1, s_d1 = triton_to_mxfp8_dim1(
-            x, inner_block_size=BLOCK_SIZE, scaling_mode="rceil"
-        )
-
-        for _ in range(2):
-            __ = triton_to_mxfp8_dim1(
-                x, inner_block_size=BLOCK_SIZE, scaling_mode="rceil"
-            )
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x, b: triton_to_mxfp8_dim1(
-                x, inner_block_size=BLOCK_SIZE, scaling_mode="rceil"
-            ),
-            x,
-            BLOCK_SIZE,
-        )
-
-        assert y_d1.dtype == torch.float8_e4m3fn
-        assert s_d1.dtype == torch.float8_e8m0fnu
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d1.numel() + s_d1.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-
-    elif mode == "dim1_mxfp8_cuda_floor":
-        from torchao.prototype.mx_formats.kernels import mxfp8_quantize_cuda
-
-        _, y_d1, _, s_d1 = mxfp8_quantize_cuda(
-            x, rowwise=False, colwise=True, scaling_mode="floor"
-        )
-
-        for _ in range(2):
-            __ = mxfp8_quantize_cuda(
-                x, rowwise=False, colwise=True, scaling_mode="floor"
-            )
-
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x: mxfp8_quantize_cuda(
-                x, rowwise=False, colwise=True, scaling_mode="floor"
-            ),
-            x,
-        )
-
-        assert y_d1.dtype == torch.float8_e4m3fn
-        assert s_d1.dtype == torch.float8_e8m0fnu
-
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d1.numel() + s_d1.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-
-    elif mode == "dim1_mxfp8_cuda_rceil":
-        from torchao.prototype.mx_formats.kernels import mxfp8_quantize_cuda
-
-        _, y_d1, _, s_d1 = mxfp8_quantize_cuda(
-            x, rowwise=False, colwise=True, scaling_mode="rceil"
-        )
-
-        for _ in range(2):
-            __ = mxfp8_quantize_cuda(
-                x, rowwise=False, colwise=True, scaling_mode="rceil"
-            )
-
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x: mxfp8_quantize_cuda(
-                x, rowwise=False, colwise=True, scaling_mode="rceil"
-            ),
-            x,
-        )
-
-        assert y_d1.dtype == torch.float8_e4m3fn
-        assert s_d1.dtype == torch.float8_e8m0fnu
-
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d1.numel() + s_d1.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-
-    elif mode == "dim0_mxfp8_cutedsl_2d_floor":
-        from torchao.prototype.moe_training.kernels.mxfp8 import (
-            mxfp8_quantize_2d_1x32_cutedsl,
-        )
-
-        y_d0, s_d0 = mxfp8_quantize_2d_1x32_cutedsl(
-            x, block_size=BLOCK_SIZE, scaling_mode="floor"
-        )
-
-        for _ in range(2):
-            __ = mxfp8_quantize_2d_1x32_cutedsl(
-                x, block_size=BLOCK_SIZE, scaling_mode="floor"
-            )
-
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x: mxfp8_quantize_2d_1x32_cutedsl(
-                x, block_size=BLOCK_SIZE, scaling_mode="floor"
-            ),
-            x,
-        )
-
-        assert y_d0.dtype == torch.float8_e4m3fn
-        assert s_d0.dtype == torch.float8_e8m0fnu
-
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d0.numel() + s_d0.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-
-    elif mode == "dim0_mxfp8_cutedsl_2d_rceil":
-        from torchao.prototype.moe_training.kernels.mxfp8 import (
-            mxfp8_quantize_2d_1x32_cutedsl,
-        )
-
-        y_d0, s_d0 = mxfp8_quantize_2d_1x32_cutedsl(
-            x, block_size=BLOCK_SIZE, scaling_mode="rceil"
-        )
-
-        for _ in range(2):
-            __ = mxfp8_quantize_2d_1x32_cutedsl(
-                x, block_size=BLOCK_SIZE, scaling_mode="rceil"
-            )
-
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x: mxfp8_quantize_2d_1x32_cutedsl(
-                x, block_size=BLOCK_SIZE, scaling_mode="rceil"
-            ),
-            x,
-        )
-
-        assert y_d0.dtype == torch.float8_e4m3fn
-        assert s_d0.dtype == torch.float8_e8m0fnu
-
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d0.numel() + s_d0.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-    elif mode == "dim1_mxfp8_cutedsl_2d_floor":
-        from torchao.prototype.moe_training.kernels.mxfp8 import (
-            mxfp8_quantize_2d_32x1_cutedsl,
-        )
-
-        y_d0, s_d0 = mxfp8_quantize_2d_32x1_cutedsl(
-            x, block_size=BLOCK_SIZE, scaling_mode="floor", blocked_scale_output=True
-        )
-
-        for _ in range(2):
-            __ = mxfp8_quantize_2d_32x1_cutedsl(
-                x,
-                block_size=BLOCK_SIZE,
-                scaling_mode="floor",
-                blocked_scale_output=True,
-            )
-
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x: mxfp8_quantize_2d_32x1_cutedsl(
-                x,
-                block_size=BLOCK_SIZE,
-                scaling_mode="floor",
-                blocked_scale_output=True,
-            ),
-            x,
-        )
-
-        assert y_d0.dtype == torch.float8_e4m3fn
-        assert s_d0.dtype == torch.float8_e8m0fnu
-
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d0.numel() + s_d0.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-
-    elif mode == "dim1_mxfp8_cutedsl_2d_rceil":
-        from torchao.prototype.moe_training.kernels.mxfp8 import (
-            mxfp8_quantize_2d_32x1_cutedsl,
-        )
-
-        y_d0, s_d0 = mxfp8_quantize_2d_32x1_cutedsl(
-            x, block_size=BLOCK_SIZE, scaling_mode="rceil", blocked_scale_output=True
-        )
-
-        for _ in range(2):
-            __ = mxfp8_quantize_2d_32x1_cutedsl(
-                x,
-                block_size=BLOCK_SIZE,
-                scaling_mode="rceil",
-                blocked_scale_output=True,
-            )
-
-        time_us = benchmark_cuda_function_in_microseconds(
-            lambda x: mxfp8_quantize_2d_32x1_cutedsl(
-                x,
-                block_size=BLOCK_SIZE,
-                scaling_mode="rceil",
-                blocked_scale_output=True,
-            ),
-            x,
-        )
-
-        assert y_d0.dtype == torch.float8_e4m3fn
-        assert s_d0.dtype == torch.float8_e8m0fnu
-
-        bytes_r = x.numel() * bytes_per_el_bf16
-        bytes_w = (y_d0.numel() + s_d0.numel()) * bytes_per_el_fp8
-        bps = (bytes_r + bytes_w) / (time_us / 1e6)
-    else:
-        raise AssertionError(f"unknown mode {mode}")
+    time_us, bytes_rw = _MODE_TO_BENCH[mode](x, BLOCK_SIZE)
+    bps = bytes_rw / (time_us / 1e6)
 
     print("time_us", time_us)
     print("mem_bw_gbps", bps / 1e9)
