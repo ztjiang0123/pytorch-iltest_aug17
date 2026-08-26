@@ -10,6 +10,7 @@ import gc
 import subprocess
 import time
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Any, List, Optional
 
 import torch
@@ -297,6 +298,27 @@ OLMOE_EXPERT_FQN_PATTERNS = (
 )
 
 
+@dataclass
+class QuantJob:
+    """Shared state for one quantization run.
+
+    Bundling these values keeps each helper's signature small instead of
+    threading the same handful of arguments through every call.
+    """
+
+    args: Any
+    is_olmoe: bool
+    filter_fn: Any
+    model: Any = None
+    tokenizer: Any = None
+    max_seq_length: Optional[int] = None
+    output_dir: str = ""
+    # Exactly one of these is populated: base_config for GPTQ flows, config for
+    # RTN flows. Whichever is set is used to attach quantization metadata on save.
+    base_config: Any = None
+    config: Any = None
+
+
 def _verify_olmoe_experts_quantized(model):
     """Assert every OlmoeExperts module has NVFP4Tensor for both expert weights."""
     from transformers.models.olmoe.modeling_olmoe import OlmoeExperts
@@ -390,8 +412,9 @@ def _quantize_model(model, config, is_olmoe, filter_fn):
         quantize_(model, config, filter_fn=filter_fn)
 
 
-def _apply_rtn_quantization(model, args, is_olmoe, filter_fn):
-    """Apply round-to-nearest quantization. Returns the config used."""
+def _apply_rtn_quantization(job):
+    """Apply round-to-nearest quantization. Stores the config used on ``job``."""
+    args, model, filter_fn = job.args, job.model, job.filter_fn
     if args.quantization == "int4-rtn":
         print("Applying Int4 RTN (Round-To-Nearest) quantization...")
         config = Int4WeightOnlyConfig(group_size=args.group_size)
@@ -407,13 +430,14 @@ def _apply_rtn_quantization(model, args, is_olmoe, filter_fn):
             use_triton_kernel=True,
         )
         # OLMoE verification prints the model itself.
-        _quantize_model(model, config, is_olmoe, filter_fn)
+        _quantize_model(model, config, job.is_olmoe, filter_fn)
         print(model)
-    return config
+    job.config = config
 
 
-def _apply_gptq_quantization(model, tokenizer, args, is_olmoe, filter_fn, max_seq_length):
-    """Run the GPTQ observe/convert flow. Returns the base config used."""
+def _apply_gptq_quantization(job):
+    """Run the GPTQ observe/convert flow. Stores the base config on ``job``."""
+    args, model = job.args, job.model
     base_config, quant_type = _make_base_config(args.quantization, args.group_size)
 
     # First application: wrap weights with GPTQObserverTensor (observe step)
@@ -424,7 +448,7 @@ def _apply_gptq_quantization(model, tokenizer, args, is_olmoe, filter_fn, max_se
         percdamp=args.percdamp,
         gptq_quantize_block_size=args.gptq_block_size,
     )
-    if is_olmoe:
+    if job.is_olmoe:
         quantize_(
             model,
             FqnToConfig(
@@ -433,7 +457,7 @@ def _apply_gptq_quantization(model, tokenizer, args, is_olmoe, filter_fn, max_se
             filter_fn=None,
         )
     else:
-        quantize_(model, observe_config, filter_fn=filter_fn)
+        quantize_(model, observe_config, filter_fn=job.filter_fn)
     print(model)
 
     # Prepare calibration dataset
@@ -442,8 +466,8 @@ def _apply_gptq_quantization(model, tokenizer, args, is_olmoe, filter_fn, max_se
         f"{args.dataset_id}..."
     )
     dataset = prepare_dataset(
-        tokenizer,
-        max_seq_length,
+        job.tokenizer,
+        job.max_seq_length,
         args.num_calibration_samples,
         dataset_id=args.dataset_id,
         dataset_split=args.dataset_split,
@@ -459,19 +483,18 @@ def _apply_gptq_quantization(model, tokenizer, args, is_olmoe, filter_fn, max_se
     )
 
     if "nonsequential" in args.quantization:
-        _apply_gptq_nonsequential(model, dataset, convert_config, args, is_olmoe, filter_fn, quant_type)
+        _apply_gptq_nonsequential(job, dataset, convert_config, quant_type)
     else:  # sequential
         print(f"Applying {quant_type} GPTQ quantization (sequential)...")
         assert not args.o_proj_only, "unsupported"
         sequential_quantize(model, dataset, convert_config)
 
-    return base_config
+    job.base_config = base_config
 
 
-def _apply_gptq_nonsequential(
-    model, dataset, convert_config, args, is_olmoe, filter_fn, quant_type
-):
+def _apply_gptq_nonsequential(job, dataset, convert_config, quant_type):
     """Calibrate on the dataset and apply the GPTQ convert step in one pass."""
+    model = job.model
     print(f"Applying {quant_type} GPTQ quantization (non-sequential)...")
     # Get device for input (from embedding layer, supports device_map="auto")
     input_device = next(model.model.embed_tokens.parameters()).device
@@ -489,7 +512,7 @@ def _apply_gptq_nonsequential(
     print(f"Total GPTQ weights to convert: {num_gptq_weights}")
 
     # Apply quantization
-    _quantize_model(model, convert_config, is_olmoe, filter_fn)
+    _quantize_model(model, convert_config, job.is_olmoe, job.filter_fn)
 
 
 def _check_nvfp4_serialization_support(is_olmoe):
@@ -568,25 +591,35 @@ def _load_model_and_tokenizer(args, is_olmoe):
     return model, tokenizer, max_seq_length
 
 
-def _save_quantized_model(model, tokenizer, args, is_olmoe, base_config, config, output_dir):
+def _save_quantized_model(job):
     """Attach quantization metadata (if any) and write the model to disk."""
+    args, model, output_dir = job.args, job.model, job.output_dir
     print(f"Saving model to {output_dir}...")
-    tokenizer.save_pretrained(output_dir)
+    job.tokenizer.save_pretrained(output_dir)
     print(model)
 
     if "nvfp4" in args.quantization:
-        _check_nvfp4_serialization_support(is_olmoe)
+        _check_nvfp4_serialization_support(job.is_olmoe)
 
     if args.quantization != "none":
         # Attach hf_quantizer so save_pretrained uses the flatten path for tensor
         # subclasses (e.g. NVFP4Tensor) that don't have a valid storage pointer.
-        ao_config = base_config if "gptq" in args.quantization else config
+        ao_config = job.base_config if "gptq" in args.quantization else job.config
         torchao_config = TorchAoConfig(quant_type=ao_config)
         model.config.quantization_config = torchao_config
         model.hf_quantizer = TorchAoHfQuantizer(torchao_config)
 
     model.save_pretrained(output_dir, safe_serialization=False)
     print("DONE!")
+
+
+def _run_quantization(job):
+    """Dispatch to the RTN or GPTQ flow based on the requested method."""
+    quantization = job.args.quantization
+    if quantization in ("int4-rtn", "int8-rtn", "nvfp4-rtn"):
+        _apply_rtn_quantization(job)
+    elif quantization in GPTQ_QUANTIZATIONS:
+        _apply_gptq_quantization(job)
 
 
 def main():
@@ -597,23 +630,20 @@ def main():
 
     model, tokenizer, max_seq_length = _load_model_and_tokenizer(args, is_olmoe)
 
-    output_dir = _build_output_dir(args)
-    print(f"Output directory: {output_dir}")
+    job = QuantJob(
+        args=args,
+        is_olmoe=is_olmoe,
+        filter_fn=_make_filter_fn(args),
+        model=model,
+        tokenizer=tokenizer,
+        max_seq_length=max_seq_length,
+        output_dir=_build_output_dir(args),
+    )
+    print(f"Output directory: {job.output_dir}")
 
     # Handle different quantization methods
     quantization_start_time = time.time()
-    filter_fn = _make_filter_fn(args)
-
-    # base_config is only set for GPTQ flows; config only for RTN flows. The one
-    # that is populated is later used to attach quantization metadata on save.
-    base_config = None
-    config = None
-    if args.quantization in ("int4-rtn", "int8-rtn", "nvfp4-rtn"):
-        config = _apply_rtn_quantization(model, args, is_olmoe, filter_fn)
-    elif args.quantization in GPTQ_QUANTIZATIONS:
-        base_config = _apply_gptq_quantization(
-            model, tokenizer, args, is_olmoe, filter_fn, max_seq_length
-        )
+    _run_quantization(job)
 
     if is_olmoe:
         # generate() switches to batched_mm for decoding, which doesn't support
@@ -630,21 +660,20 @@ def main():
         )
         print(f"{'=' * 60}\n")
 
-    _save_quantized_model(
-        model, tokenizer, args, is_olmoe, base_config, config, output_dir
-    )
+    _save_quantized_model(job)
+    output_dir = job.output_dir
 
     # Clear GPU memory before running lm_eval
     print("\nClearing GPU memory...")
     del model
     del tokenizer
+    del job
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     print("GPU memory cleared.")
 
     _run_lm_eval(args, output_dir)
-
 
 
 if __name__ == "__main__":
