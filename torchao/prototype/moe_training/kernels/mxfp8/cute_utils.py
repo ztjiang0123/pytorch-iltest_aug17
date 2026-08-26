@@ -231,8 +231,7 @@ if _cutedsl_runtime_available():
     @cute.jit
     def store_scales_reg_to_gmem_vec(
         scales_tensor: cute.Tensor,
-        lane_coord: cutlass.Int64,
-        block_base: cutlass.Int64,
+        store_coord: tuple,
         scale_buffer: cute.Tensor,
         num_scales: cutlass.Int32,
         BLOCKED_SCALE_OUTPUT: cutlass.Constexpr[bool],
@@ -248,8 +247,9 @@ if _cutedsl_runtime_available():
 
         Args:
             scales_tensor: Output scales in global memory
-            lane_coord: Global coordinate of the lane axis (M for 1x32, K for 32x1)
-            block_base: Starting block index along the quantized axis
+            store_coord: ``(lane_coord, block_base)`` where ``lane_coord`` is the
+                global coordinate of the lane axis (M for 1x32, K for 32x1) and
+                ``block_base`` is the starting block index along the quantized axis
             scale_buffer: Buffer of scales in register memory (uint8)
             num_scales: Number of scales to store
             BLOCKED_SCALE_OUTPUT: Whether using blocked layout (enables vectorization)
@@ -258,6 +258,7 @@ if _cutedsl_runtime_available():
             Input: scale_buffer (registers)
             Output: scales_tensor (global memory)
         """
+        lane_coord, block_base = store_coord
         if cutlass.const_expr(BLOCKED_SCALE_OUTPUT):
             # Blocked layout with 4 contiguous scales - write as uint32
             if num_scales == 4:
@@ -480,8 +481,7 @@ if _cutedsl_runtime_available():
             )
         store_scales_reg_to_gmem_vec(
             state.scales_tensor,
-            lane_global,
-            tile_eff * axis.blocks_per_tile,
+            (lane_global, tile_eff * axis.blocks_per_tile),
             scale_buffer,
             cutlass.Int32(axis.blocks_per_tile),
             opts.blocked_scale_output,
@@ -526,8 +526,7 @@ if _cutedsl_runtime_available():
         if num_valid_scales > 0:
             store_scales_reg_to_gmem_vec(
                 state.scales_tensor,
-                lane_global,
-                tile_eff * axis.blocks_per_tile,
+                (lane_global, tile_eff * axis.blocks_per_tile),
                 scale_buffer,
                 num_valid_scales,
                 opts.blocked_scale_output,
