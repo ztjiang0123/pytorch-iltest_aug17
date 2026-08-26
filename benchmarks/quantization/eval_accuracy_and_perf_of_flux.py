@@ -628,47 +628,44 @@ def _run_accuracy_generation(ctx, baseline_data):
     return lpips_values, times
 
 
-def _write_accuracy_rows(writer, stats):
-    """Write the accuracy-specific rows of a per-rank summary CSV."""
-    writer.writerow(["prompts_tested", stats["prompts_tested"]])
-    writer.writerow(["average_lpips", f"{stats['avg_lpips']:.4f}"])
-    writer.writerow(["max_lpips", f"{stats['max_lpips']:.4f}"])
-    writer.writerow(["min_lpips", f"{stats['min_lpips']:.4f}"])
-    for idx, val in enumerate(stats["lpips_values"]):
-        writer.writerow([f"lpips_prompt_{idx}", f"{val:.4f}"])
-    writer.writerow(["average_baseline_time", f"{stats['avg_baseline_time']:.4f}"])
-    writer.writerow(["average_quantized_time", f"{stats['avg_quant_time']:.4f}"])
+def _write_summary_rows(writer, rows):
+    """Write an ordered list of summary rows.
+
+    Each row is either a scalar ``("scalar", key, value)`` or an enumerated
+    ``("series", prefix, values)`` that expands to ``{prefix}{idx}`` rows. This
+    single writer serves every mode, so accuracy/performance layouts stay in
+    their callers as data rather than as near-duplicate writer functions.
+    """
+    for row in rows:
+        kind = row[0]
+        if kind == "scalar":
+            _, key, value = row
+            writer.writerow([key, value])
+        else:  # "series"
+            _, prefix, values = row
+            for idx, val in enumerate(values):
+                writer.writerow([f"{prefix}{idx}", f"{val:.4f}"])
 
 
-def _write_performance_rows(writer, stats):
-    """Write the performance-specific rows of a per-rank summary CSV."""
-    writer.writerow(["perf_n_iter", stats["perf_n_iter"]])
-    writer.writerow(["batch_size", stats["batch_size"]])
-    writer.writerow(["average_time", f"{stats['avg_time']:.4f}"])
-    for idx, val in enumerate(stats["times"]):
-        writer.writerow([f"time_{idx}", f"{val:.4f}"])
+def _save_summary_csv(ctx, mode, rows):
+    """Write the per-rank summary stats CSV for accuracy/performance modes.
 
-
-def _save_summary_csv(ctx, mode, stats):
-    """Write the per-rank summary stats CSV for accuracy/performance modes."""
+    ``rows`` is the ordered, mode-specific body built by the caller; the common
+    header rows are written here.
+    """
     summary_csv_path = os.path.join(
         ctx.output_dir,
         f"summary_stats_prompt_mode_{mode}_config_str_{ctx.quant_config_str}_rank_{ctx.local_rank}.csv",
     )
+    header = [
+        ("scalar", "metric", "value"),
+        ("scalar", "mode", mode),
+        ("scalar", "local_rank", ctx.local_rank),
+        ("scalar", "world_size", ctx.world_size),
+    ]
     with open(summary_csv_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["metric", "value"])
-        writer.writerow(["mode", mode])
-        writer.writerow(["local_rank", ctx.local_rank])
-        writer.writerow(["world_size", ctx.world_size])
-
-        if mode in ("accuracy", "performance_quant"):
-            writer.writerow(["total_linear_layers_quantized", stats["num_quantized"]])
-
-        if mode == "accuracy":
-            _write_accuracy_rows(writer, stats)
-        else:  # performance_hp / performance_quant
-            _write_performance_rows(writer, stats)
+        _write_summary_rows(writer, header + rows)
     print(f"{ctx.rank_prefix} Summary stats saved to {summary_csv_path}\n\n")
 
 
@@ -710,16 +707,16 @@ def _run_accuracy_mode(ctx):
     _save_summary_csv(
         ctx,
         "accuracy",
-        {
-            "num_quantized": len(fqn_to_config_dict),
-            "prompts_tested": len(baseline_data),
-            "avg_lpips": avg_lpips,
-            "max_lpips": max_lpips,
-            "min_lpips": min_lpips,
-            "lpips_values": lpips_values,
-            "avg_baseline_time": avg_baseline_time,
-            "avg_quant_time": avg_quant_time,
-        },
+        [
+            ("scalar", "total_linear_layers_quantized", len(fqn_to_config_dict)),
+            ("scalar", "prompts_tested", len(baseline_data)),
+            ("scalar", "average_lpips", f"{avg_lpips:.4f}"),
+            ("scalar", "max_lpips", f"{max_lpips:.4f}"),
+            ("scalar", "min_lpips", f"{min_lpips:.4f}"),
+            ("series", "lpips_prompt_", lpips_values),
+            ("scalar", "average_baseline_time", f"{avg_baseline_time:.4f}"),
+            ("scalar", "average_quantized_time", f"{avg_quant_time:.4f}"),
+        ],
     )
 
 
@@ -753,17 +750,19 @@ def _run_performance_mode(ctx, quantized):
     print(f"{label} Times: {times}")
     print(f"Average time: {avg_time:.4f}s")
 
-    _save_summary_csv(
-        ctx,
-        mode,
-        {
-            "num_quantized": num_quantized,
-            "perf_n_iter": ctx.perf_n_iter,
-            "batch_size": ctx.batch_size,
-            "avg_time": avg_time,
-            "times": times,
-        },
-    )
+    perf_rows = [
+        ("scalar", "perf_n_iter", ctx.perf_n_iter),
+        ("scalar", "batch_size", ctx.batch_size),
+        ("scalar", "average_time", f"{avg_time:.4f}"),
+        ("series", "time_", times),
+    ]
+    if quantized:
+        # performance_quant records the layer count right after the header,
+        # matching the accuracy layout; performance_hp omits it.
+        perf_rows.insert(
+            0, ("scalar", "total_linear_layers_quantized", num_quantized)
+        )
+    _save_summary_csv(ctx, mode, perf_rows)
 
 
 @torch.inference_mode()
