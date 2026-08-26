@@ -218,6 +218,14 @@ def _build_scale_mixin(cute, cutlass, params: _KernelParams):
             return vals_block
 
         @cute.jit
+        def _masked_load_val(self, sIN_tile: cute.Tensor, pos):
+            # ``pos`` bundles ``(col, k_rel, n, N)``; out-of-range n -> 0.0.
+            val = cutlass.Float32(0.0)
+            if pos.n < pos.N:
+                val = cutlass.Float32(sIN_tile[0, pos.col, pos.k_rel])
+            return val
+
+        @cute.jit
         def _load_vals_block_tail(
             self,
             sIN_tile: cute.Tensor,
@@ -228,11 +236,10 @@ def _build_scale_mixin(cute, cutlass, params: _KernelParams):
         ):
             vals_block = cute.make_rmem_tensor((SCALE_DIM_N_VALUE,), cutlass.Float32)
             for i in range(SCALE_DIM_N_VALUE):
-                n = n0 + n_base + i
-                if n < N:
-                    vals_block[i] = cutlass.Float32(sIN_tile[0, n_base + i, k_rel])
-                else:
-                    vals_block[i] = cutlass.Float32(0.0)
+                pos = SimpleNamespace(
+                    col=n_base + i, k_rel=k_rel, n=n0 + n_base + i, N=N
+                )
+                vals_block[i] = self._masked_load_val(sIN_tile, pos)
             return vals_block
 
         @cute.jit
@@ -439,6 +446,11 @@ def _build_tma_mixin(cute, cutlass, cpasync, utils, params: _KernelParams):
 
     class _TmaMixin:
         @cute.jit
+        def _arrive_expect_tx(self, tma_mbar_ptr: cutlass.Int64):
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(tma_mbar_ptr, TILE_COPY_BYTES)
+
+        @cute.jit
         def _issue_tma_load(
             self,
             tma_atom_in: cute.CopyAtom,
@@ -460,10 +472,7 @@ def _build_tma_mixin(cute, cutlass, cpasync, utils, params: _KernelParams):
                 )
                 tINg_stage0 = tINg[(None, 0)]
                 tINs_stage0 = tINs[(None, 0)]
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        tma_mbar_ptr, TILE_COPY_BYTES
-                    )
+                self._arrive_expect_tx(tma_mbar_ptr)
                 cute.copy(
                     tma_atom_in,
                     tINg_stage0,
@@ -504,6 +513,33 @@ def _build_tma_mixin(cute, cutlass, cpasync, utils, params: _KernelParams):
                 )
 
         @cute.jit
+        def _staged_input_layout(self):
+            if cutlass.const_expr(INPUT_TRANSPOSED_VALUE):
+                return cute.make_layout(
+                    (STAGE_COUNT_VALUE, TILE_N, TILE_K),
+                    stride=(STAGE_ELEMS, 1, TILE_N),
+                )
+            return cute.make_layout(
+                (STAGE_COUNT_VALUE, TILE_N, TILE_K),
+                stride=(STAGE_ELEMS, TILE_K, 1),
+            )
+
+        @cute.jit
+        def _init_barriers(self, tma_atoms, mbar_ptrs):
+            # ``tma_atoms`` is ``(atom_in, atom_out)``; ``mbar_ptrs`` is
+            # ``(ptr0, ptr1)``. Only lane 0 of the CTA should call this.
+            cpasync.prefetch_descriptor(tma_atoms[0])
+            cpasync.prefetch_descriptor(tma_atoms[1])
+            cute.arch.mbarrier_init(mbar_ptrs[0], 1)
+            if cutlass.const_expr(STAGE_COUNT_VALUE > 1):
+                cute.arch.mbarrier_init(mbar_ptrs[1], 1)
+
+        @cute.jit
+        def _stage_tiles(self, staged, smem_layout, stage):
+            # View of one pipeline stage's SMEM tile inside a staged buffer.
+            return cute.make_tensor(staged.iterator + stage * STAGE_ELEMS, smem_layout)
+
+        @cute.jit
         def _init_stage_smem(
             self,
             storage,
@@ -522,44 +558,25 @@ def _build_tma_mixin(cute, cutlass, cpasync, utils, params: _KernelParams):
                 TILE_K,
                 INPUT_TRANSPOSED_VALUE,
             )
-            if cutlass.const_expr(INPUT_TRANSPOSED_VALUE):
-                staged_layout_in = cute.make_layout(
-                    (STAGE_COUNT_VALUE, TILE_N, TILE_K),
-                    stride=(STAGE_ELEMS, 1, TILE_N),
-                )
-            else:
-                staged_layout_in = cute.make_layout(
-                    (STAGE_COUNT_VALUE, TILE_N, TILE_K),
-                    stride=(STAGE_ELEMS, TILE_K, 1),
-                )
+            staged_layout_in = self._staged_input_layout()
             staged_layout_out = cute.make_layout(
                 (STAGE_COUNT_VALUE, TILE_N, TILE_K),
                 stride=(STAGE_ELEMS, 1, TILE_N),
             )
             sIN_staged = storage.in_smem.get_tensor(staged_layout_in)
             sOUT_staged = storage.out_smem.get_tensor(staged_layout_out)
-            sIN_tile0 = cute.make_tensor(
-                sIN_staged.iterator + 0 * STAGE_ELEMS, smem_layout_in
-            )
-            sOUT_tile0 = cute.make_tensor(
-                sOUT_staged.iterator + 0 * STAGE_ELEMS, smem_layout_out
-            )
+            sIN_tile0 = self._stage_tiles(sIN_staged, smem_layout_in, 0)
+            sOUT_tile0 = self._stage_tiles(sOUT_staged, smem_layout_out, 0)
             sIN_tile1 = sIN_tile0
             sOUT_tile1 = sOUT_tile0
             if cutlass.const_expr(STAGE_COUNT_VALUE > 1):
-                sIN_tile1 = cute.make_tensor(
-                    sIN_staged.iterator + 1 * STAGE_ELEMS, smem_layout_in
-                )
-                sOUT_tile1 = cute.make_tensor(
-                    sOUT_staged.iterator + 1 * STAGE_ELEMS, smem_layout_out
-                )
+                sIN_tile1 = self._stage_tiles(sIN_staged, smem_layout_in, 1)
+                sOUT_tile1 = self._stage_tiles(sOUT_staged, smem_layout_out, 1)
 
             if tidx == 0:
-                cpasync.prefetch_descriptor(tma_atom_in)
-                cpasync.prefetch_descriptor(tma_atom_out)
-                cute.arch.mbarrier_init(tma_mbar_ptr0, 1)
-                if cutlass.const_expr(STAGE_COUNT_VALUE > 1):
-                    cute.arch.mbarrier_init(tma_mbar_ptr1, 1)
+                self._init_barriers(
+                    (tma_atom_in, tma_atom_out), (tma_mbar_ptr0, tma_mbar_ptr1)
+                )
             cute.arch.mbarrier_init_fence()
             cute.arch.sync_threads()
 
@@ -807,18 +824,20 @@ def _quantize_loaded_tile_3d(kernel, tiles, warp_ctx, quant_ctx):
     warp_idx)``.
     """
     cute = quant_ctx.cute
-    if not (warp_ctx.warp_idx >= 1 and warp_ctx.warp_idx <= quant_ctx.compute_warps):
-        return
-    cute.arch.mbarrier_wait(warp_ctx.tma_mbar_ptr, warp_ctx.tma_phase)
-    lane_id = warp_ctx.tidx % 32
-    lane = quant_ctx.SimpleNamespace(
-        e=warp_ctx.e,
-        n_tile=warp_ctx.n_tile,
-        lane_id=lane_id,
-        k_lane=(warp_ctx.warp_idx - 1) * 32 + lane_id,
-        k0=warp_ctx.k0,
+    is_compute_warp = (
+        warp_ctx.warp_idx >= 1 and warp_ctx.warp_idx <= quant_ctx.compute_warps
     )
-    _quantize_tile_3d(kernel, tiles, lane, quant_ctx)
+    if is_compute_warp:
+        cute.arch.mbarrier_wait(warp_ctx.tma_mbar_ptr, warp_ctx.tma_phase)
+        lane_id = warp_ctx.tidx % 32
+        lane = quant_ctx.SimpleNamespace(
+            e=warp_ctx.e,
+            n_tile=warp_ctx.n_tile,
+            lane_id=lane_id,
+            k_lane=(warp_ctx.warp_idx - 1) * 32 + lane_id,
+            k0=warp_ctx.k0,
+        )
+        _quantize_tile_3d(kernel, tiles, lane, quant_ctx)
 
 
 def _build_launch_mixin(cute, cutlass, utils, SharedStorage, params: _KernelParams):
