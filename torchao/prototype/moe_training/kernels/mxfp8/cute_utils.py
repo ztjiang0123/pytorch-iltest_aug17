@@ -8,6 +8,66 @@
 
 import importlib.util
 from types import SimpleNamespace
+from typing import Tuple
+
+import torch
+
+
+def make_tile_smem_layouts(tile_m: int, tile_k: int, out_col_major: bool):
+    """Create shared memory layouts for input and output tiles.
+
+    The input tile is always row-major (K fastest-changing). The output tile is
+    row-major for the 1x32 kernel and column-major for the 32x1 kernel, selected
+    via ``out_col_major``.
+
+    Args:
+        tile_m: Tile size in M dimension
+        tile_k: Tile size in K dimension
+        out_col_major: If True the output layout is column-major (stride
+            ``(1, tile_m)``); otherwise row-major (stride ``(tile_k, 1)``).
+
+    Returns:
+        Tuple of (smem_layout_in, smem_layout_out) for shared memory
+    """
+    import cutlass.cute as cute
+
+    smem_layout_in = cute.make_layout(
+        (tile_m, tile_k),
+        stride=(tile_k, 1),
+    )
+    out_stride = (1, tile_m) if out_col_major else (tile_k, 1)
+    smem_layout_out = cute.make_layout(
+        (tile_m, tile_k),
+        stride=out_stride,
+    )
+    return smem_layout_in, smem_layout_out
+
+
+def select_cutedsl_config(
+    configs: dict,
+    input_dtype: torch.dtype,
+    scaling_mode: str,
+) -> Tuple[str, Tuple[int, int, int, int]]:
+    """Select a kernel configuration based on input dtype.
+
+    Shared by the 1x32 and 32x1 kernels; each passes its own ``configs`` table.
+    bfloat16 inputs use the ``"bf16_default"`` entry, everything else falls back
+    to ``"fallback"``.
+
+    Args:
+        configs: Mapping of config name to its tuple of tuning parameters.
+        input_dtype: Input dtype
+        scaling_mode: Scaling mode ("floor" or "rceil")
+
+    Returns:
+        Tuple of (config_name, config_tuple)
+    """
+    if input_dtype == torch.bfloat16:
+        config_name = "bf16_default"
+    else:
+        config_name = "fallback"
+    return config_name, configs[config_name]
+
 
 # Runtime package detection
 _CUTEDSL_RUNTIME_PACKAGES = {

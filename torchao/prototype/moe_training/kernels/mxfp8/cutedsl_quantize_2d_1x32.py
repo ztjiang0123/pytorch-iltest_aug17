@@ -19,35 +19,11 @@ from .cute_utils import (
     make_kernel_io,
     make_quant_opts,
     make_tile_shape,
+    make_tile_smem_layouts,
     make_tma_handles,
     run_quantize_2d_kernel,
+    select_cutedsl_config,
 )
-
-
-def _make_tile_smem_layouts(tile_m: int, tile_k: int):
-    """Create shared memory layouts for input and output tiles.
-
-    Both layouts use row-major format (K is fastest-changing dimension).
-
-    Args:
-        tile_m: Tile size in M dimension
-        tile_k: Tile size in K dimension
-
-    Returns:
-        Tuple of (smem_layout_in, smem_layout_out), both for shared memory
-    """
-    import cutlass.cute as cute
-
-    smem_layout_in = cute.make_layout(
-        (tile_m, tile_k),
-        stride=(tile_k, 1),
-    )
-    smem_layout_out = cute.make_layout(
-        (tile_m, tile_k),
-        stride=(tile_k, 1),
-    )
-    return smem_layout_in, smem_layout_out
-
 
 # Config format:
 # (compute_warps, tile_m, tile_k, k_tiles_per_cta)
@@ -55,26 +31,6 @@ _CUTEDSL_CONFIGS = {
     "bf16_default": (4, 128, 32, 4),
     "fallback": (6, 128, 32, 2),
 }
-
-
-def _select_cutedsl_config(
-    input_dtype: torch.dtype,
-    scaling_mode: str,
-) -> Tuple[str, Tuple[int, int, int, int]]:
-    """Select kernel configuration based on input dtype.
-
-    Args:
-        input_dtype: Input dtype
-        scaling_mode: Scaling mode ("floor" or "rceil")
-
-    Returns:
-        Tuple of (config_name, (compute_warps, tile_m, tile_k, k_tiles_per_cta))
-    """
-    if input_dtype == torch.bfloat16:
-        config_name = "bf16_default"
-    else:
-        config_name = "fallback"
-    return config_name, _CUTEDSL_CONFIGS[config_name]
 
 
 @functools.cache
@@ -531,7 +487,9 @@ def _compile_mxfp8_quantize_2d_cutedsl(
 
             io = make_kernel_io(
                 storage=storage,
-                smem_layouts=_make_tile_smem_layouts(TILE_M, TILE_K),
+                smem_layouts=make_tile_smem_layouts(
+                    TILE_M, TILE_K, out_col_major=False
+                ),
                 tma=make_tma_handles(
                     atom_in=tma_atom_in,
                     tensor_in=tma_tensor_in,
@@ -582,7 +540,9 @@ def _compile_mxfp8_quantize_2d_cutedsl(
             Storage locations:
                 All tensors in global memory
             """
-            smem_layout_in, smem_layout_out = _make_tile_smem_layouts(TILE_M, TILE_K)
+            smem_layout_in, smem_layout_out = make_tile_smem_layouts(
+                TILE_M, TILE_K, out_col_major=False
+            )
             # Use tcgen05.CtaGroup.ONE for the optimised single-CTA Blackwell (SM 10.x) TMA load path.
             g2s_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
             tma_atom_in, tma_tensor_in = cpasync.make_tiled_tma_atom(
@@ -746,7 +706,7 @@ def mxfp8_quantize_cutedsl_2d_1x32(
         assert offs.dtype == torch.int32, "offs must be int32 tensor"
         assert offs.dim() == 1, "offs must be 1D tensor"
 
-    _, config = _select_cutedsl_config(x.dtype, scaling_mode)
+    _, config = select_cutedsl_config(_CUTEDSL_CONFIGS, x.dtype, scaling_mode)
     compute_warps, tile_m, tile_k, k_tiles_per_cta = config
     # B200 sweeps over representative shapes showed no
     # measurable benefit above 2 stages. We keep this configurable for
