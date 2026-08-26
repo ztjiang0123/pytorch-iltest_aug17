@@ -1,17 +1,35 @@
 from torchao.prototype.moe_training.kernels.mxfp8.quant import (
-    _mxfp8_cuda_kernels_available,  # noqa: F401
-    fused_pad_token_groups_cuda,  # noqa: F401
-    fused_unpad_token_groups_cuda,  # noqa: F401
-    mx_block_rearrange_2d_M_groups_cuda,  # noqa: F401
-    mxfp8_quantize_2d_1x32_cutedsl,  # noqa: F401
-    mxfp8_quantize_2d_32x1_cutedsl,  # noqa: F401
-    mxfp8_quantize_cuda_3d,  # noqa: F401
-    torch_pad_token_groups,  # noqa: F401
-    torch_to_blocked_2d_K_groups,  # noqa: F401
-    torch_to_blocked_2d_M_groups,  # noqa: F401
-    torch_to_blocked_per_group_3d,  # noqa: F401
-    torch_unpad_token_groups,  # noqa: F401
-    triton_mx_block_rearrange_2d_K_groups,  # noqa: F401
-    triton_mx_block_rearrange_2d_M_groups,  # noqa: F401
-    triton_mx_block_rearrange_per_group_3d,  # noqa: F401
+    _mxfp8_cuda_kernels_available,
+    fused_pad_token_groups_cuda,
+    fused_unpad_token_groups_cuda,
+    mx_block_rearrange_2d_M_groups_cuda,
+    mxfp8_quantize_2d_1x32_cutedsl,
+    mxfp8_quantize_2d_32x1_cutedsl,
+    mxfp8_quantize_cuda_3d,
+    torch_pad_token_groups,
+    torch_to_blocked_2d_K_groups,
+    torch_to_blocked_2d_M_groups,
+    torch_to_blocked_per_group_3d,
+    torch_unpad_token_groups,
+    triton_mx_block_rearrange_2d_K_groups,
+    triton_mx_block_rearrange_2d_M_groups,
+    triton_mx_block_rearrange_per_group_3d,
 )
+
+__all__ = [
+    "_mxfp8_cuda_kernels_available",
+    "fused_pad_token_groups_cuda",
+    "fused_unpad_token_groups_cuda",
+    "mx_block_rearrange_2d_M_groups_cuda",
+    "mxfp8_quantize_2d_1x32_cutedsl",
+    "mxfp8_quantize_2d_32x1_cutedsl",
+    "mxfp8_quantize_cuda_3d",
+    "torch_pad_token_groups",
+    "torch_to_blocked_2d_K_groups",
+    "torch_to_blocked_2d_M_groups",
+    "torch_to_blocked_per_group_3d",
+    "torch_unpad_token_groups",
+    "triton_mx_block_rearrange_2d_K_groups",
+    "triton_mx_block_rearrange_2d_M_groups",
+    "triton_mx_block_rearrange_per_group_3d",
+]
