@@ -41,6 +41,7 @@ preceding op. Note that this is not always true in practice.
 import copy
 import json
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 import fire
@@ -220,25 +221,49 @@ def get_gemm_times(
     return bf16_time_s, f8_time_s
 
 
-def run(
-    outfile: str,
-    do_benchmarks: bool = True,
-    shape_gen_name: str = "pow2",
-    gemm_cache_filename: Optional[str] = None,
-    n_limit: Optional[int] = None,
-    float8_recipe_name: Optional[str] = None,
-    mx_recipe_name: Optional[str] = None,
-    enable_fusion_modeling: bool = False,
-):
+@dataclass(frozen=True)
+class RunConfig:
+    """All options for a single ``float8_roofline`` run.
+
+    These values form one benchmark configuration, so they are grouped into a
+    single value object instead of a long parameter list.
+
+    * ``outfile``: path to write the results CSV to.
+    * ``do_benchmarks``: if True, gemm and e2e fwd+bwd of LNLinearSigmoid are
+      benchmarked.
+    * ``shape_gen_name``: `llama`, `pow2`, `pow2_extended`, or `sweep`.
+    * ``gemm_cache_filename`` (optional): file to cache gemm benchmark results.
+    * ``n_limit`` (optional): if specified, only runs `n_limit` iterations.
+    * ``float8_recipe_name`` (optional): float8 recipe (tensorwise, rowwise,
+      rowwise_with_gw_hp).
+    * ``mx_recipe_name`` (optional): MX format recipe.
+    * ``enable_fusion_modeling``: if False uses Linear, if True uses
+      LNLinearSigmoid and models the fusion of float8 overhead.
     """
-    Args:
-    * `do_benchmarks`: if True, gemm and e2e fwd+bwd of LNLinearSigmoid are benchmarked
-    * `shape_gen_name`: `llama`, `pow2`, `pow2_extended`, or `sweep`
-    * `gemm_cache_filename (optional)`: file to cache gemm benchmark results
-    * `n_limit (optional)`: if specified, only runs `n_limit` iterations
-    * `mx_recipe_name (optional)`: MX format recipe
-    * `enable_fusion_modeling`: if False uses Linear, if True uses LNLinearSigmoid and models the fusion of float8 overhead
-    """
+
+    outfile: str = "float8_roofline.csv"
+    do_benchmarks: bool = True
+    shape_gen_name: str = "pow2"
+    gemm_cache_filename: Optional[str] = None
+    n_limit: Optional[int] = None
+    float8_recipe_name: Optional[str] = None
+    mx_recipe_name: Optional[str] = None
+    enable_fusion_modeling: bool = False
+
+
+# Frozen (immutable) instances are safe to share as default arguments.
+_DEFAULT_RUN_CONFIG = RunConfig()
+
+
+def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
+    outfile = config.outfile
+    do_benchmarks = config.do_benchmarks
+    shape_gen_name = config.shape_gen_name
+    gemm_cache_filename = config.gemm_cache_filename
+    n_limit = config.n_limit
+    float8_recipe_name = config.float8_recipe_name
+    mx_recipe_name = config.mx_recipe_name
+    enable_fusion_modeling = config.enable_fusion_modeling
 
     assert not ((float8_recipe_name is not None) and (mx_recipe_name is not None)), (
         "unsupported"
