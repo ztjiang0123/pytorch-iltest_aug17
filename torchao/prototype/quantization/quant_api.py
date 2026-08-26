@@ -48,6 +48,24 @@ from torchao.quantization.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _validate_uintx_config(config) -> None:
+    """Validate the shared bit_width / group_size / packing_bitwidth fields used
+    by the uintx (gemlite) configs."""
+    if config.bit_width not in [4, 8]:
+        raise ValueError(f"bit_width must be 4 or 8, got {config.bit_width}")
+    valid_group_sizes = [32, 64, 128, 256, 512, 1024, None]
+    if config.group_size not in valid_group_sizes:
+        raise ValueError(
+            f"group_size must be one of {valid_group_sizes}, got {config.group_size}"
+        )
+    if config.bit_width == 8 and config.group_size is not None:
+        raise ValueError("group_size must be None for bit_width=8")
+    if config.packing_bitwidth not in [8, 16, 32, None]:
+        raise ValueError(
+            f"packing_bitwidth must be 8, 16, 32, or None, got {config.packing_bitwidth}"
+        )
+
+
 @dataclass
 class UIntxWeightOnlyConfig(AOBaseConfig):
     """Weight-only uintx quantization using bit-packed format with gemlite (https://github.com/dropbox/gemlite)
@@ -76,19 +94,7 @@ class UIntxWeightOnlyConfig(AOBaseConfig):
 
     def __post_init__(self):
         torch._C._log_api_usage_once("torchao.quantization.UIntxWeightOnlyConfig")
-        if self.bit_width not in [4, 8]:
-            raise ValueError(f"bit_width must be 4 or 8, got {self.bit_width}")
-        valid_group_sizes = [32, 64, 128, 256, 512, 1024, None]
-        if self.group_size not in valid_group_sizes:
-            raise ValueError(
-                f"group_size must be one of {valid_group_sizes}, got {self.group_size}"
-            )
-        if self.bit_width == 8 and self.group_size is not None:
-            raise ValueError("group_size must be None for bit_width=8")
-        if self.packing_bitwidth not in [8, 16, 32, None]:
-            raise ValueError(
-                f"packing_bitwidth must be 8, 16, 32, or None, got {self.packing_bitwidth}"
-            )
+        _validate_uintx_config(self)
 
 
 @register_quantize_module_handler(UIntxWeightOnlyConfig)
@@ -162,19 +168,7 @@ class Int8DynamicActivationUIntxWeightConfig(AOBaseConfig):
         torch._C._log_api_usage_once(
             "torchao.quantization.Int8DynamicActivationUIntxWeightConfig"
         )
-        if self.bit_width not in [4, 8]:
-            raise ValueError(f"bit_width must be 4 or 8, got {self.bit_width}")
-        valid_group_sizes = [32, 64, 128, 256, 512, 1024, None]
-        if self.group_size not in valid_group_sizes:
-            raise ValueError(
-                f"group_size must be one of {valid_group_sizes}, got {self.group_size}"
-            )
-        if self.bit_width == 8 and self.group_size is not None:
-            raise ValueError("group_size must be None for bit_width=8")
-        if self.packing_bitwidth not in [8, 16, 32, None]:
-            raise ValueError(
-                f"packing_bitwidth must be 8, 16, 32, or None, got {self.packing_bitwidth}"
-            )
+        _validate_uintx_config(self)
 
 
 @register_quantize_module_handler(Int8DynamicActivationUIntxWeightConfig)

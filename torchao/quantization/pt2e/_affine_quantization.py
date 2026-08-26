@@ -20,6 +20,13 @@ from torchao.quantization.pt2e.observer import (
     TorchAODType,
     ZeroPointDomain,
 )
+
+# Reuse the canonical implementations from quant_primitives so this file stays
+# in sync with the source it was copied from (see header note above).
+from torchao.quantization.quant_primitives import (
+    _get_and_check_qmin_qmax,
+    _get_reduction_params,
+)
 from torchao.quantization.utils import get_block_size
 
 ABC: Any = ABCMeta("ABC", (object,), {})  # compatible with Python 2 *and* 3:
@@ -63,80 +70,6 @@ def _is_float8_type(dtype: torch.dtype) -> bool:
         torch.float8_e5m2fnuz,
     }
     return dtype in fp8_types
-
-
-# TODO: decide on if we want to allow custom quant_min/quant_max here
-def _get_and_check_qmin_qmax(dtype, quant_min, quant_max):
-    """Get quant_min and quant_max args based on dtype and also
-    verify that they are within the range of possible quant_min/quant_max
-    for dtype
-    """
-    if dtype in FP8_TYPES:
-        quant_min_lower_bound, quant_max_upper_bound = (
-            torch.finfo(dtype).min,
-            torch.finfo(dtype).max,
-        )
-    elif dtype not in _DTYPE_TO_QVALUE_BOUNDS:
-        raise ValueError(f"Unsupported dtype: {dtype}")
-    else:
-        quant_min_lower_bound, quant_max_upper_bound = _DTYPE_TO_QVALUE_BOUNDS[dtype]
-    if quant_min is None:
-        quant_min = quant_min_lower_bound
-    if quant_max is None:
-        quant_max = quant_max_upper_bound
-
-    assert quant_min >= quant_min_lower_bound, (
-        "quant_min out of bound for dtype, "
-        f"quant_min_lower_bound: {quant_min_lower_bound} quant_min: {quant_min}"
-    )
-
-    assert quant_max <= quant_max_upper_bound, (
-        "quant_max out of bound for dtype, "
-        f"quant_max_upper_bound: {quant_max_upper_bound} quant_max: {quant_max}"
-    )
-    return quant_min, quant_max
-
-
-def _get_reduction_params(block_size, input_size):
-    """Given block_size and input size find the parameters for reduction:
-
-    Output:
-        shape_for_reduction: the shape we use to `view` input to prepare it for reduction
-        reduction_dims: the dims we'll do reduction over
-
-    Example::
-        Input:
-          block_size: (3, 3, 2, 10)
-          input_size: (3, 3, 10, 10)
-
-        Output:
-          shape_for_reduction: (3, 3, 5, 2, 10)
-          reduction_dim: [0, 1, 3, 4]
-    """
-    assert len(block_size) == len(input_size)
-    shape_for_reduction = []
-    reduction_dims = []
-    cur_dim = 0
-    for i in range(len(block_size)):
-        if block_size[i] != input_size[i] and block_size[i] > 1:
-            assert input_size[i] % block_size[i] == 0, (
-                f"Expecting input size at {i} dimension: "
-                f"{input_size[i]} to be divisible by block_size at {i} dimension: {block_size[i]}"
-            )
-            shape_for_reduction.append(input_size[i] // block_size[i])
-            shape_for_reduction.append(block_size[i])
-            # reduce over the block_size[i] dim
-            reduction_dims.append(cur_dim + 1)
-            cur_dim += 2
-        else:
-            # block_size[i] == input_size[i] or block_size[i] == 1
-            shape_for_reduction.append(input_size[i])
-            # we only need to reduce over the dimension if block_size is greater than 1
-            # otherwise it's already the same as reduced dimension
-            if block_size[i] != 1:
-                reduction_dims.append(cur_dim)
-            cur_dim += 1
-    return shape_for_reduction, reduction_dims
 
 
 def choose_qparams_affine_with_min_max(

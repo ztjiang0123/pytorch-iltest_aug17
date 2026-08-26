@@ -3,32 +3,14 @@
 #
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
-import random
-
 import numpy as np
 import torch
 import transformers
-from datasets import load_dataset
 from tqdm import tqdm
 
-
-def get_wikitext2(nsamples, seed, seqlen, tokenizer):
-    traindata = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
-    testdata = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
-
-    trainenc = tokenizer("\n\n".join(traindata["text"]), return_tensors="pt")
-    testenc = tokenizer("\n\n".join(testdata["text"]), return_tensors="pt")
-
-    random.seed(seed)
-    trainloader = []
-    for _ in range(nsamples):
-        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
-        j = i + seqlen
-        inp = trainenc.input_ids[:, i:j]
-        tar = inp.clone()
-        tar[:, :-1] = -100
-        trainloader.append((inp, tar))
-    return trainloader, testenc
+from torchao.prototype.quantization.mixed_precision.scripts.data_utils import (
+    get_wikitext2,
+)
 
 
 def cal_FIT(device, data, nsamples, model, max_iter, max_seqlen, criterion, num_layers):
