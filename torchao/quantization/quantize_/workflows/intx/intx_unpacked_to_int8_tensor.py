@@ -148,7 +148,16 @@ class IntxUnpackedToInt8Tensor(TorchAOBaseTensor):
         self.activation_quantization = activation_quantization
 
     def _quantization_type(self):
-        return f"target_dtype={self.target_dtype}, block_size={self.block_size}, shape={self.shape}, dtype={self.dtype}, device={self.device}, activation_quantization={self.activation_quantization}"
+        return self._fields_repr(
+            [
+                ("target_dtype", self.target_dtype),
+                ("block_size", self.block_size),
+                ("shape", self.shape),
+                ("dtype", self.dtype),
+                ("device", self.device),
+                ("activation_quantization", self.activation_quantization),
+            ]
+        )
 
     def _has_float_zero_point(self) -> bool:
         return self.zero_point.dtype in _FLOAT_TYPES

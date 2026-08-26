@@ -922,6 +922,46 @@ def _dequantize_affine_no_zero_point_no_dtype_check(
     return dequant.view(original_shape).to(output_dtype)
 
 
+def _dequantize_affine_validate_and_delegate(
+    no_dtype_check_impl: Callable[..., torch.Tensor],
+    input: torch.Tensor,
+    block_size: Tuple[int, ...],
+    scale: torch.Tensor,
+    zero_point: Optional[torch.Tensor],
+    input_dtype: torch.dtype,
+    quant_min: Optional[Union[int, float]],
+    quant_max: Optional[Union[int, float]],
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Validate dtype/qmin/qmax args then delegate to a ``*_no_dtype_check`` impl.
+
+    Shared driver for the public ``_dequantize_affine_*`` entry points, which
+    otherwise duplicate the same input-dtype assertion, output-dtype check,
+    qmin/qmax derivation, and delegation. ``no_dtype_check_impl`` is the
+    variant-specific dequant routine (e.g. no-zero-point or tinygemm).
+    """
+    # TODO: validate scale/zero_point dimensions are compatible with block_size
+    if input_dtype not in _SUB_BYTE_UINT_BOUNDS:
+        assert input.dtype == input_dtype, (
+            f"Expected: {input_dtype}, got: {input.dtype}"
+        )
+    assert output_dtype in [
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+    ], f"Unsupported output dtype: {output_dtype}"
+    quant_min, quant_max = _get_and_check_qmin_qmax(input_dtype, quant_min, quant_max)
+    return no_dtype_check_impl(
+        input,
+        block_size,
+        scale,
+        zero_point,
+        quant_min,
+        quant_max,
+        output_dtype,
+    )
+
+
 def _dequantize_affine_no_zero_point(
     input: torch.Tensor,
     block_size: Tuple[int, ...],
@@ -950,22 +990,13 @@ def _dequantize_affine_no_zero_point(
     Output:
       dequantized Tensor, with requested dtype or fp32
     """
-    # TODO: validate scale/zero_point dimensions are compatible with block_size
-    if input_dtype not in _SUB_BYTE_UINT_BOUNDS:
-        assert input.dtype == input_dtype, (
-            f"Expected: {input_dtype}, got: {input.dtype}"
-        )
-    assert output_dtype in [
-        torch.float32,
-        torch.float16,
-        torch.bfloat16,
-    ], f"Unsupported output dtype: {output_dtype}"
-    quant_min, quant_max = _get_and_check_qmin_qmax(input_dtype, quant_min, quant_max)
-    return _dequantize_affine_no_zero_point_no_dtype_check(
+    return _dequantize_affine_validate_and_delegate(
+        _dequantize_affine_no_zero_point_no_dtype_check,
         input,
         block_size,
         scale,
         zero_point,
+        input_dtype,
         quant_min,
         quant_max,
         output_dtype,
@@ -1045,22 +1076,13 @@ def _dequantize_affine_tinygemm(
     Output:
       dequantized Tensor, with requested dtype or fp32
     """
-    # TODO: validate scale/zero_point dimensions are compatible with block_size
-    if input_dtype not in _SUB_BYTE_UINT_BOUNDS:
-        assert input.dtype == input_dtype, (
-            f"Expected: {input_dtype}, got: {input.dtype}"
-        )
-    assert output_dtype in [
-        torch.float32,
-        torch.float16,
-        torch.bfloat16,
-    ], f"Unsupported output dtype: {output_dtype}"
-    quant_min, quant_max = _get_and_check_qmin_qmax(input_dtype, quant_min, quant_max)
-    return _dequantize_affine_tinygemm_no_dtype_check(
+    return _dequantize_affine_validate_and_delegate(
+        _dequantize_affine_tinygemm_no_dtype_check,
         input,
         block_size,
         scale,
         zero_point,
+        input_dtype,
         quant_min,
         quant_max,
         output_dtype,
