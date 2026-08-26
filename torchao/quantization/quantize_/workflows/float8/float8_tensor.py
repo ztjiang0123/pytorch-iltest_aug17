@@ -274,6 +274,11 @@ class Float8Tensor(TorchAOBaseTensor):
 implements = Float8Tensor.implements
 implements_torch_function = Float8Tensor.implements_torch_function
 
+# Maps a float8 tensor subclass to its ``_float8_addmm_impl`` so the shared
+# ``mm``/``matmul`` handler (``_float8_mm_dispatch``) can pick the right matmul
+# path. Each subclass module registers its impl at import time.
+_FLOAT8_ADDMM_IMPLS = {}
+
 
 @implements(aten.embedding.default)
 def _(func, types, args, kwargs):
@@ -304,18 +309,26 @@ def _(func, types, args, kwargs):
     return _float8_addmm_impl(input_tensor, weight_tensor.t(), bias)
 
 
-@implements(aten.matmul.default)
-@implements_torch_function(torch.matmul)
-def _(func, types, args, kwargs):
+def _float8_mm_dispatch(func, types, args, kwargs):
+    """Shared ``mm``/``matmul`` op handler for the float8 tensor subclasses.
+
+    ``Float8Tensor`` and the prototype ``PrototypeFloat8Tensor`` register this
+    same function object (via each subclass's own ``implements`` decorators), so
+    the handler body lives in exactly one place. The per-subclass matmul path
+    differs only in ``_float8_addmm_impl``, which is looked up from the weight
+    tensor's class in ``_FLOAT8_ADDMM_IMPLS`` (populated at import time).
+    """
     input_tensor, weight_tensor = args[0], args[1]
-    return _float8_addmm_impl(input_tensor, weight_tensor)
+    addmm_impl = next(
+        impl
+        for cls, impl in _FLOAT8_ADDMM_IMPLS.items()
+        if isinstance(weight_tensor, cls)
+    )
+    return addmm_impl(input_tensor, weight_tensor)
 
 
-@implements(aten.mm.default)
-@implements_torch_function(torch.mm)
-def _(func, types, args, kwargs):
-    input_tensor, weight_tensor = args[0], args[1]
-    return _float8_addmm_impl(input_tensor, weight_tensor)
+implements([aten.matmul.default, aten.mm.default])(_float8_mm_dispatch)
+implements_torch_function([torch.matmul, torch.mm])(_float8_mm_dispatch)
 
 
 @implements(aten.addmm_.default)
@@ -485,6 +498,9 @@ def _float8_addmm_impl(
             return out + bias
         else:
             return out
+
+
+_FLOAT8_ADDMM_IMPLS[Float8Tensor] = _float8_addmm_impl
 
 
 @implements_torch_function(torch.bmm)

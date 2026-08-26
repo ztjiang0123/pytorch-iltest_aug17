@@ -38,7 +38,9 @@ from torchao.quantization.quantize_.workflows import (
     QuantizeTensorToFloat8Kwargs,
 )
 from torchao.quantization.quantize_.workflows.float8.float8_tensor import (
+    _FLOAT8_ADDMM_IMPLS,
     _float8_dequantize,
+    _float8_mm_dispatch,
     _float8_quantization_type,
 )
 from torchao.quantization.utils import get_block_size
@@ -320,18 +322,10 @@ def _(func, types, args, kwargs):
     return result
 
 
-@implements(aten.matmul.default)
-@implements_torch_function(torch.matmul)
-def _(func, types, args, kwargs):
-    input_tensor, weight_tensor = args[0], args[1]
-    return _float8_addmm_impl(input_tensor, weight_tensor)
-
-
-@implements(aten.mm.default)
-@implements_torch_function(torch.mm)
-def _(func, types, args, kwargs):
-    input_tensor, weight_tensor = args[0], args[1]
-    return _float8_addmm_impl(input_tensor, weight_tensor)
+# Reuse the shared mm/matmul handler; only the addmm impl (registered below)
+# differs between the float8 tensor subclasses.
+implements([aten.matmul.default, aten.mm.default])(_float8_mm_dispatch)
+implements_torch_function([torch.matmul, torch.mm])(_float8_mm_dispatch)
 
 
 @implements(aten.addmm_.default)
@@ -493,6 +487,9 @@ def _float8_addmm_impl(
         res = res.dequantize()
 
     return res
+
+
+_FLOAT8_ADDMM_IMPLS[PrototypeFloat8Tensor] = _float8_addmm_impl
 
 
 @implements_torch_function(torch.bmm)

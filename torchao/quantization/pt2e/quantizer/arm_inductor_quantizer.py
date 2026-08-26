@@ -28,7 +28,6 @@ from torchao.quantization.pt2e.observer import (
 )
 from torchao.quantization.pt2e.quantizer import (
     QuantizationConfig,
-    get_module_name_filter,
 )
 from torchao.quantization.pt2e.quantizer.quantizer import (
     QuantizationAnnotation,
@@ -37,6 +36,7 @@ from torchao.quantization.pt2e.quantizer.quantizer import (
 
 from .x86_inductor_quantizer import (
     X86InductorQuantizer,
+    _create_module_name_filter,
 )
 
 FilterFn: TypeAlias = Callable[[List[Node]], bool]
@@ -73,30 +73,6 @@ default_quantizable_ops = {
 quantizable_ops = default_quantizable_ops | {
     torch.ops.aten.matmul.default,
 }
-
-
-def _create_module_name_filter(module_name: str) -> FilterFn:
-    """Create a filter function for a given module name.
-
-    The filter function takes a list of nodes (as determined by the annotate function)
-    and return True if *all* nodes come from the specified module name, False otherwise.
-
-    For example:
-        linear_1: "f32[3, 10]" = torch.ops.aten.linear.default(...) # comes from a module with name `sub.linear1`
-        relu: "f32[3, 10]" = torch.ops.aten.relu.default(linear_1); # comes from a module with name `sub.relu1`
-
-    >> module_name_filter = _create_module_name_filter_inner("sub")
-    >> print(module_name_filter([relu, linear_1]))
-    # True  # These two nodes are determined by `_annotate_linear_unary` function and from "sub".
-    """
-
-    filter_fn = get_module_name_filter(module_name)
-
-    def check_all_nodes_from_module(nodes: list[Node]) -> bool:
-        all_nodes_from_module_name: bool = all(filter_fn(n) for n in nodes)
-        return all_nodes_from_module_name
-
-    return check_all_nodes_from_module
 
 
 def _create_operator_type_filter(
@@ -369,8 +345,15 @@ class ArmInductorQuantizer(X86InductorQuantizer):
         filter_fn: Optional[FilterFn] = None,
     ):
         # Annotate QAT Specific patterns
-        self._annotate_qat_conv2d_bn_binary(model, quantization_config, filter_fn)
-        self._annotate_qat_conv2d_bn(model, quantization_config, filter_fn)
+        self._run_annotators(
+            [
+                "_annotate_qat_conv2d_bn_binary",
+                "_annotate_qat_conv2d_bn",
+            ],
+            model,
+            quantization_config,
+            filter_fn,
+        )
 
     def _annotate_conv2d_fusion_pattern(
         self,
@@ -392,5 +375,12 @@ class ArmInductorQuantizer(X86InductorQuantizer):
         quantization_config: Optional[QuantizationConfig],
         filter_fn: Optional[FilterFn] = None,
     ):
-        self._annotate_linear_unary(model, quantization_config, filter_fn)
-        self._annotate_linear(model, quantization_config, filter_fn)
+        self._run_annotators(
+            [
+                "_annotate_linear_unary",
+                "_annotate_linear",
+            ],
+            model,
+            quantization_config,
+            filter_fn,
+        )
