@@ -273,6 +273,29 @@ def parse_args():
 
 OLMOE_MODEL_ID = "allenai/OLMoE-1B-7B-0924"
 
+# Quantization methods that run a GPTQ observe/convert flow (as opposed to RTN).
+GPTQ_QUANTIZATIONS = (
+    "int4-gptq-sequential",
+    "int4-gptq-nonsequential",
+    "int8-gptq-sequential",
+    "int8-gptq-nonsequential",
+    "nvfp4-gptq-sequential",
+    "nvfp4-gptq-nonsequential",
+)
+
+# Quantization methods OLMoE supports (it only quantizes the MoE expert weights).
+OLMOE_SUPPORTED_QUANTIZATIONS = (
+    "none",
+    "nvfp4-rtn",
+    "nvfp4-gptq-nonsequential",
+)
+
+# FQNs of the OLMoE expert weights to quantize when using FqnToConfig.
+OLMOE_EXPERT_FQN_PATTERNS = (
+    r"re:.*\.experts\.gate_up_proj",
+    r"re:.*\.experts\.down_proj",
+)
+
 
 def _verify_olmoe_experts_quantized(model):
     """Assert every OlmoeExperts module has NVFP4Tensor for both expert weights."""
@@ -292,15 +315,9 @@ def _verify_olmoe_experts_quantized(model):
     print(f"Verified NVFP4 quantization on {found} OlmoeExperts modules")
 
 
-def main():
-    args = parse_args()
-
-    is_olmoe = args.model_id == OLMOE_MODEL_ID
-    if is_olmoe and args.quantization not in (
-        "none",
-        "nvfp4-rtn",
-        "nvfp4-gptq-nonsequential",
-    ):
+def _validate_args(args, is_olmoe):
+    """Validate argument combinations before doing any expensive work."""
+    if is_olmoe and args.quantization not in OLMOE_SUPPORTED_QUANTIZATIONS:
         raise ValueError(
             f"model {args.model_id} only supports 'none', 'nvfp4-rtn', or "
             f"'nvfp4-gptq-nonsequential', got '{args.quantization}'"
@@ -314,53 +331,24 @@ def main():
     if "nvfp4" in args.quantization:
         assert args.lm_eval_batch_size != "auto", "unsupported"
 
-    # Map dtype string to torch dtype
-    dtype_map = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
-    dtype = dtype_map.get("bfloat16", torch.bfloat16)
 
-    print(f"Loading model {args.model_id}...")
-    from_pretrained_kwargs = dict(device_map="cuda:0", dtype=dtype)
-    if is_olmoe:
-        from_pretrained_kwargs["experts_implementation"] = "grouped_mm"
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id, **from_pretrained_kwargs
-    )
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-
-    print(f"Model config: {model.config}")
-
-    # Determine max sequence length
-    max_seq_length = args.max_sequence_length
-    if max_seq_length is None:
-        max_seq_length = getattr(model.config, "max_length", 2048)
-        print(f"Using model's max_length: {max_seq_length}")
-
-    # Generate output directory name from args
+def _build_output_dir(args):
+    """Derive the output directory name from the run configuration."""
     model_name = args.model_id.split("/")[-1]  # Get last part of model ID
     output_dir = f"{args.output_dir_prefix}_{model_name}_{args.quantization}"
 
     if args.quantization != "none":
         output_dir += f"_gs{args.group_size}"
 
-    if args.quantization in [
-        "int4-gptq-sequential",
-        "int4-gptq-nonsequential",
-        "int8-gptq-sequential",
-        "int8-gptq-nonsequential",
-        "nvfp4-gptq-sequential",
-        "nvfp4-gptq-nonsequential",
-    ]:
+    if args.quantization in GPTQ_QUANTIZATIONS:
         output_dir += f"_{args.dataset_id}_n{args.num_calibration_samples}"
         output_dir += f"_damp{args.percdamp}_bs{args.gptq_block_size}"
 
-    print(f"Output directory: {output_dir}")
+    return output_dir
 
-    # Handle different quantization methods
-    quantization_start_time = time.time()
+
+def _make_filter_fn(args):
+    """Build the module filter used to select layers to quantize."""
 
     def skip_lm_head(module, fqn):
         return isinstance(module, torch.nn.Linear) and "lm_head" not in fqn
@@ -372,205 +360,159 @@ def main():
             and "o_proj" in fqn
         )
 
-    filter_fn_to_use = skip_lm_head
-    if args.o_proj_only:
-        filter_fn_to_use = skip_lm_head_o_proj
+    return skip_lm_head_o_proj if args.o_proj_only else skip_lm_head
 
+
+def _make_base_config(quantization, group_size):
+    """Return the (base_config, quant_type) pair for a quantization method."""
+    if "int4" in quantization:
+        return Int4WeightOnlyConfig(group_size=group_size), "Int4"
+    if "int8" in quantization:
+        return Int8WeightOnlyConfig(granularity=PerRow(), version=2), "Int8"
+    # nvfp4
+    base_config = NVFP4DynamicActivationNVFP4WeightConfig(
+        use_dynamic_per_tensor_scale=True,
+        use_triton_kernel=True,
+    )
+    return base_config, "NVFP4"
+
+
+def _quantize_model(model, config, is_olmoe, filter_fn):
+    """Apply ``config`` to ``model``, routing OLMoE through FqnToConfig."""
+    if is_olmoe:
+        quantize_(
+            model,
+            FqnToConfig({pattern: config for pattern in OLMOE_EXPERT_FQN_PATTERNS}),
+            filter_fn=None,
+        )
+        _verify_olmoe_experts_quantized(model)
+    else:
+        quantize_(model, config, filter_fn=filter_fn)
+
+
+def _apply_rtn_quantization(model, args, is_olmoe, filter_fn):
+    """Apply round-to-nearest quantization. Returns the config used."""
     if args.quantization == "int4-rtn":
         print("Applying Int4 RTN (Round-To-Nearest) quantization...")
         config = Int4WeightOnlyConfig(group_size=args.group_size)
-        quantize_(model, config, filter_fn=filter_fn_to_use)
-
+        quantize_(model, config, filter_fn=filter_fn)
     elif args.quantization == "int8-rtn":
         print("Applying Int8 RTN (Round-To-Nearest) quantization...")
         config = Int8WeightOnlyConfig(version=2, granularity=PerRow())
-        quantize_(model, config, filter_fn=filter_fn_to_use)
-
-    elif args.quantization == "nvfp4-rtn":
+        quantize_(model, config, filter_fn=filter_fn)
+    else:  # nvfp4-rtn
         print("Applying NVFP4 RTN (Round-To-Nearest) quantization...")
-
         config = NVFP4DynamicActivationNVFP4WeightConfig(
             use_dynamic_per_tensor_scale=True,
             use_triton_kernel=True,
         )
-        if is_olmoe:
-            quantize_(
-                model,
-                FqnToConfig(
-                    {
-                        r"re:.*\.experts\.gate_up_proj": config,
-                        r"re:.*\.experts\.down_proj": config,
-                    }
-                ),
-                filter_fn=None,
-            )
-            _verify_olmoe_experts_quantized(model)
-        else:
-            quantize_(model, config, filter_fn=filter_fn_to_use)
+        # OLMoE verification prints the model itself.
+        _quantize_model(model, config, is_olmoe, filter_fn)
         print(model)
+    return config
 
-    elif args.quantization in [
-        "int4-gptq-sequential",
-        "int4-gptq-nonsequential",
-        "int8-gptq-sequential",
-        "int8-gptq-nonsequential",
-        "nvfp4-gptq-sequential",
-        "nvfp4-gptq-nonsequential",
-    ]:
-        # Determine base config based on quantization type
-        if "int4" in args.quantization:
-            base_config = Int4WeightOnlyConfig(group_size=args.group_size)
-            quant_type = "Int4"
-        elif "int8" in args.quantization:
-            base_config = Int8WeightOnlyConfig(granularity=PerRow(), version=2)
-            quant_type = "Int8"
-        else:  # nvfp4
-            base_config = NVFP4DynamicActivationNVFP4WeightConfig(
-                use_dynamic_per_tensor_scale=True,
-                use_triton_kernel=True,
-            )
-            quant_type = "NVFP4"
 
-        # First application: wrap weights with GPTQObserverTensor (observe step)
-        print(
-            f"Wrapping weights with GPTQObserverTensor for {quant_type} calibration..."
-        )
-        observe_config = GPTQConfig(
-            step="observe",
-            base_config=base_config,
-            percdamp=args.percdamp,
-            gptq_quantize_block_size=args.gptq_block_size,
-        )
-        if is_olmoe:
-            quantize_(
-                model,
-                FqnToConfig(
-                    {
-                        r"re:.*\.experts\.gate_up_proj": observe_config,
-                        r"re:.*\.experts\.down_proj": observe_config,
-                    }
-                ),
-                filter_fn=None,
-            )
-        else:
-            quantize_(model, observe_config, filter_fn=filter_fn_to_use)
-        print(model)
+def _apply_gptq_quantization(model, tokenizer, args, is_olmoe, filter_fn, max_seq_length):
+    """Run the GPTQ observe/convert flow. Returns the base config used."""
+    base_config, quant_type = _make_base_config(args.quantization, args.group_size)
 
-        # Prepare calibration dataset
-        print(
-            f"Preparing {args.num_calibration_samples} calibration samples from {args.dataset_id}..."
-        )
-        dataset = prepare_dataset(
-            tokenizer,
-            max_seq_length,
-            args.num_calibration_samples,
-            dataset_id=args.dataset_id,
-            dataset_split=args.dataset_split,
-            seed=42,
-        )
-
-        # Second application: apply GPTQ quantization (convert step)
-        convert_config = GPTQConfig(
-            step="convert",
-            base_config=base_config,
-            percdamp=args.percdamp,
-            gptq_quantize_block_size=args.gptq_block_size,
-        )
-
-        if "nonsequential" in args.quantization:
-            print(f"Applying {quant_type} GPTQ quantization (non-sequential)...")
-            # Get device for input (from embedding layer, supports device_map="auto")
-            input_device = next(model.model.embed_tokens.parameters()).device
-
-            # Run calibration
-            for seq in tqdm(dataset, desc="Calibrating"):
-                model(seq.to(input_device))
-            # Print total # of GPTQ modules
-            num_gptq_weights = 0
-            for name, param in model.named_parameters():
-                if isinstance(param, GPTQObserverTensor):
-                    num_gptq_weights += 1
-            print(f"Total GPTQ weights to convert: {num_gptq_weights}")
-            # Apply quantization
-            if is_olmoe:
-                quantize_(
-                    model,
-                    FqnToConfig(
-                        {
-                            r"re:.*\.experts\.gate_up_proj": convert_config,
-                            r"re:.*\.experts\.down_proj": convert_config,
-                        }
-                    ),
-                    filter_fn=None,
-                )
-                _verify_olmoe_experts_quantized(model)
-            else:
-                quantize_(model, convert_config, filter_fn=filter_fn_to_use)
-        else:  # sequential
-            print(f"Applying {quant_type} GPTQ quantization (sequential)...")
-            assert filter_fn_to_use == skip_lm_head, "unsupported"
-            sequential_quantize(model, dataset, convert_config)
-
+    # First application: wrap weights with GPTQObserverTensor (observe step)
+    print(f"Wrapping weights with GPTQObserverTensor for {quant_type} calibration...")
+    observe_config = GPTQConfig(
+        step="observe",
+        base_config=base_config,
+        percdamp=args.percdamp,
+        gptq_quantize_block_size=args.gptq_block_size,
+    )
     if is_olmoe:
-        # generate() switches to batched_mm for decoding, which doesn't support
-        # NVFP4Tensor (needs aten.index.Tensor). Override to keep grouped_mm.
-        # TODO(future): remove when NVFP4 MoE supports bmm-style decode
-        model._optimize_model_for_decode = nullcontext
-
-    quantization_end_time = time.time()
-    quantization_time = quantization_end_time - quantization_start_time
-
-    if args.quantization != "none":
-        print(f"\n{'=' * 60}")
-        print(
-            f"Quantization completed in {quantization_time:.2f} seconds ({quantization_time / 60:.2f} minutes)"
+        quantize_(
+            model,
+            FqnToConfig(
+                {pattern: observe_config for pattern in OLMOE_EXPERT_FQN_PATTERNS}
+            ),
+            filter_fn=None,
         )
-        print(f"{'=' * 60}\n")
-
-    # Save model to generated output directory
-    print(f"Saving model to {output_dir}...")
-    tokenizer.save_pretrained(output_dir)
+    else:
+        quantize_(model, observe_config, filter_fn=filter_fn)
     print(model)
 
-    if "nvfp4" in args.quantization:
-        import inspect
+    # Prepare calibration dataset
+    print(
+        f"Preparing {args.num_calibration_samples} calibration samples from "
+        f"{args.dataset_id}..."
+    )
+    dataset = prepare_dataset(
+        tokenizer,
+        max_seq_length,
+        args.num_calibration_samples,
+        dataset_id=args.dataset_id,
+        dataset_split=args.dataset_split,
+        seed=42,
+    )
 
-        source = inspect.getsource(TorchAoHfQuantizer.get_weight_conversions)
-        if "per_tensor_scale" not in source:
-            raise RuntimeError(
-                "Your version of `transformers` does not support NVFP4 serialization. "
-                "Please install a version that includes "
-                "https://github.com/huggingface/transformers/pull/45573"
-            )
-        if is_olmoe and "gate_up_proj" not in source:
-            raise RuntimeError(
-                "Your version of `transformers` does not support NVFP4 MoE serialization. "
-                "Please install a version that includes "
-                "https://github.com/huggingface/transformers/pull/45609"
-            )
+    # Second application: apply GPTQ quantization (convert step)
+    convert_config = GPTQConfig(
+        step="convert",
+        base_config=base_config,
+        percdamp=args.percdamp,
+        gptq_quantize_block_size=args.gptq_block_size,
+    )
 
-    if args.quantization != "none":
-        # Attach hf_quantizer so save_pretrained uses the flatten path for tensor
-        # subclasses (e.g. NVFP4Tensor) that don't have a valid storage pointer.
-        ao_config = base_config if "gptq" in args.quantization else config
-        torchao_config = TorchAoConfig(quant_type=ao_config)
-        model.config.quantization_config = torchao_config
-        model.hf_quantizer = TorchAoHfQuantizer(torchao_config)
+    if "nonsequential" in args.quantization:
+        _apply_gptq_nonsequential(model, dataset, convert_config, args, is_olmoe, filter_fn, quant_type)
+    else:  # sequential
+        print(f"Applying {quant_type} GPTQ quantization (sequential)...")
+        assert not args.o_proj_only, "unsupported"
+        sequential_quantize(model, dataset, convert_config)
 
-    model.save_pretrained(output_dir, safe_serialization=False)
+    return base_config
 
-    print("DONE!")
 
-    # Clear GPU memory before running lm_eval
-    print("\nClearing GPU memory...")
-    del model
-    del tokenizer
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    print("GPU memory cleared.")
+def _apply_gptq_nonsequential(
+    model, dataset, convert_config, args, is_olmoe, filter_fn, quant_type
+):
+    """Calibrate on the dataset and apply the GPTQ convert step in one pass."""
+    print(f"Applying {quant_type} GPTQ quantization (non-sequential)...")
+    # Get device for input (from embedding layer, supports device_map="auto")
+    input_device = next(model.model.embed_tokens.parameters()).device
 
-    # Run lm_eval on the saved model
+    # Run calibration
+    for seq in tqdm(dataset, desc="Calibrating"):
+        model(seq.to(input_device))
+
+    # Print total # of GPTQ modules
+    num_gptq_weights = sum(
+        1
+        for _, param in model.named_parameters()
+        if isinstance(param, GPTQObserverTensor)
+    )
+    print(f"Total GPTQ weights to convert: {num_gptq_weights}")
+
+    # Apply quantization
+    _quantize_model(model, convert_config, is_olmoe, filter_fn)
+
+
+def _check_nvfp4_serialization_support(is_olmoe):
+    """Fail early if the installed transformers cannot serialize NVFP4 weights."""
+    import inspect
+
+    source = inspect.getsource(TorchAoHfQuantizer.get_weight_conversions)
+    if "per_tensor_scale" not in source:
+        raise RuntimeError(
+            "Your version of `transformers` does not support NVFP4 serialization. "
+            "Please install a version that includes "
+            "https://github.com/huggingface/transformers/pull/45573"
+        )
+    if is_olmoe and "gate_up_proj" not in source:
+        raise RuntimeError(
+            "Your version of `transformers` does not support NVFP4 MoE serialization. "
+            "Please install a version that includes "
+            "https://github.com/huggingface/transformers/pull/45609"
+        )
+
+
+def _run_lm_eval(args, output_dir):
+    """Invoke the lm_eval CLI on the saved model (unless skipped)."""
     print(f"\n{'=' * 60}")
     print("Running lm_eval on the quantized model...")
     print(f"{'=' * 60}\n")
@@ -602,6 +544,107 @@ def main():
         print(f"lm_eval failed with error: {e}")
     except FileNotFoundError:
         print("lm_eval not found. Please install it with: pip install lm-eval")
+
+
+def _load_model_and_tokenizer(args, is_olmoe):
+    """Load the model and tokenizer, returning (model, tokenizer, max_seq_length)."""
+    dtype = torch.bfloat16
+
+    print(f"Loading model {args.model_id}...")
+    from_pretrained_kwargs = dict(device_map="cuda:0", dtype=dtype)
+    if is_olmoe:
+        from_pretrained_kwargs["experts_implementation"] = "grouped_mm"
+    model = AutoModelForCausalLM.from_pretrained(args.model_id, **from_pretrained_kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+
+    print(f"Model config: {model.config}")
+
+    # Determine max sequence length
+    max_seq_length = args.max_sequence_length
+    if max_seq_length is None:
+        max_seq_length = getattr(model.config, "max_length", 2048)
+        print(f"Using model's max_length: {max_seq_length}")
+
+    return model, tokenizer, max_seq_length
+
+
+def _save_quantized_model(model, tokenizer, args, is_olmoe, base_config, config, output_dir):
+    """Attach quantization metadata (if any) and write the model to disk."""
+    print(f"Saving model to {output_dir}...")
+    tokenizer.save_pretrained(output_dir)
+    print(model)
+
+    if "nvfp4" in args.quantization:
+        _check_nvfp4_serialization_support(is_olmoe)
+
+    if args.quantization != "none":
+        # Attach hf_quantizer so save_pretrained uses the flatten path for tensor
+        # subclasses (e.g. NVFP4Tensor) that don't have a valid storage pointer.
+        ao_config = base_config if "gptq" in args.quantization else config
+        torchao_config = TorchAoConfig(quant_type=ao_config)
+        model.config.quantization_config = torchao_config
+        model.hf_quantizer = TorchAoHfQuantizer(torchao_config)
+
+    model.save_pretrained(output_dir, safe_serialization=False)
+    print("DONE!")
+
+
+def main():
+    args = parse_args()
+    is_olmoe = args.model_id == OLMOE_MODEL_ID
+
+    _validate_args(args, is_olmoe)
+
+    model, tokenizer, max_seq_length = _load_model_and_tokenizer(args, is_olmoe)
+
+    output_dir = _build_output_dir(args)
+    print(f"Output directory: {output_dir}")
+
+    # Handle different quantization methods
+    quantization_start_time = time.time()
+    filter_fn = _make_filter_fn(args)
+
+    # base_config is only set for GPTQ flows; config only for RTN flows. The one
+    # that is populated is later used to attach quantization metadata on save.
+    base_config = None
+    config = None
+    if args.quantization in ("int4-rtn", "int8-rtn", "nvfp4-rtn"):
+        config = _apply_rtn_quantization(model, args, is_olmoe, filter_fn)
+    elif args.quantization in GPTQ_QUANTIZATIONS:
+        base_config = _apply_gptq_quantization(
+            model, tokenizer, args, is_olmoe, filter_fn, max_seq_length
+        )
+
+    if is_olmoe:
+        # generate() switches to batched_mm for decoding, which doesn't support
+        # NVFP4Tensor (needs aten.index.Tensor). Override to keep grouped_mm.
+        # TODO(future): remove when NVFP4 MoE supports bmm-style decode
+        model._optimize_model_for_decode = nullcontext
+
+    quantization_time = time.time() - quantization_start_time
+    if args.quantization != "none":
+        print(f"\n{'=' * 60}")
+        print(
+            f"Quantization completed in {quantization_time:.2f} seconds "
+            f"({quantization_time / 60:.2f} minutes)"
+        )
+        print(f"{'=' * 60}\n")
+
+    _save_quantized_model(
+        model, tokenizer, args, is_olmoe, base_config, config, output_dir
+    )
+
+    # Clear GPU memory before running lm_eval
+    print("\nClearing GPU memory...")
+    del model
+    del tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("GPU memory cleared.")
+
+    _run_lm_eval(args, output_dir)
+
 
 
 if __name__ == "__main__":

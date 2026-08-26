@@ -288,6 +288,478 @@ def apply_torch_compile(pipe, torch_compile_mode: str = "default"):
         )
 
 
+def _aggregate_accuracy(
+    quant_config_str: str,
+    num_gpus_used: int,
+    local_rank: int,
+    world_size: int,
+):
+    """Aggregate per-rank LPIPS CSV files into a single summary CSV."""
+    if num_gpus_used is None:
+        raise ValueError("num_gpus_used is required for aggregate_accuracy mode")
+
+    # Only run on rank 0
+    if local_rank != 0:
+        print(
+            f"[Rank {local_rank}/{world_size}] Skipping aggregate_accuracy mode "
+            "(only rank 0 runs)"
+        )
+        return
+
+    print(f"Aggregating LPIPS results from {num_gpus_used} GPU runs")
+
+    model = "black-forest-labs/FLUX.1-schnell"
+    output_dir = os.path.join(OUTPUT_DIR, model)
+
+    # Read CSV files from all ranks
+    all_lpips_data = {}  # dict mapping global prompt idx to lpips value
+    for rank in range(num_gpus_used):
+        csv_path = os.path.join(
+            output_dir,
+            f"summary_stats_prompt_mode_accuracy_config_str_{quant_config_str}_rank_{rank}.csv",
+        )
+        if not os.path.exists(csv_path):
+            print(f"Warning: CSV file not found for rank {rank}: {csv_path}")
+            continue
+
+        print(f"Reading {csv_path}")
+        with open(csv_path, "r") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) == 2 and row[0].startswith("lpips_prompt_"):
+                    # Extract local prompt index from the CSV
+                    local_idx = int(row[0].split("_")[-1])
+                    lpips_value = float(row[1])
+                    # Calculate global prompt index
+                    global_idx = rank + local_idx * num_gpus_used
+                    all_lpips_data[global_idx] = lpips_value
+
+    if not all_lpips_data:
+        print("Error: No LPIPS data found in CSV files")
+        return
+
+    # Sort by global prompt index
+    sorted_prompts = sorted(all_lpips_data.keys())
+    sorted_lpips_values = [all_lpips_data[idx] for idx in sorted_prompts]
+
+    avg_lpips = sum(sorted_lpips_values) / len(sorted_lpips_values)
+    max_lpips = max(sorted_lpips_values)
+    min_lpips = min(sorted_lpips_values)
+
+    print("=" * 80)
+    print("Aggregated LPIPS Results:")
+    print(f"  Total prompts: {len(sorted_lpips_values)}")
+    print(f"  Average LPIPS: {avg_lpips:.4f}")
+    print(f"  Max LPIPS: {max_lpips:.4f}")
+    print(f"  Min LPIPS: {min_lpips:.4f}")
+    print(f"  All values: {[f'{v:.4f}' for v in sorted_lpips_values]}")
+    print("=" * 80)
+
+    aggregated_csv_path = os.path.join(
+        output_dir,
+        f"summary_stats_prompt_mode_accuracy_config_str_{quant_config_str}_aggregated.csv",
+    )
+    with open(aggregated_csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["metric", "value"])
+        writer.writerow(["mode", "aggregated"])
+        writer.writerow(["num_gpus_used", num_gpus_used])
+        writer.writerow(["total_prompts", len(sorted_lpips_values)])
+        writer.writerow(["average_lpips", f"{avg_lpips:.4f}"])
+        writer.writerow(["max_lpips", f"{max_lpips:.4f}"])
+        writer.writerow(["min_lpips", f"{min_lpips:.4f}"])
+        # Write individual LPIPS values in global prompt order
+        for global_idx in sorted_prompts:
+            writer.writerow(
+                [f"lpips_prompt_{global_idx}", f"{all_lpips_data[global_idx]:.4f}"]
+            )
+
+    print(f"Aggregated results saved to {aggregated_csv_path}")
+
+
+def _print_run_config(local_rank, world_size, mode, model, quant_config_str, params):
+    """Print the resolved run configuration for a rank."""
+    prefix = f"[Rank {local_rank}/{world_size}]"
+    print(f"{prefix} {torch.__version__=}")
+    print(f"{prefix} {torchao.__version__=}")
+    print(f"{prefix} {diffusers.__version__=}")
+    print(f"{prefix} {mode=}")
+    print(f"{prefix} Model: {model}")
+    print(f"{prefix} Quant config: {quant_config_str}")
+    print(f"{prefix} num_inference_steps: {params['num_inference_steps']}")
+    print(f"{prefix} prompts_dataset: {params['prompts_dataset']}")
+    print(f"{prefix} use_compile: {params['use_compile']}")
+    print(f"{prefix} torch_compile_mode: {params['torch_compile_mode']}")
+    print(f"{prefix} use_deterministic_algorithms={params['use_deterministic']}")
+    print(f"{prefix} batch_size={params['batch_size']}")
+    print(f"{prefix} cache_baseline_images={params['cache_baseline_images']}")
+
+
+def _resolve_prompts(debug_prompt, prompts_dataset, num_prompts, mode, local_rank, world_size):
+    """Load prompts, then shard/limit them for this rank."""
+    if debug_prompt is None:
+        dataset = load_dataset(prompts_dataset, split="train")
+        all_prompts = [item["Prompts"] for item in dataset]
+    else:
+        all_prompts = [debug_prompt]
+
+    # Limit prompts for debugging if requested
+    prompts_to_use = all_prompts if num_prompts is None else all_prompts[:num_prompts]
+
+    # Shard the prompts across GPUs (each rank processes every world_size-th prompt)
+    if mode == "accuracy":
+        my_prompts = prompts_to_use[local_rank::world_size]
+        print(
+            f"[Rank {local_rank}/{world_size}] Processing {len(my_prompts)} prompts "
+            f"out of {len(prompts_to_use)} total"
+        )
+    else:
+        # For performance modes, don't shard - only rank 0 runs
+        my_prompts = prompts_to_use if local_rank == 0 else []
+
+    return prompts_to_use, my_prompts
+
+
+def _generate_baseline_images(
+    pipe, my_prompts, cache_dir, cache_baseline_images, device,
+    num_inference_steps, local_rank, world_size,
+):
+    """Generate (or load from cache) baseline images for accuracy mode."""
+    baseline_data = []  # List of (prompt_idx, prompt, baseline_img, baseline_t)
+    baseline_times = []
+    for local_idx, prompt in enumerate(my_prompts):
+        # Calculate global prompt index
+        global_idx = local_rank + local_idx * world_size
+        prompt_idx = f"prompt_{global_idx}"
+        img_path = os.path.join(cache_dir, f"{prompt_idx}.png")
+        if cache_baseline_images and os.path.exists(img_path):
+            print(
+                f"[Rank {local_rank}/{world_size}] Loading baseline image for prompt "
+                f"{prompt_idx}: {prompt} from cache"
+            )
+            t0 = time.time()
+            baseline_img = Image.open(img_path)
+            t1 = time.time()
+        else:
+            print(
+                f"[Rank {local_rank}/{world_size}] Generating baseline image for "
+                f"prompt {prompt_idx}: {prompt}"
+            )
+            t0 = time.time()
+            baseline_img = generate_image(
+                pipe, prompt, RANDOM_SEED, device, num_inference_steps
+            )
+            t1 = time.time()
+            baseline_img.save(img_path)
+        baseline_t = pil_to_lpips_tensor(baseline_img, device)
+        baseline_data.append((prompt_idx, prompt, baseline_img, baseline_t))
+        baseline_times.append(t1 - t0)
+    return baseline_data, baseline_times
+
+
+def _measure_generation_perf(
+    pipe, prompt, device, num_inference_steps, batch_size, perf_n_iter
+):
+    """Warm up compile, then time ``perf_n_iter`` generations. Returns times list."""
+    # warm up compile
+    _ = generate_image(
+        pipe, prompt, RANDOM_SEED, device, num_inference_steps, batch_size=batch_size
+    )
+    times = []
+    for _ in range(perf_n_iter):
+        t0 = time.time()
+        _ = generate_image(
+            pipe, prompt, RANDOM_SEED, device, num_inference_steps, batch_size=batch_size
+        )
+        t1 = time.time()
+        times.append(t1 - t0)
+    return times
+
+
+def _quantize_transformer(pipe, quant_config_str, print_model):
+    """Build an FqnToConfig from a heuristic and quantize the transformer.
+
+    Returns the dict of quantized fqns -> config that was applied.
+    """
+    # Inspect Linear layers in main component
+    component_linear_fqns_and_weight_shapes = []
+    for fqn, module in pipe.transformer.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            weight_shape = module.weight.shape
+            if print_model:
+                print(f"  {fqn}: {weight_shape}")
+            component_linear_fqns_and_weight_shapes.append([fqn, weight_shape])
+
+    config_obj = string_to_config(quant_config_str)
+
+    # Create FqnToConfig mapping
+    fqn_to_config_dict = {}
+    for fqn, weight_shape in component_linear_fqns_and_weight_shapes:
+        if _should_quantize_fqn(fqn, weight_shape):
+            fqn_to_config_dict[fqn] = config_obj
+    fqn_to_config = FqnToConfig(fqn_to_config=fqn_to_config_dict)
+
+    # Quantize the main component using this config
+    quantize_(pipe.transformer, fqn_to_config, filter_fn=None)
+    return fqn_to_config_dict
+
+
+def _should_quantize_fqn(fqn, weight_shape):
+    """Hand-crafted heuristic: skip embeddings, the last two layers, small weights.
+
+    Activations for ``norm.linear`` have shape [batch_size, 3072], too small to
+    see speedups from activation quantization.
+    """
+    if "embed" in fqn:
+        return False
+    if fqn in ("norm_out.linear", "proj_out"):
+        return False
+    if "norm.linear" in fqn:
+        return False
+    if weight_shape[0] < 1024 or weight_shape[1] < 1024:
+        return False
+    return True
+
+
+def _run_accuracy_generation(
+    pipe, baseline_data, loss_fn, device, num_inference_steps,
+    quant_config_str, output_dir, local_rank, world_size,
+):
+    """Generate quantized images, compute LPIPS, and save comparison images.
+
+    Returns (lpips_values, times).
+    """
+    print(
+        f"[Rank {local_rank}/{world_size}] Generating images with quantized model "
+        "for all prompts"
+    )
+    lpips_values = []
+    comparison_images = []
+    times = []
+    for prompt_idx, prompt, baseline_img, baseline_t in baseline_data:
+        print(f"[Rank {local_rank}/{world_size}] Generating image for {prompt_idx}")
+        t0 = time.time()
+        modified_img = generate_image(
+            pipe, prompt, RANDOM_SEED, device, num_inference_steps
+        )
+        t1 = time.time()
+        times.append(t1 - t0)
+
+        # Compute LPIPS for fully quantized model
+        modified_t = pil_to_lpips_tensor(modified_img, device)
+        with torch.no_grad():
+            lpips_value = loss_fn(baseline_t, modified_t).item()
+        lpips_values.append(lpips_value)
+        print(
+            f"[Rank {local_rank}/{world_size}] LPIPS distance "
+            f"(full quantization, {prompt_idx}): {lpips_value:.4f}"
+        )
+
+        # Create and save comparison image
+        print(f"[Rank {local_rank}/{world_size}] Creating comparison image")
+        comparison_img = create_comparison_image(
+            baseline_img, modified_img, lpips_value, prompt=prompt
+        )
+        comparison_images.append(comparison_img)
+        comparison_path = os.path.join(
+            output_dir,
+            f"comparison_prompt_mode_full_quant_config_str_{quant_config_str}_{prompt_idx}_rank_{local_rank}.png",
+        )
+        comparison_img.save(comparison_path)
+        print(
+            f"[Rank {local_rank}/{world_size}] Saved comparison image to: "
+            f"{comparison_path}"
+        )
+
+    # Create combined image with all comparisons stacked vertically
+    combined_img = create_combined_comparison_image(comparison_images)
+    combined_path = os.path.join(
+        output_dir,
+        f"comparison_prompt_mode_full_quant_config_str_{quant_config_str}_combined_rank_{local_rank}.png",
+    )
+    combined_img.save(combined_path)
+    print(
+        f"[Rank {local_rank}/{world_size}] Saved combined comparison image to: "
+        f"{combined_path}"
+    )
+    return lpips_values, times
+
+
+def _save_summary_csv(output_dir, mode, quant_config_str, local_rank, world_size, stats):
+    """Write the per-rank summary stats CSV for accuracy/performance modes."""
+    summary_csv_path = os.path.join(
+        output_dir,
+        f"summary_stats_prompt_mode_{mode}_config_str_{quant_config_str}_rank_{local_rank}.csv",
+    )
+    with open(summary_csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["metric", "value"])
+        writer.writerow(["mode", mode])
+        writer.writerow(["local_rank", local_rank])
+        writer.writerow(["world_size", world_size])
+
+        if mode in ("accuracy", "performance_quant"):
+            writer.writerow(
+                ["total_linear_layers_quantized", stats["num_quantized"]]
+            )
+
+        if mode == "accuracy":
+            writer.writerow(["prompts_tested", stats["prompts_tested"]])
+            writer.writerow(["average_lpips", f"{stats['avg_lpips']:.4f}"])
+            writer.writerow(["max_lpips", f"{stats['max_lpips']:.4f}"])
+            writer.writerow(["min_lpips", f"{stats['min_lpips']:.4f}"])
+            for idx, val in enumerate(stats["lpips_values"]):
+                writer.writerow([f"lpips_prompt_{idx}", f"{val:.4f}"])
+            writer.writerow(
+                ["average_baseline_time", f"{stats['avg_baseline_time']:.4f}"]
+            )
+            writer.writerow(
+                ["average_quantized_time", f"{stats['avg_quant_time']:.4f}"]
+            )
+        else:  # performance_hp / performance_quant
+            writer.writerow(["perf_n_iter", stats["perf_n_iter"]])
+            writer.writerow(["batch_size", stats["batch_size"]])
+            writer.writerow(["average_time", f"{stats['avg_time']:.4f}"])
+            for idx, val in enumerate(stats["times"]):
+                writer.writerow([f"time_{idx}", f"{val:.4f}"])
+    print(
+        f"[Rank {local_rank}/{world_size}] Summary stats saved to {summary_csv_path}\n\n"
+    )
+
+
+def _run_accuracy_mode(ctx):
+    """Generate baseline + quantized images, report LPIPS, and save the summary."""
+    local_rank, world_size = ctx["local_rank"], ctx["world_size"]
+
+    # note: never compile for baseline images
+    baseline_data, baseline_times = _generate_baseline_images(
+        ctx["pipe"],
+        ctx["my_prompts"],
+        ctx["cache_dir"],
+        ctx["cache_baseline_images"],
+        ctx["device"],
+        ctx["num_inference_steps"],
+        local_rank,
+        world_size,
+    )
+
+    fqn_to_config_dict = _quantize_transformer(
+        ctx["pipe"], ctx["quant_config_str"], ctx["print_model"]
+    )
+    if ctx["use_compile"]:
+        apply_torch_compile(ctx["pipe"], ctx["torch_compile_mode"])
+    if ctx["print_model"]:
+        print_pipeline_architecture(ctx["pipe"])
+
+    lpips_values, times = _run_accuracy_generation(
+        ctx["pipe"],
+        baseline_data,
+        ctx["loss_fn"],
+        ctx["device"],
+        ctx["num_inference_steps"],
+        ctx["quant_config_str"],
+        ctx["output_dir"],
+        local_rank,
+        world_size,
+    )
+
+    avg_lpips = sum(lpips_values) / len(lpips_values)
+    max_lpips = max(lpips_values)
+    min_lpips = min(lpips_values)
+    avg_baseline_time = sum(baseline_times) / len(baseline_times)
+    avg_quant_time = sum(times) / len(times)
+
+    print("=" * 80)
+    print("Test Mode Summary:")
+    print(f"  Total Linear layers quantized: {len(fqn_to_config_dict)}")
+    print(f"  Prompts tested: {len(baseline_data)}")
+    print("")
+    print("LPIPS Results:")
+    print(f"  Average LPIPS: {avg_lpips:.4f}")
+    print(f"  Max LPIPS: {max_lpips:.4f}")
+    print(f"  Min LPIPS: {min_lpips:.4f}")
+    print(f"  All values: {[f'{v:.4f}' for v in lpips_values]}")
+    print("=" * 80)
+    print(f"Baseline times: {baseline_times}")
+    print(f"Quantized times: {times}")
+    print(f"Average baseline time: {avg_baseline_time:.4f}s")
+    print(f"Average quantized time: {avg_quant_time:.4f}s")
+
+    _save_summary_csv(
+        ctx["output_dir"],
+        "accuracy",
+        ctx["quant_config_str"],
+        local_rank,
+        world_size,
+        {
+            "num_quantized": len(fqn_to_config_dict),
+            "prompts_tested": len(baseline_data),
+            "avg_lpips": avg_lpips,
+            "max_lpips": max_lpips,
+            "min_lpips": min_lpips,
+            "lpips_values": lpips_values,
+            "avg_baseline_time": avg_baseline_time,
+            "avg_quant_time": avg_quant_time,
+        },
+    )
+
+
+def _run_performance_mode(ctx, quantized):
+    """Measure generation performance, optionally after quantizing the transformer.
+
+    ``quantized`` selects performance_quant (True) vs performance_hp (False).
+    """
+    local_rank, world_size = ctx["local_rank"], ctx["world_size"]
+    mode = "performance_quant" if quantized else "performance_hp"
+
+    num_quantized = 0
+    if quantized:
+        num_quantized = len(
+            _quantize_transformer(ctx["pipe"], ctx["quant_config_str"], ctx["print_model"])
+        )
+        if ctx["print_model"]:
+            print_pipeline_architecture(ctx["pipe"])
+    if ctx["use_compile"]:
+        apply_torch_compile(ctx["pipe"], ctx["torch_compile_mode"])
+
+    times = []
+    # Only rank 0 runs performance measurements.
+    if local_rank == 0:
+        times = _measure_generation_perf(
+            ctx["pipe"],
+            ctx["prompts_to_use"][0],
+            ctx["device"],
+            ctx["num_inference_steps"],
+            ctx["batch_size"],
+            ctx["perf_n_iter"],
+        )
+
+    print("=" * 80)
+    print("Test Mode Summary:")
+    if quantized:
+        print(f"  Total Linear layers quantized: {num_quantized}")
+
+    avg_time = sum(times) / len(times)
+    label = "Quantized Model" if quantized else "High Precision (Baseline)"
+    print(f"{label} Times: {times}")
+    print(f"Average time: {avg_time:.4f}s")
+
+    _save_summary_csv(
+        ctx["output_dir"],
+        mode,
+        ctx["quant_config_str"],
+        local_rank,
+        world_size,
+        {
+            "num_quantized": num_quantized,
+            "perf_n_iter": ctx["perf_n_iter"],
+            "batch_size": ctx["batch_size"],
+            "avg_time": avg_time,
+            "times": times,
+        },
+    )
+
+
 @torch.inference_mode()
 def run(
     mode: str = "accuracy",
@@ -353,21 +825,22 @@ def run(
         # this is needed to make torch.compile be deterministic with flux-1.schnell
         torch.use_deterministic_algorithms(True)
 
-    print(f"[Rank {local_rank}/{world_size}] {torch.__version__=}")
-    print(f"[Rank {local_rank}/{world_size}] {torchao.__version__=}")
-    print(f"[Rank {local_rank}/{world_size}] {diffusers.__version__=}")
-    print(f"[Rank {local_rank}/{world_size}] {mode=}")
-    print(f"[Rank {local_rank}/{world_size}] Model: {model}")
-    print(f"[Rank {local_rank}/{world_size}] Quant config: {quant_config_str}")
-    print(
-        f"[Rank {local_rank}/{world_size}] num_inference_steps: {num_inference_steps}"
+    _print_run_config(
+        local_rank,
+        world_size,
+        mode,
+        model,
+        quant_config_str,
+        {
+            "num_inference_steps": num_inference_steps,
+            "prompts_dataset": prompts_dataset,
+            "use_compile": use_compile,
+            "torch_compile_mode": torch_compile_mode,
+            "use_deterministic": use_deterministic_algorithms,
+            "batch_size": batch_size,
+            "cache_baseline_images": cache_baseline_images,
+        },
     )
-    print(f"[Rank {local_rank}/{world_size}] prompts_dataset: {prompts_dataset}")
-    print(f"[Rank {local_rank}/{world_size}] use_compile: {use_compile}")
-    print(f"[Rank {local_rank}/{world_size}] torch_compile_mode: {torch_compile_mode}")
-    print(f"[Rank {local_rank}/{world_size}] {use_deterministic_algorithms=}")
-    print(f"[Rank {local_rank}/{world_size}] {batch_size=}")
-    print(f"[Rank {local_rank}/{world_size}] {cache_baseline_images=}")
 
     assert mode in (
         "accuracy",
@@ -381,92 +854,9 @@ def run(
             f"batch_size must be 1 for {mode} mode, got {batch_size}"
         )
 
-    # Handle aggregate_accuracy mode separately
+    # Handle aggregate_accuracy mode separately (reads existing CSVs, no model load)
     if mode == "aggregate_accuracy":
-        if num_gpus_used is None:
-            raise ValueError("num_gpus_used is required for aggregate_accuracy mode")
-
-        # Only run on rank 0
-        if local_rank != 0:
-            print(
-                f"[Rank {local_rank}/{world_size}] Skipping aggregate_accuracy mode (only rank 0 runs)"
-            )
-            return
-
-        print(f"Aggregating LPIPS results from {num_gpus_used} GPU runs")
-
-        # Create model-specific output directory
-        output_dir = os.path.join(OUTPUT_DIR, model)
-
-        # Read CSV files from all ranks
-        all_lpips_data = {}  # dict mapping global prompt idx to lpips value
-
-        for rank in range(num_gpus_used):
-            csv_path = os.path.join(
-                output_dir,
-                f"summary_stats_prompt_mode_accuracy_config_str_{quant_config_str}_rank_{rank}.csv",
-            )
-
-            if not os.path.exists(csv_path):
-                print(f"Warning: CSV file not found for rank {rank}: {csv_path}")
-                continue
-
-            print(f"Reading {csv_path}")
-            with open(csv_path, "r") as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    if len(row) == 2 and row[0].startswith("lpips_prompt_"):
-                        # Extract local prompt index from the CSV
-                        local_idx = int(row[0].split("_")[-1])
-                        lpips_value = float(row[1])
-                        # Calculate global prompt index
-                        global_idx = rank + local_idx * num_gpus_used
-                        all_lpips_data[global_idx] = lpips_value
-
-        if not all_lpips_data:
-            print("Error: No LPIPS data found in CSV files")
-            return
-
-        # Sort by global prompt index
-        sorted_prompts = sorted(all_lpips_data.keys())
-        sorted_lpips_values = [all_lpips_data[idx] for idx in sorted_prompts]
-
-        # Calculate statistics
-        avg_lpips = sum(sorted_lpips_values) / len(sorted_lpips_values)
-        max_lpips = max(sorted_lpips_values)
-        min_lpips = min(sorted_lpips_values)
-
-        print("=" * 80)
-        print("Aggregated LPIPS Results:")
-        print(f"  Total prompts: {len(sorted_lpips_values)}")
-        print(f"  Average LPIPS: {avg_lpips:.4f}")
-        print(f"  Max LPIPS: {max_lpips:.4f}")
-        print(f"  Min LPIPS: {min_lpips:.4f}")
-        print(f"  All values: {[f'{v:.4f}' for v in sorted_lpips_values]}")
-        print("=" * 80)
-
-        # Save aggregated results
-        aggregated_csv_path = os.path.join(
-            output_dir,
-            f"summary_stats_prompt_mode_accuracy_config_str_{quant_config_str}_aggregated.csv",
-        )
-
-        with open(aggregated_csv_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["metric", "value"])
-            writer.writerow(["mode", "aggregated"])
-            writer.writerow(["num_gpus_used", num_gpus_used])
-            writer.writerow(["total_prompts", len(sorted_lpips_values)])
-            writer.writerow(["average_lpips", f"{avg_lpips:.4f}"])
-            writer.writerow(["max_lpips", f"{max_lpips:.4f}"])
-            writer.writerow(["min_lpips", f"{min_lpips:.4f}"])
-            # Write individual LPIPS values in global prompt order
-            for global_idx in sorted_prompts:
-                writer.writerow(
-                    [f"lpips_prompt_{global_idx}", f"{all_lpips_data[global_idx]:.4f}"]
-                )
-
-        print(f"Aggregated results saved to {aggregated_csv_path}")
+        _aggregate_accuracy(quant_config_str, num_gpus_used, local_rank, world_size)
         return
 
     # Create model-specific output directory
@@ -497,288 +887,38 @@ def run(
     loss_fn = lpips.LPIPS(net="vgg").to(device)
 
     # -----------------------------
-    # 2. Baseline images (for all prompts)
+    # 2. Dispatch to the selected mode
     # -----------------------------
-    # Load prompts from file or HuggingFace dataset
-    if debug_prompt is None:
-        dataset = load_dataset(prompts_dataset, split="train")
-        all_prompts = [item["Prompts"] for item in dataset]
-    else:
-        all_prompts = [debug_prompt]
+    prompts_to_use, my_prompts = _resolve_prompts(
+        debug_prompt, prompts_dataset, num_prompts, mode, local_rank, world_size
+    )
 
-    # Limit prompts for debugging if requested
-    prompts_to_use = all_prompts if num_prompts is None else all_prompts[:num_prompts]
+    ctx = {
+        "pipe": pipe,
+        "loss_fn": loss_fn,
+        "device": device,
+        "output_dir": output_dir,
+        "cache_dir": cache_dir,
+        "local_rank": local_rank,
+        "world_size": world_size,
+        "prompts_to_use": prompts_to_use,
+        "my_prompts": my_prompts,
+        "num_inference_steps": num_inference_steps,
+        "quant_config_str": quant_config_str,
+        "use_compile": use_compile,
+        "torch_compile_mode": torch_compile_mode,
+        "print_model": print_model,
+        "cache_baseline_images": cache_baseline_images,
+        "perf_n_iter": perf_n_iter,
+        "batch_size": batch_size,
+    }
 
-    # Shard the prompts across GPUs (each rank processes every world_size-th prompt)
     if mode == "accuracy":
-        my_prompts = prompts_to_use[local_rank::world_size]
-        print(
-            f"[Rank {local_rank}/{world_size}] Processing {len(my_prompts)} prompts out of {len(prompts_to_use)} total"
-        )
-    else:
-        # For performance modes, don't shard - only rank 0 runs
-        my_prompts = prompts_to_use if local_rank == 0 else []
-
-    baseline_data = []  # List of (prompt_idx, prompt, baseline_img, baseline_t)
-    baseline_times = []
-
-    if mode == "accuracy":
-        # note: never compile for baseline images
-
-        for local_idx, prompt in enumerate(my_prompts):
-            # Calculate global prompt index
-            global_idx = local_rank + local_idx * world_size
-            prompt_idx = f"prompt_{global_idx}"
-            img_path = os.path.join(cache_dir, f"{prompt_idx}.png")
-            if cache_baseline_images and os.path.exists(img_path):
-                print(
-                    f"[Rank {local_rank}/{world_size}] Loading baseline image for prompt {prompt_idx}: {prompt} from cache"
-                )
-                t0 = time.time()
-                baseline_img = Image.open(img_path)
-                t1 = time.time()
-            else:
-                print(
-                    f"[Rank {local_rank}/{world_size}] Generating baseline image for prompt {prompt_idx}: {prompt}"
-                )
-                t0 = time.time()
-                baseline_img = generate_image(
-                    pipe, prompt, RANDOM_SEED, device, num_inference_steps
-                )
-                t1 = time.time()
-                baseline_img.save(img_path)
-            baseline_t = pil_to_lpips_tensor(baseline_img, device)
-            baseline_data.append((prompt_idx, prompt, baseline_img, baseline_t))
-            baseline_times.append(t1 - t0)
-
+        _run_accuracy_mode(ctx)
     elif mode == "performance_hp":
-        if use_compile:
-            apply_torch_compile(pipe, torch_compile_mode)
-
-        # High precision performance mode - measure baseline without quantization
-        if local_rank == 0:
-            # warm up compile
-            _ = generate_image(
-                pipe,
-                prompts_to_use[0],
-                RANDOM_SEED,
-                device,
-                num_inference_steps,
-                batch_size=batch_size,
-            )
-
-            for _ in range(perf_n_iter):
-                t0 = time.time()
-                _ = generate_image(
-                    pipe,
-                    prompts_to_use[0],
-                    RANDOM_SEED,
-                    device,
-                    num_inference_steps,
-                    batch_size=batch_size,
-                )
-                t1 = time.time()
-                baseline_times.append(t1 - t0)
-
-    # Only quantize for accuracy and performance_quant modes
-    if mode in ("accuracy", "performance_quant"):
-        # Inspect Linear layers in main component
-        component_linear_fqns_and_weight_shapes = []
-        for fqn, module in pipe.transformer.named_modules():
-            if isinstance(module, torch.nn.Linear):
-                weight_shape = module.weight.shape
-                if print_model:
-                    print(f"  {fqn}: {weight_shape}")
-                component_linear_fqns_and_weight_shapes.append([fqn, weight_shape])
-
-        config_obj = string_to_config(quant_config_str)
-
-        # Create FqnToConfig mapping
-        fqn_to_config_dict = {}
-        for fqn, weight_shape in component_linear_fqns_and_weight_shapes:
-            # Hand-crafted heuristic: don't quantize embedding layers, the last two
-            # layers, and layers with small weights
-            if "embed" in fqn:
-                continue
-            elif fqn == "norm_out.linear":
-                continue
-            elif fqn == "proj_out":
-                continue
-            elif "norm.linear" in fqn:
-                # activations here have shape [batch_size, 3072], so
-                # too small to see speedups from activation quantization
-                continue
-            elif weight_shape[0] < 1024 or weight_shape[1] < 1024:
-                continue
-            fqn_to_config_dict[fqn] = config_obj
-        fqn_to_config = FqnToConfig(fqn_to_config=fqn_to_config_dict)
-
-        # Quantize the main component using this config
-        quantize_(pipe.transformer, fqn_to_config, filter_fn=None)
-
-        if use_compile:
-            apply_torch_compile(pipe, torch_compile_mode)
-
-        if print_model:
-            print_pipeline_architecture(pipe)
-
-    times = []
-
-    if mode == "accuracy":
-        print(
-            f"[Rank {local_rank}/{world_size}] Generating images with quantized model for all prompts"
-        )
-        lpips_values = []
-        comparison_images = []
-        for prompt_idx, prompt, baseline_img, baseline_t in baseline_data:
-            print(f"[Rank {local_rank}/{world_size}] Generating image for {prompt_idx}")
-            t0 = time.time()
-            modified_img = generate_image(
-                pipe, prompt, RANDOM_SEED, device, num_inference_steps
-            )
-            t1 = time.time()
-            times.append(t1 - t0)
-
-            # Compute LPIPS for fully quantized model
-            modified_t = pil_to_lpips_tensor(modified_img, device)
-            with torch.no_grad():
-                lpips_value = loss_fn(baseline_t, modified_t).item()
-
-            lpips_values.append(lpips_value)
-            print(
-                f"[Rank {local_rank}/{world_size}] LPIPS distance (full quantization, {prompt_idx}): {lpips_value:.4f}"
-            )
-
-            # Create and save comparison image
-            print(f"[Rank {local_rank}/{world_size}] Creating comparison image")
-            comparison_img = create_comparison_image(
-                baseline_img, modified_img, lpips_value, prompt=prompt
-            )
-            comparison_images.append(comparison_img)
-            comparison_path = os.path.join(
-                output_dir,
-                f"comparison_prompt_mode_full_quant_config_str_{quant_config_str}_{prompt_idx}_rank_{local_rank}.png",
-            )
-            comparison_img.save(comparison_path)
-            print(
-                f"[Rank {local_rank}/{world_size}] Saved comparison image to: {comparison_path}"
-            )
-
-        # Create combined image with all comparisons stacked vertically
-        combined_img = create_combined_comparison_image(comparison_images)
-        combined_path = os.path.join(
-            output_dir,
-            f"comparison_prompt_mode_full_quant_config_str_{quant_config_str}_combined_rank_{local_rank}.png",
-        )
-        combined_img.save(combined_path)
-        print(
-            f"[Rank {local_rank}/{world_size}] Saved combined comparison image to: {combined_path}"
-        )
-
+        _run_performance_mode(ctx, quantized=False)
     elif mode == "performance_quant":
-        # Quantized performance mode - measure performance with quantization
-        if local_rank == 0:
-            # warm up compile
-            _ = generate_image(
-                pipe,
-                prompts_to_use[0],
-                RANDOM_SEED,
-                device,
-                num_inference_steps,
-                batch_size=batch_size,
-            )
-
-            for _ in range(perf_n_iter):
-                t0 = time.time()
-                _ = generate_image(
-                    pipe,
-                    prompts_to_use[0],
-                    RANDOM_SEED,
-                    device,
-                    num_inference_steps,
-                    batch_size=batch_size,
-                )
-                t1 = time.time()
-                times.append(t1 - t0)
-
-    # Print summary
-    print("=" * 80)
-    print("Test Mode Summary:")
-    if mode in ("accuracy", "performance_quant"):
-        print(f"  Total Linear layers quantized: {len(fqn_to_config_dict)}")
-    if mode == "accuracy":
-        print(f"  Prompts tested: {len(baseline_data)}")
-        print("")
-        print("LPIPS Results:")
-        avg_lpips = sum(lpips_values) / len(lpips_values)
-        max_lpips = max(lpips_values)
-        min_lpips = min(lpips_values)
-        print(f"  Average LPIPS: {avg_lpips:.4f}")
-        print(f"  Max LPIPS: {max_lpips:.4f}")
-        print(f"  Min LPIPS: {min_lpips:.4f}")
-        print(f"  All values: {[f'{v:.4f}' for v in lpips_values]}")
-        print("=" * 80)
-
-    # Performance reporting
-    if mode == "performance_hp":
-        print(f"High Precision (Baseline) Times: {baseline_times}")
-        avg_time = sum(baseline_times) / len(baseline_times)
-        print(f"Average time: {avg_time:.4f}s")
-    elif mode == "performance_quant":
-        print(f"Quantized Model Times: {times}")
-        avg_time = sum(times) / len(times)
-        print(f"Average time: {avg_time:.4f}s")
-    elif mode == "accuracy":
-        print(f"Baseline times: {baseline_times}")
-        print(f"Quantized times: {times}")
-        avg_baseline_time = sum(baseline_times) / len(baseline_times)
-        avg_quant_time = sum(times) / len(times)
-        print(f"Average baseline time: {avg_baseline_time:.4f}s")
-        print(f"Average quantized time: {avg_quant_time:.4f}s")
-
-    # Save summary stats to CSV
-    if mode in ("accuracy", "performance_hp", "performance_quant"):
-        summary_csv_path = os.path.join(
-            output_dir,
-            f"summary_stats_prompt_mode_{mode}_config_str_{quant_config_str}_rank_{local_rank}.csv",
-        )
-        with open(summary_csv_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["metric", "value"])
-            writer.writerow(["mode", mode])
-            writer.writerow(["local_rank", local_rank])
-            writer.writerow(["world_size", world_size])
-
-            if mode in ("accuracy", "performance_quant"):
-                writer.writerow(
-                    ["total_linear_layers_quantized", len(fqn_to_config_dict)]
-                )
-
-            if mode == "accuracy":
-                writer.writerow(["prompts_tested", len(baseline_data)])
-                writer.writerow(["average_lpips", f"{avg_lpips:.4f}"])
-                writer.writerow(["max_lpips", f"{max_lpips:.4f}"])
-                writer.writerow(["min_lpips", f"{min_lpips:.4f}"])
-                # Write individual LPIPS values
-                for idx, val in enumerate(lpips_values):
-                    writer.writerow([f"lpips_prompt_{idx}", f"{val:.4f}"])
-                writer.writerow(["average_baseline_time", f"{avg_baseline_time:.4f}"])
-                writer.writerow(["average_quantized_time", f"{avg_quant_time:.4f}"])
-            elif mode == "performance_hp":
-                writer.writerow(["perf_n_iter", perf_n_iter])
-                writer.writerow(["batch_size", batch_size])
-                writer.writerow(["average_time", f"{avg_time:.4f}"])
-                for idx, val in enumerate(baseline_times):
-                    writer.writerow([f"time_{idx}", f"{val:.4f}"])
-            elif mode == "performance_quant":
-                writer.writerow(["perf_n_iter", perf_n_iter])
-                writer.writerow(["batch_size", batch_size])
-                writer.writerow(["average_time", f"{avg_time:.4f}"])
-                for idx, val in enumerate(times):
-                    writer.writerow([f"time_{idx}", f"{val:.4f}"])
-        print(
-            f"[Rank {local_rank}/{world_size}] Summary stats saved to {summary_csv_path}\n\n"
-        )
+        _run_performance_mode(ctx, quantized=True)
 
 
 if __name__ == "__main__":
