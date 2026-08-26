@@ -19,36 +19,19 @@ from .cute_utils import (
     make_kernel_io,
     make_quant_opts,
     make_tile_shape,
+    make_tile_smem_layouts,
     make_tma_handles,
     run_quantize_2d_kernel,
+    select_cutedsl_config,
 )
 
 
 def _make_tile_smem_layouts(tile_m: int, tile_k: int):
-    """Create shared memory layouts for input and output tiles.
+    """Create shared memory layouts for the 32x1 kernel.
 
-    Input uses row-major format. Output uses column-major format.
-
-    Args:
-        tile_m: Tile size in M dimension
-        tile_k: Tile size in K dimension
-
-    Returns:
-        Tuple of (smem_layout_in, smem_layout_out) for shared memory
+    Input is row-major and output is column-major.
     """
-    import cutlass.cute as cute
-
-    # Input SMEM: Row-major layout
-    smem_layout_in = cute.make_layout(
-        (tile_m, tile_k),
-        stride=(tile_k, 1),
-    )
-    # Output SMEM: Column-major layout
-    smem_layout_out = cute.make_layout(
-        (tile_m, tile_k),
-        stride=(1, tile_m),
-    )
-    return smem_layout_in, smem_layout_out
+    return make_tile_smem_layouts(tile_m, tile_k, out_col_major=True)
 
 
 # Config format:
@@ -64,20 +47,8 @@ def _select_cutedsl_config(
     input_dtype: torch.dtype,
     scaling_mode: str,
 ) -> Tuple[str, Tuple[int, int, int, int]]:
-    """Select kernel configuration based on input dtype.
-
-    Args:
-        input_dtype: Input dtype
-        scaling_mode: Scaling mode ("floor" or "rceil")
-
-    Returns:
-        Tuple of (config_name, (compute_warps, tile_m, tile_k, m_tiles_per_cta))
-    """
-    if input_dtype == torch.bfloat16:
-        config_name = "bf16_default"
-    else:
-        config_name = "fallback"
-    return config_name, _CUTEDSL_CONFIGS[config_name]
+    """Select the 32x1 kernel configuration based on input dtype."""
+    return select_cutedsl_config(_CUTEDSL_CONFIGS, input_dtype, scaling_mode)
 
 
 @functools.cache
