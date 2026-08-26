@@ -144,6 +144,72 @@ class BenchmarkResult:
         return result_dict
 
 
+def _sparsity_only_config(sparsity: str) -> AOBaseConfig:
+    """Resolve a config when only sparsity (no quantization) is requested."""
+    if "semi" in sparsity or "2:4" in sparsity:
+        return SemiSparseWeightConfig()
+    raise ValueError(f"Unknown sparsity type: {sparsity}")
+
+
+def _int8_dynamic_activation_intx_config(
+    quantization: str, high_precision_dtype: torch.dtype
+) -> AOBaseConfig:
+    """Build an Int8DynamicActivationIntxWeightConfig from an ``intx`` string."""
+    assert high_precision_dtype == torch.float32, (
+        "int8_dynamic_activation_intx_weight requires using high_precision_dtype=torch.float32"
+    )
+
+    from torchao.quantization.granularity import PerAxis, PerGroup
+    from torchao.quantization.quant_api import (
+        Int8DynamicActivationIntxWeightConfig,
+    )
+
+    _quant_args = quantization.split("-")
+    weight_dtype = getattr(torch, f"int{_quant_args[1]}")
+    group_size = int(_quant_args[2])
+    granularity = PerGroup(group_size) if group_size > 0 else PerAxis(0)
+    is_asymmetric = bool(_quant_args[3])
+    mapping_type = MappingType.ASYMMETRIC if is_asymmetric else MappingType.SYMMETRIC
+    return Int8DynamicActivationIntxWeightConfig(
+        weight_dtype=weight_dtype,
+        weight_granularity=granularity,
+        weight_mapping_type=mapping_type,
+        intx_packing_format="opaque_torchao_auto",
+    )
+
+
+def _float8dq_config(quantization: str) -> AOBaseConfig:
+    """Build a Float8DynamicActivationFloat8WeightConfig from a ``float8dq`` string."""
+    granularity_name = str(quantization.split("-")[-1])
+    granularity = PerRow() if granularity_name == "row" else PerTensor()
+    return Float8DynamicActivationFloat8WeightConfig(granularity=granularity)
+
+
+def _quantization_to_config(
+    quantization: str, high_precision_dtype: torch.dtype
+) -> AOBaseConfig:
+    """Resolve a config from a quantization string (assumes non-empty input)."""
+    if "int4wo" in quantization and not HAS_TRITON:
+        print("Warning: Triton not available, falling back to baseline")
+        return None
+    if "baseline" in quantization:
+        return None
+    if "int8wo" in quantization:
+        return Int8WeightOnlyConfig()
+    if "int8dq" in quantization:
+        weight_only_decode = "int8dq_prefill_wo_decode" in quantization
+        return Int8DynamicActivationInt8WeightConfig(
+            weight_only_decode=weight_only_decode
+        )
+    if "int8_dynamic_activation_intx_weight" in quantization:
+        return _int8_dynamic_activation_intx_config(quantization, high_precision_dtype)
+    if "float8wo" in quantization:
+        return Float8WeightOnlyConfig()
+    if "float8dq" in quantization:
+        return _float8dq_config(quantization)
+    return None
+
+
 def string_to_config(
     quantization: Optional[str], sparsity: Optional[str], **kwargs
 ) -> AOBaseConfig:
@@ -158,69 +224,17 @@ def string_to_config(
         AOBaseConfig: Quantization configuration object
     """
     # Handle block sparsity case - with block sparsity, quantization should always be "none" or "baseline"
-    if sparsity is not None and sparsity == "block":
+    if sparsity == "block":
         return BlockSparseWeightConfig()
 
-    # Handle other sparsity cases
-    if quantization is None and sparsity is not None:
-        if "semi" in sparsity or "2:4" in sparsity:
-            return SemiSparseWeightConfig()
-        else:
-            raise ValueError(f"Unknown sparsity type: {sparsity}")
-    if quantization is None and sparsity is None:
+    # Handle other sparsity-only cases
+    if quantization is None:
+        if sparsity is not None:
+            return _sparsity_only_config(sparsity)
         return None
+
     high_precision_dtype = kwargs.get("high_precision_dtype", torch.bfloat16)
-
-    if "int4wo" in quantization and not HAS_TRITON:
-        print("Warning: Triton not available, falling back to baseline")
-        return None
-
-    # Quantization techniques
-    if "baseline" in quantization:
-        return None
-    if "int8wo" in quantization:
-        return Int8WeightOnlyConfig()
-    if "int8dq" in quantization:
-        if "int8dq_prefill_wo_decode" in quantization:
-            return Int8DynamicActivationInt8WeightConfig(weight_only_decode=True)
-        else:
-            return Int8DynamicActivationInt8WeightConfig()
-    if "int8_dynamic_activation_intx_weight" in quantization:
-        assert high_precision_dtype == torch.float32, (
-            "int8_dynamic_activation_intx_weight requires using high_precision_dtype=torch.float32"
-        )
-
-        from torchao.quantization.granularity import PerAxis, PerGroup
-        from torchao.quantization.quant_api import (
-            Int8DynamicActivationIntxWeightConfig,
-        )
-
-        # Quantize model
-        _quant_args = quantization.split("-")
-        weight_dtype = getattr(torch, f"int{_quant_args[1]}")
-        group_size = int(_quant_args[2])
-        granularity = PerGroup(group_size) if group_size > 0 else PerAxis(0)
-        is_asymmetric = bool(_quant_args[3])
-        return Int8DynamicActivationIntxWeightConfig(
-            weight_dtype=weight_dtype,
-            weight_granularity=granularity,
-            weight_mapping_type=MappingType.ASYMMETRIC
-            if is_asymmetric
-            else MappingType.SYMMETRIC,
-            intx_packing_format="opaque_torchao_auto",
-        )
-    elif "float8wo" in quantization:
-        return Float8WeightOnlyConfig()
-    elif "float8dq" in quantization:
-        granularity = str(quantization.split("-")[-1])
-        if granularity == "tensor":
-            granularity = PerTensor()
-        elif granularity == "row":
-            granularity = PerRow()
-        else:
-            granularity = PerTensor()
-        return Float8DynamicActivationFloat8WeightConfig(granularity=granularity)
-    return None
+    return _quantization_to_config(quantization, high_precision_dtype)
 
 
 @torch.no_grad()
