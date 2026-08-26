@@ -973,12 +973,12 @@ def _(func, types, args, kwargs):
     self, dim = args
     if func is aten.squeeze.dim:
         assert dim == 0, f"Only dim == 0 is supported, got: {dim}"
-        reshape = lambda t: t.squeeze(dim=dim)  # noqa: E731
+        method_name = "squeeze"
     else:
-        reshape = lambda t: t.unsqueeze(dim=dim)  # noqa: E731
-    new = _rebuild_with_inferred_block_size(
-        self, reshape(self.qdata), reshape(self.scale)
-    )
+        method_name = "unsqueeze"
+    qdata = getattr(self.qdata, method_name)(dim=dim)
+    scale = getattr(self.scale, method_name)(dim=dim)
+    new = _rebuild_with_inferred_block_size(self, qdata, scale)
     return return_and_correct_aliasing(func, args, kwargs, new)
 
 
