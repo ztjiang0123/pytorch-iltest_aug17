@@ -35,3 +35,10 @@ def get_wikitext2(nsamples, seed, seqlen, tokenizer):
         tar[:, :-1] = -100
         trainloader.append((inp, tar))
     return trainloader, testenc
+
+
+def get_wikitext2_test_input_ids(nsamples, seed, seqlen, tokenizer):
+    """Same as :func:`get_wikitext2` but returns only the test split token ids
+    (``testenc.input_ids``) instead of the full ``BatchEncoding``."""
+    trainloader, testenc = get_wikitext2(nsamples, seed, seqlen, tokenizer)
+    return trainloader, testenc.input_ids

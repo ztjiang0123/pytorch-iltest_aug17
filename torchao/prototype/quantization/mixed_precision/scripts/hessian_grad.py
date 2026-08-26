@@ -10,17 +10,12 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from tqdm import tqdm
 
 from torchao.prototype.quantization.mixed_precision.scripts.data_utils import (
-    get_wikitext2 as _get_wikitext2,
+    get_wikitext2_test_input_ids as get_wikitext2,
 )
 
 
 def group_product(xs, ys):
     return [torch.sum(x * y) for (x, y) in zip(xs, ys)]
-
-
-def get_wikitext2(nsamples, seed, seqlen, tokenizer):
-    trainloader, testenc = _get_wikitext2(nsamples, seed, seqlen, tokenizer)
-    return trainloader, testenc.input_ids
 
 
 def dataloader_hv_product(
