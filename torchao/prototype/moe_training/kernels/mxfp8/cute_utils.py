@@ -278,6 +278,88 @@ if _cutedsl_runtime_available():
                 scales_tensor[lane_coord, block_base + i] = scale_buffer[i]
 
     @cute.jit
+    def issue_tma_load(load, warp_idx: cutlass.Int32, tile_copy_bytes: cutlass.Int32):
+        """Issue a G2S TMA load from the producer warp (warp 0 only).
+
+        Shared verbatim by the 1x32 and 32x1 MXFP8 kernels: only warp 0
+        partitions the tile, arrives on the mbarrier with the expected
+        transaction bytes, and issues the bulk-tensor copy.
+
+        Args:
+            load: ``(tma_atom_in, gIN_tile, sIN_tile, tma_mbar_ptr)`` — the
+                TMA copy atom, the global input tile, the shared-memory input
+                tile, and the TMA mbarrier pointer.
+            warp_idx: Warp index; only warp 0 issues the load.
+            tile_copy_bytes: Expected transaction size in bytes for the mbarrier.
+
+        Storage locations:
+            Source: gIN_tile (global memory) -> Destination: sIN_tile (shared)
+        """
+        tma_atom_in, gIN_tile, sIN_tile, tma_mbar_ptr = load
+        if warp_idx == 0:
+            cta_layout = cute.make_layout((1,))
+            sIN_for_tma_partition = cute.group_modes(sIN_tile, 0, 1)
+            gIN_for_tma_partition = cute.group_modes(gIN_tile, 0, 1)
+            tINs, tINg = _cpasync.tma_partition(
+                tma_atom_in,
+                0,
+                cta_layout,
+                sIN_for_tma_partition,
+                gIN_for_tma_partition,
+            )
+            tINg_stage0 = tINg[(None, 0)]
+            tINs_stage0 = tINs[(None, 0)]
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(tma_mbar_ptr, tile_copy_bytes)
+            cute.copy(
+                tma_atom_in,
+                tINg_stage0,
+                tINs_stage0,
+                tma_bar_ptr=tma_mbar_ptr,
+            )
+
+    @cute.jit
+    def issue_tma_store(store, warp_idx: cutlass.Int32):
+        """Issue an S2G TMA store from the producer warp (warp 0 only).
+
+        Shared verbatim by the 1x32 and 32x1 MXFP8 kernels: fence + block
+        sync, then warp 0 partitions the output tile and issues the
+        bulk-tensor copy back to global memory.
+
+        Args:
+            store: ``(tma_atom_out, gOUT_tile, sOUT_tile)`` — the TMA copy
+                atom, the global output tile, and the shared-memory output tile.
+            warp_idx: Warp index; only warp 0 issues the store.
+
+        Storage locations:
+            Source: sOUT_tile (shared) -> Destination: gOUT_tile (global memory)
+        """
+        tma_atom_out, gOUT_tile, sOUT_tile = store
+        cute.arch.fence_proxy(
+            "async.shared",
+            space="cta",
+        )
+        cute.arch.sync_threads()
+        if warp_idx == 0:
+            cta_layout = cute.make_layout((1,))
+            sOUT_for_tma_partition = cute.group_modes(sOUT_tile, 0, 1)
+            gOUT_for_tma_partition = cute.group_modes(gOUT_tile, 0, 1)
+            tOUTs, tOUTg = _cpasync.tma_partition(
+                tma_atom_out,
+                0,
+                cta_layout,
+                sOUT_for_tma_partition,
+                gOUT_for_tma_partition,
+            )
+            tOUTs_stage0 = tOUTs[(None, 0)]
+            tOUTg_stage0 = tOUTg[(None, 0)]
+            cute.copy(
+                tma_atom_out,
+                tOUTs_stage0,
+                tOUTg_stage0,
+            )
+
+    @cute.jit
     def validate_group_sizes(offs: cute.Tensor):
         # Only first thread validates to avoid redundant work
         num_groups = offs.shape[0]
@@ -300,9 +382,14 @@ if _cutedsl_runtime_available():
                 "Group sizes must be multiples of 128",
             )
 
-    def make_tile_shape(*, tile_m, tile_k, stage_count):
+    def make_tile_shape(*, tile_m, tile_k, stage_count, tile_copy_bytes):
         """Bundle compile-time tile geometry for the MXFP8 kernels."""
-        return SimpleNamespace(tile_m=tile_m, tile_k=tile_k, stage_count=stage_count)
+        return SimpleNamespace(
+            tile_m=tile_m,
+            tile_k=tile_k,
+            stage_count=stage_count,
+            tile_copy_bytes=tile_copy_bytes,
+        )
 
     def make_tma_handles(*, atom_in, tensor_in, atom_out, tensor_out):
         """Bundle the input/output TMA atoms and tensor views for a kernel."""
@@ -423,11 +510,13 @@ if _cutedsl_runtime_available():
 
     def _issue_tile_loads(state, tile_step, tile_eff, sIN_tile, tma_mbar_ptr):
         """Issue the current-tile TMA load and prefetch the next tile's load."""
-        kernel, tma, shape, axis = state.kernel, state.tma, state.shape, state.axis
+        tma, shape, axis = state.tma, state.shape, state.axis
         stage_count = shape.stage_count
         tiles_per_cta = axis.tiles_per_cta
         tile_shape = (shape.tile_m, shape.tile_k)
         warp_idx = state.warp_idx
+
+        tile_copy_bytes = shape.tile_copy_bytes
 
         if cutlass.const_expr(
             tile_step == 0 or not (stage_count > 1 and tiles_per_cta > 1)
@@ -437,8 +526,10 @@ if _cutedsl_runtime_available():
                 tile_shape,
                 _axis_tile_coord(axis, tile_eff, axis.fixed_tile),
             )
-            kernel._issue_tma_load(
-                tma.atom_in, gIN_tile, sIN_tile, tma_mbar_ptr, warp_idx
+            issue_tma_load(
+                (tma.atom_in, gIN_tile, sIN_tile, tma_mbar_ptr),
+                warp_idx,
+                tile_copy_bytes,
             )
 
         if cutlass.const_expr(stage_count > 1 and tiles_per_cta > 1):
@@ -454,8 +545,10 @@ if _cutedsl_runtime_available():
                     tile_shape,
                     _axis_tile_coord(axis, tile_next, axis.fixed_tile),
                 )
-                kernel._issue_tma_load(
-                    tma.atom_in, gIN_tile_next, sIN_tile_next, mbar_next, warp_idx
+                issue_tma_load(
+                    (tma.atom_in, gIN_tile_next, sIN_tile_next, mbar_next),
+                    warp_idx,
+                    tile_copy_bytes,
                 )
 
     def _quantize_lane_full(state, tiles, lane, tile_eff):
@@ -609,7 +702,7 @@ if _cutedsl_runtime_available():
                 (shape.tile_m, shape.tile_k),
                 _axis_tile_coord(axis, tile_eff, axis.fixed_tile),
             )
-            kernel._issue_tma_store(tma.atom_out, gOUT_tile, sOUT_tile, warp_idx)
+            issue_tma_store((tma.atom_out, gOUT_tile, sOUT_tile), warp_idx)
 
     def make_kernel_io(**fields):
         """Bundle the per-launch I/O + geometry a 2D quantize kernel needs.
