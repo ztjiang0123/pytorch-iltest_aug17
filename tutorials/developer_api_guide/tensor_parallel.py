@@ -164,7 +164,8 @@ def shard(
     placements: Sequence[Placement],
 ) -> DTensor:
     """
-    Add a shard function to simplify both colwise_shard and rowwise_shard.  The
+    Add a shard function to simplify ``shard_linear`` for both column-wise and
+    row-wise sharding.  The
     shard function accepts a full tensor, and returns a DTensor based on
     indicated placements.  Goal is to move the shard function as a static method
     of DTensor, e.g.
@@ -183,12 +184,15 @@ def shard(
     return DTensor.from_local(local_tensor, device_mesh, placements)
 
 
-def _shard_linear_weight(
+def shard_linear(
     m: torch.nn.Module, mesh: DeviceMesh, shard_dim: int
 ) -> torch.nn.Module:
     """
     Shard the linear layer weight of ``m`` along ``shard_dim`` and replace the
-    parameter in place. Shared implementation for column-wise and row-wise sharding.
+    parameter in place.
+
+    ``shard_dim=0`` gives column-wise sharding of the model (row-wise wrt A^T),
+    ``shard_dim=1`` gives row-wise sharding (column-wise wrt A^T).
     """
     orig_weight = m.linear.weight
     # Construct DTensor from local shard
@@ -196,22 +200,6 @@ def _shard_linear_weight(
     # Replace parameter in module
     m.linear.weight = torch.nn.Parameter(dtensor, requires_grad=False)
     return m
-
-
-def colwise_shard(m: torch.nn.Module, mesh: DeviceMesh) -> torch.nn.Module:
-    """
-    Shard linear layer of the model in column-wise fashion
-    """
-    # Column-wise is wrt to A^T, so for A it is row-wise (Shard(0)).
-    return _shard_linear_weight(m, mesh, 0)
-
-
-def rowwise_shard(m: torch.nn.Module, mesh: DeviceMesh) -> torch.nn.Module:
-    """
-    Shard linear layer of the model in row-wise fashion
-    """
-    # Row-wise is wrt to A^T, so for A it is column-wise (Shard(1)).
-    return _shard_linear_weight(m, mesh, 1)
 
 
 ########
@@ -242,9 +230,9 @@ def main():
     dist.init_process_group(backend="nccl")
     mesh = dist.init_device_mesh("cuda", (world_size,))
 
-    # Shard the models
-    up_dist = colwise_shard(up_quant, mesh)
-    dn_dist = rowwise_shard(dn_quant, mesh)
+    # Shard the models: column-wise (dim 0) for the up-proj, row-wise (dim 1) for the down-proj
+    up_dist = shard_linear(up_quant, mesh, 0)
+    dn_dist = shard_linear(dn_quant, mesh, 1)
 
     # We need to turn inputs into DTensor form as well -- just a format change
     input_dtensor = DTensor.from_local(example_input, mesh, [Replicate()])

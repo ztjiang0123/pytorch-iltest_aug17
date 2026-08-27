@@ -150,20 +150,27 @@ def build_results_batch(predictor, batch, batch_size, pad_input_image_batch):
     return result_batch, orig_input_image_batch_size, elapsed_time
 
 
-def _maybe_compile_and_warmup(
-    predictor, batch, batch_size, use_compile, use_fullgraph, pad_input_image_batch, batch_runner
-):
-    """Compile the image encoder (if requested) and run a few warmup iterations."""
+def _maybe_compile_image_encoder(predictor, use_compile, use_fullgraph):
+    """Compile the predictor's image encoder in place, unless compilation is disabled."""
+    if str(use_compile) != "False":
+        predictor.model.image_encoder = torch.compile(
+            predictor.model.image_encoder,
+            mode=use_compile,
+            fullgraph=use_fullgraph,
+        )
+
+
+def _compile_and_warmup(predictor, use_compile, use_fullgraph, run_batch):
+    """Compile the image encoder (if requested) and run a few warmup iterations.
+
+    ``run_batch`` is a zero-arg callable that runs one batch through the predictor;
+    it keeps batch-specific arguments out of this helper's signature.
+    """
     with torch.autograd.profiler.record_function("compilation and warmup"):
-        if str(use_compile) != "False":
-            predictor.model.image_encoder = torch.compile(
-                predictor.model.image_encoder,
-                mode=use_compile,
-                fullgraph=use_fullgraph,
-            )
+        _maybe_compile_image_encoder(predictor, use_compile, use_fullgraph)
         # Run first batch a few times for warmup and exclude it from the final timings
         for _ in range(5):
-            _ = batch_runner(predictor, batch, batch_size, pad_input_image_batch)
+            _ = run_batch()
 
 
 def _should_count_timing(num_images):
@@ -199,14 +206,13 @@ def build_results(
     for batch in tqdm.tqdm(batched_data_iter):
         with torch.no_grad():
             if batch_idx == 0:
-                _maybe_compile_and_warmup(
+                _compile_and_warmup(
                     predictor,
-                    batch,
-                    batch_size,
                     use_compile,
                     use_fullgraph,
-                    pad_input_image_batch,
-                    batch_runner,
+                    lambda: batch_runner(
+                        predictor, batch, batch_size, pad_input_image_batch
+                    ),
                 )
             result_batch, num_datapoints, kernel_time = batch_runner(
                 predictor, batch, batch_size, pad_input_image_batch
