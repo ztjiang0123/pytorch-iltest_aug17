@@ -538,16 +538,8 @@ def detect_hipblaslt_extended_enums(rocm_home):
     return found_col16, found_vec_ext, found_outer_vec
 
 
-def get_extensions():
-    # Skip building C++ extensions if USE_CPP is set to "0"
-    if use_cpp == "0":
-        print("USE_CPP=0: Skipping compilation of C++ extensions")
-        return []
-
-    debug_mode = use_debug_mode()
-    if debug_mode:
-        print("Compiling in debug mode")
-
+def _warn_missing_gpu_toolkits():
+    """Print guidance when a GPU torch build has no matching toolkit installed."""
     if CUDA_HOME is None and torch.version.cuda:
         print("CUDA toolkit is not available. Skipping compilation of CUDA extensions")
         print(
@@ -557,39 +549,23 @@ def get_extensions():
         print("ROCm is not available. Skipping compilation of ROCm extensions")
         print("If you'd like to compile ROCm extensions locally please install ROCm")
 
-    use_cuda = torch.version.cuda and CUDA_HOME is not None
-    use_rocm = torch.version.hip and ROCM_HOME is not None
-    extension = CUDAExtension if (use_cuda or use_rocm) else CppExtension
 
-    nvcc_args = [
+def _base_gpu_args(debug_mode, extra):
+    """Common ``-DNDEBUG/-O3`` style flags plus any ``extra`` trailing flags."""
+    return [
         "-DNDEBUG" if not debug_mode else "-DDEBUG",
         "-O3" if not debug_mode else "-O0",
-        "-t=0",
-        "-std=c++20",
+        *extra,
     ]
-    rocm_args = [
-        "-DNDEBUG" if not debug_mode else "-DDEBUG",
-        "-O3" if not debug_mode else "-O0",
-        "-std=c++20",
-    ]
-    maybe_hipify_v2_flag = []
-    if use_rocm and detect_hipify_v2():
-        maybe_hipify_v2_flag = ["-DHIPIFY_V2"]
 
-    extra_link_args = []
-    extra_compile_args = {
-        "cxx": [f"-DPy_LIMITED_API={min_supported_cpython_hexcode}"]
-        + maybe_hipify_v2_flag,
-        "nvcc": nvcc_args if use_cuda else rocm_args + maybe_hipify_v2_flag,
-    }
 
+def _apply_platform_compile_args(extra_compile_args, extra_link_args, debug_mode):
+    """Append OS-specific (and debug) compile/link flags in place."""
     if not IS_WINDOWS:
         extra_compile_args["cxx"].extend(
             ["-O3" if not debug_mode else "-O0", "-fdiagnostics-color=always"]
         )
-
         add_options_for_x86(extra_compile_args)
-
         if debug_mode:
             extra_compile_args["cxx"].append("-g")
             if "nvcc" in extra_compile_args:
@@ -599,37 +575,71 @@ def get_extensions():
         extra_compile_args["cxx"].extend(
             ["/O2" if not debug_mode else "/Od", "/permissive-"]
         )
-
         if debug_mode:
             extra_compile_args["cxx"].append("/ZI")
             extra_compile_args["nvcc"].append("-g")
             extra_link_args.append("/DEBUG")
 
+
+def _apply_hipblaslt_flags(extra_compile_args):
+    """Detect hipBLASLt extended enums and append the matching -D flags in place."""
+    # naive search for hipblalst.h, if any found contain HIPBLASLT_ORDER_COL16 and VEC_EXT
+    print("ROCM_HOME", ROCM_HOME)
+    found_col16, found_vec_ext, found_outer_vec = detect_hipblaslt_extended_enums(
+        ROCM_HOME
+    )
+    if found_col16:
+        extra_compile_args["cxx"].append("-DHIPBLASLT_HAS_ORDER_COL16")
+        print("hipblaslt found extended col order enums")
+    else:
+        print("hipblaslt does not have extended col order enums")
+    if found_outer_vec:
+        extra_compile_args["cxx"].append("-DHIPBLASLT_OUTER_VEC")
+        print("hipblaslt found outer vec")
+    elif found_vec_ext:
+        extra_compile_args["cxx"].append("-DHIPBLASLT_VEC_EXT")
+        print("hipblaslt found vec ext")
+    else:
+        print("hipblaslt does not have vec ext")
+
+
+def _build_extra_compile_args(debug_mode, use_cuda, use_rocm):
+    """Assemble ``extra_compile_args`` and ``extra_link_args`` for the main extension."""
+    nvcc_args = _base_gpu_args(debug_mode, ["-t=0", "-std=c++20"])
+    rocm_args = _base_gpu_args(debug_mode, ["-std=c++20"])
+
+    maybe_hipify_v2_flag = ["-DHIPIFY_V2"] if use_rocm and detect_hipify_v2() else []
+
+    extra_link_args = []
+    extra_compile_args = {
+        "cxx": [f"-DPy_LIMITED_API={min_supported_cpython_hexcode}"]
+        + maybe_hipify_v2_flag,
+        "nvcc": nvcc_args if use_cuda else rocm_args + maybe_hipify_v2_flag,
+    }
+
+    _apply_platform_compile_args(extra_compile_args, extra_link_args, debug_mode)
+
     if use_rocm:
-        # naive search for hipblalst.h, if any found contain HIPBLASLT_ORDER_COL16 and VEC_EXT
-        print("ROCM_HOME", ROCM_HOME)
-        found_col16, found_vec_ext, found_outer_vec = detect_hipblaslt_extended_enums(
-            ROCM_HOME
-        )
-        if found_col16:
-            extra_compile_args["cxx"].append("-DHIPBLASLT_HAS_ORDER_COL16")
-            print("hipblaslt found extended col order enums")
-        else:
-            print("hipblaslt does not have extended col order enums")
-        if found_outer_vec:
-            extra_compile_args["cxx"].append("-DHIPBLASLT_OUTER_VEC")
-            print("hipblaslt found outer vec")
-        elif found_vec_ext:
-            extra_compile_args["cxx"].append("-DHIPBLASLT_VEC_EXT")
-            print("hipblaslt found vec ext")
-        else:
-            print("hipblaslt does not have vec ext")
+        _apply_hipblaslt_flags(extra_compile_args)
 
-    # Get base directory and source paths
-    curdir = os.path.dirname(os.path.curdir)
-    extensions_dir = os.path.join(curdir, "torchao", "csrc")
+    return extra_compile_args, extra_link_args, nvcc_args
 
-    # Collect C++ source files
+
+def _collect_rocm_sources(extensions_dir):
+    """Collect ROCm sources (.cu/.hip/.cpp) from the known ROCm source directories."""
+    rocm_source_dirs = [
+        os.path.join(extensions_dir, "rocm", "swizzle"),
+    ]
+    rocm_sources = []
+    for rocm_dir in rocm_source_dirs:
+        rocm_sources.extend(glob.glob(os.path.join(rocm_dir, "*.cu"), recursive=True))
+        rocm_sources.extend(glob.glob(os.path.join(rocm_dir, "*.hip"), recursive=True))
+        rocm_sources.extend(glob.glob(os.path.join(rocm_dir, "*.cpp"), recursive=True))
+    return rocm_sources
+
+
+def _collect_sources(extensions_dir, extensions_cuda_dir, mxfp8_extension_dir):
+    """Gather C++/CUDA/ROCm sources honoring platform toggles, minus CMake/mxfp8 files."""
     sources = list(glob.glob(os.path.join(extensions_dir, "**/*.cpp"), recursive=True))
 
     # Exclude C++ CPU sources that are built by CMake
@@ -653,40 +663,265 @@ def get_extensions():
         )
         sources = [s for s in sources if s not in excluded_sources]
 
-    # Collect CUDA source files
-    extensions_cuda_dir = os.path.join(extensions_dir, "cuda")
     cuda_sources = list(
         glob.glob(os.path.join(extensions_cuda_dir, "**/*.cu"), recursive=True)
     )
 
-    # Define ROCm source directories
-    rocm_source_dirs = [
-        os.path.join(extensions_dir, "rocm", "swizzle"),
-    ]
-
-    # Collect all ROCm sources from the defined directories
-    rocm_sources = []
-    for rocm_dir in rocm_source_dirs:
-        rocm_sources.extend(glob.glob(os.path.join(rocm_dir, "*.cu"), recursive=True))
-        rocm_sources.extend(glob.glob(os.path.join(rocm_dir, "*.hip"), recursive=True))
-        rocm_sources.extend(glob.glob(os.path.join(rocm_dir, "*.cpp"), recursive=True))
-
-    # Add CUDA source files if needed
-    if use_cuda:
-        sources += cuda_sources
-
-    # Add MXFP8 cuda extension dir
-    mxfp8_extension_dir = os.path.join(extensions_dir, "cuda", "mx_kernels")
+    # Exclude the separately-built MXFP8 sources.
     mxfp8_sources_to_exclude = list(
         glob.glob(os.path.join(mxfp8_extension_dir, "**/*"), recursive=True)
     )
     sources = [s for s in sources if s not in mxfp8_sources_to_exclude]
 
+    return sources, cuda_sources
+
+
+def _configure_cutlass(extra_compile_args, sources, extensions_cuda_dir, use_cuda):
+    """
+    Configure CUTLASS include flags and sm90a sources.
+
+    Returns ``(cutlass_90a_sources, build_for_sm90a, build_for_sm100a)`` and
+    mutates ``extra_compile_args``/``sources`` in place to reflect the selection.
+    """
+    use_cutlass = use_cuda and not IS_WINDOWS
+    cutlass_90a_sources = None
+    build_for_sm90a = False
+    build_for_sm100a = False
+
+    if not use_cutlass:
+        # Remove CUTLASS-based kernels from the sources list.  An
+        # assumption is that these files will have "cutlass" in its name.
+        cutlass_sources = list(
+            glob.glob(
+                os.path.join(extensions_cuda_dir, "**/*cutlass*.cu"), recursive=True
+            )
+        )
+        sources[:] = [s for s in sources if s not in cutlass_sources]
+        return cutlass_90a_sources, build_for_sm90a, build_for_sm100a
+
+    cutlass_dir = os.path.join(third_party_path, "cutlass")
+    cutlass_include_dir = os.path.join(cutlass_dir, "include")
+    cutlass_tools_include_dir = os.path.join(cutlass_dir, "tools", "util", "include")
+    cutlass_extensions_include_dir = os.path.join(cwd, extensions_cuda_dir)
+    extra_compile_args["nvcc"].extend(
+        [
+            "-DTORCHAO_USE_CUTLASS",
+            "-I" + cutlass_include_dir,
+            "-I" + cutlass_tools_include_dir,
+            "-I" + cutlass_extensions_include_dir,
+            "-DCUTE_USE_PACKED_TUPLE=1",
+            "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+            "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
+            "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
+            "--ftemplate-backtrace-limit=0",
+            # "--keep",
+            # "--ptxas-options=--verbose,--register-usage-level=5,--warn-on-local-memory-usage",
+            # "--resource-usage",
+            # "-lineinfo",
+            # "-DCUTLASS_ENABLE_GDC_FOR_SM90",  # https://github.com/NVIDIA/cutlass/blob/main/media/docs/dependent_kernel_launch.md
+        ]
+    )
+
+    build_for_sm90a, build_for_sm100a = get_cutlass_build_flags()
+
+    # Define sm90a sources that use stable ABI (requires torch >= 2.10.0)
+    cutlass_90a_sources = [
+        os.path.join(
+            extensions_cuda_dir,
+            "to_sparse_semi_structured_cutlass_sm9x",
+            "to_sparse_semi_structured_cutlass_sm9x_f8.cu",
+        ),
+        os.path.join(
+            extensions_cuda_dir,
+            "rowwise_scaled_linear_sparse_cutlass",
+            "rowwise_scaled_linear_sparse_cutlass_f8f8.cu",
+        ),
+    ]
+    for dtypes in ["e4m3e4m3", "e4m3e5m2", "e5m2e4m3", "e5m2e5m2"]:
+        cutlass_90a_sources.append(
+            os.path.join(
+                extensions_cuda_dir,
+                "rowwise_scaled_linear_sparse_cutlass",
+                "rowwise_scaled_linear_sparse_cutlass_" + dtypes + ".cu",
+            )
+        )
+
+    # Always remove sm90a sources from main sources
+    sources[:] = [s for s in sources if s not in cutlass_90a_sources]
+
+    return cutlass_90a_sources, build_for_sm90a, build_for_sm100a
+
+
+def _maybe_mxfp8_extension(mxfp8_extension_dir, nvcc_args, build_for_sm100a):
+    """Return the mxfp8 CUDAExtension when its sources exist and the target matches."""
+    mxfp8_sources = [
+        os.path.join(mxfp8_extension_dir, "mxfp8_extension.cpp"),
+        os.path.join(mxfp8_extension_dir, "mxfp8_cuda.cu"),
+        os.path.join(mxfp8_extension_dir, "mx_block_rearrange_2d_M_groups.cu"),
+        os.path.join(mxfp8_extension_dir, "fused_pad_token_groups.cu"),
+    ]
+
+    # Only add the extension if the source files exist AND we are building for sm100
+    mxfp8_src_files_exist = all(os.path.exists(f) for f in mxfp8_sources)
+    if not (
+        mxfp8_src_files_exist and build_for_sm100a and _torch_version_at_least("2.11.0")
+    ):
+        return None
+
+    print("Building mxfp8_cuda extension")
+    return CUDAExtension(
+        name="torchao._C_mxfp8",
+        sources=mxfp8_sources,
+        include_dirs=[
+            mxfp8_extension_dir,  # For mxfp8_quantize.cuh, mxfp8_extension.cpp, and mxfp8_cuda.cu
+        ],
+        extra_compile_args={
+            "cxx": [
+                f"-DPy_LIMITED_API={min_supported_cpython_hexcode}",
+                "-std=c++20",
+                "-O3",
+                "-DUSE_CUDA",
+                # define TORCH_TARGET_VERSION with min version 2.11 for ABI stable Float8_e8m0fnu
+                "-DTORCH_TARGET_VERSION=0x020b000000000000",
+            ],
+            "nvcc": nvcc_args
+            + [
+                "-gencode=arch=compute_100,code=sm_100",
+                "-gencode=arch=compute_120,code=compute_120",
+                "-DUSE_CUDA",
+                "-DTORCH_TARGET_VERSION=0x020b000000000000",
+            ],
+        },
+    )
+
+
+def _maybe_cutlass_90a_extension(
+    extension, cutlass_90a_sources, extra_compile_args, extra_link_args, build_for_sm90a
+):
+    """Return the stable-ABI cutlass_90a extension when eligible, else ``None``."""
+    if not (
+        cutlass_90a_sources is not None
+        and len(cutlass_90a_sources) > 0
+        and build_for_sm90a
+        and _torch_version_at_least("2.10.0")
+    ):
+        return None
+
+    cutlass_90a_extra_compile_args = copy.deepcopy(extra_compile_args)
+    # Only use sm90a architecture for these sources, ignoring other flags
+    cutlass_90a_extra_compile_args["nvcc"].extend(
+        [
+            "-DUSE_CUDA",
+            "-gencode=arch=compute_90a,code=sm_90a",
+            "-DTORCH_TARGET_VERSION=0x020a000000000000",
+        ]
+    )
+    # Add compile flags for stable ABI support (requires torch >= 2.10)
+    cutlass_90a_extra_compile_args["cxx"].extend(
+        [
+            "-DUSE_CUDA",
+            "-DTORCH_TARGET_VERSION=0x020a000000000000",
+        ]
+    )
+    # stable ABI cutlass_90a module
+    return extension(
+        "torchao._C_cutlass_90a",
+        cutlass_90a_sources,
+        py_limited_api=True,
+        extra_compile_args=cutlass_90a_extra_compile_args,
+        extra_link_args=extra_link_args,
+    )
+
+
+def _cmake_extensions():
+    """Build the optional CMake-driven CPU/MPS extensions for macOS ARM / experimental."""
+    # Build CMakeLists from /torchao/csrc/cpu - additional options become available : TORCHAO_BUILD_CPU_AARCH64, TORCHAO_BUILD_KLEIDIAI, TORCHAO_BUILD_MPS_OPS, TORCHAO_PARALLEL_BACKEND
+    if not (build_macos_arm_auto or os.getenv("BUILD_TORCHAO_EXPERIMENTAL") == "1"):
+        return []
+
+    build_options = BuildOptions()
+
+    from distutils.sysconfig import get_python_lib
+
+    torch_dir = get_python_lib() + "/torch/share/cmake/Torch"
+
+    ext_modules = [
+        CMakeExtension(
+            "torchao._C_cpu_shared_kernels_aten",
+            cmake_lists_dir="torchao/csrc/cpu",
+            cmake_args=(
+                [
+                    f"-DCMAKE_BUILD_TYPE={'Debug' if use_debug_mode() else 'Release'}",
+                    f"-DTORCHAO_BUILD_CPU_AARCH64={bool_to_on_off(build_options.build_cpu_aarch64)}",
+                    f"-DTORCHAO_BUILD_KLEIDIAI={bool_to_on_off(build_options.build_kleidi_ai)}",
+                    f"-DTORCHAO_ENABLE_ARM_NEON_DOT={bool_to_on_off(build_options.enable_arm_neon_dot)}",
+                    f"-DTORCHAO_ENABLE_ARM_I8MM={bool_to_on_off(build_options.enable_arm_i8mm)}",
+                    f"-DTORCHAO_PARALLEL_BACKEND={build_options.parallel_backend}",
+                    "-DTORCHAO_BUILD_TESTS=OFF",
+                    "-DTORCHAO_BUILD_BENCHMARKS=OFF",
+                    "-DTorch_DIR=" + torch_dir,
+                ]
+            ),
+        )
+    ]
+
+    if build_options.build_experimental_mps:
+        ext_modules.append(
+            CMakeExtension(
+                "torchao._C_mps",
+                cmake_lists_dir="torchao/experimental/ops/mps",
+                cmake_args=(
+                    [
+                        f"-DCMAKE_BUILD_TYPE={'Debug' if use_debug_mode() else 'Release'}",
+                        f"-DTORCHAO_BUILD_MPS_OPS={bool_to_on_off(build_options.build_experimental_mps)}",
+                        "-DTorch_DIR=" + torch_dir,
+                    ]
+                ),
+            )
+        )
+
+    return ext_modules
+
+
+def get_extensions():
+    # Skip building C++ extensions if USE_CPP is set to "0"
+    if use_cpp == "0":
+        print("USE_CPP=0: Skipping compilation of C++ extensions")
+        return []
+
+    debug_mode = use_debug_mode()
+    if debug_mode:
+        print("Compiling in debug mode")
+
+    _warn_missing_gpu_toolkits()
+
+    use_cuda = torch.version.cuda and CUDA_HOME is not None
+    use_rocm = torch.version.hip and ROCM_HOME is not None
+    extension = CUDAExtension if (use_cuda or use_rocm) else CppExtension
+
+    extra_compile_args, extra_link_args, nvcc_args = _build_extra_compile_args(
+        debug_mode, use_cuda, use_rocm
+    )
+
+    # Get base directory and source paths
+    curdir = os.path.dirname(os.path.curdir)
+    extensions_dir = os.path.join(curdir, "torchao", "csrc")
+    extensions_cuda_dir = os.path.join(extensions_dir, "cuda")
+    mxfp8_extension_dir = os.path.join(extensions_dir, "cuda", "mx_kernels")
+
+    sources, cuda_sources = _collect_sources(
+        extensions_dir, extensions_cuda_dir, mxfp8_extension_dir
+    )
+
+    # Add CUDA source files if needed
+    if use_cuda:
+        sources += cuda_sources
+
     # TOOD: Remove this and use what CUDA has once we fix all the builds.
     # TODO: Add support for other ROCm GPUs
     if use_rocm:
         extra_compile_args["nvcc"].append("--offload-arch=gfx942")
-        sources += rocm_sources
+        sources += _collect_rocm_sources(extensions_dir)
     else:
         # Remove ROCm-based sources from the sources list.
         extensions_rocm_dir = os.path.join(extensions_dir, "rocm")
@@ -695,80 +930,13 @@ def get_extensions():
         )
         sources = [s for s in sources if s not in rocm_sources]
 
-    use_cutlass = False
-    cutlass_90a_sources = None
-    build_for_sm90a = False
-    build_for_sm100a = False
-    if use_cuda and not IS_WINDOWS:
-        use_cutlass = True
-        cutlass_dir = os.path.join(third_party_path, "cutlass")
-        cutlass_include_dir = os.path.join(cutlass_dir, "include")
-        cutlass_tools_include_dir = os.path.join(
-            cutlass_dir, "tools", "util", "include"
-        )
-        cutlass_extensions_include_dir = os.path.join(cwd, extensions_cuda_dir)
-    if use_cutlass:
-        extra_compile_args["nvcc"].extend(
-            [
-                "-DTORCHAO_USE_CUTLASS",
-                "-I" + cutlass_include_dir,
-                "-I" + cutlass_tools_include_dir,
-                "-I" + cutlass_extensions_include_dir,
-                "-DCUTE_USE_PACKED_TUPLE=1",
-                "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
-                "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
-                "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
-                "--ftemplate-backtrace-limit=0",
-                # "--keep",
-                # "--ptxas-options=--verbose,--register-usage-level=5,--warn-on-local-memory-usage",
-                # "--resource-usage",
-                # "-lineinfo",
-                # "-DCUTLASS_ENABLE_GDC_FOR_SM90",  # https://github.com/NVIDIA/cutlass/blob/main/media/docs/dependent_kernel_launch.md
-            ]
-        )
-
-        build_for_sm90a, build_for_sm100a = get_cutlass_build_flags()
-
-        # Define sm90a sources that use stable ABI (requires torch >= 2.10.0)
-        cutlass_90a_sources = [
-            os.path.join(
-                extensions_cuda_dir,
-                "to_sparse_semi_structured_cutlass_sm9x",
-                "to_sparse_semi_structured_cutlass_sm9x_f8.cu",
-            ),
-            os.path.join(
-                extensions_cuda_dir,
-                "rowwise_scaled_linear_sparse_cutlass",
-                "rowwise_scaled_linear_sparse_cutlass_f8f8.cu",
-            ),
-        ]
-        for dtypes in ["e4m3e4m3", "e4m3e5m2", "e5m2e4m3", "e5m2e5m2"]:
-            cutlass_90a_sources.append(
-                os.path.join(
-                    extensions_cuda_dir,
-                    "rowwise_scaled_linear_sparse_cutlass",
-                    "rowwise_scaled_linear_sparse_cutlass_" + dtypes + ".cu",
-                )
-            )
-
-        # Always remove sm90a sources from main sources
-        sources = [s for s in sources if s not in cutlass_90a_sources]
-
-    else:
-        # Remove CUTLASS-based kernels from the sources list.  An
-        # assumption is that these files will have "cutlass" in its
-        # name.
-        cutlass_sources = list(
-            glob.glob(
-                os.path.join(extensions_cuda_dir, "**/*cutlass*.cu"), recursive=True
-            )
-        )
-        sources = [s for s in sources if s not in cutlass_sources]
+    cutlass_90a_sources, build_for_sm90a, build_for_sm100a = _configure_cutlass(
+        extra_compile_args, sources, extensions_cuda_dir, use_cuda
+    )
 
     ext_modules = []
     if len(sources) > 0:
         print("SOURCES", sources)
-
         ext_modules.append(
             extension(
                 "torchao._C",
@@ -781,125 +949,25 @@ def get_extensions():
 
     # Add the mxfp8 casting CUDA extension
     if use_cuda:
-        mxfp8_sources = [
-            os.path.join(mxfp8_extension_dir, "mxfp8_extension.cpp"),
-            os.path.join(mxfp8_extension_dir, "mxfp8_cuda.cu"),
-            os.path.join(mxfp8_extension_dir, "mx_block_rearrange_2d_M_groups.cu"),
-            os.path.join(mxfp8_extension_dir, "fused_pad_token_groups.cu"),
-        ]
-
-        # Only add the extension if the source files exist AND we are building for sm100
-        mxfp8_src_files_exist = all(os.path.exists(f) for f in mxfp8_sources)
-        if (
-            mxfp8_src_files_exist
-            and build_for_sm100a
-            and _torch_version_at_least("2.11.0")
-        ):
-            print("Building mxfp8_cuda extension")
-            ext_modules.append(
-                CUDAExtension(
-                    name="torchao._C_mxfp8",
-                    sources=mxfp8_sources,
-                    include_dirs=[
-                        mxfp8_extension_dir,  # For mxfp8_quantize.cuh, mxfp8_extension.cpp, and mxfp8_cuda.cu
-                    ],
-                    extra_compile_args={
-                        "cxx": [
-                            f"-DPy_LIMITED_API={min_supported_cpython_hexcode}",
-                            "-std=c++20",
-                            "-O3",
-                            "-DUSE_CUDA",
-                            # define TORCH_TARGET_VERSION with min version 2.11 for ABI stable Float8_e8m0fnu
-                            "-DTORCH_TARGET_VERSION=0x020b000000000000",
-                        ],
-                        "nvcc": nvcc_args
-                        + [
-                            "-gencode=arch=compute_100,code=sm_100",
-                            "-gencode=arch=compute_120,code=compute_120",
-                            "-DUSE_CUDA",
-                            "-DTORCH_TARGET_VERSION=0x020b000000000000",
-                        ],
-                    },
-                ),
-            )
+        mxfp8_extension = _maybe_mxfp8_extension(
+            mxfp8_extension_dir, nvcc_args, build_for_sm100a
+        )
+        if mxfp8_extension is not None:
+            ext_modules.append(mxfp8_extension)
 
     # Only build the cutlass_90a extension if sm90a is in the architecture flags
     # and if torch version >= 2.10
-    if (
-        cutlass_90a_sources is not None
-        and len(cutlass_90a_sources) > 0
-        and build_for_sm90a
-        and _torch_version_at_least("2.10.0")
-    ):
-        cutlass_90a_extra_compile_args = copy.deepcopy(extra_compile_args)
-        # Only use sm90a architecture for these sources, ignoring other flags
-        cutlass_90a_extra_compile_args["nvcc"].extend(
-            [
-                "-DUSE_CUDA",
-                "-gencode=arch=compute_90a,code=sm_90a",
-                "-DTORCH_TARGET_VERSION=0x020a000000000000",
-            ]
-        )
-        # Add compile flags for stable ABI support (requires torch >= 2.10)
-        cutlass_90a_extra_compile_args["cxx"].extend(
-            [
-                "-DUSE_CUDA",
-                "-DTORCH_TARGET_VERSION=0x020a000000000000",
-            ]
-        )
-        # stable ABI cutlass_90a module
-        ext_modules.append(
-            extension(
-                "torchao._C_cutlass_90a",
-                cutlass_90a_sources,
-                py_limited_api=True,
-                extra_compile_args=cutlass_90a_extra_compile_args,
-                extra_link_args=extra_link_args,
-            )
-        )
+    cutlass_90a_extension = _maybe_cutlass_90a_extension(
+        extension,
+        cutlass_90a_sources,
+        extra_compile_args,
+        extra_link_args,
+        build_for_sm90a,
+    )
+    if cutlass_90a_extension is not None:
+        ext_modules.append(cutlass_90a_extension)
 
-    # Build CMakeLists from /torchao/csrc/cpu - additional options become available : TORCHAO_BUILD_CPU_AARCH64, TORCHAO_BUILD_KLEIDIAI, TORCHAO_BUILD_MPS_OPS, TORCHAO_PARALLEL_BACKEND
-    if build_macos_arm_auto or os.getenv("BUILD_TORCHAO_EXPERIMENTAL") == "1":
-        build_options = BuildOptions()
-
-        from distutils.sysconfig import get_python_lib
-
-        torch_dir = get_python_lib() + "/torch/share/cmake/Torch"
-
-        ext_modules.append(
-            CMakeExtension(
-                "torchao._C_cpu_shared_kernels_aten",
-                cmake_lists_dir="torchao/csrc/cpu",
-                cmake_args=(
-                    [
-                        f"-DCMAKE_BUILD_TYPE={'Debug' if use_debug_mode() else 'Release'}",
-                        f"-DTORCHAO_BUILD_CPU_AARCH64={bool_to_on_off(build_options.build_cpu_aarch64)}",
-                        f"-DTORCHAO_BUILD_KLEIDIAI={bool_to_on_off(build_options.build_kleidi_ai)}",
-                        f"-DTORCHAO_ENABLE_ARM_NEON_DOT={bool_to_on_off(build_options.enable_arm_neon_dot)}",
-                        f"-DTORCHAO_ENABLE_ARM_I8MM={bool_to_on_off(build_options.enable_arm_i8mm)}",
-                        f"-DTORCHAO_PARALLEL_BACKEND={build_options.parallel_backend}",
-                        "-DTORCHAO_BUILD_TESTS=OFF",
-                        "-DTORCHAO_BUILD_BENCHMARKS=OFF",
-                        "-DTorch_DIR=" + torch_dir,
-                    ]
-                ),
-            )
-        )
-
-        if build_options.build_experimental_mps:
-            ext_modules.append(
-                CMakeExtension(
-                    "torchao._C_mps",
-                    cmake_lists_dir="torchao/experimental/ops/mps",
-                    cmake_args=(
-                        [
-                            f"-DCMAKE_BUILD_TYPE={'Debug' if use_debug_mode() else 'Release'}",
-                            f"-DTORCHAO_BUILD_MPS_OPS={bool_to_on_off(build_options.build_experimental_mps)}",
-                            "-DTorch_DIR=" + torch_dir,
-                        ]
-                    ),
-                )
-            )
+    ext_modules.extend(_cmake_extensions())
 
     return ext_modules
 

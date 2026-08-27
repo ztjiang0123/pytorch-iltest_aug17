@@ -550,7 +550,34 @@ def _dequantize_affine_no_dtype_check(
     return dequant.view(original_shape).to(output_dtype)
 
 
-class AffineQuantizedMinMaxObserver(AffineQuantizedObserverBase):
+class _MinMaxQParamsMixin:
+    """
+    Shared `calculate_qparams` for observers that track reduced `min_val` and
+    `max_val` buffers (see `AffineQuantizedMinMaxObserver` and
+    `AffineQuantizedMovingAverageMinMaxObserver`).
+    """
+
+    def calculate_qparams(self) -> tuple[torch.Tensor, torch.Tensor]:
+        assert hasattr(self, "min_val") and hasattr(self, "max_val"), (
+            "Expecting the observer has min_val and max_val, please run the observer before calling calculate_qparams"
+        )
+        return choose_qparams_affine_with_min_max(
+            self.min_val,
+            self.max_val,
+            self.mapping_type,
+            [],  # BlockSize is not needed because the min/max are already reduced
+            self.target_dtype,
+            self.quant_min,
+            self.quant_max,
+            self.eps,
+            self.scale_dtype,
+            self.zero_point_dtype,
+            self.preserve_zero,
+            self.zero_point_domain,
+        )
+
+
+class AffineQuantizedMinMaxObserver(_MinMaxQParamsMixin, AffineQuantizedObserverBase):
     def forward(self, input: torch.Tensor):
         if input.numel() == 0:
             return input
@@ -583,27 +610,10 @@ class AffineQuantizedMinMaxObserver(AffineQuantizedObserverBase):
         # returning original input
         return input
 
-    def calculate_qparams(self) -> tuple[torch.Tensor, torch.Tensor]:
-        assert hasattr(self, "min_val") and hasattr(self, "max_val"), (
-            "Expecting the observer has min_val and max_val, please run the observer before calling calculate_qparams"
-        )
-        return choose_qparams_affine_with_min_max(
-            self.min_val,
-            self.max_val,
-            self.mapping_type,
-            [],  # BlockSize is not needed because the min/max are already reduced
-            self.target_dtype,
-            self.quant_min,
-            self.quant_max,
-            self.eps,
-            self.scale_dtype,
-            self.zero_point_dtype,
-            self.preserve_zero,
-            self.zero_point_domain,
-        )
 
-
-class AffineQuantizedMovingAverageMinMaxObserver(AffineQuantizedObserverBase):
+class AffineQuantizedMovingAverageMinMaxObserver(
+    _MinMaxQParamsMixin, AffineQuantizedObserverBase
+):
     def __init__(
         self,
         mapping_type: MappingType,
@@ -674,26 +684,6 @@ class AffineQuantizedMovingAverageMinMaxObserver(AffineQuantizedObserverBase):
 
         # returning original input
         return input
-
-    def calculate_qparams(self) -> tuple[torch.Tensor, torch.Tensor]:
-        assert hasattr(self, "min_val") and hasattr(self, "max_val"), (
-            "Expecting the observer has min_val and max_val, please run the observer before calling calculate_qparams"
-        )
-
-        return choose_qparams_affine_with_min_max(
-            self.min_val,
-            self.max_val,
-            self.mapping_type,
-            [],  # BlockSize is not needed because the min/max are already reduced
-            self.target_dtype,
-            self.quant_min,
-            self.quant_max,
-            self.eps,
-            self.scale_dtype,
-            self.zero_point_dtype,
-            self.preserve_zero,
-            self.zero_point_domain,
-        )
 
 
 class AffineQuantizedPlaceholderObserver(AffineQuantizedObserverBase):

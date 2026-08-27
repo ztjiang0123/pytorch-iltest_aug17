@@ -171,6 +171,19 @@ class _LegacyQATQuantizer(TwoStepQuantizer):
     def get_weight_fake_quantize_config(self) -> Optional[FakeQuantizeConfigBase]:
         return None
 
+    def _convert_qat_linear(self, module: torch.nn.Module) -> None:
+        """
+        Replace all QAT linear submodules in place with their quantized
+        equivalents. Subclasses implement the module-specific replacement.
+        """
+        raise NotImplementedError
+
+    def convert(
+        self, model: torch.nn.Module, *args: Any, **kwargs: Any
+    ) -> torch.nn.Module:
+        self._convert_qat_linear(model)
+        return model
+
 
 # ===========================================
 # | int8 dynamic activations + int4 weights |
@@ -216,13 +229,7 @@ class Int8DynActInt4WeightQATQuantizer(_LegacyQATQuantizer):
         )
         return model
 
-    def convert(
-        self, model: torch.nn.Module, *args: Any, **kwargs: Any
-    ) -> torch.nn.Module:
-        self._convert_qat_linear_8da4w(model)
-        return model
-
-    def _convert_qat_linear_8da4w(self, module: torch.nn.Module):
+    def _convert_qat_linear(self, module: torch.nn.Module) -> None:
         """
         Replace all `Int8DynActInt4WeightQATLinear` with `Int8DynActInt4WeightLinear`.
         """
@@ -268,7 +275,7 @@ class Int8DynActInt4WeightQATQuantizer(_LegacyQATQuantizer):
                 if child.bias is not None:
                     quantized_linear.bias = child.bias
             else:
-                self._convert_qat_linear_8da4w(child)
+                self._convert_qat_linear(child)
 
     def get_activation_fake_quantize_config(self) -> Optional[FakeQuantizeConfigBase]:
         return _get_8da4w_activation_config(self.activation_scales_precision)
@@ -421,13 +428,7 @@ class Int4WeightOnlyQATQuantizer(_LegacyQATQuantizer):
         )
         return model
 
-    def convert(
-        self, model: torch.nn.Module, *args: Any, **kwargs: Any
-    ) -> torch.nn.Module:
-        self._convert_qat_linear_4w(model)
-        return model
-
-    def _convert_qat_linear_4w(self, module: torch.nn.Module):
+    def _convert_qat_linear(self, module: torch.nn.Module) -> None:
         """
         Replace all `Int4WeightOnlyQATLinear` with `WeightOnlyInt4Linear`.
         """
@@ -469,7 +470,7 @@ class Int4WeightOnlyQATQuantizer(_LegacyQATQuantizer):
                 quantized_linear.weight = q_weight
                 quantized_linear.scales_and_zeros = scales_and_zeros
             else:
-                self._convert_qat_linear_4w(child)
+                self._convert_qat_linear(child)
 
     def get_weight_fake_quantize_config(self) -> Optional[FakeQuantizeConfigBase]:
         return _get_4w_weight_config(self.groupsize, self.scales_precision)

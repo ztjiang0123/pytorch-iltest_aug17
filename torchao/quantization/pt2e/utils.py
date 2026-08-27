@@ -62,7 +62,31 @@ __all__ = [
     "_is_conv_transpose_node",
     "_is_sym_size_node",
     "_filter_sym_size_users",
+    "ScalarBufferStateDictMixin",
 ]
+
+
+class ScalarBufferStateDictMixin:
+    """
+    Mixin that serializes scalar-valued attributes which cannot be registered
+    as buffers.
+
+    ``torch.nn.Module._save_to_state_dict`` does not persist attributes that are
+    not registered buffers/parameters, so observers and fake quantizers that hold
+    scalar tensors (e.g. ``scale``/``zero_point`` or ``min_val``/``max_val``)
+    must serialize them manually. Subclasses list the attribute names in the
+    ``_scalar_state_dict_buffers`` class attribute; this mixin's
+    ``_save_to_state_dict`` runs the default serialization and then writes each
+    of those attributes into ``destination`` under ``prefix``.
+    """
+
+    # Subclasses override this with the scalar attribute names to serialize.
+    _scalar_state_dict_buffers: tuple = ()
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        for name in self._scalar_state_dict_buffers:
+            destination[prefix + name] = getattr(self, name)
 
 
 # TODO: remove unused
@@ -1322,5 +1346,5 @@ def _is_sym_size_node(node: Node):
 
 
 def _filter_sym_size_users(node: torch.fx.Node) -> list[torch.fx.Node]:
-    node_users = list(filter((lambda x: (_is_sym_size_node(x) is False)), node.users))
+    node_users = list(filter((lambda x: _is_sym_size_node(x) is False), node.users))
     return node_users

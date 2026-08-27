@@ -37,6 +37,7 @@ from torchao.quantization import (
     PerToken,
 )
 from torchao.quantization.pt2e.utils import (
+    ScalarBufferStateDictMixin,
     calculate_qmin_qmax,
     check_min_max_valid,
     is_per_channel,
@@ -994,7 +995,7 @@ class MovingAveragePerChannelMinMaxObserver(PerChannelMinMaxObserver):
         return x_orig
 
 
-class HistogramObserver(UniformQuantizationObserverBase):
+class HistogramObserver(ScalarBufferStateDictMixin, UniformQuantizationObserverBase):
     r"""
     The module records the running histogram of tensor values along with
     min/max values. ``calculate_qparams`` will calculate scale and zero_point.
@@ -1022,6 +1023,10 @@ class HistogramObserver(UniformQuantizationObserverBase):
     histogram: torch.Tensor
     min_val: torch.Tensor
     max_val: torch.Tensor
+
+    # We cannot currently register scalar values as buffers, so serialize them
+    # manually via ScalarBufferStateDictMixin._save_to_state_dict.
+    _scalar_state_dict_buffers = ("min_val", "max_val")
 
     def __init__(
         self,
@@ -1372,11 +1377,6 @@ class HistogramObserver(UniformQuantizationObserverBase):
         new_min, new_max = self._non_linear_param_search()
 
         return self._calculate_qparams(new_min, new_max)
-
-    def _save_to_state_dict(self, destination, prefix, keep_vars):
-        super()._save_to_state_dict(destination, prefix, keep_vars)
-        destination[prefix + "min_val"] = self.min_val
-        destination[prefix + "max_val"] = self.max_val
 
     def _load_from_state_dict(
         self,
