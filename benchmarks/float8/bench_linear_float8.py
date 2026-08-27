@@ -61,6 +61,16 @@ def benchmark_torch_function_in_microseconds(
     return t0.blocked_autorange().median * 1e6
 
 
+def n_times(n: int, fn: Callable) -> Callable:
+    """Return a wrapper that invokes ``fn`` ``n`` times per call."""
+
+    def wrapper(*args, **kwargs):
+        for _ in range(n):
+            fn(*args, **kwargs)
+
+    return wrapper
+
+
 @dataclass
 class Experiment:
     name: str
@@ -209,13 +219,6 @@ def main(
 
         def float8_forw_backward():
             linear_float8(input_tensor).sum().backward()
-
-        def n_times(n, fn, *args, **kwargs):
-            def wrapper(*args, **kwargs):
-                for _ in range(n):
-                    fn(*args, **kwargs)
-
-            return wrapper
 
         REPEAT_N = 100
 
