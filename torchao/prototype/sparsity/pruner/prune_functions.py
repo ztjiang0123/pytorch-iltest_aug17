@@ -134,15 +134,23 @@ def _prune_module_weight_helper(module: nn.Module, out_size_attr: str) -> Tensor
     return mask
 
 
+# SHARED
+def _prune_standalone_module(module: nn.Module, out_size_attr: str) -> None:
+    # prune a parametrized linear/conv2d that is not fused with a next layer:
+    # drop the masked output rows/channels and, when requested, prune the bias
+    # to match.
+    mask = _prune_module_weight_helper(module, out_size_attr)
+    if getattr(module, "prune_bias", False):
+        _prune_module_bias(module, mask)
+
+
 # LINEAR
 def _prune_linear_helper(linear: nn.Linear) -> Tensor:
     return _prune_module_weight_helper(linear, "out_features")
 
 
 def prune_linear(linear: nn.Linear) -> None:
-    mask = _prune_linear_helper(linear)
-    if getattr(linear, "prune_bias", False):
-        _prune_module_bias(linear, mask)
+    _prune_standalone_module(linear, "out_features")
 
 
 def prune_linear_linear(linear1: nn.Linear, linear2: nn.Linear) -> None:
@@ -219,9 +227,7 @@ def prune_conv2d_padded(conv2d_1: nn.Conv2d) -> None:
 
 
 def prune_conv2d(conv2d: nn.Conv2d) -> None:
-    mask = _prune_conv2d_helper(conv2d)
-    if getattr(conv2d, "prune_bias", False):
-        _prune_module_bias(conv2d, mask)
+    _prune_standalone_module(conv2d, "out_channels")
 
 
 def prune_conv2d_conv2d(conv2d_1: nn.Conv2d, conv2d_2: nn.Conv2d) -> None:
