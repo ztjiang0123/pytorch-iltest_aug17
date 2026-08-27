@@ -32,12 +32,27 @@ class CalibrationConfig:
     limit: int
 
 
-def _apply_calibration(
-    model, config_class, base_config, calibration, tokenizer, filter_fn=None
-):
+@dataclass
+class QuantizationSpec:
+    """The step-based config class and its base config, which travel together.
+
+    ``config_class`` and ``base_config`` are only ever used in combination to
+    build a per-step config via ``config_class(base_config, step=...)``, so they
+    are grouped into a single spec instead of two parallel arguments.
+    """
+
+    config_class: type
+    base_config: object
+
+    def build(self, step: str):
+        """Instantiate the config for a given calibration ``step``."""
+        return self.config_class(self.base_config, step=step)
+
+
+def _apply_calibration(model, spec, calibration, tokenizer, filter_fn=None):
     """Apply prepare->calibrate->convert workflow for AWQ/SmoothQuant."""
     # Prepare
-    quantize_(model, config_class(base_config, step="prepare"), filter_fn=filter_fn)
+    quantize_(model, spec.build("prepare"), filter_fn=filter_fn)
     print(f"Calibrating with tasks={calibration.tasks}, limit={calibration.limit}")
 
     # Calibrate
@@ -47,8 +62,8 @@ def _apply_calibration(
         limit=calibration.limit,
         batch_size=1,
     )
-    quantize_(model, config_class(base_config, step="convert"), filter_fn=filter_fn)
-    load_config = config_class(base_config, step="prepare_for_loading")
+    quantize_(model, spec.build("convert"), filter_fn=filter_fn)
+    load_config = spec.build("prepare_for_loading")
     model.config.quantization_config = TorchAoConfig(load_config)
 
 
@@ -68,11 +83,11 @@ def quantize_model_and_save(
     if base_config_cls is None:
         pass
     elif recipe == "awq_int4_weight_only":
-        _apply_calibration(model, AWQConfig, base_config_cls, calibration, tokenizer)
+        spec = QuantizationSpec(AWQConfig, base_config_cls)
+        _apply_calibration(model, spec, calibration, tokenizer)
     elif recipe == "smoothquant_int8":
-        _apply_calibration(
-            model, SmoothQuantConfig, base_config_cls, calibration, tokenizer
-        )
+        spec = QuantizationSpec(SmoothQuantConfig, base_config_cls)
+        _apply_calibration(model, spec, calibration, tokenizer)
     else:
         raise AssertionError(f"unsupported recipe: {recipe}")
 

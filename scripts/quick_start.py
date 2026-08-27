@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 import copy
+from dataclasses import dataclass
 
 import torch
 
@@ -12,12 +13,23 @@ import torch
 # ================
 
 
+@dataclass
+class LinearDims:
+    """The layer dimensions that describe the toy model's shape.
+
+    ``input_dim``, ``hidden_dim``, and ``output_dim`` always travel together, so
+    they are grouped into a single value instead of three parallel arguments.
+    """
+
+    input_dim: int
+    hidden_dim: int
+    output_dim: int
+
+
 class ToyLinearModel(torch.nn.Module):
     def __init__(
         self,
-        input_dim,
-        hidden_dim,
-        output_dim,
+        dims,
         dtype,
         device,
         has_bias=False,
@@ -26,10 +38,10 @@ class ToyLinearModel(torch.nn.Module):
         self.dtype = dtype
         self.device = device
         self.linear1 = torch.nn.Linear(
-            input_dim, hidden_dim, bias=has_bias, dtype=dtype, device=device
+            dims.input_dim, dims.hidden_dim, bias=has_bias, dtype=dtype, device=device
         )
         self.linear2 = torch.nn.Linear(
-            hidden_dim, output_dim, bias=has_bias, dtype=dtype, device=device
+            dims.hidden_dim, dims.output_dim, bias=has_bias, dtype=dtype, device=device
         )
 
     def example_inputs(self, batch_size=1):
@@ -48,7 +60,9 @@ class ToyLinearModel(torch.nn.Module):
         return x
 
 
-model = ToyLinearModel(1024, 1024, 1024, device="cuda", dtype=torch.bfloat16).eval()
+model = ToyLinearModel(
+    LinearDims(1024, 1024, 1024), device="cuda", dtype=torch.bfloat16
+).eval()
 model_w16a16 = copy.deepcopy(model)
 model_w8a8 = copy.deepcopy(model)  # We will quantize in next chapter!
 
