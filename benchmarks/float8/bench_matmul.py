@@ -62,6 +62,25 @@ _SUPPORTED_RECIPES = (
 )
 
 
+@dataclass(frozen=True)
+class _MatmulInputs:
+    """Per-iteration inputs the recipe helpers need to build the matmul.
+
+    Bundling these together keeps the ``_prepare_*`` helpers to a single
+    parameter instead of a long, easily-transposed argument list.
+    """
+
+    recipe: str
+    A_hp: torch.Tensor
+    B_hp_t: torch.Tensor
+    dtype: torch.dtype
+    M: int
+    N: int
+    device: str
+    fp4_peak_tops: float
+    fp8_peak_tops: float
+
+
 @dataclass
 class _MatmulOperands:
     """The quantized inputs, scales, and metadata for one recipe's matmul."""
@@ -74,9 +93,9 @@ class _MatmulOperands:
     out_dtype: Optional[torch.dtype]  # fp8 output dtype; ``None`` for fp4 recipes
 
 
-def _prepare_mxfp4_operands(A_hp, B_hp_t, fp4_peak_tops):
-    A_scales, A_data = to_mx(A_hp, torch.float4_e2m1fn_x2, 32)
-    B_scales, Bt_data = to_mx(B_hp_t, torch.float4_e2m1fn_x2, 32)
+def _prepare_mxfp4_operands(inputs: _MatmulInputs):
+    A_scales, A_data = to_mx(inputs.A_hp, torch.float4_e2m1fn_x2, 32)
+    B_scales, Bt_data = to_mx(inputs.B_hp_t, torch.float4_e2m1fn_x2, 32)
     A = A_data.view(torch.float4_e2m1fn_x2)
     B = Bt_data.view(torch.float4_e2m1fn_x2).contiguous().T
     # Use the blockwise scales from to_mx
@@ -85,16 +104,16 @@ def _prepare_mxfp4_operands(A_hp, B_hp_t, fp4_peak_tops):
         B=B,
         scale_a=to_blocked(A_scales),
         scale_b=to_blocked(B_scales),
-        peak_tops=fp4_peak_tops,
+        peak_tops=inputs.fp4_peak_tops,
         out_dtype=None,
     )
 
 
-def _prepare_nvfp4_operands(A_hp, B_hp_t, fp4_peak_tops):
+def _prepare_nvfp4_operands(inputs: _MatmulInputs):
     from torchao.prototype.mx_formats.nvfp4_tensor import nvfp4_quantize
 
-    A_scales, A_data = nvfp4_quantize(A_hp, block_size=16)
-    B_scales, B_data = nvfp4_quantize(B_hp_t, block_size=16)
+    A_scales, A_data = nvfp4_quantize(inputs.A_hp, block_size=16)
+    B_scales, B_data = nvfp4_quantize(inputs.B_hp_t, block_size=16)
     A = A_data.view(torch.float4_e2m1fn_x2)
     B = B_data.view(torch.float4_e2m1fn_x2).T
     # Use the blockwise scales from nvfp4_quantize (pad if needed)
@@ -103,48 +122,44 @@ def _prepare_nvfp4_operands(A_hp, B_hp_t, fp4_peak_tops):
         B=B,
         scale_a=to_blocked(A_scales.view(torch.float8_e4m3fn)),
         scale_b=to_blocked(B_scales.view(torch.float8_e4m3fn)),
-        peak_tops=fp4_peak_tops,
+        peak_tops=inputs.fp4_peak_tops,
         out_dtype=None,
     )
 
 
-def _prepare_fp8_operands(recipe, A_hp, B_hp_t, dtype, fp8_peak_tops, M, N, device):
+def _prepare_fp8_operands(inputs: _MatmulInputs):
     # raw float8 matmul (upper bound for what we can achive in eager mode)
     # TODO(future): add e5m2
     e4m3_dtype = torch.float8_e4m3fn
     if torch.version.hip and torch.cuda.is_available() and is_MI300():
         e4m3_dtype = torch.float8_e4m3fnuz
-    A = A_hp.to(e4m3_dtype)
-    B = B_hp_t.to(e4m3_dtype).contiguous().T
+    A = inputs.A_hp.to(e4m3_dtype)
+    B = inputs.B_hp_t.to(e4m3_dtype).contiguous().T
 
-    if recipe == "tensorwise":
-        scale_a = torch.tensor([1.0], device=device)
-        scale_b = torch.tensor([1.0], device=device)
+    if inputs.recipe == "tensorwise":
+        scale_a = torch.tensor([1.0], device=inputs.device)
+        scale_b = torch.tensor([1.0], device=inputs.device)
     else:  # rowwise
-        scale_a = torch.ones(M, 1, device=device)
-        scale_b = torch.ones(1, N, device=device)
+        scale_a = torch.ones(inputs.M, 1, device=inputs.device)
+        scale_b = torch.ones(1, inputs.N, device=inputs.device)
 
     return _MatmulOperands(
         A=A,
         B=B,
         scale_a=scale_a,
         scale_b=scale_b,
-        peak_tops=fp8_peak_tops,
-        out_dtype=dtype,
+        peak_tops=inputs.fp8_peak_tops,
+        out_dtype=inputs.dtype,
     )
 
 
-def _prepare_operands(
-    recipe, A_hp, B_hp_t, dtype, fp4_peak_tops, fp8_peak_tops, M, N, device
-):
-    """Quantize inputs and build scales for ``recipe``, returning ``_MatmulOperands``."""
-    if recipe == "mxfp4_cutlass":
-        return _prepare_mxfp4_operands(A_hp, B_hp_t, fp4_peak_tops)
-    if recipe == "nvfp4":
-        return _prepare_nvfp4_operands(A_hp, B_hp_t, fp4_peak_tops)
-    return _prepare_fp8_operands(
-        recipe, A_hp, B_hp_t, dtype, fp8_peak_tops, M, N, device
-    )
+def _prepare_operands(inputs: _MatmulInputs):
+    """Quantize inputs and build scales for the recipe, returning ``_MatmulOperands``."""
+    if inputs.recipe == "mxfp4_cutlass":
+        return _prepare_mxfp4_operands(inputs)
+    if inputs.recipe == "nvfp4":
+        return _prepare_nvfp4_operands(inputs)
+    return _prepare_fp8_operands(inputs)
 
 
 def _select_matmul(recipe, operands, dtype, fast_accum):
@@ -250,7 +265,17 @@ def run(config: MatmulBenchConfig = _DEFAULT_CONFIG):
         B_hp_t = torch.randn(N, K, device=device)
 
         operands = _prepare_operands(
-            recipe, A_hp, B_hp_t, dtype, fp4_peak_tops, fp8_peak_tops, M, N, device
+            _MatmulInputs(
+                recipe=recipe,
+                A_hp=A_hp,
+                B_hp_t=B_hp_t,
+                dtype=dtype,
+                M=M,
+                N=N,
+                device=device,
+                fp4_peak_tops=fp4_peak_tops,
+                fp8_peak_tops=fp8_peak_tops,
+            )
         )
         do_matmul = _select_matmul(recipe, operands, dtype, fast_accum)
 
