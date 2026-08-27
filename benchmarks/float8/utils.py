@@ -273,6 +273,8 @@ def get_name_to_shapes_iter(
     K: Optional[int],
     N: Optional[int],
 ):
+    # Dispatch to the per-generator helper; each returns a {name: (M, K, N)}
+    # dict, so the top-level flow is a single lookup + guard.
     shape_generator = _SHAPE_GENERATORS.get(shape_gen_name)
     if shape_generator is None:
         raise AssertionError(f"unknown shape_gen_name {shape_gen_name}")
