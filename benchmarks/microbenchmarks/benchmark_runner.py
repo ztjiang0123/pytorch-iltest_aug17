@@ -27,6 +27,7 @@ import yaml
 
 from benchmarks.microbenchmarks.utils import (
     BenchmarkConfig,
+    BenchmarkConfigParams,
     generate_results_csv,
     print_results,
 )
@@ -238,13 +239,15 @@ def load_benchmark_configs(cli_args: argparse.Namespace) -> List[BenchmarkConfig
         ):
             configs.append(
                 BenchmarkConfig(
-                    quantization=quant_config,
-                    sparsity=sparse_config,
-                    params=params,
-                    shape_name=shape_name,
-                    shape=shape,
-                    output_dir=output_dir,
-                    benchmark_mode=benchmark_mode,
+                    BenchmarkConfigParams(
+                        quantization=quant_config,
+                        sparsity=sparse_config,
+                        params=params,
+                        shape_name=shape_name,
+                        shape=shape,
+                        output_dir=output_dir,
+                        benchmark_mode=benchmark_mode,
+                    )
                 )
             )
     return configs

@@ -11,6 +11,7 @@ import torch
 
 from benchmarks.microbenchmarks.utils import (
     BenchmarkConfig,
+    BenchmarkConfigParams,
     BenchmarkResult,
     BlockSparseWeightConfig,
     Int4WeightOnlyConfig,
@@ -41,13 +42,15 @@ class TestUtils(unittest.TestCase):
 
     def test_benchmark_config(self):
         config = BenchmarkConfig(
-            quantization="baseline",
-            sparsity=None,
-            params=self.test_params,
-            shape_name="custom",
-            shape=self.test_shape,
-            output_dir=str(self.test_output_dir),
-            benchmark_mode="inference",
+            BenchmarkConfigParams(
+                quantization="baseline",
+                sparsity=None,
+                params=self.test_params,
+                shape_name="custom",
+                shape=self.test_shape,
+                output_dir=str(self.test_output_dir),
+                benchmark_mode="inference",
+            )
         )
 
         self.assertEqual(config.quantization, "baseline")
@@ -62,13 +65,15 @@ class TestUtils(unittest.TestCase):
 
     def test_benchmark_result(self):
         config = BenchmarkConfig(
-            quantization="baseline",
-            sparsity=None,
-            params=self.test_params,
-            shape_name="custom",
-            shape=self.test_shape,
-            output_dir=str(self.test_output_dir),
-            benchmark_mode="inference",
+            BenchmarkConfigParams(
+                quantization="baseline",
+                sparsity=None,
+                params=self.test_params,
+                shape_name="custom",
+                shape=self.test_shape,
+                output_dir=str(self.test_output_dir),
+                benchmark_mode="inference",
+            )
         )
         result = BenchmarkResult(config=config)
 
@@ -182,24 +187,28 @@ class TestUtils(unittest.TestCase):
         results = [
             BenchmarkResult(
                 BenchmarkConfig(
-                    quantization="int8wo",
-                    sparsity=None,
-                    params={},
-                    shape_name="custom",
-                    shape=[1024, 1024, 1024],
-                    output_dir="test_output",
-                    benchmark_mode="inference",
+                    BenchmarkConfigParams(
+                        quantization="int8wo",
+                        sparsity=None,
+                        params={},
+                        shape_name="custom",
+                        shape=[1024, 1024, 1024],
+                        output_dir="test_output",
+                        benchmark_mode="inference",
+                    )
                 ),
             ),
             BenchmarkResult(
                 BenchmarkConfig(
-                    quantization="int4wo",
-                    sparsity=None,
-                    params={},
-                    shape_name="custom",
-                    shape=[1024, 1024, 1024],
-                    output_dir="test_output",
-                    benchmark_mode="inference",
+                    BenchmarkConfigParams(
+                        quantization="int4wo",
+                        sparsity=None,
+                        params={},
+                        shape_name="custom",
+                        shape=[1024, 1024, 1024],
+                        output_dir="test_output",
+                        benchmark_mode="inference",
+                    )
                 ),
             ),
         ]

@@ -45,6 +45,19 @@ class ExperimentConfig:
     N: int
 
 
+@dataclass(frozen=True)
+class RooflineSymbols:
+    """The sympy symbols (M, K, N) shared by every roofline expression.
+
+    They are always used as a triple, so grouping them keeps the roofline
+    helpers from taking a long, easy-to-misorder parameter list.
+    """
+
+    M: sympy.Symbol
+    K: sympy.Symbol
+    N: sympy.Symbol
+
+
 def _get_shape_configs(
     shape_gen_name: str,
     dsv3_seq_len: int,
@@ -129,6 +142,7 @@ def _benchmark_fwd_bwd_s(
 
 def _get_roofline_expressions(gpu_name: str, enable_fusion_modeling: bool):
     M, K, N = sympy.symbols("M K N")
+    symbols = RooflineSymbols(M=M, K=K, N=N)
     bf16_gemm_time_sympy = get_gemm_time_sympy(
         M, K, N, torch.bfloat16, None, None, gpu_name
     )
@@ -136,11 +150,13 @@ def _get_roofline_expressions(gpu_name: str, enable_fusion_modeling: bool):
     fp8_ovhd_time_sympy = get_blockwise_float8_mem_sympy(
         M, K, N, enable_fusion_modeling, gpu_name
     )
-    return M, K, N, bf16_gemm_time_sympy, fp8_gemm_time_sympy, fp8_ovhd_time_sympy
+    return symbols, bf16_gemm_time_sympy, fp8_gemm_time_sympy, fp8_ovhd_time_sympy
 
 
-def _eval_roofline_s(expr, M_sym, K_sym, N_sym, M_val: int, K_val: int, N_val: int):
-    return float(expr.subs(M_sym, M_val).subs(K_sym, K_val).subs(N_sym, N_val))
+def _eval_roofline_s(expr, symbols: RooflineSymbols, shape: ExperimentConfig):
+    return float(
+        expr.subs(symbols.M, shape.M).subs(symbols.K, shape.K).subs(symbols.N, shape.N)
+    )
 
 
 def run(args: argparse.Namespace):
@@ -166,8 +182,8 @@ def run(args: argparse.Namespace):
         args.dsv3_inter_dim,
         args.n_limit,
     )
-    M_sym, K_sym, N_sym, r_bf16_expr, r_fp8_gemm_expr, r_fp8_ovhd_expr = (
-        _get_roofline_expressions(roofline_gpu_name, args.enable_fusion_modeling)
+    symbols, r_bf16_expr, r_fp8_gemm_expr, r_fp8_ovhd_expr = _get_roofline_expressions(
+        roofline_gpu_name, args.enable_fusion_modeling
     )
 
     rows = []
@@ -204,15 +220,9 @@ def run(args: argparse.Namespace):
             fp8_model, x, grad_output, args.warmup, args.iterations
         )
 
-        r_bf16_gemm_s = _eval_roofline_s(
-            r_bf16_expr, M_sym, K_sym, N_sym, config.M, config.K, config.N
-        )
-        r_fp8_gemm_s = _eval_roofline_s(
-            r_fp8_gemm_expr, M_sym, K_sym, N_sym, config.M, config.K, config.N
-        )
-        r_fp8_ovhd_s = _eval_roofline_s(
-            r_fp8_ovhd_expr, M_sym, K_sym, N_sym, config.M, config.K, config.N
-        )
+        r_bf16_gemm_s = _eval_roofline_s(r_bf16_expr, symbols, config)
+        r_fp8_gemm_s = _eval_roofline_s(r_fp8_gemm_expr, symbols, config)
+        r_fp8_ovhd_s = _eval_roofline_s(r_fp8_ovhd_expr, symbols, config)
         r_fp8_gemm_and_ovhd_s = r_fp8_gemm_s + r_fp8_ovhd_s
         r_fp8_gemm_and_ovhd_spdp = r_bf16_gemm_s / r_fp8_gemm_and_ovhd_s
         b_fp8_e2e_spdp = b_bf16_e2e_s / b_fp8_e2e_s

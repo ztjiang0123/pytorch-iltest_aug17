@@ -8,7 +8,11 @@ import unittest
 from unittest.mock import patch
 
 from benchmarks.microbenchmarks.benchmark_inference import run
-from benchmarks.microbenchmarks.utils import BenchmarkConfig, BenchmarkResult
+from benchmarks.microbenchmarks.utils import (
+    BenchmarkConfig,
+    BenchmarkConfigParams,
+    BenchmarkResult,
+)
 
 
 class TestBenchmarkInference(unittest.TestCase):
@@ -17,17 +21,19 @@ class TestBenchmarkInference(unittest.TestCase):
         self.temp_dir = tempfile.mkdtemp()
 
         self.config = BenchmarkConfig(
-            quantization="baseline",
-            sparsity="semi-sparse",
-            params={
-                "high_precision_dtype": "torch.float32",
-                "device": "cpu",
-                "model_type": "linear",
-            },
-            shape_name="custom",
-            shape=[16, 32, 8],  # Small shape for testing
-            output_dir=self.temp_dir,
-            benchmark_mode="inference",
+            BenchmarkConfigParams(
+                quantization="baseline",
+                sparsity="semi-sparse",
+                params={
+                    "high_precision_dtype": "torch.float32",
+                    "device": "cpu",
+                    "model_type": "linear",
+                },
+                shape_name="custom",
+                shape=[16, 32, 8],  # Small shape for testing
+                output_dir=self.temp_dir,
+                benchmark_mode="inference",
+            )
         )
 
     def tearDown(self):
@@ -60,17 +66,19 @@ class TestBenchmarkInference(unittest.TestCase):
         # Test with block sparsity
         mock_string_to_config.return_value = BlockSparseWeightConfig()
         config = BenchmarkConfig(
-            quantization="baseline",
-            sparsity="block",
-            params={
-                "high_precision_dtype": "torch.float32",
-                "device": "cpu",
-                "model_type": "linear",
-            },
-            shape_name="custom",
-            shape=[64, 64, 64],  # Use dimensions divisible by 64
-            output_dir=self.temp_dir,
-            benchmark_mode="inference",
+            BenchmarkConfigParams(
+                quantization="baseline",
+                sparsity="block",
+                params={
+                    "high_precision_dtype": "torch.float32",
+                    "device": "cpu",
+                    "model_type": "linear",
+                },
+                shape_name="custom",
+                shape=[64, 64, 64],  # Use dimensions divisible by 64
+                output_dir=self.temp_dir,
+                benchmark_mode="inference",
+            )
         )
         result = run(config)
         self.assertIsInstance(result, BenchmarkResult)
