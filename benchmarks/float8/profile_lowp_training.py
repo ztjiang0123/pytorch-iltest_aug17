@@ -279,18 +279,7 @@ def policy_fn(ctx, op, *args, **kwargs):
 context_fn = functools.partial(create_selective_checkpoint_contexts, policy_fn)
 
 
-def main(
-    profile_path_prefix: pathlib.Path,
-    compile: bool = True,
-    float8_recipe_name: Optional[str] = None,
-    mx_recipe_name: Optional[str] = None,
-    model_type: str = "linear",
-    experiment_filter: str = "both",
-    add_inductor_metadata_to_trace: bool = False,
-    enable_activation_checkpointing: bool = False,
-    mode_filter: str = "fwd_bwd",
-    forward_only: bool = False,
-):
+def _validate_main_args(model_type, experiment_filter, mode_filter):
     assert model_type in (
         "linear",
         "ln_linear",
@@ -314,35 +303,29 @@ def main(
     if mode_filter == "cast_only":
         assert experiment_filter == "lowp", "unsupported"
 
+
+def _resolve_config(float8_recipe_name, mx_recipe_name):
     assert not (float8_recipe_name is not None and mx_recipe_name is not None), (
         "either float8_recipe_name or mx_recipe_name can be specified, but not both"
     )
 
-    if float8_recipe_name is None and mx_recipe_name is None:
-        config = Float8LinearConfig()
-    elif float8_recipe_name is not None:
-        config = Float8LinearConfig.from_recipe_name(float8_recipe_name)
-    elif mx_recipe_name is not None:
-        try:
-            config = MXFP8TrainingOpConfig.from_recipe(
-                MXFP8TrainingRecipe(mx_recipe_name)
-            )
-        except ValueError:
-            raise ValueError(
-                f"Unsupported mx_recipe_name: {mx_recipe_name}. "
-                f"Supported values: {[r.value for r in MXFP8TrainingRecipe]}"
-            )
+    if float8_recipe_name is not None:
+        return Float8LinearConfig.from_recipe_name(float8_recipe_name)
 
-    print(f"Compile is set to       | {compile}")
-    print(f"model_type is set to    | {model_type}")
-    print(
-        f"enable_activation_checkpointing is set to {enable_activation_checkpointing}"
-    )
-    print(f"mode_filter is set to {mode_filter}")
-    print(f"config: {config}")
+    if mx_recipe_name is None:
+        return Float8LinearConfig()
 
-    device = "cuda"
-    ref_dtype = torch.bfloat16
+    try:
+        return MXFP8TrainingOpConfig.from_recipe(MXFP8TrainingRecipe(mx_recipe_name))
+    except ValueError:
+        raise ValueError(
+            f"Unsupported mx_recipe_name: {mx_recipe_name}. "
+            f"Supported values: {[r.value for r in MXFP8TrainingRecipe]}"
+        )
+
+
+def _build_ref_model_and_input(model_type, device, ref_dtype):
+    """Return the reference model and its input tensor for the given model_type."""
     if model_type == "ln_linear":
         M, K, N = 4 * 4096, 8192, 7168
         m_ref = LNLinear(K, N)
@@ -377,6 +360,110 @@ def main(
         input_tensor = torch.randn(
             M, K, device=device, dtype=ref_dtype, requires_grad=True
         )
+    return m_ref, input_tensor
+
+
+def _times_to_data(experiment_label, times, profile_iters):
+    """Convert a {kernel_name: time_us} mapping into rows for the summary frame."""
+    total_time_ms = sum(v for v in times.values()) / 1e3 / profile_iters
+    rows = []
+    for k, v in times.items():
+        v_ms = v / 1e3 / profile_iters
+        rows.append(
+            [
+                experiment_label,
+                k,
+                kernel_name_to_category(k),
+                v_ms,
+                v_ms / total_time_ms,
+                None,
+            ]
+        )
+    return rows
+
+
+def _profile_experiment(
+    experiment_label,
+    tag,
+    forw_backward_fn,
+    profile_path_prefix,
+    model_type,
+    compile,
+    profile_iters,
+    num_leaf_tensors,
+    add_inductor_metadata_to_trace,
+    input_tensor,
+):
+    """Profile a single (`ref` or `lowp`) experiment and return its summary rows."""
+    print(f"profiling {tag}")
+    trace_suffix = f"_{model_type}_{tag}_compile_{compile}.json"
+    logs_suffix = f"_{model_type}_{tag}_compile_{compile}.txt"
+    trace_path = profile_path_prefix + trace_suffix
+    log_path = profile_path_prefix + logs_suffix
+    trace_modified_path = trace_path.replace(".json", "_modified.json")
+    profile_config = ProfileConfig(
+        trace_path,
+        log_path,
+        trace_modified_path,
+        trace_suffix,
+        iters=profile_iters,
+        warmup_iters=2,
+        sync=True,
+    )
+    p = profile_function(
+        profile_config,
+        forw_backward_fn,
+        add_inductor_metadata_to_trace,
+        input_tensor,
+    )
+    print(f"saved profiling trace to {trace_path}")
+    if add_inductor_metadata_to_trace:
+        print(f"saved torch logs to {log_path}")
+        print(f"saved modified trace to {trace_modified_path}")
+    times = profiler_output_to_filtered_time_by_kernel_name(
+        p, profile_iters, num_leaf_tensors
+    )
+    return _times_to_data(experiment_label, times, profile_iters)
+
+
+def _populate_triton_bandwidth(data, redirected_output):
+    """Fill in the bandwidth column from the redirected TORCHINDUCTOR_PROFILE output."""
+    for line in redirected_output.split("\n"):
+        maybe_bw, maybe_kernel_name = parse_bw_and_kernel_name(line)
+        if maybe_kernel_name is None:
+            continue
+        # O(N) search, but it's ok since lists are small
+        for datum in data:
+            if datum[1] == maybe_kernel_name:
+                datum[-1] = maybe_bw
+
+
+def main(
+    profile_path_prefix: pathlib.Path,
+    compile: bool = True,
+    float8_recipe_name: Optional[str] = None,
+    mx_recipe_name: Optional[str] = None,
+    model_type: str = "linear",
+    experiment_filter: str = "both",
+    add_inductor_metadata_to_trace: bool = False,
+    enable_activation_checkpointing: bool = False,
+    mode_filter: str = "fwd_bwd",
+    forward_only: bool = False,
+):
+    _validate_main_args(model_type, experiment_filter, mode_filter)
+    config = _resolve_config(float8_recipe_name, mx_recipe_name)
+
+    print(f"Compile is set to       | {compile}")
+    print(f"model_type is set to    | {model_type}")
+    print(
+        f"enable_activation_checkpointing is set to {enable_activation_checkpointing}"
+    )
+    print(f"mode_filter is set to {mode_filter}")
+    print(f"config: {config}")
+
+    device = "cuda"
+    ref_dtype = torch.bfloat16
+    m_ref, input_tensor = _build_ref_model_and_input(model_type, device, ref_dtype)
 
     m_ref = m_ref.to(device).to(ref_dtype)
 
@@ -489,104 +576,41 @@ def main(
     try:
         with context, maybe_no_grad_context:
             profile_iters = 5
-            ref_times, lowp_times = None, None
             data = []
 
             num_leaf_tensors = 1 + len(list(m_ref.parameters()))
 
             if experiment_filter != "lowp":
-                # Profile Reference Model
-                print("profiling ref")
-                ref_trace_suffix = f"_{model_type}_ref_compile_{compile}.json"
-                ref_logs_suffix = f"_{model_type}_ref_compile_{compile}.txt"
-                trace_ref_path = profile_path_prefix + ref_trace_suffix
-                log_ref_path = profile_path_prefix + ref_logs_suffix
-                trace_ref_modified_path = trace_ref_path.replace(
-                    ".json", "_modified.json"
-                )
-                profile_config = ProfileConfig(
-                    trace_ref_path,
-                    log_ref_path,
-                    trace_ref_modified_path,
-                    ref_trace_suffix,
-                    iters=profile_iters,
-                    warmup_iters=2,
-                    sync=True,
-                )
-                p = profile_function(
-                    profile_config,
-                    ref_forw_backward,
-                    add_inductor_metadata_to_trace,
-                    input_tensor,
-                )
-                print(f"saved profiling trace to {trace_ref_path}")
-                if add_inductor_metadata_to_trace:
-                    print(f"saved torch logs to {log_ref_path}")
-                    print(f"saved modified trace to {trace_ref_modified_path}")
-                ref_times = profiler_output_to_filtered_time_by_kernel_name(
-                    p, profile_iters, num_leaf_tensors
-                )
-                total_time_ms = sum(v for v in ref_times.values()) / 1e3 / profile_iters
-                for k, v in ref_times.items():
-                    v_ms = v / 1e3 / profile_iters
-                    data.append(
-                        [
-                            "0_ref",
-                            k,
-                            kernel_name_to_category(k),
-                            v_ms,
-                            v_ms / total_time_ms,
-                            None,
-                        ]
+                data.extend(
+                    _profile_experiment(
+                        "0_ref",
+                        "ref",
+                        ref_forw_backward,
+                        profile_path_prefix,
+                        model_type,
+                        compile,
+                        profile_iters,
+                        num_leaf_tensors,
+                        add_inductor_metadata_to_trace,
+                        input_tensor,
                     )
+                )
 
             if experiment_filter != "ref":
-                # Profile lowp Model
-                print("profiling lowp")
-                lowp_trace_suffix = f"_{model_type}_lowp_compile_{compile}.json"
-                lowp_log_suffix = f"_{model_type}_lowp_compile_{compile}.txt"
-                trace_lowp_path = profile_path_prefix + lowp_trace_suffix
-                log_lowp_path = profile_path_prefix + lowp_log_suffix
-                trace_lowp_modified_path = trace_lowp_path.replace(
-                    ".json", "_modified.json"
-                )
-                profile_config = ProfileConfig(
-                    trace_lowp_path,
-                    log_lowp_path,
-                    trace_lowp_modified_path,
-                    lowp_trace_suffix,
-                    iters=profile_iters,
-                    warmup_iters=2,
-                    sync=True,
-                )
-                p = profile_function(
-                    profile_config,
-                    lowp_forw_backward_wrapper,
-                    add_inductor_metadata_to_trace,
-                    input_tensor,
-                )
-                print(f"saved profiling trace to {trace_lowp_path}")
-                if add_inductor_metadata_to_trace:
-                    print(f"saved torch logs to {log_lowp_path}")
-                    print(f"saved modified trace to {trace_lowp_modified_path}")
-                lowp_times = profiler_output_to_filtered_time_by_kernel_name(
-                    p, profile_iters, num_leaf_tensors
-                )
-                total_time_ms = (
-                    sum(v for v in lowp_times.values()) / 1e3 / profile_iters
-                )
-                for k, v in lowp_times.items():
-                    v_ms = v / 1e3 / profile_iters
-                    data.append(
-                        [
-                            "1_lowp",
-                            k,
-                            kernel_name_to_category(k),
-                            v / 1e3 / profile_iters,
-                            v_ms / total_time_ms,
-                            None,
-                        ]
+                data.extend(
+                    _profile_experiment(
+                        "1_lowp",
+                        "lowp",
+                        lowp_forw_backward_wrapper,
+                        profile_path_prefix,
+                        model_type,
+                        compile,
+                        profile_iters,
+                        num_leaf_tensors,
+                        add_inductor_metadata_to_trace,
+                        input_tensor,
                     )
+                )
 
     finally:
         if f is not None:
@@ -596,13 +620,7 @@ def main(
     # TODO(future PR): this seems to no longer work, fix it or delete it
     if os.environ.get("TORCHINDUCTOR_PROFILE", "") != "":
         # populate the triton kernel bandwidth
-        for line in f.getvalue().split("\n"):
-            maybe_bw, maybe_kernel_name = parse_bw_and_kernel_name(line)
-            if maybe_kernel_name is not None:
-                # O(N) search, but it's ok since lists are small
-                for datum in data:
-                    if datum[1] == maybe_kernel_name:
-                        datum[-1] = maybe_bw
+        _populate_triton_bandwidth(data, f.getvalue())
 
     df = pd.DataFrame(
         data,
