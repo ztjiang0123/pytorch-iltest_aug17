@@ -18,7 +18,7 @@ from torchao.prototype.quantization.codebook.codebook_ops import (
 from torchao.quantization.transform_module import (
     register_quantize_module_handler,
 )
-from torchao.utils import TorchAOBaseTensor
+from torchao.utils import TorchAOBaseTensor, _format_codebook_repr
 
 aten = torch.ops.aten
 
@@ -80,9 +80,9 @@ class CodebookQuantizedTensor(TorchAOBaseTensor):
         self._dtype = dtype  # not sure this is right
 
     def __repr__(self):
-        return (
-            f"{self.__class__.__name__}(codes={self.codes}, codebook={self.codebook}, block_size={self.block_size}, scales={self.scales}, "
-            f"shape={self.shape}, device={self.device}, dtype={self.dtype}, requires_grad={self.requires_grad})"
+        return _format_codebook_repr(
+            self,
+            {"block_size": self.block_size, "scales": self.scales},
         )
 
     def _quantization_type(self):

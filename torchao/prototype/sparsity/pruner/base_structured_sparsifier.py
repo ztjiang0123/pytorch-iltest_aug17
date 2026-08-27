@@ -41,60 +41,41 @@ def _get_supported_structured_pruning_modules():
     return SUPPORTED_STRUCTURED_PRUNING_MODULES
 
 
+# The supported activations, listed once as (functional, module) pairs so the
+# functional set and the module set stay in sync instead of being maintained as
+# two parallel copies.
+_SUPPORTED_ACTIVATIONS = (
+    (F.relu, nn.ReLU),
+    (F.rrelu, nn.RReLU),
+    (F.hardtanh, nn.Hardtanh),
+    (F.relu6, nn.ReLU6),
+    (F.sigmoid, nn.Sigmoid),
+    (F.hardsigmoid, nn.Hardsigmoid),
+    (F.tanh, nn.Tanh),
+    (F.silu, nn.SiLU),
+    (F.mish, nn.Mish),
+    (F.hardswish, nn.Hardswish),
+    (F.elu, nn.ELU),
+    (F.celu, nn.CELU),
+    (F.selu, nn.SELU),
+    (F.hardshrink, nn.Hardshrink),
+    (F.leaky_relu, nn.LeakyReLU),
+    (F.logsigmoid, nn.LogSigmoid),
+    (F.softplus, nn.Softplus),
+    (F.prelu, nn.PReLU),
+    (F.softsign, nn.Softsign),
+    (F.tanhshrink, nn.Tanhshrink),
+    (F.gelu, nn.GELU),
+    (F.dropout, nn.Dropout),
+)
+
+
 def _get_supported_activation_functions():
-    SUPPORTED_ACTIVATION_FUNCTIONS = {
-        F.relu,
-        F.rrelu,
-        F.hardtanh,
-        F.relu6,
-        F.sigmoid,
-        F.hardsigmoid,
-        F.tanh,
-        F.silu,
-        F.mish,
-        F.hardswish,
-        F.elu,
-        F.celu,
-        F.selu,
-        F.hardshrink,
-        F.leaky_relu,
-        F.logsigmoid,
-        F.softplus,
-        F.prelu,
-        F.softsign,
-        F.tanhshrink,
-        F.gelu,
-        F.dropout,
-    }
-    return SUPPORTED_ACTIVATION_FUNCTIONS
+    return {function for function, _module in _SUPPORTED_ACTIVATIONS}
 
 
 def _get_supported_activation_modules():
-    SUPPORTED_ACTIVATION_MODULES = {
-        nn.ReLU,
-        nn.RReLU,
-        nn.Hardtanh,
-        nn.ReLU6,
-        nn.Sigmoid,
-        nn.Hardsigmoid,
-        nn.Tanh,
-        nn.SiLU,
-        nn.Mish,
-        nn.Hardswish,
-        nn.ELU,
-        nn.CELU,
-        nn.SELU,
-        nn.Hardshrink,
-        nn.LeakyReLU,
-        nn.LogSigmoid,
-        nn.Softplus,
-        nn.PReLU,
-        nn.Softsign,
-        nn.Tanhshrink,
-        nn.GELU,
-        nn.Dropout,
-    }
-    return SUPPORTED_ACTIVATION_MODULES
+    return {module for _function, module in _SUPPORTED_ACTIVATIONS}
 
 
 def _get_default_structured_pruning_patterns() -> Dict[

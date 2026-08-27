@@ -54,6 +54,137 @@ class MatmulBenchConfig:
 _DEFAULT_CONFIG = MatmulBenchConfig()
 
 
+_SUPPORTED_RECIPES = (
+    "tensorwise",
+    "rowwise",
+    "mxfp4_cutlass",
+    "nvfp4",
+)
+
+
+@dataclass
+class _MatmulOperands:
+    """The quantized inputs, scales, and metadata for one recipe's matmul."""
+
+    A: torch.Tensor
+    B: torch.Tensor
+    scale_a: torch.Tensor
+    scale_b: torch.Tensor
+    peak_tops: float
+    out_dtype: Optional[torch.dtype]  # fp8 output dtype; ``None`` for fp4 recipes
+
+
+def _prepare_mxfp4_operands(A_hp, B_hp_t, fp4_peak_tops):
+    A_scales, A_data = to_mx(A_hp, torch.float4_e2m1fn_x2, 32)
+    B_scales, Bt_data = to_mx(B_hp_t, torch.float4_e2m1fn_x2, 32)
+    A = A_data.view(torch.float4_e2m1fn_x2)
+    B = Bt_data.view(torch.float4_e2m1fn_x2).contiguous().T
+    # Use the blockwise scales from to_mx
+    return _MatmulOperands(
+        A=A,
+        B=B,
+        scale_a=to_blocked(A_scales),
+        scale_b=to_blocked(B_scales),
+        peak_tops=fp4_peak_tops,
+        out_dtype=None,
+    )
+
+
+def _prepare_nvfp4_operands(A_hp, B_hp_t, fp4_peak_tops):
+    from torchao.prototype.mx_formats.nvfp4_tensor import nvfp4_quantize
+
+    A_scales, A_data = nvfp4_quantize(A_hp, block_size=16)
+    B_scales, B_data = nvfp4_quantize(B_hp_t, block_size=16)
+    A = A_data.view(torch.float4_e2m1fn_x2)
+    B = B_data.view(torch.float4_e2m1fn_x2).T
+    # Use the blockwise scales from nvfp4_quantize (pad if needed)
+    return _MatmulOperands(
+        A=A,
+        B=B,
+        scale_a=to_blocked(A_scales.view(torch.float8_e4m3fn)),
+        scale_b=to_blocked(B_scales.view(torch.float8_e4m3fn)),
+        peak_tops=fp4_peak_tops,
+        out_dtype=None,
+    )
+
+
+def _prepare_fp8_operands(recipe, A_hp, B_hp_t, dtype, fp8_peak_tops, M, N, device):
+    # raw float8 matmul (upper bound for what we can achive in eager mode)
+    # TODO(future): add e5m2
+    e4m3_dtype = torch.float8_e4m3fn
+    if torch.version.hip and torch.cuda.is_available() and is_MI300():
+        e4m3_dtype = torch.float8_e4m3fnuz
+    A = A_hp.to(e4m3_dtype)
+    B = B_hp_t.to(e4m3_dtype).contiguous().T
+
+    if recipe == "tensorwise":
+        scale_a = torch.tensor([1.0], device=device)
+        scale_b = torch.tensor([1.0], device=device)
+    else:  # rowwise
+        scale_a = torch.ones(M, 1, device=device)
+        scale_b = torch.ones(1, N, device=device)
+
+    return _MatmulOperands(
+        A=A,
+        B=B,
+        scale_a=scale_a,
+        scale_b=scale_b,
+        peak_tops=fp8_peak_tops,
+        out_dtype=dtype,
+    )
+
+
+def _prepare_operands(
+    recipe, A_hp, B_hp_t, dtype, fp4_peak_tops, fp8_peak_tops, M, N, device
+):
+    """Quantize inputs and build scales for ``recipe``, returning ``_MatmulOperands``."""
+    if recipe == "mxfp4_cutlass":
+        return _prepare_mxfp4_operands(A_hp, B_hp_t, fp4_peak_tops)
+    if recipe == "nvfp4":
+        return _prepare_nvfp4_operands(A_hp, B_hp_t, fp4_peak_tops)
+    return _prepare_fp8_operands(
+        recipe, A_hp, B_hp_t, dtype, fp8_peak_tops, M, N, device
+    )
+
+
+def _select_matmul(recipe, operands, dtype, fast_accum):
+    """Build the matmul closure for ``recipe`` over the prepared operands."""
+    scale_a = operands.scale_a
+    scale_b = operands.scale_b
+
+    def do_matmul_fp8(A, B):
+        return torch._scaled_mm(
+            A,
+            B,
+            scale_a,
+            scale_b,
+            out_dtype=operands.out_dtype,
+            use_fast_accum=fast_accum,
+        )
+
+    def do_matmul_mxfp4(A, B):
+        return F.scaled_mm(
+            A,
+            B,
+            scale_a=scale_a,
+            scale_recipe_a=ScalingType.BlockWise1x32,
+            scale_b=scale_b,
+            scale_recipe_b=ScalingType.BlockWise1x32,
+            swizzle_a=SwizzleType.SWIZZLE_32_4_4,
+            swizzle_b=SwizzleType.SWIZZLE_32_4_4,
+            output_dtype=dtype,
+        )
+
+    def do_matmul_nvfp4(A, B):
+        return torch._scaled_mm(A, B, scale_a, scale_b, out_dtype=dtype)
+
+    if recipe == "mxfp4_cutlass":
+        return do_matmul_mxfp4
+    if recipe == "nvfp4":
+        return do_matmul_nvfp4
+    return do_matmul_fp8
+
+
 @torch.inference_mode()
 def run(config: MatmulBenchConfig = _DEFAULT_CONFIG):
     shape_gen_name = config.shape_gen_name
@@ -64,12 +195,7 @@ def run(config: MatmulBenchConfig = _DEFAULT_CONFIG):
     out_filename = config.out_filename
     device = "cuda"
     # TODO(future PR): this is ugly
-    assert recipe in (
-        "tensorwise",
-        "rowwise",
-        "mxfp4_cutlass",
-        "nvfp4",
-    ), "unsupported"
+    assert recipe in _SUPPORTED_RECIPES, "unsupported"
     use_fp4 = recipe in ("mxfp4_cutlass", "nvfp4")
 
     specs = get_specs()
@@ -123,113 +249,24 @@ def run(config: MatmulBenchConfig = _DEFAULT_CONFIG):
         A_hp = torch.randn(M, K, device=device)
         B_hp_t = torch.randn(N, K, device=device)
 
-        if recipe == "mxfp4_cutlass":
-            A_scales, A_data = to_mx(A_hp, torch.float4_e2m1fn_x2, 32)
-            B_scales, Bt_data = to_mx(B_hp_t, torch.float4_e2m1fn_x2, 32)
-            A = A_data.view(torch.float4_e2m1fn_x2)
-            B = Bt_data.view(torch.float4_e2m1fn_x2).contiguous().T
-            peak_tops = fp4_peak_tops
-        elif recipe == "nvfp4":
-            from torchao.prototype.mx_formats.nvfp4_tensor import nvfp4_quantize
-
-            A_scales, A_data = nvfp4_quantize(A_hp, block_size=16)
-            B_scales, B_data = nvfp4_quantize(B_hp_t, block_size=16)
-            A = A_data.view(torch.float4_e2m1fn_x2)
-            B = B_data.view(torch.float4_e2m1fn_x2).T
-            peak_tops = fp4_peak_tops
-        else:
-            # raw float8 matmul (upper bound for what we can achive in eager mode)
-            # TODO(future): add e5m2
-            e4m3_dtype = torch.float8_e4m3fn
-            if torch.version.hip and torch.cuda.is_available() and is_MI300():
-                e4m3_dtype = torch.float8_e4m3fnuz
-            d1, d2, d3 = e4m3_dtype, e4m3_dtype, dtype
-            A = A_hp.to(d1)
-            B = B_hp_t.to(d2).contiguous().T
-            peak_tops = fp8_peak_tops
-
-        if recipe == "tensorwise":
-            scale_a = torch.tensor([1.0], device=device)
-            scale_b = torch.tensor([1.0], device=device)
-        elif recipe == "rowwise":
-            scale_a = torch.ones(M, 1, device=device)
-            scale_b = torch.ones(1, N, device=device)
-        elif recipe == "mxfp8_cublas":
-            scale_a = torch.ones(M, K // 32, device=device, dtype=torch.float8_e8m0fnu)
-            scale_b = torch.ones(N, K // 32, device=device, dtype=torch.float8_e8m0fnu)
-            # pad if needed
-            scale_a = to_blocked(scale_a)
-            scale_b = to_blocked(scale_b)
-        elif recipe == "mxfp4_cutlass":
-            # Use the blockwise scales from to_mx
-            scale_a = to_blocked(A_scales)
-            scale_b = to_blocked(B_scales)
-        elif recipe == "nvfp4":
-            # Use the blockwise scales from nvfp4_quantize
-            scale_a = A_scales.view(torch.float8_e4m3fn)
-            scale_b = B_scales.view(torch.float8_e4m3fn)
-            # pad if needed
-            scale_a = to_blocked(scale_a)
-            scale_b = to_blocked(scale_b)
-        else:
-            assert False, f"unknown recipe {recipe}"
-
-        def do_matmul_fp8(A, B):
-            nonlocal scale_a
-            nonlocal scale_b
-            return torch._scaled_mm(
-                A, B, scale_a, scale_b, out_dtype=d3, use_fast_accum=fast_accum
-            )
-
-        def do_matmul_mxfp4(A, B):
-            nonlocal scale_a
-            nonlocal scale_b
-            return F.scaled_mm(
-                A,
-                B,
-                scale_a=scale_a,
-                scale_recipe_a=ScalingType.BlockWise1x32,
-                scale_b=scale_b,
-                scale_recipe_b=ScalingType.BlockWise1x32,
-                swizzle_a=SwizzleType.SWIZZLE_32_4_4,
-                swizzle_b=SwizzleType.SWIZZLE_32_4_4,
-                output_dtype=dtype,
-            )
-
-        def do_matmul_nvfp4(A, B):
-            nonlocal scale_a
-            nonlocal scale_b
-            return torch._scaled_mm(A, B, scale_a, scale_b, out_dtype=dtype)
-
-        def do_grouped_mm(A, B):
-            return torch._grouped_mm(A, B, use_fast_accum=fast_accum)
-
-        def do_scaled_grouped_mm(A, B):
-            nonlocal scale_a
-            nonlocal scale_b
-            return torch._scaled_grouped_mm(
-                A, B, scale_a, scale_b, use_fast_accum=fast_accum
-            )
-
-        if recipe == "mxfp4_cutlass":
-            do_matmul = do_matmul_mxfp4
-        elif recipe == "nvfp4":
-            do_matmul = do_matmul_nvfp4
-        else:
-            do_matmul = do_matmul_fp8
+        operands = _prepare_operands(
+            recipe, A_hp, B_hp_t, dtype, fp4_peak_tops, fp8_peak_tops, M, N, device
+        )
+        do_matmul = _select_matmul(recipe, operands, dtype, fast_accum)
 
         time_sec, tops_sec, pct_top_peak = do_benchmarks(
-            tops, peak_tops, use_gpu_kernel_time, do_matmul, A, B
+            tops,
+            operands.peak_tops,
+            use_gpu_kernel_time,
+            do_matmul,
+            operands.A,
+            operands.B,
         )
         print(
             f"time_sec {time_sec:.2E}, tops/sec {tops_sec:.2E}, pct_peak {pct_top_peak:.3f}"
         )
 
-        del A, B
-        if scale_a is not None:
-            del scale_a
-        if scale_b is not None:
-            del scale_b
+        del operands
 
         results.append(
             [
