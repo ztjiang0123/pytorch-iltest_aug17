@@ -261,57 +261,65 @@ if _cutedsl_runtime_available():
         q_fp8_vals4.store(q_fp8_vec4)
         return q_fp8_vals4
 
+    def make_chunk_store(*, kernel, sOUT_tile, inv_scale, scale_dim, use_rceil):
+        """Bundle everything a per-block chunk loop needs except the chunk coords.
+
+        Passed to :func:`quantize_block_store_full` / ``_tail`` so those helpers
+        stay within the parameter-count budget. ``kernel`` supplies the per-kernel
+        ``_store_q_fp8_reg_to_smem(q_fp8_vals4, sOUT_tile, lane_rel, chunk_base)``,
+        whose body (row-major uint32 vectorized vs column-major scalar) is the
+        only thing that differs between the 1x32 and 32x1 kernels.
+        """
+        return SimpleNamespace(
+            kernel=kernel,
+            sOUT_tile=sOUT_tile,
+            inv_scale=inv_scale,
+            scale_dim=scale_dim,
+            use_rceil=use_rceil,
+        )
+
     @cute.jit
     def quantize_block_store_full(
-        kernel,
+        store,
         vals_block: cute.Tensor,
-        inv_scale: cutlass.Float32,
-        sOUT_tile: cute.Tensor,
         lane_rel: cutlass.Int32,
         block_base: cutlass.Int32,
-        scale_dim: cutlass.Constexpr[int],
-        USE_RCEIL: cutlass.Constexpr[bool],
     ):
         """Quantize and store a full ``scale_dim``-element block in chunks of 4.
 
         Shared by the 1x32 and 32x1 MXFP8 kernels, whose per-block store loops
-        are identical up to the transposed axis. Each chunk is dispatched to
-        ``kernel._store_quantized_chunk`` with the canonical
-        ``(lane_rel, chunk_base)`` coordinate pair; the kernel decides how that
-        pair maps onto its (row-major vs column-major) output tile.
+        are identical up to the transposed axis. Each chunk is quantized by the
+        shared :func:`quantize_chunk_to_fp8_reg` and handed to the kernel's own
+        ``_store_q_fp8_reg_to_smem`` with the canonical ``(lane_rel, chunk_base)``
+        coordinate pair; the kernel decides how that pair maps onto its (row- vs
+        column-major) output tile.
 
         Args:
-            kernel: Kernel instance providing ``_store_quantized_chunk``.
+            store: Chunk-store context (see :func:`make_chunk_store`).
             vals_block: ``scale_dim`` input elements in register memory.
-            inv_scale: Inverse scale in register memory.
-            sOUT_tile: Output tile in shared memory.
             lane_rel: Lane coordinate within the tile (row for 1x32, col for 32x1).
             block_base: Starting index of this block along the quantized axis.
-            scale_dim: Number of elements per quantization block (32).
-            USE_RCEIL: Whether using RCEIL mode or FLOOR mode.
         """
         chunk_vec = 4
-        num_chunks = scale_dim // chunk_vec
+        num_chunks = store.scale_dim // chunk_vec
         for c in range(num_chunks):
             local_base = c * chunk_vec
             chunk_base = block_base + local_base
             vals_chunk = load_vals_chunk_full(vals_block, local_base)
-            kernel._store_quantized_chunk(
-                vals_chunk, inv_scale, sOUT_tile, lane_rel, chunk_base, USE_RCEIL
+            q_fp8_vals4 = quantize_chunk_to_fp8_reg(
+                vals_chunk, store.inv_scale, store.use_rceil
+            )
+            store.kernel._store_q_fp8_reg_to_smem(
+                q_fp8_vals4, store.sOUT_tile, lane_rel, chunk_base
             )
 
     @cute.jit
     def quantize_block_store_tail(
-        kernel,
+        store,
         vals_block: cute.Tensor,
-        inv_scale: cutlass.Float32,
-        sOUT_tile: cute.Tensor,
-        block_axis_base: cutlass.Int64,
         lane_rel: cutlass.Int32,
         block_base: cutlass.Int32,
-        block_axis_size: cutlass.Int64,
-        scale_dim: cutlass.Constexpr[int],
-        USE_RCEIL: cutlass.Constexpr[bool],
+        bounds: tuple,
     ):
         """Quantize and store a ``scale_dim``-element block with bounds checking.
 
@@ -320,27 +328,27 @@ if _cutedsl_runtime_available():
         the store dispatch is identical to the full path.
 
         Args:
-            kernel: Kernel instance providing ``_store_quantized_chunk``.
+            store: Chunk-store context (see :func:`make_chunk_store`).
             vals_block: ``scale_dim`` input elements in register memory.
-            inv_scale: Inverse scale in register memory.
-            sOUT_tile: Output tile in shared memory.
-            block_axis_base: Global offset of this tile along the quantized axis.
             lane_rel: Lane coordinate within the tile (row for 1x32, col for 32x1).
             block_base: Starting index of this block along the quantized axis.
-            block_axis_size: Total size of the quantized axis for bounds checking.
-            scale_dim: Number of elements per quantization block (32).
-            USE_RCEIL: Whether using RCEIL mode or FLOOR mode.
+            bounds: ``(block_axis_base, block_axis_size)`` — the tile's global
+                offset and total size along the quantized axis, for the tail check.
         """
+        block_axis_base, block_axis_size = bounds
         chunk_vec = 4
-        num_chunks = scale_dim // chunk_vec
+        num_chunks = store.scale_dim // chunk_vec
         for c in range(num_chunks):
             local_base = c * chunk_vec
             chunk_base = block_base + local_base
             vals_chunk = load_vals_chunk_tail(
                 vals_block, block_axis_base, chunk_base, local_base, block_axis_size
             )
-            kernel._store_quantized_chunk(
-                vals_chunk, inv_scale, sOUT_tile, lane_rel, chunk_base, USE_RCEIL
+            q_fp8_vals4 = quantize_chunk_to_fp8_reg(
+                vals_chunk, store.inv_scale, store.use_rceil
+            )
+            store.kernel._store_q_fp8_reg_to_smem(
+                q_fp8_vals4, store.sOUT_tile, lane_rel, chunk_base
             )
 
     @cute.jit
@@ -591,16 +599,14 @@ if _cutedsl_runtime_available():
             amax = compute_amax(vals_block)
             scale_biased, inv_scale = compute_scale_from_amax(amax, opts.use_rceil)
             scale_buffer[blk] = cutlass.Uint8(scale_biased)
-            quantize_block_store_full(
-                kernel,
-                vals_block,
-                inv_scale,
-                sOUT_tile,
-                lane_rel,
-                block_base,
-                axis.scale_dim,
-                opts.use_rceil,
+            store = make_chunk_store(
+                kernel=kernel,
+                sOUT_tile=sOUT_tile,
+                inv_scale=inv_scale,
+                scale_dim=axis.scale_dim,
+                use_rceil=opts.use_rceil,
             )
+            quantize_block_store_full(store, vals_block, lane_rel, block_base)
         store_scales_reg_to_gmem_vec(
             state.scales_tensor,
             (lane_global, tile_eff * axis.blocks_per_tile),
@@ -635,17 +641,19 @@ if _cutedsl_runtime_available():
                 scale_biased, inv_scale = compute_scale_from_amax(amax, opts.use_rceil)
                 scale_buffer[num_valid_scales] = cutlass.Uint8(scale_biased)
                 num_valid_scales = num_valid_scales + 1
+                store = make_chunk_store(
+                    kernel=kernel,
+                    sOUT_tile=sOUT_tile,
+                    inv_scale=inv_scale,
+                    scale_dim=axis.scale_dim,
+                    use_rceil=opts.use_rceil,
+                )
                 quantize_block_store_tail(
-                    kernel,
+                    store,
                     vals_block,
-                    inv_scale,
-                    sOUT_tile,
-                    block_axis_tile_base,
                     lane_rel,
                     block_base,
-                    axis.block_axis_size,
-                    axis.scale_dim,
-                    opts.use_rceil,
+                    (block_axis_tile_base, axis.block_axis_size),
                 )
         if num_valid_scales > 0:
             store_scales_reg_to_gmem_vec(

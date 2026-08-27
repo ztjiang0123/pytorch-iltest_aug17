@@ -17,7 +17,6 @@ from .cute_utils import (
     make_quant_opts,
     make_tile_shape,
     make_tma_handles,
-    quantize_chunk_to_fp8_reg,
     run_quantize_2d_kernel,
 )
 
@@ -244,19 +243,22 @@ def _compile_mxfp8_quantize_2d_cutedsl(
             self,
             q_fp8_vals4: cute.Tensor,
             sOUT_tile: cute.Tensor,
-            m_rel: cutlass.Int32,
-            sout_base: cutlass.Int32,
+            lane_rel: cutlass.Int32,
+            chunk_base: cutlass.Int32,
         ):
-            """Store 4 FP8 values from registers to shared memory as uint32.
+            """Store 4 quantized FP8 values from registers to shared memory as uint32.
 
-            Vectorizes 4 FP8 values (32 bits) into a single uint32 write.
-            The swizzle is applied automatically by the composed layout.
+            Vectorizes 4 FP8 values (32 bits) into a single uint32 write. The
+            swizzle is applied automatically by the composed layout. Called by the
+            shared ``quantize_block_store_full``/``_tail`` loops in ``cute_utils``
+            with the canonical ``(lane_rel, chunk_base)`` coordinate pair; for the
+            1x32 kernel the lane is the tile row (M) and ``chunk_base`` the K index.
 
             Args:
-                q_fp8_vals4: 4 FP8 values in register memory
+                q_fp8_vals4: 4 quantized FP8 values in register memory
                 sOUT_tile: Output tile in shared memory (TILE_M, TILE_K)
-                m_rel: Row index within tile
-                sout_base: Starting K index for this chunk within tile
+                lane_rel: Row index within tile (M)
+                chunk_base: Starting K index for this chunk within tile
 
             Storage locations:
                 Input: q_fp8_vals4 (registers)
@@ -264,41 +266,7 @@ def _compile_mxfp8_quantize_2d_cutedsl(
             """
             sOUT_tile_u32 = cute.recast_tensor(sOUT_tile, cutlass.Uint32)
             q_fp8_vals4_u32 = cute.recast_tensor(q_fp8_vals4, cutlass.Uint32)
-            sOUT_tile_u32[m_rel, sout_base // cutlass.Int32(4)] = q_fp8_vals4_u32[0]
-
-        @cute.jit
-        def _store_quantized_chunk(
-            self,
-            vals_chunk: cute.Tensor,
-            inv_scale: cutlass.Float32,
-            sOUT_tile: cute.Tensor,
-            lane_rel: cutlass.Int32,
-            sout_base: cutlass.Int32,
-            USE_RCEIL: cutlass.Constexpr[bool],
-        ):
-            """Quantize 4 input elements to FP8 and store to shared memory.
-
-            Applies inverse scale, optional clamping (FLOOR mode), and converts
-            to FP8. For the 1x32 kernel the lane coordinate is the tile row
-            (``m_rel``) and ``sout_base`` is the K index of the chunk.
-
-            The shared full/tail block loops in ``cute_utils`` dispatch each chunk
-            here via the canonical ``(lane_rel, sout_base)`` coordinate pair.
-
-            Args:
-                vals_chunk: 4 input elements in register memory
-                inv_scale: Inverse scale in register memory
-                sOUT_tile: Output tile in shared memory (TILE_M, TILE_K)
-                lane_rel: Row index within tile (M)
-                sout_base: Starting K index for this chunk within tile
-                USE_RCEIL: Whether using RCEIL mode (no clamping) or FLOOR mode (clamp to ±448)
-
-            Storage locations:
-                Inputs: vals_chunk, inv_scale (registers)
-                Output: sOUT_tile (shared memory)
-            """
-            q_fp8_vals4 = quantize_chunk_to_fp8_reg(vals_chunk, inv_scale, USE_RCEIL)
-            self._store_q_fp8_reg_to_smem(q_fp8_vals4, sOUT_tile, lane_rel, sout_base)
+            sOUT_tile_u32[lane_rel, chunk_base // cutlass.Int32(4)] = q_fp8_vals4_u32[0]
 
         @cute.jit
         def _issue_tma_load(

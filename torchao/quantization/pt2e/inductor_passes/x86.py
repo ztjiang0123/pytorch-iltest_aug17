@@ -11,6 +11,7 @@ import functools
 import itertools
 import math
 import operator
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -1079,97 +1080,103 @@ def _is_valid_dequant_linear_pattern(dtype, input_dim_exceeds_two, input_contigu
     return _inner
 
 
-def _redirect_uses_to_new_qlinear(
-    new_linear_node,
-    linear_node,
-    output_reshape_node,
-    match,
-    bias,
-    input_dim_exceeds_two,
-    input_contiguous,
-):
+@dataclass
+class _DequantLinearPattern:
+    """The matched dequant→linear nodes and the flags describing the variant.
+
+    Bundling these lets the use-redirect and node-erase steps take a single
+    context argument instead of a long parameter list. Nodes that only exist
+    for some variants (``wgt_expand_node`` for non-contiguous >2D input,
+    ``weight_to_bf16_node`` for bf16, ``output_add_node_for_bias`` for a
+    non-contiguous >2D input with bias) default to ``None``.
+    """
+
+    # Variant flags.
+    dtype: Any
+    bias: Any
+    input_dim_exceeds_two: bool
+    input_contiguous: bool
+    # Matched nodes.
+    linear_node: Any
+    output_reshape_node: Any
+    act_reshape_node: Any
+    act_expand_node: Any
+    activation_to_bf16_node: Any
+    dequant_node: Any
+    t_node: Any
+    dequant: Any
+    wgt_expand_node: Any = None
+    weight_to_bf16_node: Any = None
+    output_add_node_for_bias: Any = None
+
+
+def _redirect_uses_to_new_qlinear(ctx: _DequantLinearPattern, match, new_linear_node):
     """Point the consumers of the matched linear at ``new_linear_node``.
 
-    Returns the bias-add output node when it exists (non-contiguous >2D input
-    with a bias), so the caller can erase it later; otherwise returns ``None``.
+    Records the bias-add output node on ``ctx`` when it exists (non-contiguous
+    >2D input with a bias) so the erase step can remove it later.
     """
     # 2D input: uses hang off the linear node directly.
-    if not input_dim_exceeds_two:
-        linear_node.replace_all_uses_with(new_linear_node)
-        new_linear_node.meta.update(linear_node.meta)
-        return None
+    if not ctx.input_dim_exceeds_two:
+        ctx.linear_node.replace_all_uses_with(new_linear_node)
+        new_linear_node.meta.update(ctx.linear_node.meta)
+        return
 
     # >2D contiguous input: uses hang off the trailing output reshape.
-    if input_contiguous:
-        output_reshape_node.replace_all_uses_with(new_linear_node)
-        new_linear_node.meta.update(output_reshape_node.meta)
-        return None
+    if ctx.input_contiguous:
+        ctx.output_reshape_node.replace_all_uses_with(new_linear_node)
+        new_linear_node.meta.update(ctx.output_reshape_node.meta)
+        return
 
     # >2D non-contiguous input without bias: uses hang off the linear node.
-    if not bias:
-        linear_node.replace_all_uses_with(new_linear_node)
-        new_linear_node.meta.update(linear_node.meta)
-        return None
+    if not ctx.bias:
+        ctx.linear_node.replace_all_uses_with(new_linear_node)
+        new_linear_node.meta.update(ctx.linear_node.meta)
+        return
 
     # >2D non-contiguous input with bias: uses hang off the bias add.
     output_add_node_for_bias = match.output_node()
     assert output_add_node_for_bias.target is aten.add.Tensor
     output_add_node_for_bias.replace_all_uses_with(new_linear_node)
     new_linear_node.meta.update(output_add_node_for_bias.meta)
-    return output_add_node_for_bias
+    ctx.output_add_node_for_bias = output_add_node_for_bias
 
 
-def _erase_dequant_linear_pattern(
-    graph,
-    dtype,
-    bias,
-    input_dim_exceeds_two,
-    input_contiguous,
-    linear_node,
-    output_reshape_node,
-    output_add_node_for_bias,
-    act_reshape_node,
-    act_expand_node,
-    wgt_expand_node,
-    activation_to_bf16_node,
-    dequant_node,
-    t_node,
-    weight_to_bf16_node,
-    dequant,
-):
+def _erase_dequant_linear_pattern(ctx: _DequantLinearPattern, graph):
     """Erase the original nodes replaced by the fused qlinear node.
 
-    ``wgt_expand_node`` / ``weight_to_bf16_node`` / ``output_add_node_for_bias``
-    are ``None`` when the corresponding node does not exist for this pattern
-    variant, which keeps the erase order flat and branch-light.
+    The optional ``ctx`` nodes are ``None`` when they do not exist for the
+    matched variant, which keeps the erase order flat and branch-light.
     """
-    # Erase the trailing output node (reshape, or bias-add) for >2D inputs.
-    if input_dim_exceeds_two:
-        if input_contiguous:
-            graph.erase_node(output_reshape_node)
-        elif bias:
-            graph.erase_node(output_add_node_for_bias)
+    is_bf16 = ctx.weight_to_bf16_node is not None
 
-    graph.erase_node(linear_node)
+    # Erase the trailing output node (reshape, or bias-add) for >2D inputs.
+    if ctx.input_dim_exceeds_two:
+        if ctx.input_contiguous:
+            graph.erase_node(ctx.output_reshape_node)
+        elif ctx.bias:
+            graph.erase_node(ctx.output_add_node_for_bias)
+
+    graph.erase_node(ctx.linear_node)
 
     # Erase the activation reshape/expand (and weight expand) for >2D inputs.
-    if input_dim_exceeds_two:
-        if input_contiguous:
-            graph.erase_node(act_reshape_node)
+    if ctx.input_dim_exceeds_two:
+        if ctx.input_contiguous:
+            graph.erase_node(ctx.act_reshape_node)
         else:
-            graph.erase_node(act_expand_node)
-            graph.erase_node(wgt_expand_node)
+            graph.erase_node(ctx.act_expand_node)
+            graph.erase_node(ctx.wgt_expand_node)
 
-    if weight_to_bf16_node is not None:
-        graph.erase_node(activation_to_bf16_node)
+    if is_bf16:
+        graph.erase_node(ctx.activation_to_bf16_node)
 
     # Erase the dequant pattern.
-    graph.erase_node(dequant_node)
+    graph.erase_node(ctx.dequant_node)
     # Erase the dequant per channel pattern.
-    graph.erase_node(t_node)
-    if weight_to_bf16_node is not None:
-        graph.erase_node(weight_to_bf16_node)
-    graph.erase_node(dequant)
+    graph.erase_node(ctx.t_node)
+    if is_bf16:
+        graph.erase_node(ctx.weight_to_bf16_node)
+    graph.erase_node(ctx.dequant)
 
 
 def _register_qlinear_weight_prepack_pass(
@@ -1293,36 +1300,30 @@ def _register_qlinear_weight_prepack_pass(
                 new_linear_node = graph.call_function(
                     torch.ops.onednn.qlinear_pointwise.default, args=new_args
                 )
-            output_add_node_for_bias = _redirect_uses_to_new_qlinear(
-                new_linear_node,
-                linear_node,
-                output_reshape_node,
-                match,
-                bias,
-                input_dim_exceeds_two,
-                input_contiguous,
+            pattern_ctx = _DequantLinearPattern(
+                dtype=dtype,
+                bias=bias,
+                input_dim_exceeds_two=input_dim_exceeds_two,
+                input_contiguous=input_contiguous,
+                linear_node=linear_node,
+                output_reshape_node=output_reshape_node,
+                act_reshape_node=act_reshape_node,
+                act_expand_node=act_expand_node,
+                activation_to_bf16_node=activation_to_bf16_node,
+                dequant_node=dequant_node,
+                t_node=t_node,
+                dequant=dequant,
+                wgt_expand_node=(
+                    wgt_expand_node
+                    if input_dim_exceeds_two and not input_contiguous
+                    else None
+                ),
+                weight_to_bf16_node=(
+                    weight_to_bf16_node if dtype == torch.bfloat16 else None
+                ),
             )
-
-            _erase_dequant_linear_pattern(
-                graph,
-                dtype,
-                bias,
-                input_dim_exceeds_two,
-                input_contiguous,
-                linear_node,
-                output_reshape_node,
-                output_add_node_for_bias,
-                act_reshape_node,
-                act_expand_node,
-                wgt_expand_node
-                if input_dim_exceeds_two and not input_contiguous
-                else None,
-                activation_to_bf16_node,
-                dequant_node,
-                t_node,
-                weight_to_bf16_node if dtype == torch.bfloat16 else None,
-                dequant,
-            )
+            _redirect_uses_to_new_qlinear(pattern_ctx, match, new_linear_node)
+            _erase_dequant_linear_pattern(pattern_ctx, graph)
 
             counters["inductor"]["qlinear_weight_prepack_matcher_count"] += 1
             counters["inductor"]["qlinear_weight_prepack_matcher_nodes"] += len(
