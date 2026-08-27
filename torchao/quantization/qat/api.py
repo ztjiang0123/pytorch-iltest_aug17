@@ -444,19 +444,22 @@ class ComposableQATQuantizer(TwoStepQuantizer):
         torch._C._log_api_usage_once("torchao.quantization.qat.ComposableQATQuantizer")
         self.quantizers = quantizers
 
+    def _apply_step(self, step: str, model: torch.nn.Module) -> torch.nn.Module:
+        """Apply the given two-step quantizer method (``"prepare"`` or
+        ``"convert"``) from every composed quantizer in order."""
+        for quantizer in self.quantizers:
+            model = getattr(quantizer, step)(model)
+        return model
+
     def prepare(
         self, model: torch.nn.Module, *args: Any, **kwargs: Any
     ) -> torch.nn.Module:
-        for quantizer in self.quantizers:
-            model = quantizer.prepare(model)
-        return model
+        return self._apply_step("prepare", model)
 
     def convert(
         self, model: torch.nn.Module, *args: Any, **kwargs: Any
     ) -> torch.nn.Module:
-        for quantizer in self.quantizers:
-            model = quantizer.convert(model)
-        return model
+        return self._apply_step("convert", model)
 
 
 def initialize_fake_quantizers(
