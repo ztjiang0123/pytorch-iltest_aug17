@@ -382,48 +382,50 @@ def _times_to_data(experiment_label, times, profile_iters):
     return rows
 
 
-def _profile_experiment(
-    experiment_label,
-    tag,
-    forw_backward_fn,
-    profile_path_prefix,
-    model_type,
-    compile,
-    profile_iters,
-    num_leaf_tensors,
-    add_inductor_metadata_to_trace,
-    input_tensor,
-):
+@dataclass
+class ProfileContext:
+    """Invariant profiling context shared across the ref and lowp experiments."""
+
+    profile_path_prefix: str
+    model_type: str
+    compile: bool
+    profile_iters: int
+    num_leaf_tensors: int
+    add_inductor_metadata_to_trace: bool
+    input_tensor: "torch.Tensor"
+
+
+def _profile_experiment(ctx, experiment_label, tag, forw_backward_fn):
     """Profile a single (`ref` or `lowp`) experiment and return its summary rows."""
     print(f"profiling {tag}")
-    trace_suffix = f"_{model_type}_{tag}_compile_{compile}.json"
-    logs_suffix = f"_{model_type}_{tag}_compile_{compile}.txt"
-    trace_path = profile_path_prefix + trace_suffix
-    log_path = profile_path_prefix + logs_suffix
+    trace_suffix = f"_{ctx.model_type}_{tag}_compile_{ctx.compile}.json"
+    logs_suffix = f"_{ctx.model_type}_{tag}_compile_{ctx.compile}.txt"
+    trace_path = ctx.profile_path_prefix + trace_suffix
+    log_path = ctx.profile_path_prefix + logs_suffix
     trace_modified_path = trace_path.replace(".json", "_modified.json")
     profile_config = ProfileConfig(
         trace_path,
         log_path,
         trace_modified_path,
         trace_suffix,
-        iters=profile_iters,
+        iters=ctx.profile_iters,
         warmup_iters=2,
         sync=True,
     )
     p = profile_function(
         profile_config,
         forw_backward_fn,
-        add_inductor_metadata_to_trace,
-        input_tensor,
+        ctx.add_inductor_metadata_to_trace,
+        ctx.input_tensor,
     )
     print(f"saved profiling trace to {trace_path}")
-    if add_inductor_metadata_to_trace:
+    if ctx.add_inductor_metadata_to_trace:
         print(f"saved torch logs to {log_path}")
         print(f"saved modified trace to {trace_modified_path}")
     times = profiler_output_to_filtered_time_by_kernel_name(
-        p, profile_iters, num_leaf_tensors
+        p, ctx.profile_iters, ctx.num_leaf_tensors
     )
-    return _times_to_data(experiment_label, times, profile_iters)
+    return _times_to_data(experiment_label, times, ctx.profile_iters)
 
 
 def _populate_triton_bandwidth(data, redirected_output):
@@ -580,35 +582,25 @@ def main(
 
             num_leaf_tensors = 1 + len(list(m_ref.parameters()))
 
+            profile_ctx = ProfileContext(
+                profile_path_prefix=profile_path_prefix,
+                model_type=model_type,
+                compile=compile,
+                profile_iters=profile_iters,
+                num_leaf_tensors=num_leaf_tensors,
+                add_inductor_metadata_to_trace=add_inductor_metadata_to_trace,
+                input_tensor=input_tensor,
+            )
+
             if experiment_filter != "lowp":
                 data.extend(
-                    _profile_experiment(
-                        "0_ref",
-                        "ref",
-                        ref_forw_backward,
-                        profile_path_prefix,
-                        model_type,
-                        compile,
-                        profile_iters,
-                        num_leaf_tensors,
-                        add_inductor_metadata_to_trace,
-                        input_tensor,
-                    )
+                    _profile_experiment(profile_ctx, "0_ref", "ref", ref_forw_backward)
                 )
 
             if experiment_filter != "ref":
                 data.extend(
                     _profile_experiment(
-                        "1_lowp",
-                        "lowp",
-                        lowp_forw_backward_wrapper,
-                        profile_path_prefix,
-                        model_type,
-                        compile,
-                        profile_iters,
-                        num_leaf_tensors,
-                        add_inductor_metadata_to_trace,
-                        input_tensor,
+                        profile_ctx, "1_lowp", "lowp", lowp_forw_backward_wrapper
                     )
                 )
 
