@@ -700,12 +700,13 @@ def _(func, types, args, kwargs):
         )
 
 
-@implements(aten.conv3d.default)
-def _(func, types, args, kwargs):
-    """The semantics of memory_format will match high precision counterparts
-    i.e. if any of input or weight are in channels_last_3d format
-    the output will be in channels_last_3d format, otherwise the output
-    will be contiguous
+def _float8_conv3d_impl(args, quantize_and_scaled_conv3d=_quantize_and_scaled_conv3d):
+    """Shared ``aten.conv3d.default`` implementation.
+
+    Used by both ``Float8Tensor`` and the prototype float8 tensor so the
+    dispatch handler is defined once and the logic can't drift between them.
+    ``quantize_and_scaled_conv3d`` lets each tensor type plug in its own
+    quantized conv3d (the prototype variant threads ``act_quant_scale``).
     """
     (
         input_tensor,
@@ -716,7 +717,7 @@ def _(func, types, args, kwargs):
         dilation,
         groups,
     ) = fill_defaults(args, 7, [None, [1, 1, 1], [0, 0, 0], [1, 1, 1], 1])
-    conv3d_output = _quantize_and_scaled_conv3d(
+    return quantize_and_scaled_conv3d(
         input_tensor,
         weight_tensor,
         bias,
@@ -724,7 +725,16 @@ def _(func, types, args, kwargs):
         padding,
         dilation,
     )
-    return conv3d_output
+
+
+@implements(aten.conv3d.default)
+def _(func, types, args, kwargs):
+    """The semantics of memory_format will match high precision counterparts
+    i.e. if any of input or weight are in channels_last_3d format
+    the output will be in channels_last_3d format, otherwise the output
+    will be contiguous
+    """
+    return _float8_conv3d_impl(args)
 
 
 @implements(aten.conv2d.default)
