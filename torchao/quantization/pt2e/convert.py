@@ -174,17 +174,20 @@ def _get_static_qparams_decomposed(activation_post_process, dtype):
 
 def _replace_observer_static_decomposed(
     model,
-    graph,
     node,
     activation_post_process,
     dtype,
-    module_path,
-    prefix,
-    model_device,
+    attr_ctx,
 ):
-    """Replace observer with q/dq nodes for the static quantization branch."""
+    """Replace observer with q/dq nodes for the static quantization branch.
+
+    ``attr_ctx`` bundles the information needed to register scale/zero_point
+    buffers on the root module: ``(module_path, prefix, model_device)``.
+    """
     # TODO: probably should cleanup this condition check, it's hard
     # to reason about this if and the following elif
+    graph = model.graph
+    module_path, prefix, model_device = attr_ctx
 
     # 1. extract information for inserting q/dq node from activation_post_process
     quantize_op, dequantize_op, qparams = _get_static_qparams_decomposed(
@@ -407,13 +410,10 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
         # uint8/int8/int32 static quantization branch
         _replace_observer_static_decomposed(
             model,
-            graph,
             node,
             activation_post_process,
             dtype,
-            module_path,
-            prefix,
-            model_device,
+            (module_path, prefix, model_device),
         )
     elif is_dynamic:
         # uint8/int8/fp16 dynamic quantization

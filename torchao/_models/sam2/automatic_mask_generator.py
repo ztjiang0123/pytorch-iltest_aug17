@@ -462,20 +462,18 @@ class SAM2AutomaticMaskGenerator(torch.nn.Module, SAM2HFPretrainedMixin):
 
     def _compress_batches_to_rle(self, all_batch_iterator_data, crop_box, orig_size):
         """Uncrop, RLE-compress and concatenate the per-batch mask data of a crop."""
-        orig_h, orig_w = orig_size
         result_data = None
         with torch.autograd.profiler.record_function("all mask_to_rle_pytorch_2"):
             for data in all_batch_iterator_data:
                 result_data = self._compress_single_batch_to_rle(
-                    data, result_data, crop_box, orig_h, orig_w
+                    data, result_data, crop_box, orig_size
                 )
             self.predictor.reset_predictor()
         return result_data
 
-    def _compress_single_batch_to_rle(
-        self, data, result_data, crop_box, orig_h, orig_w
-    ):
+    def _compress_single_batch_to_rle(self, data, result_data, crop_box, orig_size):
         """Compress a single batch's masks to RLE and accumulate onto result_data."""
+        orig_h, orig_w = orig_size
         # Compress to RLE
         data["masks"] = uncrop_masks(data["masks"], crop_box, orig_h, orig_w)
         # TODO: Capture all these masks in a single NT for mask_to_rle_pytorch_2
