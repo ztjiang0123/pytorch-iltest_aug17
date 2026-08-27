@@ -440,6 +440,116 @@ def _populate_triton_bandwidth(data, redirected_output):
                 datum[-1] = maybe_bw
 
 
+@dataclass
+class TrainingSetup:
+    """Models, tensors, and cast helpers shared by the ref/lowp experiments."""
+
+    m_ref: "torch.nn.Module"
+    m_lowp: "torch.nn.Module"
+    input_tensor: "torch.Tensor"
+    grad_output: "torch.Tensor"
+    config: object
+    to_mx_func: Callable
+    cast_with_to_blocked: Callable
+    cast_only_dim0_dim1: Callable
+
+
+def _forward(model, x, enable_activation_checkpointing):
+    """Run the forward pass, optionally under activation checkpointing."""
+    if enable_activation_checkpointing:
+        return checkpoint(model, x, use_reentrant=False, context_fn=context_fn)
+    return model(x)
+
+
+def _cast_only_lowp(setup, mode_filter):
+    """Handle the cast-only lowp modes; return True if the mode was handled."""
+    if mode_filter == "cast_only":
+        setup.to_mx_func(
+            setup.input_tensor,
+            setup.config.elem_dtype,
+            setup.config.block_size,
+            gemm_kernel_choice=setup.config.gemm_kernel_choice,
+        )
+        return True
+    if mode_filter == "cast_with_to_blocked":
+        setup.cast_with_to_blocked(setup.input_tensor)
+        return True
+    if mode_filter == "cast_only_dim0_dim1":
+        setup.cast_only_dim0_dim1(setup.input_tensor)
+        return True
+    return False
+
+
+def _build_forw_backward_fns(setup, mode_filter, enable_activation_checkpointing):
+    """Return the ref and lowp forward-backward callables for the profiler."""
+
+    def ref_forw_backward(x):
+        assert mode_filter not in ("cast_only", "cast_with_to_blocked"), "unsupported"
+        out = _forward(setup.m_ref, x, enable_activation_checkpointing)
+        if mode_filter == "fwd_bwd":
+            out.backward(setup.grad_output)
+
+    def lowp_forw_backward_wrapper(x):
+        if _cast_only_lowp(setup, mode_filter):
+            return
+        out = _forward(setup.m_lowp, x, enable_activation_checkpointing)
+        if mode_filter == "fwd_bwd":
+            with record_function("backward"):
+                out.backward(setup.grad_output)
+
+    return ref_forw_backward, lowp_forw_backward_wrapper
+
+
+def _run_experiments(ctx, experiment_filter, ref_forw_backward, lowp_forw_backward):
+    """Run the enabled experiments and return the collected summary rows."""
+    data = []
+    if experiment_filter != "lowp":
+        data.extend(_profile_experiment(ctx, "0_ref", "ref", ref_forw_backward))
+    if experiment_filter != "ref":
+        data.extend(_profile_experiment(ctx, "1_lowp", "lowp", lowp_forw_backward))
+    return data
+
+
+def _summarize(data, experiment_filter):
+    """Build, sort, and print the per-kernel and per-category summary frames."""
+    df = pd.DataFrame(
+        data,
+        columns=[
+            "experiment",
+            "kernel",
+            "category",
+            "time_ms",
+            "pct_gpu_time",
+            "bw_gpbs",
+        ],
+    )
+    df.sort_values(
+        ["experiment", "category", "pct_gpu_time"],
+        ascending=[True, True, False],
+        inplace=True,
+    )
+    print("\nSummary of GPU time by CPU kernel\n\n", df)
+
+    # compare gemm and overhead time
+    df_p = df.pivot_table(
+        columns=["category"],
+        index="experiment",
+        values="time_ms",
+        aggfunc="sum",
+        fill_value=0,
+        margins=True,
+    )
+    # drop last row, which has totals across ref + lowp which does not make sense
+    df_p = df_p[:-1]
+    df_p = df_p.transpose()
+
+    if experiment_filter == "both":
+        df_p["lowp_div_ref"] = df_p["1_lowp"] / df_p["0_ref"]
+        df_p["ref_div_lowp"] = df_p["0_ref"] / df_p["1_lowp"]
+
+    print("\nSummary of time (ms) by kernel category\n\n", df_p)
+
+
 def main(
     profile_path_prefix: pathlib.Path,
     compile: bool = True,
@@ -518,42 +628,6 @@ def main(
     print("grad_output.shape", grad_output.shape)
     print()
 
-    def ref_forw_backward(x):
-        assert mode_filter not in ("cast_only", "cast_with_to_blocked"), "unsupported"
-        if enable_activation_checkpointing:
-            out = checkpoint(m_ref, x, use_reentrant=False, context_fn=context_fn)
-        else:
-            out = m_ref(x)
-        if mode_filter == "fwd_bwd":
-            out.backward(grad_output)
-
-    def lowp_forw_backward_wrapper(x):
-        if mode_filter == "cast_only":
-            # just cast and return early
-            _input_tensor_mx = to_mx_func(
-                input_tensor,
-                config.elem_dtype,
-                config.block_size,
-                gemm_kernel_choice=config.gemm_kernel_choice,
-            )
-            return
-        elif mode_filter == "cast_with_to_blocked":
-            _input_tensor_mx, scale = cast_with_to_blocked(input_tensor)
-            return
-        elif mode_filter == "cast_only_dim0_dim1":
-            _input_tensor_mx_dim0, _input_tensor_mx_dim1 = cast_only_dim0_dim1(
-                input_tensor,
-            )
-            return
-
-        if enable_activation_checkpointing:
-            out = checkpoint(m_lowp, x, use_reentrant=False, context_fn=context_fn)
-        else:
-            out = m_lowp(x)
-        if mode_filter == "fwd_bwd":
-            with record_function("backward"):
-                out.backward(grad_output)
-
     if compile:
         m_ref = torch.compile(m_ref, fullgraph=True)
         m_lowp = torch.compile(m_lowp, fullgraph=True)
@@ -561,95 +635,60 @@ def main(
         cast_with_to_blocked = torch.compile(cast_with_to_blocked, fullgraph=True)
         cast_only_dim0_dim1 = torch.compile(cast_only_dim0_dim1, fullgraph=True)
 
+    setup = TrainingSetup(
+        m_ref=m_ref,
+        m_lowp=m_lowp,
+        input_tensor=input_tensor,
+        grad_output=grad_output,
+        config=config,
+        to_mx_func=to_mx_func,
+        cast_with_to_blocked=cast_with_to_blocked,
+        cast_only_dim0_dim1=cast_only_dim0_dim1,
+    )
+    ref_forw_backward, lowp_forw_backward_wrapper = _build_forw_backward_fns(
+        setup, mode_filter, enable_activation_checkpointing
+    )
+
     # if the `TORCHINDUCTOR_PROFILE` env var is enabled, parse its output
     # to populate triton kernel bandwidth further down in the script
-    if os.environ.get("TORCHINDUCTOR_PROFILE", "") == "":
-        context = nullcontext()
-        f = None
-    else:
-        f = io.StringIO()
-        context = redirect_stdout(f)
+    profiling_enabled = os.environ.get("TORCHINDUCTOR_PROFILE", "") != ""
+    f = io.StringIO() if profiling_enabled else None
+    context = redirect_stdout(f) if profiling_enabled else nullcontext()
 
     # if we are skipping forward, enable torch.no_grad()
     maybe_no_grad_context = (
         torch.no_grad() if mode_filter != "fwd_bwd" else nullcontext()
     )
 
+    profile_ctx = ProfileContext(
+        profile_path_prefix=profile_path_prefix,
+        model_type=model_type,
+        compile=compile,
+        profile_iters=5,
+        num_leaf_tensors=1 + len(list(m_ref.parameters())),
+        add_inductor_metadata_to_trace=add_inductor_metadata_to_trace,
+        input_tensor=input_tensor,
+    )
+
     try:
         with context, maybe_no_grad_context:
-            profile_iters = 5
-            data = []
-
-            num_leaf_tensors = 1 + len(list(m_ref.parameters()))
-
-            profile_ctx = ProfileContext(
-                profile_path_prefix=profile_path_prefix,
-                model_type=model_type,
-                compile=compile,
-                profile_iters=profile_iters,
-                num_leaf_tensors=num_leaf_tensors,
-                add_inductor_metadata_to_trace=add_inductor_metadata_to_trace,
-                input_tensor=input_tensor,
+            data = _run_experiments(
+                profile_ctx,
+                experiment_filter,
+                ref_forw_backward,
+                lowp_forw_backward_wrapper,
             )
-
-            if experiment_filter != "lowp":
-                data.extend(
-                    _profile_experiment(profile_ctx, "0_ref", "ref", ref_forw_backward)
-                )
-
-            if experiment_filter != "ref":
-                data.extend(
-                    _profile_experiment(
-                        profile_ctx, "1_lowp", "lowp", lowp_forw_backward_wrapper
-                    )
-                )
-
     finally:
         if f is not None:
             # print the redirected stdout back to regular stdout
             print(f.getvalue())
 
     # TODO(future PR): this seems to no longer work, fix it or delete it
-    if os.environ.get("TORCHINDUCTOR_PROFILE", "") != "":
+    if profiling_enabled:
         # populate the triton kernel bandwidth
         _populate_triton_bandwidth(data, f.getvalue())
 
-    df = pd.DataFrame(
-        data,
-        columns=[
-            "experiment",
-            "kernel",
-            "category",
-            "time_ms",
-            "pct_gpu_time",
-            "bw_gpbs",
-        ],
-    )
-    df.sort_values(
-        ["experiment", "category", "pct_gpu_time"],
-        ascending=[True, True, False],
-        inplace=True,
-    )
-    print("\nSummary of GPU time by CPU kernel\n\n", df)
-
-    # compare gemm and overhead time
-    df_p = df.pivot_table(
-        columns=["category"],
-        index="experiment",
-        values="time_ms",
-        aggfunc="sum",
-        fill_value=0,
-        margins=True,
-    )
-    # drop last row, which has totals across ref + lowp which does not make sense
-    df_p = df_p[:-1]
-    df_p = df_p.transpose()
-
-    if experiment_filter == "both":
-        df_p["lowp_div_ref"] = df_p["1_lowp"] / df_p["0_ref"]
-        df_p["ref_div_lowp"] = df_p["0_ref"] / df_p["1_lowp"]
-
-    print("\nSummary of time (ms) by kernel category\n\n", df_p)
+    _summarize(data, experiment_filter)
 
 
 def invoke_main() -> None:
