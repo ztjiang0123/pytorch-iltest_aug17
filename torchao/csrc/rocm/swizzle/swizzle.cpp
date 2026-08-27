@@ -8,6 +8,7 @@
 #include <ATen/OpMathType.h>
 #include <ATen/TensorUtils.h>
 #include <ATen/core/Tensor.h>
+#include <ATen/core/stack.h>
 #include <ATen/hip/HIPDataType.h>
 #include <ATen/hip/HIPBlas.h>
 #include <ATen/native/Resize.h>
@@ -965,20 +966,27 @@ static void register_swizzle_impls(
   }
 }
 
-// Adapts the flat schema argument list to the grouped `SwizzleScaledMMParams`
-// so the registered kernel matches `torchao::swizzle_scaled_mm` while the
-// implementation keeps a single, cohesive parameter.
-static Tensor swizzle_scaled_mm_kernel(
-    const Tensor& mat_a,
-    const Tensor& mat_b,
-    bool mat1_is_swizzled,
-    bool mat2_is_swizzled,
-    const Tensor& scale_a,
-    const Tensor& scale_b,
-    const std::optional<at::Tensor>& bias,
-    const std::optional<at::Tensor>& scale_result,
-    std::optional<c10::ScalarType> out_dtype) {
-  return swizzle_scaled_mm(SwizzleScaledMMParams{
+// Boxed adapter for `torchao::swizzle_scaled_mm`. Reading the flat schema
+// arguments off the dispatcher stack (rather than declaring them as a long
+// parameter list) lets the grouped `SwizzleScaledMMParams` stay the only
+// operand plumbing while still matching the registered schema.
+static void swizzle_scaled_mm_boxed(
+    const c10::OperatorHandle& /*op*/,
+    c10::Stack* stack) {
+  // Argument order mirrors the torchao::swizzle_scaled_mm schema.
+  auto [mat_a, mat_b, mat1_is_swizzled, mat2_is_swizzled, scale_a, scale_b,
+        bias, scale_result, out_dtype] =
+      torch::jit::pop<
+          Tensor,
+          Tensor,
+          bool,
+          bool,
+          Tensor,
+          Tensor,
+          std::optional<at::Tensor>,
+          std::optional<at::Tensor>,
+          std::optional<c10::ScalarType>>(stack);
+  Tensor out = swizzle_scaled_mm(SwizzleScaledMMParams{
       mat_a,
       mat_b,
       mat1_is_swizzled,
@@ -988,6 +996,7 @@ static Tensor swizzle_scaled_mm_kernel(
       bias,
       scale_result,
       out_dtype});
+  torch::jit::push(stack, std::move(out));
 }
 
 TORCH_LIBRARY_IMPL(torchao, CUDA, m) {
@@ -996,6 +1005,6 @@ TORCH_LIBRARY_IMPL(torchao, CUDA, m) {
       "torchao::swizzle_mm",
       &swizzle_mm,
       "torchao::swizzle_scaled_mm",
-      &swizzle_scaled_mm_kernel);
+      torch::CppFunction::makeFromBoxedFunction<&swizzle_scaled_mm_boxed>());
 }
 #endif // USE_ROCM
