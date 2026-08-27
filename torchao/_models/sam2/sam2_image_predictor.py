@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+from dataclasses import dataclass, fields
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -14,6 +15,57 @@ from PIL.Image import Image
 from torchao._models.sam2.modeling.sam2_base import SAM2Base
 from torchao._models.sam2.utils.misc import SAM2HFPretrainedMixin, get_image_size
 from torchao._models.sam2.utils.transforms import SAM2Transforms
+
+
+@dataclass
+class SAM2Prompt:
+    """Input prompts for a single :meth:`SAM2ImagePredictor.predict` call.
+
+    Groups the prompt values that travel together so the ``predict`` API is
+    easier to read and call correctly.
+
+    Attributes:
+      point_coords (np.ndarray or None): A Nx2 array of point prompts to the
+        model. Each point is in (X,Y) in pixels.
+      point_labels (np.ndarray or None): A length N array of labels for the
+        point prompts. 1 indicates a foreground point and 0 indicates a
+        background point.
+      box (np.ndarray or None): A length 4 array given a box prompt to the
+        model, in XYXY format.
+      mask_input (np.ndarray or None): A low resolution mask input to the model,
+        typically coming from a previous prediction iteration. Has form 1xHxW,
+        where for SAM, H=W=256.
+    """
+
+    point_coords: Optional[np.ndarray] = None
+    point_labels: Optional[np.ndarray] = None
+    box: Optional[np.ndarray] = None
+    mask_input: Optional[np.ndarray] = None
+
+
+@dataclass
+class SAM2PredictOptions:
+    """Output/behavior options for a :meth:`SAM2ImagePredictor.predict` call.
+
+    Attributes:
+      multimask_output (bool): If true, the model will return three masks.
+        For ambiguous input prompts (such as a single click), this will often
+        produce better masks than a single prediction. If only a single
+        mask is needed, the model's predicted quality score can be used
+        to select the best mask. For non-ambiguous prompts, such as multiple
+        input prompts, multimask_output=False can give better results.
+      return_logits (bool): If true, returns un-thresholded masks logits
+        instead of a binary mask.
+      normalize_coords (bool): If true, the point coordinates will be normalized
+        to the range [0,1] and point_coords is expected to be wrt. image
+        dimensions.
+      return_type (str): Either "numpy" or "torch"; selects the output type.
+    """
+
+    multimask_output: bool = True
+    return_logits: bool = False
+    normalize_coords: bool = True
+    return_type: str = "numpy"
 
 
 class SAM2ImagePredictor(torch.nn.Module, SAM2HFPretrainedMixin):
@@ -238,38 +290,23 @@ class SAM2ImagePredictor(torch.nn.Module, SAM2HFPretrainedMixin):
 
     def predict(
         self,
-        point_coords: Optional[np.ndarray] = None,
-        point_labels: Optional[np.ndarray] = None,
-        box: Optional[np.ndarray] = None,
-        mask_input: Optional[np.ndarray] = None,
-        multimask_output: bool = True,
-        return_logits: bool = False,
-        normalize_coords=True,
-        return_type: str = "numpy",
+        prompt: Optional[SAM2Prompt] = None,
+        options: Optional[SAM2PredictOptions] = None,
+        **kwargs,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Predict masks for the given input prompts, using the currently set image.
 
         Arguments:
-          point_coords (np.ndarray or None): A Nx2 array of point prompts to the
-            model. Each point is in (X,Y) in pixels.
-          point_labels (np.ndarray or None): A length N array of labels for the
-            point prompts. 1 indicates a foreground point and 0 indicates a
-            background point.
-          box (np.ndarray or None): A length 4 array given a box prompt to the
-            model, in XYXY format.
-          mask_input (np.ndarray): A low resolution mask input to the model, typically
-            coming from a previous prediction iteration. Has form 1xHxW, where
-            for SAM, H=W=256.
-          multimask_output (bool): If true, the model will return three masks.
-            For ambiguous input prompts (such as a single click), this will often
-            produce better masks than a single prediction. If only a single
-            mask is needed, the model's predicted quality score can be used
-            to select the best mask. For non-ambiguous prompts, such as multiple
-            input prompts, multimask_output=False can give better results.
-          return_logits (bool): If true, returns un-thresholded masks logits
-            instead of a binary mask.
-          normalize_coords (bool): If true, the point coordinates will be normalized to the range [0,1] and point_coords is expected to be wrt. image dimensions.
+          prompt (SAM2Prompt or None): The input prompts (point coordinates,
+            point labels, box, and mask input). See :class:`SAM2Prompt` for the
+            per-field documentation.
+          options (SAM2PredictOptions or None): Output/behavior options such as
+            ``multimask_output``, ``return_logits``, ``normalize_coords``, and
+            ``return_type``. See :class:`SAM2PredictOptions`.
+          **kwargs: For backwards compatibility, the individual :class:`SAM2Prompt`
+            and :class:`SAM2PredictOptions` fields may also be passed as keyword
+            arguments instead of (or in addition to) the grouped objects.
 
         Returns:
           (np.ndarray): The output masks in CxHxW format, where C is the
@@ -280,9 +317,12 @@ class SAM2ImagePredictor(torch.nn.Module, SAM2HFPretrainedMixin):
             of masks and H=W=256. These low resolution logits can be passed to
             a subsequent iteration as mask input.
         """
-        if return_type not in ["numpy", "torch"]:
+        prompt, options = self._resolve_predict_args(prompt, options, kwargs)
+
+        if options.return_type not in ["numpy", "torch"]:
             raise ValueError(
-                f"Expected return_type to be either numpy or torch, but got {return_type}"
+                "Expected return_type to be either numpy or torch, but got "
+                f"{options.return_type}"
             )
         if not self._is_image_set:
             raise RuntimeError(
@@ -292,7 +332,11 @@ class SAM2ImagePredictor(torch.nn.Module, SAM2HFPretrainedMixin):
         # Transform input prompts
 
         mask_input, unnorm_coords, labels, unnorm_box = self._prep_prompts(
-            point_coords, point_labels, box, mask_input, normalize_coords
+            prompt.point_coords,
+            prompt.point_labels,
+            prompt.box,
+            prompt.mask_input,
+            options.normalize_coords,
         )
 
         masks, iou_predictions, low_res_masks = self._predict(
@@ -300,11 +344,11 @@ class SAM2ImagePredictor(torch.nn.Module, SAM2HFPretrainedMixin):
             labels,
             unnorm_box,
             mask_input,
-            multimask_output,
-            return_logits=return_logits,
+            options.multimask_output,
+            return_logits=options.return_logits,
         )
 
-        if return_type == "torch":
+        if options.return_type == "torch":
             return (
                 masks.squeeze(0),
                 iou_predictions.squeeze(0),
@@ -315,6 +359,29 @@ class SAM2ImagePredictor(torch.nn.Module, SAM2HFPretrainedMixin):
         iou_predictions_np = iou_predictions.squeeze(0).float().detach().cpu().numpy()
         low_res_masks_np = low_res_masks.squeeze(0).float().detach().cpu().numpy()
         return masks_np, iou_predictions_np, low_res_masks_np
+
+    @staticmethod
+    def _resolve_predict_args(
+        prompt: Optional[SAM2Prompt],
+        options: Optional[SAM2PredictOptions],
+        kwargs: dict,
+    ) -> Tuple[SAM2Prompt, SAM2PredictOptions]:
+        """Merge grouped ``predict`` arguments with any legacy keyword arguments."""
+        prompt = prompt if prompt is not None else SAM2Prompt()
+        options = options if options is not None else SAM2PredictOptions()
+
+        prompt_fields = {f.name for f in fields(SAM2Prompt)}
+        options_fields = {f.name for f in fields(SAM2PredictOptions)}
+        for key, value in kwargs.items():
+            if key in prompt_fields:
+                setattr(prompt, key, value)
+            elif key in options_fields:
+                setattr(options, key, value)
+            else:
+                raise TypeError(
+                    f"predict() got an unexpected keyword argument '{key}'"
+                )
+        return prompt, options
 
     def _prep_prompts(
         self, point_coords, point_labels, box, mask_logits, normalize_coords, img_idx=-1
