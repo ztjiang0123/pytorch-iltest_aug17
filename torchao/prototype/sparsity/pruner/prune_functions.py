@@ -114,22 +114,29 @@ def _propogate_module_bias(module: nn.Module, mask: Tensor) -> Optional[Tensor]:
     return pruned_biases
 
 
-# LINEAR
-def _prune_linear_helper(linear: nn.Linear) -> Tensor:
-    # expects linear to be a parameterized linear module
-    parametrization_dict = cast(nn.ModuleDict, linear.parametrizations)
+# SHARED
+def _prune_module_weight_helper(module: nn.Module, out_size_attr: str) -> Tensor:
+    # expects module to be a parameterized linear or conv2d module; prunes the
+    # output rows/channels selected by its FakeStructuredSparsity mask and stores
+    # the new output size on ``out_size_attr`` (``out_features`` / ``out_channels``)
+    parametrization_dict = cast(nn.ModuleDict, module.parametrizations)
     weight_parameterizations = cast(ParametrizationList, parametrization_dict.weight)
     for p in weight_parameterizations:
         if isinstance(p, FakeStructuredSparsity):
             mask = cast(Tensor, p.mask)
 
     with torch.no_grad():
-        parametrize.remove_parametrizations(linear, "weight", leave_parametrized=True)
-        linear.weight = nn.Parameter(linear.weight[mask])  # type: ignore[possibly-undefined]
-    linear.out_features = linear.weight.shape[0]
-    _remove_bias_handles(linear)
+        parametrize.remove_parametrizations(module, "weight", leave_parametrized=True)
+        module.weight = nn.Parameter(module.weight[mask])  # type: ignore[possibly-undefined]
+    setattr(module, out_size_attr, module.weight.shape[0])
+    _remove_bias_handles(module)
 
     return mask
+
+
+# LINEAR
+def _prune_linear_helper(linear: nn.Linear) -> Tensor:
+    return _prune_module_weight_helper(linear, "out_features")
 
 
 def prune_linear(linear: nn.Linear) -> None:
@@ -175,19 +182,7 @@ def prune_linear_activation_linear(
 
 # CONV2D
 def _prune_conv2d_helper(conv2d: nn.Conv2d) -> Tensor:
-    parametrization_dict = cast(nn.ModuleDict, conv2d.parametrizations)
-    weight_parameterizations = cast(ParametrizationList, parametrization_dict.weight)
-    for p in weight_parameterizations:
-        if isinstance(p, FakeStructuredSparsity):
-            mask = cast(Tensor, p.mask)
-
-    with torch.no_grad():
-        parametrize.remove_parametrizations(conv2d, "weight", leave_parametrized=True)
-        conv2d.weight = nn.Parameter(conv2d.weight[mask])  # type: ignore[possibly-undefined]
-    conv2d.out_channels = conv2d.weight.shape[0]
-
-    _remove_bias_handles(conv2d)
-    return mask
+    return _prune_module_weight_helper(conv2d, "out_channels")
 
 
 def prune_conv2d_padded(conv2d_1: nn.Conv2d) -> None:

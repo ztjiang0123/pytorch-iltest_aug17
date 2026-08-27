@@ -29,6 +29,9 @@ from torchao.quantization.quant_primitives import (
 )
 from torchao.quantization.utils import get_block_size
 
+# Reuse the canonical float8 dtype check so this stays in sync with torchao.utils.
+from torchao.utils import _is_float8_type
+
 ABC: Any = ABCMeta("ABC", (object,), {})  # compatible with Python 2 *and* 3:
 
 logger = logging.getLogger(__name__)
@@ -60,16 +63,6 @@ _DTYPE_TO_QVALUE_BOUNDS: dict[Union[torch.dtype, TorchAODType], tuple[int, int]]
     torch.int32: (-(2**31), 2**31 - 1),
 }
 _DTYPE_TO_QVALUE_BOUNDS.update(_SUB_BYTE_UINT_BOUNDS)
-
-
-def _is_float8_type(dtype: torch.dtype) -> bool:
-    fp8_types = {
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-        torch.float8_e5m2,
-        torch.float8_e5m2fnuz,
-    }
-    return dtype in fp8_types
 
 
 def choose_qparams_affine_with_min_max(
