@@ -5,9 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+
 
 class LsqBinaryTernaryExtension(torch.autograd.Function):
     """
@@ -242,18 +244,25 @@ class StretchedElasticQuant(torch.autograd.Function):
 
 
 
+@dataclass
+class WeightQuantConfig:
+    """Weight-quantization settings for :class:`QuantizeLinear`.
+
+    Groups the knobs that travel together so callers configure the linear
+    layer through a single value type instead of a long parameter list.
+    """
+
+    w_bits: int = 16
+    weight_layerwise: bool = False
+
+
 class QuantizeLinear(nn.Linear):
-    def __init__(
-        self,
-        *kargs,
-        symmetric=True,
-        bias=False,
-        w_bits=16,
-        weight_layerwise=False,
-    ):
+    def __init__(self, *kargs, weight_quant_config=None):
         super(QuantizeLinear, self).__init__(*kargs, bias=False)
-        self.w_bits = w_bits
-        self.weight_layerwise = weight_layerwise
+        if weight_quant_config is None:
+            weight_quant_config = WeightQuantConfig()
+        self.w_bits = weight_quant_config.w_bits
+        self.weight_layerwise = weight_quant_config.weight_layerwise
         # params for weight quant
         if self.w_bits < 16:
             self.weight_clip_val = nn.Parameter(torch.Tensor(self.weight.shape[0], 1))
