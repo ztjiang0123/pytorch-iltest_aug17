@@ -159,46 +159,41 @@ def pil_to_lpips_tensor(img: Image.Image, device: str) -> torch.Tensor:
 def generate_image(
     pipe,
     prompt: str,
-    seed: int,
-    device: str,
-    num_inference_steps: int,
-    height: int = 2048,
-    width: int = 2048,
-    flash_impl: Optional[str] = None,
-    sdpa_backend: Optional[SDPBackend] = None,
+    config: BenchmarkConfig,
+    gen: GenSettings,
 ) -> Image.Image:
     """Generate an image from a prompt with deterministic seed."""
-    generator = torch.Generator(device=device).manual_seed(seed)
+    generator = torch.Generator(device=config.device).manual_seed(RANDOM_SEED)
 
     # For BF16 backends, force the correct SDPA backend on the transformer
     # only (not the VAE, whose head_dim=512 exceeds flash/cuDNN limits and
     # needs the math backend). FP8 backends call their ops directly and
     # don't need this.
     orig_forward = None
-    if sdpa_backend is not None:
+    if gen.sdpa_backend is not None:
         orig_forward = pipe.transformer.forward
 
         def _forced_backend_forward(*args, **kwargs):
-            with sdpa_kernel(sdpa_backend):
+            with sdpa_kernel(gen.sdpa_backend):
                 return orig_forward(*args, **kwargs)
 
         pipe.transformer.forward = _forced_backend_forward
 
-    if flash_impl:
-        activate_flash_attention_impl(flash_impl)
+    if gen.flash_impl:
+        activate_flash_attention_impl(gen.flash_impl)
     try:
         image = pipe(
             prompt=prompt,
-            num_inference_steps=num_inference_steps,
+            num_inference_steps=config.num_inference_steps,
             guidance_scale=3.5,
-            height=height,
-            width=width,
+            height=config.height,
+            width=config.width,
             generator=generator,
         ).images[0]
     finally:
         if orig_forward is not None:
             pipe.transformer.forward = orig_forward
-        if flash_impl:
+        if gen.flash_impl:
             restore_flash_attention_impl()
 
     if IMAGE_SIZE is not None:
@@ -256,17 +251,7 @@ def _timed_generate(pipe, prompt: str, config: BenchmarkConfig, gen: GenSettings
     end_event = torch.cuda.Event(enable_timing=True)
 
     start_event.record()
-    image = generate_image(
-        pipe,
-        prompt,
-        RANDOM_SEED,
-        config.device,
-        config.num_inference_steps,
-        height=config.height,
-        width=config.width,
-        flash_impl=gen.flash_impl,
-        sdpa_backend=gen.sdpa_backend,
-    )
+    image = generate_image(pipe, prompt, config, gen)
     end_event.record()
     torch.cuda.synchronize()
     elapsed_ms = start_event.elapsed_time(end_event)
