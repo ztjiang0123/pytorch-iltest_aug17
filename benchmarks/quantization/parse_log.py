@@ -39,17 +39,26 @@ def parse_accuracy_metrics(section_lines: List[str]) -> Dict[str, Optional[float
         "winogrande_acc_stderr": None,
     }
 
-    for line in section_lines:
-        # Parse wikitext word_perplexity
-        # Format: |          |       |none  |     0|word_perplexity|↓  |7.5435|±  |   N/A|
-        # Note: The task name "wikitext" is on a previous line, this is a continuation row
-        if "|word_perplexity" in line:
-            _parse_wikitext_perplexity(line, metrics)
+    # Each entry maps a metric key to the ``(label, offset)`` column in the
+    # lm_eval table row identified by ``row_marker``.
+    # Format of a matched row, e.g.:
+    #   |          |    |none|0|word_perplexity|↓|7.5435|±|   N/A|
+    #   |winogrande|1   |none|0|acc            |↑|0.7419|±|0.0123|
+    row_specs = [
+        ("|word_perplexity", [("wikitext_word_perplexity", "word_perplexity", 2)]),
+        (
+            "|winogrande",
+            [
+                ("winogrande_acc", "acc", 2),
+                ("winogrande_acc_stderr", "acc", 4),
+            ],
+        ),
+    ]
 
-        # Parse winogrande accuracy
-        # Format: |winogrande|      1|none  |     0|acc            |↑  |0.7419|±  |0.0123|
-        if "|winogrande" in line and "|acc" in line:
-            _parse_winogrande_acc(line, metrics)
+    for line in section_lines:
+        for row_marker, columns in row_specs:
+            if row_marker in line:
+                _extract_row_metrics(line, columns, metrics)
 
     return metrics
 
@@ -71,21 +80,17 @@ def _column_value(parts: List[str], label: str, offset: int) -> Optional[float]:
         return None
 
 
-def _parse_wikitext_perplexity(line: str, metrics: Dict[str, Optional[float]]) -> None:
+def _extract_row_metrics(
+    line: str,
+    columns: List[tuple],
+    metrics: Dict[str, Optional[float]],
+) -> None:
+    """Extract each ``(metric_key, label, offset)`` column from a table ``line``."""
     parts = [p.strip() for p in line.split("|")]
-    value = _column_value(parts, "word_perplexity", 2)
-    if value is not None:
-        metrics["wikitext_word_perplexity"] = value
-
-
-def _parse_winogrande_acc(line: str, metrics: Dict[str, Optional[float]]) -> None:
-    parts = [p.strip() for p in line.split("|")]
-    acc = _column_value(parts, "acc", 2)
-    if acc is not None:
-        metrics["winogrande_acc"] = acc
-    stderr = _column_value(parts, "acc", 4)
-    if stderr is not None:
-        metrics["winogrande_acc_stderr"] = stderr
+    for metric_key, label, offset in columns:
+        value = _column_value(parts, label, offset)
+        if value is not None:
+            metrics[metric_key] = value
 
 
 def parse_throughput_metrics(
