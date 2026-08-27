@@ -20,6 +20,11 @@ if torch_version_at_least("2.10.0") and has_triton():
     )
     from torchao.utils import is_sm_at_least_100
 
+    # L2-cache-friendly tile grouping along N for the persistent grid-stride loop.
+    # Constant across all launches, so it lives here instead of as a kernel parameter.
+    # A captured int global is treated as a compile-time constant inside @triton.jit.
+    QUANTIZE_2D_GROUP_SIZE_N = 8
+
     # SM100+ autotune configs.
     QUANTIZE_2D_TILE_SHAPES: list[tuple[int, int]] = [
         (128, 128),
@@ -106,11 +111,14 @@ if torch_version_at_least("2.10.0") and has_triton():
         N,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
-        GROUP_SIZE_N: tl.constexpr,
-        NUM_SMS: tl.constexpr,
         NUM_STAGES: tl.constexpr,
     ):
-        """2D (16×16) NVFP4 E2M1 weight quantization — one tile per CTA."""
+        """2D (16×16) NVFP4 E2M1 weight quantization — one tile per CTA.
+
+        The persistent grid is launched with one program per SM, so the grid-stride
+        step is ``tl.num_programs(0)`` and the L2 grouping factor is the module-level
+        ``QUANTIZE_2D_GROUP_SIZE_N`` constant — neither needs to be a kernel parameter.
+        """
         # Create TMA descriptors in-kernel from raw pointers, shape, and stride
         a_desc = tl.make_tensor_descriptor(
             a_ptr,
@@ -143,11 +151,13 @@ if torch_version_at_least("2.10.0") and has_triton():
             block_shape=[BLOCK_N // 128, BLOCK_M // 64, 32, 16],
         )
 
-        # Persistent grid-stride loop
+        # Persistent grid-stride loop. The grid is launched with one program per SM,
+        # so the stride between tiles handled by a program is tl.num_programs(0).
         start_pid = tl.program_id(0)
+        num_sms = tl.num_programs(0)
         num_pid_m = tl.cdiv(M, BLOCK_M)
         num_pid_n = tl.cdiv(N, BLOCK_N)
-        num_pid_in_group = GROUP_SIZE_N * num_pid_m
+        num_pid_in_group = QUANTIZE_2D_GROUP_SIZE_N * num_pid_m
         num_tiles = num_pid_m * num_pid_n
 
         # Load global amax scalar once
@@ -156,12 +166,12 @@ if torch_version_at_least("2.10.0") and has_triton():
         for tile_id in tl.range(
             start_pid,
             num_tiles,
-            NUM_SMS,
+            num_sms,
             flatten=False,
             num_stages=NUM_STAGES,
         ):
             pid_n, pid_m = _compute_pid(
-                tile_id, num_pid_in_group, num_pid_n, GROUP_SIZE_N
+                tile_id, num_pid_in_group, num_pid_n, QUANTIZE_2D_GROUP_SIZE_N
             )
 
             # Load A (BLOCK_M, BLOCK_N)
@@ -260,9 +270,11 @@ if torch_version_at_least("2.10.0") and has_triton():
         )
 
         NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
-        GROUP_SIZE_N: int = 8
 
         try:
+            # Launch one program per SM; the kernel reads the SM count back via
+            # tl.num_programs(0) and uses the module-level QUANTIZE_2D_GROUP_SIZE_N,
+            # so neither is passed as a kernel argument.
             triton_quantize_2d_weight[(NUM_SMS,)](
                 A,
                 a_fp4,
@@ -272,8 +284,6 @@ if torch_version_at_least("2.10.0") and has_triton():
                 global_amax,
                 M,
                 N,
-                GROUP_SIZE_N=GROUP_SIZE_N,
-                NUM_SMS=NUM_SMS,
             )
         finally:
             if hasattr(triton, "set_allocator"):
