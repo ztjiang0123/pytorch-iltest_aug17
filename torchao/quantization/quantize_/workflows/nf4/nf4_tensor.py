@@ -131,6 +131,17 @@ def apply_to_inner_tensors(nf4tensor: "NF4Tensor", aten_op, args, kwargs):
     return attr_to_tensor
 
 
+def _nf4_op_via_inner_tensors(aten_op, args, kwargs):
+    """Apply ``aten_op`` to each inner tensor and rebuild the ``NF4Tensor``.
+
+    Shared by op handlers (e.g. ``detach``, ``_pin_memory``) that simply forward
+    the op to the inner tensors and reconstruct the outer tensor unchanged.
+    """
+    nf4tensor = args[0]
+    updated_attrs = apply_to_inner_tensors(nf4tensor, aten_op, args[1:], kwargs)
+    return NF4Tensor(*construct_nf4_args(nf4tensor, updated_attrs))
+
+
 # __torch_function__ utils: call tensor ops from inner tensors
 def call_from_inner_tensors(nf4tensor: "NF4Tensor", method_name: str, args, kwargs):
     attr_to_tensor = {}
@@ -203,9 +214,7 @@ def clone(func, *args, **kwargs):
     ]
 )
 def nf4_detach(aten_op, args, kwargs=None):
-    nf4tensor = args[0]
-    updated_attrs = apply_to_inner_tensors(nf4tensor, aten_op, args[1:], kwargs)
-    return NF4Tensor(*construct_nf4_args(nf4tensor, updated_attrs))
+    return _nf4_op_via_inner_tensors(aten_op, args, kwargs)
 
 
 @implements(
@@ -478,9 +487,7 @@ def nf4_is_pinned(aten_op, args, kwargs=None):
     ]
 )
 def nf4_pin_memory(aten_op, args, kwargs=None):
-    nf4tensor = args[0]
-    updated_attrs = apply_to_inner_tensors(nf4tensor, aten_op, args[1:], kwargs)
-    return NF4Tensor(*construct_nf4_args(nf4tensor, updated_attrs))
+    return _nf4_op_via_inner_tensors(aten_op, args, kwargs)
 
 
 @implements(

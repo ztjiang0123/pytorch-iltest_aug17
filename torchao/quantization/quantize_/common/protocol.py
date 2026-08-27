@@ -26,6 +26,19 @@ class SupportsActivationPreScaling(Protocol):
     act_pre_scale: Optional[torch.Tensor]
 
 
+def quantization_type_with_act_pre_scale(tensor) -> str:
+    """Shared ``_quantization_type`` string for tensors with ``act_pre_scale``.
+
+    Used by tensor subclasses whose ``_quantization_type`` reports shape,
+    block size, device and (optionally) the activation pre-scale shape, so the
+    identical string-building logic lives in one place.
+    """
+    s = f"shape={tensor.shape}, block_size={tensor.block_size}, device={tensor.device}"
+    if tensor.act_pre_scale is not None:
+        s += f", act_pre_scale.shape={tensor.act_pre_scale.shape}"
+    return s
+
+
 @runtime_checkable
 class IsStaticQuantizationConfig(Protocol):
     """Protocol for static quantization configuration.

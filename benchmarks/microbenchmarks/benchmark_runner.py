@@ -32,6 +32,118 @@ from benchmarks.microbenchmarks.utils import (
     print_results,
 )
 
+# Static model weight-shape tables, keyed by the shape-config ``name``.
+# Each entry is a list of (label, (M, K, N)) tuples materialized verbatim.
+_LLAMA_M = 4 * 4096  # bsz=4, seq_len=4096, fused attn.wqkv and ffn.w13
+_STATIC_MODEL_SHAPES: Dict[str, List[Tuple[str, Tuple[int, int, int]]]] = {
+    "llama": [
+        ("attn.wqkv", (_LLAMA_M, 8192, 1280)),
+        ("attn.w0", (_LLAMA_M, 1024, 8192)),
+        ("ffn.w13", (_LLAMA_M, 8192, 7168)),
+        ("ffn.w2", (_LLAMA_M, 3584, 8192)),
+    ],
+    "llama4": [
+        ("FFN", (16384, 8192, 5120)),
+        ("QO_proj", (16384, 8192, 8192)),
+        ("KV_proj", (16384, 8192, 1024)),
+        ("FFN", (128000, 8192, 5120)),
+        ("QO_proj", (128000, 8192, 8192)),
+        ("KV_proj", (128000, 8192, 1024)),
+    ],
+    "deepseek_v3_236b": [
+        ("FFN", (16384, 1536, 5120)),
+        ("QKVO_proj", (16384, 7168, 7168)),
+        ("FFN", (128000, 1536, 5120)),
+        ("QKVO_proj", (128000, 7168, 7168)),
+    ],
+    "deepseek_v3_671b": [
+        ("FFN", (16384, 2048, 7168)),
+        ("QKVO_proj", (16384, 7168, 7168)),
+        ("FFN", (128000, 2048, 7168)),
+        ("QKVO_proj", (128000, 7168, 7168)),
+    ],
+    "qwen3_32b": [
+        ("QO_proj", (16384, 5120, 5120)),
+        ("KV_proj", (16384, 5120, 640)),
+        ("QO_proj", (128000, 5120, 5120)),
+        ("KV_proj", (128000, 5120, 640)),
+    ],
+    "gemma3_27b": [
+        ("QO_proj", (16384, 4096, 4096)),
+        ("KV_proj", (16384, 4096, 1024)),
+        ("QO_proj", (128000, 4096, 4096)),
+        ("KV_proj", (128000, 4096, 1024)),
+    ],
+}
+
+
+def _custom_shapes(name, shape_config):
+    return [(name, shape) for shape in shape_config["shapes"]]
+
+
+def _static_model_shapes(name, shape_config):
+    return [(f"{name}_{label}", shape) for label, shape in _STATIC_MODEL_SHAPES[name]]
+
+
+def _pow2_shapes(name, shape_config):
+    min_power_of_2 = shape_config.get("min_power", 10)  # 1024
+    max_power_of_2 = shape_config.get("max_power", 14)  # 16,384
+    shapes = []
+    for idx, power_of_2 in enumerate(range(min_power_of_2, max_power_of_2 + 1)):
+        val = 2**power_of_2
+        shapes.append((f"{name}_{idx}", [val, val, val]))
+    return shapes
+
+
+def _pow2_extended_shapes(name, shape_config):
+    # Powers of 2 and powers of 2 + half.
+    min_power_of_2 = shape_config.get("min_power", 10)  # 1024
+    max_power_of_2 = shape_config.get("max_power", 14)  # 16,384
+    shapes = []
+    for idx, power_of_2 in enumerate(range(min_power_of_2, max_power_of_2 + 1)):
+        val1 = 2**power_of_2
+        val2 = 2**power_of_2 + 2 ** (power_of_2 - 1)
+        shapes.append((f"{name}_{idx * 2}", [val1, val1, val1]))
+        shapes.append((f"{name}_{idx * 2 + 1}", [val2, val2, val2]))
+    return shapes
+
+
+def _sweep_shapes(name, shape_config, *, default_min, default_max, increasing_only):
+    min_p2 = shape_config.get("min_power", default_min)
+    max_p2 = shape_config.get("max_power", default_max)
+    shapes = []
+    counter = 0
+    for M_p2, K_p2, N_p2 in product(range(min_p2, max_p2 + 1), repeat=3):
+        M, K, N = 2**M_p2, 2**K_p2, 2**N_p2
+        if increasing_only and not (M <= K <= N):
+            continue
+        shapes.append((f"{name}_{counter}", [M, K, N]))
+        counter += 1
+    return shapes
+
+
+def _small_sweep_shapes(name, shape_config):
+    return _sweep_shapes(
+        name, shape_config, default_min=10, default_max=14, increasing_only=True
+    )
+
+
+def _full_sweep_shapes(name, shape_config):
+    return _sweep_shapes(
+        name, shape_config, default_min=8, default_max=15, increasing_only=False
+    )
+
+
+# Dispatch table: shape-config ``name`` -> handler(name, shape_config) -> shapes.
+_SHAPE_HANDLERS = {
+    "custom": _custom_shapes,
+    "pow2": _pow2_shapes,
+    "pow2_extended": _pow2_extended_shapes,
+    "small_sweep": _small_sweep_shapes,
+    "sweep": _full_sweep_shapes,
+    **{name: _static_model_shapes for name in _STATIC_MODEL_SHAPES},
+}
+
 
 def get_shapes_for_config(
     shape_configs: List[Dict[str, Any]],
@@ -47,114 +159,13 @@ def get_shapes_for_config(
     shapes = []
     for shape_config in shape_configs:
         name = shape_config["name"]
-        if name == "custom":
-            shapes.extend([(name, shape) for shape in shape_config["shapes"]])
-        elif name == "llama":
-            # LLaMa 2 70B single-node weight shapes
-            # assumes fused attn.wqkv and ffn.w13
-            bsz, seq_len = 4, 4096
-            M = bsz * seq_len
-            llama_shapes = {
-                "attn.wqkv": (M, 8192, 1280),
-                "attn.w0": (M, 1024, 8192),
-                "ffn.w13": (M, 8192, 7168),
-                "ffn.w2": (M, 3584, 8192),
-            }
-            shapes.extend([(f"{name}_{k}", v) for k, v in llama_shapes.items()])
-        elif name == "llama4":
-            # LLaMa 4 shapes
-            llama4_shapes = [
-                ("FFN", (16384, 8192, 5120)),
-                ("QO_proj", (16384, 8192, 8192)),
-                ("KV_proj", (16384, 8192, 1024)),
-                ("FFN", (128000, 8192, 5120)),
-                ("QO_proj", (128000, 8192, 8192)),
-                ("KV_proj", (128000, 8192, 1024)),
-            ]
-            shapes.extend([(f"{name}_{k}", v) for k, v in llama4_shapes])
-        elif name == "deepseek_v3_236b":
-            # DeepSeek V3 236B shapes
-            deepseek_v3_236b_shapes = [
-                ("FFN", (16384, 1536, 5120)),
-                ("QKVO_proj", (16384, 7168, 7168)),
-                ("FFN", (128000, 1536, 5120)),
-                ("QKVO_proj", (128000, 7168, 7168)),
-            ]
-            shapes.extend([(f"{name}_{k}", v) for k, v in deepseek_v3_236b_shapes])
-        elif name == "deepseek_v3_671b":
-            # DeepSeek V3 671B shapes
-            deepseek_v3_671b_shapes = [
-                ("FFN", (16384, 2048, 7168)),
-                ("QKVO_proj", (16384, 7168, 7168)),
-                ("FFN", (128000, 2048, 7168)),
-                ("QKVO_proj", (128000, 7168, 7168)),
-            ]
-            shapes.extend([(f"{name}_{k}", v) for k, v in deepseek_v3_671b_shapes])
-        elif name == "qwen3_32b":
-            # Qwen3 32B shapes
-            qwen3_32b_shapes = [
-                ("QO_proj", (16384, 5120, 5120)),
-                ("KV_proj", (16384, 5120, 640)),
-                ("QO_proj", (128000, 5120, 5120)),
-                ("KV_proj", (128000, 5120, 640)),
-            ]
-            shapes.extend([(f"{name}_{k}", v) for k, v in qwen3_32b_shapes])
-        elif name == "gemma3_27b":
-            # Gemma3 27B shapes
-            gemma3_27b_shapes = [
-                ("QO_proj", (16384, 4096, 4096)),
-                ("KV_proj", (16384, 4096, 1024)),
-                ("QO_proj", (128000, 4096, 4096)),
-                ("KV_proj", (128000, 4096, 1024)),
-            ]
-            shapes.extend([(f"{name}_{k}", v) for k, v in gemma3_27b_shapes])
-        elif name == "pow2":
-            # Generate shapes with dimensions that are powers of 2
-            min_power_of_2 = shape_config.get("min_power", 10)  # 1024
-            max_power_of_2 = shape_config.get("max_power", 14)  # 16,384
-            for idx, power_of_2 in enumerate(range(min_power_of_2, max_power_of_2 + 1)):
-                val = 2**power_of_2
-                shapes.append((f"{name}_{idx}", [val, val, val]))
-        elif name == "pow2_extended":
-            # Generate shapes with dimensions that are powers of 2 and powers of 2 + half
-            min_power_of_2 = shape_config.get("min_power", 10)  # 1024
-            max_power_of_2 = shape_config.get("max_power", 14)  # 16,384
-            for idx, power_of_2 in enumerate(range(min_power_of_2, max_power_of_2 + 1)):
-                val1 = 2**power_of_2
-                val2 = 2**power_of_2 + 2 ** (power_of_2 - 1)
-                shapes.append((f"{name}_{idx * 2}", [val1, val1, val1]))
-                shapes.append((f"{name}_{idx * 2 + 1}", [val2, val2, val2]))
-        elif name == "small_sweep":
-            # Generate a small sweep of shapes with increasing powers of 2 for M, K, N
-            min_p2 = shape_config.get("min_power", 10)  # 1024
-            max_p2 = shape_config.get("max_power", 14)  # 16,384
-            counter = 0
-            for M_p2 in range(min_p2, max_p2 + 1):
-                M = 2**M_p2
-                for K_p2 in range(min_p2, max_p2 + 1):
-                    K = 2**K_p2
-                    for N_p2 in range(min_p2, max_p2 + 1):
-                        N = 2**N_p2
-                        if M <= K <= N:  # Ensure increasing order
-                            shapes.append((f"{name}_{counter}", [M, K, N]))
-                            counter += 1
-        elif name == "sweep":
-            # Generate a sweep of shapes with different powers of 2 for M, K, N
-            min_p2 = shape_config.get("min_power", 8)  # 256
-            max_p2 = shape_config.get("max_power", 15)  # 32,768
-            counter = 0
-            for M_p2 in range(min_p2, max_p2 + 1):
-                M = 2**M_p2
-                for K_p2 in range(min_p2, max_p2 + 1):
-                    K = 2**K_p2
-                    for N_p2 in range(min_p2, max_p2 + 1):
-                        N = 2**N_p2
-                        shapes.append((f"{name}_{counter}", [M, K, N]))
-                        counter += 1
-        else:
+        handler = _SHAPE_HANDLERS.get(name)
+        if handler is None:
+            supported = ", ".join(sorted(_SHAPE_HANDLERS))
             raise NotImplementedError(
-                f"Shape config {name} not supported. Supported options: custom, llama, llama4, deepseek_v3_236b, deepseek_v3_671b, qwen3_32b, gemma3_27b, pow2, pow2_extended, sweep."
+                f"Shape config {name} not supported. Supported options: {supported}."
             )
+        shapes.extend(handler(name, shape_config))
     return shapes
 
 

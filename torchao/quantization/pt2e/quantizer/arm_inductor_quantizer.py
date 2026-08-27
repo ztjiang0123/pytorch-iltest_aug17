@@ -243,18 +243,10 @@ class ArmInductorQuantizer(X86InductorQuantizer):
             )
         return self
 
-    @_config_checker
-    def set_module_name_qconfig(
-        self, module_name: str, quantization_config: Optional[QuantizationConfig]
-    ):
-        """Set quantization_config for a submodule with name: `module_name`, for example:
-        quantizer.set_module_name_qconfig("blocks.sub"), it will quantize all supported operator/operator
-        patterns in the submodule with this module name with the given `quantization_config`
-
-        The supported operators include `quantizable_ops` only.
-        """
-        self.module_name_qconfig[module_name] = quantization_config
-        return self
+    # `set_module_name_qconfig` is inherited unchanged from
+    # `X86InductorQuantizer`; the stored config and behavior are identical
+    # (Arm only differs in its supported-op set, handled elsewhere), so the
+    # override is intentionally omitted to avoid duplicating the base method.
 
     def _set_aten_operator_qconfig(
         self,

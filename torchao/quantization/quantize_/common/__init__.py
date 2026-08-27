@@ -1,6 +1,10 @@
 from .kernel_preference import KernelPreference
 from .packing_format import PackingFormat
-from .protocol import IsStaticQuantizationConfig, SupportsActivationPreScaling
+from .protocol import (
+    IsStaticQuantizationConfig,
+    SupportsActivationPreScaling,
+    quantization_type_with_act_pre_scale,
+)
 from .quantize_tensor_kwargs import (
     QuantizeTensorKwargs,
     _choose_quant_func_and_quantize_tensor,
@@ -13,4 +17,5 @@ __all__ = [
     "SupportsActivationPreScaling",
     "IsStaticQuantizationConfig",
     "_choose_quant_func_and_quantize_tensor",
+    "quantization_type_with_act_pre_scale",
 ]

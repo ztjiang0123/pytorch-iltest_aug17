@@ -14,6 +14,9 @@ from torchao.quantization.quant_primitives import (
     choose_qparams_affine,
     quantize_affine,
 )
+from torchao.quantization.quantize_.common import (
+    quantization_type_with_act_pre_scale,
+)
 from torchao.utils import TorchAOBaseTensor
 
 __all__ = [
@@ -78,10 +81,7 @@ class Int4PlainInt32Tensor(TorchAOBaseTensor):
         self.act_pre_scale = act_pre_scale
 
     def _quantization_type(self):
-        s = f"shape={self.shape}, block_size={self.block_size}, device={self.device}"
-        if self.act_pre_scale is not None:
-            s += f", act_pre_scale.shape={self.act_pre_scale.shape}"
-        return s
+        return quantization_type_with_act_pre_scale(self)
 
     @classmethod
     def from_hp(
