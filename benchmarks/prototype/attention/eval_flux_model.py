@@ -16,6 +16,7 @@ Usage:
 import argparse
 import gc
 import random
+from dataclasses import dataclass
 from typing import Optional
 
 import lpips
@@ -71,6 +72,36 @@ BACKENDS = {
 IMAGE_SIZE = (512, 512)  # (width, height) - resize for consistent LPIPS
 RANDOM_SEED = 42
 MODEL_ID = "black-forest-labs/FLUX.1-schnell"
+
+
+@dataclass
+class BenchmarkConfig:
+    """Settings shared across every phase of a benchmark run."""
+
+    device: str
+    num_inference_steps: int
+    height: int
+    width: int
+    warmup_iters: int
+    compile: bool
+
+
+@dataclass
+class GenSettings:
+    """Per-backend generation settings resolved by ``setup_backend``."""
+
+    flash_impl: Optional[str]
+    sdpa_backend: Optional[SDPBackend]
+
+
+@dataclass
+class Runner:
+    """Loaded model state reused across the baseline and test phases."""
+
+    pipe: object
+    orig_transformer: object
+    loss_fn: object
+    config: BenchmarkConfig
 
 
 def cleanup_gpu():
@@ -193,69 +224,33 @@ def _load_prompts(debug_prompt: Optional[str], num_prompts: int) -> list:
     return prompts
 
 
-def _load_pipeline_and_lpips(device: str, compile: bool):
-    """Load the FLUX pipeline and the LPIPS loss model.
-
-    Returns ``(pipe, loss_fn, orig_transformer)``.
-    """
+def _load_runner(config: BenchmarkConfig) -> Runner:
+    """Load the FLUX pipeline and the LPIPS loss model into a ``Runner``."""
     print(f"\nLoading FLUX.1-schnell from {MODEL_ID}...")
     pipe = FluxPipeline.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.bfloat16,
     )
-    pipe = pipe.to(device)
+    pipe = pipe.to(config.device)
     pipe.set_progress_bar_config(disable=True)
 
     print("Loading LPIPS model (VGG)...")
-    loss_fn = lpips.LPIPS(net="vgg").to(device)
+    loss_fn = lpips.LPIPS(net="vgg").to(config.device)
 
     orig_transformer = pipe.transformer
 
-    if compile:
+    if config.compile:
         pipe.vae.decode = torch.compile(pipe.vae.decode)
 
-    return pipe, loss_fn, orig_transformer
+    return Runner(
+        pipe=pipe,
+        orig_transformer=orig_transformer,
+        loss_fn=loss_fn,
+        config=config,
+    )
 
 
-def _warmup(
-    pipe,
-    backend_name: str,
-    warmup_prompt: str,
-    device: str,
-    num_inference_steps: int,
-    height: int,
-    width: int,
-    flash_impl: Optional[str],
-    sdpa_backend: Optional[SDPBackend],
-    warmup_iters: int,
-) -> None:
-    """Run warmup iterations for a backend."""
-    print(f"Warming up {backend_name} with {warmup_iters} iterations...")
-    for i in range(warmup_iters):
-        _ = generate_image(
-            pipe,
-            warmup_prompt,
-            RANDOM_SEED,
-            device,
-            num_inference_steps,
-            height=height,
-            width=width,
-            flash_impl=flash_impl,
-            sdpa_backend=sdpa_backend,
-        )
-        print(f"  Warmup {i + 1}/{warmup_iters} complete")
-
-
-def _timed_generate(
-    pipe,
-    prompt: str,
-    device: str,
-    num_inference_steps: int,
-    height: int,
-    width: int,
-    flash_impl: Optional[str],
-    sdpa_backend: Optional[SDPBackend],
-):
+def _timed_generate(pipe, prompt: str, config: BenchmarkConfig, gen: GenSettings):
     """Generate an image and return ``(image, elapsed_ms)``."""
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -265,12 +260,12 @@ def _timed_generate(
         pipe,
         prompt,
         RANDOM_SEED,
-        device,
-        num_inference_steps,
-        height=height,
-        width=width,
-        flash_impl=flash_impl,
-        sdpa_backend=sdpa_backend,
+        config.device,
+        config.num_inference_steps,
+        height=config.height,
+        width=config.width,
+        flash_impl=gen.flash_impl,
+        sdpa_backend=gen.sdpa_backend,
     )
     end_event.record()
     torch.cuda.synchronize()
@@ -278,63 +273,52 @@ def _timed_generate(
     return image, elapsed_ms
 
 
-def _run_baseline_phase(
+def _warmup(
     pipe,
-    baseline_backend: str,
-    orig_transformer,
-    prompts: list,
-    device: str,
-    num_inference_steps: int,
-    height: int,
-    width: int,
-    warmup_iters: int,
-    compile: bool,
-):
+    backend_name: str,
+    warmup_prompt: str,
+    config: BenchmarkConfig,
+    gen: GenSettings,
+) -> None:
+    """Run warmup iterations for a backend."""
+    print(f"Warming up {backend_name} with {config.warmup_iters} iterations...")
+    for i in range(config.warmup_iters):
+        _ = _timed_generate(pipe, warmup_prompt, config, gen)
+        print(f"  Warmup {i + 1}/{config.warmup_iters} complete")
+
+
+def _prepare_phase(runner: Runner, backend: str, phase_num: int) -> GenSettings:
+    """Print the phase header and set up ``backend``, returning its settings."""
+    print("\n" + "-" * 80)
+    print(f"Phase {phase_num}: Generating images ({backend})")
+    print("-" * 80)
+
+    flash_impl, sdpa_backend = setup_backend(
+        runner.pipe,
+        backend,
+        runner.config.compile,
+        runner.orig_transformer,
+    )
+    return GenSettings(flash_impl=flash_impl, sdpa_backend=sdpa_backend)
+
+
+def _run_baseline_phase(runner: Runner, baseline_backend: str, prompts: list):
     """Generate baseline images. Returns ``(baseline_data, avg_baseline_ms)``.
 
     ``baseline_data`` is a list of ``(prompt, cpu_tensor)`` tuples.
     """
-    print("\n" + "-" * 80)
-    print(f"Phase 1: Generating images ({baseline_backend})")
-    print("-" * 80)
-
-    flash_impl, sdpa_backend = setup_backend(
-        pipe,
-        baseline_backend,
-        compile,
-        orig_transformer,
-    )
-
-    _warmup(
-        pipe,
-        baseline_backend,
-        prompts[0],
-        device,
-        num_inference_steps,
-        height,
-        width,
-        flash_impl,
-        sdpa_backend,
-        warmup_iters,
-    )
+    config = runner.config
+    gen = _prepare_phase(runner, baseline_backend, 1)
+    _warmup(runner.pipe, baseline_backend, prompts[0], config, gen)
 
     baseline_data = []
     baseline_times_ms = []
 
     for idx, prompt in enumerate(prompts):
         print(f"[{idx + 1}/{len(prompts)}] {baseline_backend}: {prompt[:50]}...")
-        baseline_img, elapsed_ms = _timed_generate(
-            pipe,
-            prompt,
-            device,
-            num_inference_steps,
-            height,
-            width,
-            flash_impl,
-            sdpa_backend,
-        )
+        baseline_img, elapsed_ms = _timed_generate(runner.pipe, prompt, config, gen)
 
-        baseline_tensor = pil_to_lpips_tensor(baseline_img, device)
+        baseline_tensor = pil_to_lpips_tensor(baseline_img, config.device)
         # Store tensors on CPU to free GPU memory for the test phase.
         baseline_data.append((prompt, baseline_tensor.cpu()))
         baseline_times_ms.append(elapsed_ms)
@@ -346,63 +330,24 @@ def _run_baseline_phase(
     return baseline_data, avg_baseline_ms
 
 
-def _run_test_phase(
-    pipe,
-    test_backend: str,
-    orig_transformer,
-    baseline_data: list,
-    loss_fn,
-    device: str,
-    num_inference_steps: int,
-    height: int,
-    width: int,
-    warmup_iters: int,
-    compile: bool,
-):
+def _run_test_phase(runner: Runner, test_backend: str, baseline_data: list):
     """Generate test images and compute LPIPS. Returns ``(lpips_values, avg_test_ms)``."""
-    print("\n" + "-" * 80)
-    print(f"Phase 2: Generating images ({test_backend})")
-    print("-" * 80)
-
-    flash_impl, sdpa_backend = setup_backend(
-        pipe,
-        test_backend,
-        compile,
-        orig_transformer,
-    )
-
-    _warmup(
-        pipe,
-        test_backend,
-        baseline_data[0][0],
-        device,
-        num_inference_steps,
-        height,
-        width,
-        flash_impl,
-        sdpa_backend,
-        warmup_iters,
-    )
+    config = runner.config
+    gen = _prepare_phase(runner, test_backend, 2)
+    _warmup(runner.pipe, test_backend, baseline_data[0][0], config, gen)
 
     lpips_values = []
     test_times_ms = []
 
     for idx, (prompt, baseline_tensor_cpu) in enumerate(baseline_data):
         print(f"[{idx + 1}/{len(baseline_data)}] {test_backend}: {prompt[:50]}...")
-        test_img, elapsed_ms = _timed_generate(
-            pipe,
-            prompt,
-            device,
-            num_inference_steps,
-            height,
-            width,
-            flash_impl,
-            sdpa_backend,
-        )
+        test_img, elapsed_ms = _timed_generate(runner.pipe, prompt, config, gen)
         test_times_ms.append(elapsed_ms)
 
-        test_tensor = pil_to_lpips_tensor(test_img, device)
-        lpips_value = loss_fn(baseline_tensor_cpu.to(device), test_tensor).item()
+        test_tensor = pil_to_lpips_tensor(test_img, config.device)
+        lpips_value = runner.loss_fn(
+            baseline_tensor_cpu.to(config.device), test_tensor
+        ).item()
         lpips_values.append(lpips_value)
 
         print(f"    LPIPS: {lpips_value:.4f}, Time: {elapsed_ms:.1f} ms")
@@ -412,18 +357,20 @@ def _run_test_phase(
 
 
 def _report_results(
+    config: BenchmarkConfig,
+    backends: tuple,
+    timings: tuple,
     lpips_values: list,
-    avg_baseline_ms: float,
-    avg_test_ms: float,
-    baseline_backend: str,
-    test_backend: str,
     num_prompts: int,
-    num_inference_steps: int,
-    height: int,
-    width: int,
-    compile: bool,
 ) -> dict:
-    """Print benchmark statistics and return the summary dict."""
+    """Print benchmark statistics and return the summary dict.
+
+    ``backends`` is ``(baseline_backend, test_backend)`` and ``timings`` is
+    ``(avg_baseline_ms, avg_test_ms)``.
+    """
+    baseline_backend, test_backend = backends
+    avg_baseline_ms, avg_test_ms = timings
+
     print("\n" + "=" * 80)
     print("BENCHMARK RESULTS")
     print("=" * 80)
@@ -447,11 +394,11 @@ def _report_results(
     print("\nBenchmark Configuration:")
     print(f"  Baseline backend:  {baseline_backend}")
     print(f"  Test backend:      {test_backend}")
-    print(f"  torch.compile:     {compile}")
+    print(f"  torch.compile:     {config.compile}")
     print(f"  Model:             {MODEL_ID}")
     print(f"  Prompts tested:    {num_prompts}")
-    print(f"  Inference steps:   {num_inference_steps}")
-    print(f"  Generation size:   {width}x{height}")
+    print(f"  Inference steps:   {config.num_inference_steps}")
+    print(f"  Generation size:   {config.width}x{config.height}")
     print(f"  LPIPS resize:      {IMAGE_SIZE[0]}x{IMAGE_SIZE[1]}")
     print(f"  Random seed:       {RANDOM_SEED}")
     print("=" * 80)
@@ -490,52 +437,33 @@ def run_benchmark(
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
 
-    device = "cuda"
+    config = BenchmarkConfig(
+        device="cuda",
+        num_inference_steps=num_inference_steps,
+        height=height,
+        width=width,
+        warmup_iters=warmup_iters,
+        compile=compile,
+    )
 
     prompts = _load_prompts(debug_prompt, num_prompts)
-    pipe, loss_fn, orig_transformer = _load_pipeline_and_lpips(device, compile)
+    runner = _load_runner(config)
 
     baseline_data, avg_baseline_ms = _run_baseline_phase(
-        pipe,
-        baseline_backend,
-        orig_transformer,
-        prompts,
-        device,
-        num_inference_steps,
-        height,
-        width,
-        warmup_iters,
-        compile,
+        runner, baseline_backend, prompts
     )
 
     # ----- Cleanup before test phase -----
     cleanup_gpu()
 
-    lpips_values, avg_test_ms = _run_test_phase(
-        pipe,
-        test_backend,
-        orig_transformer,
-        baseline_data,
-        loss_fn,
-        device,
-        num_inference_steps,
-        height,
-        width,
-        warmup_iters,
-        compile,
-    )
+    lpips_values, avg_test_ms = _run_test_phase(runner, test_backend, baseline_data)
 
     return _report_results(
+        config,
+        (baseline_backend, test_backend),
+        (avg_baseline_ms, avg_test_ms),
         lpips_values,
-        avg_baseline_ms,
-        avg_test_ms,
-        baseline_backend,
-        test_backend,
         len(prompts),
-        num_inference_steps,
-        height,
-        width,
-        compile,
     )
 
 
