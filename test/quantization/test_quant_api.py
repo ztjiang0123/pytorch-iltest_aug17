@@ -232,9 +232,14 @@ class TestQuantFlow(TestCase):
 
     def test_8da4w_quantizer(self):
         from torchao.quantization.linear_quant_modules import Int8DynActInt4WeightLinear
-        from torchao.quantization.quant_api import Int8DynActInt4WeightQuantizer
+        from torchao.quantization.quant_api import (
+            Int8DynActInt4WeightQuantizer,
+            Int8DynActInt4WeightQuantizerConfig,
+        )
 
-        quantizer = Int8DynActInt4WeightQuantizer(groupsize=32)
+        quantizer = Int8DynActInt4WeightQuantizer(
+            Int8DynActInt4WeightQuantizerConfig(groupsize=32)
+        )
         m = ToyLinearModel().eval()
         example_inputs = m.example_inputs()
         m = quantizer.quantize(m)
@@ -244,9 +249,14 @@ class TestQuantFlow(TestCase):
 
     def test_8da4w_quantizer_linear_bias(self):
         from torchao.quantization.linear_quant_modules import Int8DynActInt4WeightLinear
-        from torchao.quantization.quant_api import Int8DynActInt4WeightQuantizer
+        from torchao.quantization.quant_api import (
+            Int8DynActInt4WeightQuantizer,
+            Int8DynActInt4WeightQuantizerConfig,
+        )
 
-        quantizer = Int8DynActInt4WeightQuantizer(groupsize=32)
+        quantizer = Int8DynActInt4WeightQuantizer(
+            Int8DynActInt4WeightQuantizerConfig(groupsize=32)
+        )
         m = ToyLinearModel(bias=True).eval()
         example_inputs = m.example_inputs()
         m = quantizer.quantize(m)
@@ -261,12 +271,17 @@ class TestQuantFlow(TestCase):
         # distinct scales_precision silently produced runtime modules whose
         # scales were cast to the activation precision instead.
         from torchao.quantization.linear_quant_modules import Int8DynActInt4WeightLinear
-        from torchao.quantization.quant_api import Int8DynActInt4WeightQuantizer
+        from torchao.quantization.quant_api import (
+            Int8DynActInt4WeightQuantizer,
+            Int8DynActInt4WeightQuantizerConfig,
+        )
 
         quantizer = Int8DynActInt4WeightQuantizer(
-            groupsize=32,
-            precision=torch.float32,
-            scales_precision=torch.bfloat16,
+            Int8DynActInt4WeightQuantizerConfig(
+                groupsize=32,
+                precision=torch.float32,
+                scales_precision=torch.bfloat16,
+            )
         )
         m = ToyLinearModel(bias=True).eval()
         example_inputs = m.example_inputs()

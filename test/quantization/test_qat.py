@@ -361,7 +361,10 @@ class TestQAT(TestCase):
             raise ValueError("Unknown ptq_linear type: %s" % type(ptq_linear))
 
     def test_qat_8da4w_linear(self):
-        from torchao.quantization.linear_quant_modules import Int8DynActInt4WeightLinear
+        from torchao.quantization.linear_quant_modules import (
+            Int8DynActInt4WeightConfig,
+            Int8DynActInt4WeightLinear,
+        )
         from torchao.quantization.qat.linear import Int8DynActInt4WeightQATLinear
 
         group_size = 128
@@ -369,14 +372,12 @@ class TestQAT(TestCase):
         qat_linear = Int8DynActInt4WeightQATLinear(
             256,
             688,
-            bias=False,
-            groupsize=group_size,
+            config=Int8DynActInt4WeightConfig(bias=False, groupsize=group_size),
         )
         ptq_linear = Int8DynActInt4WeightLinear(
             256,
             688,
-            bias=False,
-            groupsize=group_size,
+            config=Int8DynActInt4WeightConfig(bias=False, groupsize=group_size),
         )
 
         # Force the weights to be the same
@@ -393,6 +394,7 @@ class TestQAT(TestCase):
     def test_qat_8da4w_quantizer(self):
         from torchao.quantization.linear_quant_modules import (
             Int8DynActInt4WeightQuantizer,
+            Int8DynActInt4WeightQuantizerConfig,
         )
         from torchao.quantization.qat import Int8DynActInt4WeightQATQuantizer
 
@@ -401,7 +403,9 @@ class TestQAT(TestCase):
         m = M()
         m2 = copy.deepcopy(m)
         qat_quantizer = Int8DynActInt4WeightQATQuantizer(groupsize=group_size)
-        ptq_quantizer = Int8DynActInt4WeightQuantizer(groupsize=group_size)
+        ptq_quantizer = Int8DynActInt4WeightQuantizer(
+            Int8DynActInt4WeightQuantizerConfig(groupsize=group_size)
+        )
         qat_model = qat_quantizer.prepare(m)
         ptq_model = ptq_quantizer.quantize(m2)
 
@@ -661,7 +665,10 @@ class TestQAT(TestCase):
 
     @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def test_qat_4w_linear(self):
-        from torchao.quantization.linear_quant_modules import WeightOnlyInt4Linear
+        from torchao.quantization.linear_quant_modules import (
+            Int4LinearConfig,
+            WeightOnlyInt4Linear,
+        )
         from torchao.quantization.qat.linear import Int4WeightOnlyQATLinear
 
         group_size = 128
@@ -672,16 +679,12 @@ class TestQAT(TestCase):
         qat_linear = Int4WeightOnlyQATLinear(
             256,
             688,
-            bias=False,
-            groupsize=group_size,
-            device=device,
+            config=Int4LinearConfig(bias=False, device=device, groupsize=group_size),
         )
         ptq_linear = WeightOnlyInt4Linear(
             256,
             688,
-            bias=False,
-            groupsize=group_size,
-            device=device,
+            config=Int4LinearConfig(bias=False, device=device, groupsize=group_size),
         )
 
         # Force the weights to be the same
@@ -704,7 +707,10 @@ class TestQAT(TestCase):
     @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     @skip_if_xpu("skipped due to https://github.com/intel/torch-xpu-ops/issues/1770")
     def test_qat_4w_quantizer(self):
-        from torchao.quantization.linear_quant_modules import Int4WeightOnlyQuantizer
+        from torchao.quantization.linear_quant_modules import (
+            Int4WeightOnlyQuantizer,
+            Int4WeightOnlyQuantizerConfig,
+        )
         from torchao.quantization.qat import Int4WeightOnlyQATQuantizer
 
         group_size = 32
@@ -720,7 +726,9 @@ class TestQAT(TestCase):
             inner_k_tiles=inner_k_tiles,
         )
         ptq_quantizer = Int4WeightOnlyQuantizer(
-            groupsize=group_size, inner_k_tiles=inner_k_tiles, device=device
+            Int4WeightOnlyQuantizerConfig(
+                groupsize=group_size, inner_k_tiles=inner_k_tiles, device=device
+            )
         )
         qat_model = qat_quantizer.prepare(m)
         ptq_model = ptq_quantizer.quantize(m2)
