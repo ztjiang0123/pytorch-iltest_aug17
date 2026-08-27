@@ -733,6 +733,66 @@ def _is_valid_dequant_conv_pattern(dtype):
     return _inner
 
 
+@dataclass
+class _QConvDequantPattern:
+    """Nodes of a matched dequant->conv pattern that weight prepack rewrites.
+
+    ``convert_to_bf16`` and ``weight_to_bf16_node`` are only present for the
+    bfloat16 pattern; ``clone_node`` is only present when the weight is cloned
+    to channel-last. They are ``None`` otherwise.
+    """
+
+    conv_node: Any
+    dequant_node: Any
+    dequant: Any
+    convert_to_bf16: Any
+    weight_to_bf16_node: Any
+    clone_node: Any
+
+
+def _navigate_qconv_dequant_pattern(conv_node, is_bf16):
+    """Walk the activation and weight branches of ``conv_node`` to their dequants.
+
+    For bfloat16 an extra dtype-convert node sits between the conv and each
+    dequant. The weight branch may also contain an optional clone (channel-last)
+    node before the weight dtype-convert.
+    """
+    # Activation branch: conv <- [convert_to_bf16] <- dequant_node
+    act_input = conv_node.args[0]
+    convert_to_bf16 = act_input if is_bf16 else None
+    dequant_node = convert_to_bf16.args[0] if is_bf16 else act_input
+
+    # Weight branch: conv <- [clone] <- [weight_to_bf16] <- dequant
+    weight_input = conv_node.args[1]
+    has_clone = weight_input.target is aten.clone.default
+    clone_node = weight_input if has_clone else None
+    weight_branch_node = clone_node.args[0] if has_clone else weight_input
+    weight_to_bf16_node = weight_branch_node if is_bf16 else None
+    dequant = weight_branch_node.args[0] if is_bf16 else weight_branch_node
+
+    return _QConvDequantPattern(
+        conv_node=conv_node,
+        dequant_node=dequant_node,
+        dequant=dequant,
+        convert_to_bf16=convert_to_bf16,
+        weight_to_bf16_node=weight_to_bf16_node,
+        clone_node=clone_node,
+    )
+
+
+def _erase_qconv_dequant_pattern(graph, pattern):
+    """Erase the original conv and its dequant nodes, most-downstream first."""
+    graph.erase_node(pattern.conv_node)
+    if pattern.convert_to_bf16 is not None:
+        graph.erase_node(pattern.convert_to_bf16)
+    graph.erase_node(pattern.dequant_node)
+    if pattern.clone_node is not None:
+        graph.erase_node(pattern.clone_node)
+    if pattern.weight_to_bf16_node is not None:
+        graph.erase_node(pattern.weight_to_bf16_node)
+    graph.erase_node(pattern.dequant)
+
+
 def _register_qconv_weight_prepack_pass(
     pattern, pass_number, dtype=torch.float32, is_fp8=False
 ):
@@ -756,33 +816,12 @@ def _register_qconv_weight_prepack_pass(
         onednn.qconv_pointwise <- onednn.qconv_prepack <- int8_weight
         """
         assert dtype in [torch.float32, torch.bfloat16]
+        is_bf16 = dtype == torch.bfloat16
         conv_node = match.output_node()
         assert conv_node.target is aten.convolution.default
-        if dtype == torch.float32:
-            dequant_node = conv_node.args[0]
-        else:
-            convert_to_bf16 = conv_node.args[0]
-            dequant_node = convert_to_bf16.args[0]  # type: ignore[union-attr]
-        has_clone_to_channel_last_node_in_pattern = (
-            conv_node.args[1].target is aten.clone.default  # type: ignore[union-attr]
-        )
-        clone_node = (
-            conv_node.args[1] if has_clone_to_channel_last_node_in_pattern else None
-        )
 
-        if dtype == torch.float32:
-            dequant = (
-                clone_node.args[0]  # type: ignore[union-attr]
-                if has_clone_to_channel_last_node_in_pattern
-                else conv_node.args[1]
-            )
-        else:
-            weight_to_bf16_node = (
-                clone_node.args[0]  # type: ignore[union-attr]
-                if has_clone_to_channel_last_node_in_pattern
-                else conv_node.args[1]
-            )
-            dequant = weight_to_bf16_node.args[0]  # type: ignore[union-attr]
+        pattern_nodes = _navigate_qconv_dequant_pattern(conv_node, is_bf16)
+        dequant = pattern_nodes.dequant
 
         assert dequant.target in [  # type: ignore[union-attr]
             quantized_decomposed.dequantize_per_channel.default,
@@ -879,18 +918,8 @@ def _register_qconv_weight_prepack_pass(
             conv_node.replace_all_uses_with(new_conv_node)
             new_conv_node.meta.update(conv_node.meta)
 
-            # Erase the original conv node
-            graph.erase_node(conv_node)
-            # Erase the dequant pattern
-            if dtype == torch.bfloat16:
-                graph.erase_node(convert_to_bf16)  # type: ignore[possibly-undefined, arg-type]
-            graph.erase_node(dequant_node)  # type: ignore[arg-type]
-            # Erase the dequant per channel pattern
-            if clone_node is not None:
-                graph.erase_node(clone_node)  # type: ignore[arg-type]
-            if dtype == torch.bfloat16:
-                graph.erase_node(weight_to_bf16_node)  # type: ignore[possibly-undefined, arg-type]
-            graph.erase_node(dequant)  # type: ignore[arg-type]
+            # Erase the original conv node and its dequant pattern.
+            _erase_qconv_dequant_pattern(graph, pattern_nodes)
             counters["inductor"]["qconv_weight_prepack_matcher_count"] += 1
             counters["inductor"]["qconv_weight_prepack_matcher_nodes"] += len(
                 match.nodes
