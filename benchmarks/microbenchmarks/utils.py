@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 import csv
 import os
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -46,24 +47,44 @@ def get_default_device(device: str = "cuda") -> str:
         return "cpu"
 
 
+@dataclass
+class BenchmarkConfigParams:
+    """Grouped inputs for :class:`BenchmarkConfig`.
+
+    Bundling the values that always travel together keeps the
+    ``BenchmarkConfig`` constructor small and easy to call correctly.
+    """
+
+    # Quantization string format is similar to the format being used for
+    # llama/generate.py.
+    quantization: Optional[str]
+    # Specify the type of sparsity to be used.
+    sparsity: Optional[str]
+    # Free-form knobs (precision, device, compile mode, profiler flags, ...).
+    params: Dict[str, Any]
+    # Human-readable name of the benchmarked shape and its [m, k, n] dims.
+    shape_name: str
+    shape: List[int]
+    output_dir: str
+    benchmark_mode: str = "inference"
+
+    def __post_init__(self):
+        if self.params is None:
+            self.params = {}
+
+
 class BenchmarkConfig:
     def __init__(
         self,
-        quantization: Optional[
-            str
-        ],  # Quantization string format is similar to the format being used for llama/generate.py
-        sparsity: Optional[str],  # Specify the type of sparsity to be used
-        params: Dict[str, Any],
-        shape_name: str,
-        shape: List[int],
-        output_dir: str,
-        benchmark_mode: str,
+        config_params: BenchmarkConfigParams,
     ):
-        self.benchmark_mode = benchmark_mode
-        self.quantization = quantization
-        self.sparsity = sparsity
-        self.m, self.k, self.n = shape
-        self.shape_name = shape_name
+        self.benchmark_mode = config_params.benchmark_mode
+        self.quantization = config_params.quantization
+        self.sparsity = config_params.sparsity
+        self.m, self.k, self.n = config_params.shape
+        self.shape_name = config_params.shape_name
+        params = config_params.params
+        output_dir = config_params.output_dir
         self.high_precision_dtype = self._parse_precision(
             params.get("high_precision_dtype", "torch.bfloat16")
         )

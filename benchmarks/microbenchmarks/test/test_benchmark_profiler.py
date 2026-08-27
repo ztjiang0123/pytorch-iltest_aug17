@@ -19,6 +19,7 @@ from benchmarks.microbenchmarks.profiler import (
 )
 from benchmarks.microbenchmarks.utils import (
     BenchmarkConfig,
+    BenchmarkConfigParams,
 )
 from torchao.testing.model_architectures import ToyLinearModel
 
@@ -50,16 +51,18 @@ class TestBenchmarkProfiler(unittest.TestCase):
     def test_profiler_enabled(self):
         """Test that profiler works when enabled"""
         config = BenchmarkConfig(
-            quantization=None,
-            sparsity=None,
-            params={
-                "enable_profiler": True,
-                "device": self.device,
-            },
-            shape_name="test",
-            shape=[self.m, self.k, self.n],
-            output_dir=self.results_dir,
-            benchmark_mode="inference",
+            BenchmarkConfigParams(
+                quantization=None,
+                sparsity=None,
+                params={
+                    "enable_profiler": True,
+                    "device": self.device,
+                },
+                shape_name="test",
+                shape=[self.m, self.k, self.n],
+                output_dir=self.results_dir,
+                benchmark_mode="inference",
+            )
         )
 
         profile_path = os.path.join(
@@ -83,16 +86,18 @@ class TestBenchmarkProfiler(unittest.TestCase):
     def test_profiler_basic_output(self):
         """Test that profiler output contains expected basic fields"""
         config = BenchmarkConfig(
-            quantization=None,
-            sparsity=None,
-            params={
-                "enable_profiler": True,
-                "device": self.device,
-            },
-            shape_name="test",
-            shape=[self.m, self.k, self.n],
-            output_dir=self.results_dir,
-            benchmark_mode="inference",
+            BenchmarkConfigParams(
+                quantization=None,
+                sparsity=None,
+                params={
+                    "enable_profiler": True,
+                    "device": self.device,
+                },
+                shape_name="test",
+                shape=[self.m, self.k, self.n],
+                output_dir=self.results_dir,
+                benchmark_mode="inference",
+            )
         )
 
         profile_path = os.path.join(
@@ -124,16 +129,18 @@ class TestBenchmarkProfiler(unittest.TestCase):
     def test_cuda_profiling(self):
         """Test CUDA profiling when available"""
         config = BenchmarkConfig(
-            quantization=None,
-            sparsity=None,
-            params={
-                "enable_profiler": True,
-                "device": "cuda",
-            },
-            shape_name="test",
-            shape=[self.m, self.k, self.n],
-            output_dir=self.results_dir,
-            benchmark_mode="inference",
+            BenchmarkConfigParams(
+                quantization=None,
+                sparsity=None,
+                params={
+                    "enable_profiler": True,
+                    "device": "cuda",
+                },
+                shape_name="test",
+                shape=[self.m, self.k, self.n],
+                output_dir=self.results_dir,
+                benchmark_mode="inference",
+            )
         )
 
         profile_path = os.path.join(
@@ -159,16 +166,18 @@ class TestBenchmarkProfiler(unittest.TestCase):
     def test_memory_profiler_enabled(self):
         """Test that memory profiler works when enabled and CUDA is available"""
         config = BenchmarkConfig(
-            quantization=None,
-            sparsity=None,
-            params={
-                "enable_memory_profiler": True,
-                "device": "cuda",
-            },
-            shape_name="test",
-            shape=[self.m, self.k, self.n],
-            output_dir=self.results_dir,
-            benchmark_mode="inference",
+            BenchmarkConfigParams(
+                quantization=None,
+                sparsity=None,
+                params={
+                    "enable_memory_profiler": True,
+                    "device": "cuda",
+                },
+                shape_name="test",
+                shape=[self.m, self.k, self.n],
+                output_dir=self.results_dir,
+                benchmark_mode="inference",
+            )
         )
 
         memory_profile_path = os.path.join(
@@ -198,16 +207,18 @@ class TestBenchmarkProfiler(unittest.TestCase):
     def test_memory_profiler_visualization(self):
         """Test memory profile visualization"""
         config = BenchmarkConfig(
-            quantization=None,
-            sparsity=None,
-            params={
-                "enable_memory_profiler": True,
-                "device": "cuda",
-            },
-            shape_name="test",
-            shape=[self.m, self.k, self.n],
-            output_dir=self.results_dir,
-            benchmark_mode="inference",
+            BenchmarkConfigParams(
+                quantization=None,
+                sparsity=None,
+                params={
+                    "enable_memory_profiler": True,
+                    "device": "cuda",
+                },
+                shape_name="test",
+                shape=[self.m, self.k, self.n],
+                output_dir=self.results_dir,
+                benchmark_mode="inference",
+            )
         )
 
         memory_profile_path = os.path.join(
@@ -252,16 +263,18 @@ class TestBenchmarkProfiler(unittest.TestCase):
             torch.cuda.is_available = lambda: False
 
             config = BenchmarkConfig(
-                quantization=None,
-                sparsity=None,
-                params={
-                    "enable_memory_profiler": True,
-                    "device": "cpu",  # Force CPU to test CUDA unavailable case
-                },
-                shape_name="test",
-                shape=[self.m, self.k, self.n],
-                output_dir=self.results_dir,
-                benchmark_mode="inference",
+                BenchmarkConfigParams(
+                    quantization=None,
+                    sparsity=None,
+                    params={
+                        "enable_memory_profiler": True,
+                        "device": "cpu",  # Force CPU to test CUDA unavailable case
+                    },
+                    shape_name="test",
+                    shape=[self.m, self.k, self.n],
+                    output_dir=self.results_dir,
+                    benchmark_mode="inference",
+                )
             )
 
             memory_profile_path = os.path.join(
