@@ -146,10 +146,10 @@ def unpack_uint4(uint8_data) -> torch.Tensor:
 
     # trying Bert Maher's suggestion
     # 2024-04-04: this works in unit tests but is broken on LLaMa 7B FFN with
-    #   ptxas /tmp/tmp84wp7lea.ptx, line 227; error   : Unexpected instruction types specified for 'sub'  # noqa: E501
-    # which seems to be the same issue as https://github.com/pytorch/pytorch/issues/118589  # noqa: E501
-    # TODO(later): try removing subtractions from our cast to see if we can work around  # noqa: E501
-    # shift_tensor = torch.tensor([4, 0], dtype=torch.uint8, device=uint8_data.device)  # noqa: E501
+    #   ptxas /tmp/tmp84wp7lea.ptx, line 227; error   : Unexpected instruction types specified for 'sub'
+    # which seems to be the same issue as https://github.com/pytorch/pytorch/issues/118589
+    # TODO(later): try removing subtractions from our cast to see if we can work around
+    # shift_tensor = torch.tensor([4, 0], dtype=torch.uint8, device=uint8_data.device)
     # unpacked = (uint8_data.reshape(-1)[::, None] >> shift_tensor) & 0b1111
     # unpacked = unpacked.view(up_size(shape))
 
