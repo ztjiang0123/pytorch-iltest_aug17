@@ -8,7 +8,7 @@
 import contextlib
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, NamedTuple, Optional
 
 import torch
 from torch._higher_order_ops.out_dtype import out_dtype
@@ -41,63 +41,80 @@ __all__ = [
 ]
 
 
+class _QParams(NamedTuple):
+    """Per-tensor affine quantization parameters that travel together.
+
+    Grouping these keeps the linear pattern/replacement signatures small while
+    preserving the traced graph: a ``NamedTuple`` is flattened by PyTorch's
+    pytree into its fields in declaration order, so the flat example inputs and
+    the resulting graph placeholders are unchanged.
+    """
+
+    scale: Any
+    zero_point: Any
+    quant_min: Any
+    quant_max: Any
+
+
+class _QuantizedTensor(NamedTuple):
+    """An int8 tensor bundled with the quant params needed to interpret it.
+
+    Like :class:`_QParams`, this is a ``NamedTuple`` so pytree flattens it into
+    ``(int8, scale, zero_point, quant_min, quant_max)`` in order, leaving the
+    traced pattern/replacement graphs identical to the un-grouped signatures.
+    """
+
+    int8: Any
+    qparams: _QParams
+
+
 def _qdq_quantized_linear(
-    x_i8,
-    x_scale,
-    x_zero_point,
-    x_quant_min,
-    x_quant_max,
-    weight_i8,
-    weight_scale,
-    weight_zero_point,
-    weight_quant_min,
-    weight_quant_max,
+    x: _QuantizedTensor,
+    weight: _QuantizedTensor,
     bias_fp32,
-    out_scale,
-    out_zero_point,
-    out_quant_min,
-    out_quant_max,
+    out_qparams: _QParams,
 ):
     x_fp32 = torch.ops.quantized_decomposed.dequantize_per_tensor(
-        x_i8, x_scale, x_zero_point, x_quant_min, x_quant_max, torch.int8
+        x.int8,
+        x.qparams.scale,
+        x.qparams.zero_point,
+        x.qparams.quant_min,
+        x.qparams.quant_max,
+        torch.int8,
     )
     weight_fp32 = torch.ops.quantized_decomposed.dequantize_per_tensor(
-        weight_i8,
-        weight_scale,
-        weight_zero_point,
-        weight_quant_min,
-        weight_quant_max,
+        weight.int8,
+        weight.qparams.scale,
+        weight.qparams.zero_point,
+        weight.qparams.quant_min,
+        weight.qparams.quant_max,
         torch.int8,
     )
     out_fp32 = torch.ops.aten.linear.default(x_fp32, weight_fp32, bias_fp32)
     out_i8 = torch.ops.quantized_decomposed.quantize_per_tensor(
-        out_fp32, out_scale, out_zero_point, out_quant_min, out_quant_max, torch.int8
+        out_fp32,
+        out_qparams.scale,
+        out_qparams.zero_point,
+        out_qparams.quant_min,
+        out_qparams.quant_max,
+        torch.int8,
     )
     return out_i8
 
 
 def _reference_quantized_linear(
-    x_i8,
-    x_scale,
-    x_zero_point,
-    x_quant_min,
-    x_quant_max,
-    weight_i8,
-    weight_scale,
-    weight_zero_point,
-    weight_quant_min,
-    weight_quant_max,
+    x: _QuantizedTensor,
+    weight: _QuantizedTensor,
     bias_fp32,
-    out_scale,
-    out_zero_point,
-    out_quant_min,
-    out_quant_max,
+    out_qparams: _QParams,
 ):
     # without using quant_min/max in clamp, the traced graph will not have quant_mi/max args.
     # This results in failure to match the pattern.
     # Therefore, we call a torch.ops.aten.clamp here
-    x_i8 = torch.ops.aten.clamp(x_i8, x_quant_min, x_quant_max)
-    weight_i8 = torch.ops.aten.clamp(weight_i8, weight_quant_min, weight_quant_max)
+    x_i8 = torch.ops.aten.clamp(x.int8, x.qparams.quant_min, x.qparams.quant_max)
+    weight_i8 = torch.ops.aten.clamp(
+        weight.int8, weight.qparams.quant_min, weight.qparams.quant_max
+    )
 
     x_i16 = x_i8.to(torch.int16)
     weight_i16 = weight_i8.to(torch.int16)
@@ -106,13 +123,13 @@ def _reference_quantized_linear(
     acc_i32 = out_dtype(
         torch.ops.aten.linear.default,
         torch.int32,
-        x_i16 - x_zero_point,
-        weight_i16 - weight_zero_point,
+        x_i16 - x.qparams.zero_point,
+        weight_i16 - weight.qparams.zero_point,
         None,
     )
     # TODO: change to mul.Scalar
     # Note: we are quantizing bias with these scales without signal from user, but it might be OK
-    bias_scale = x_scale * weight_scale
+    bias_scale = x.qparams.scale * weight.qparams.scale
     bias_i32 = out_dtype(torch.ops.aten.div.Tensor, torch.int32, bias_fp32, bias_scale)
     acc_i32 = acc_i32 + bias_i32
     # TODO: change to mul.Scalar when we make x_scale/weight_scale etc. Scalar values
@@ -121,11 +138,13 @@ def _reference_quantized_linear(
             torch.ops.aten.mul.Tensor,
             torch.int32,
             acc_i32,
-            x_scale * weight_scale / out_scale,
+            x.qparams.scale * weight.qparams.scale / out_qparams.scale,
         )
-        + out_zero_point
+        + out_qparams.zero_point
     )
-    out_i8 = torch.ops.aten.clamp(acc_i32, out_quant_min, out_quant_max).to(torch.int8)
+    out_i8 = torch.ops.aten.clamp(
+        acc_i32, out_qparams.quant_min, out_qparams.quant_max
+    ).to(torch.int8)
     return out_i8
 
 
@@ -928,23 +947,58 @@ class _RewriteInfo:
     port_metadata_fn: Optional[Callable[["ReplacedPatterns"], None]] = None
 
 
-def reference_representation_rewrite(model: GraphModule) -> GraphModule:
+class _ExampleInputs(NamedTuple):
+    """Named bundle of the example-input tuples for every rewrite pattern.
+
+    Lets :func:`_get_example_inputs` return all sets at once and
+    :func:`_get_rewrite_info_list` reference them by name.
+    """
+
+    quantized_linear: tuple[Any, ...]
+    dynamic_quantized_linear: tuple[Any, ...]
+    quantized_conv2d: tuple[Any, ...]
+    quantized_add_or_add_relu: tuple[Any, ...]
+    quantized_max_pool2d: tuple[Any, ...]
+    quantize_per_tensor_int8: tuple[Any, ...]
+    dequantize_per_tensor_int8: tuple[Any, ...]
+    quantize_per_channel_int8: tuple[Any, ...]
+    dequantize_per_channel_int8: tuple[Any, ...]
+    dynamic_quantized_linear_4bit_groupwise_1: tuple[Any, ...]
+    dynamic_quantized_linear_4bit_groupwise_2: tuple[Any, ...]
+
+
+def _get_example_inputs() -> "_ExampleInputs":
+    """Build the example inputs used to trace each rewrite pattern/replacement.
+
+    Split out from :func:`_get_rewrite_info_list` so neither function is
+    dominated by these tuple literals; the returned bundle is consumed by name.
+    """
     _QUANTIZED_LINEAR_EXAMPLE_INPUTS = (
-        torch.randint(-128, 127, (2, 5), dtype=torch.int8),
+        _QuantizedTensor(
+            torch.randint(-128, 127, (2, 5), dtype=torch.int8),
+            _QParams(
+                torch.randn(1, dtype=torch.float),
+                torch.zeros(1, dtype=torch.int),
+                torch.tensor([-128], dtype=torch.int),
+                torch.tensor([127], dtype=torch.int),
+            ),
+        ),
+        _QuantizedTensor(
+            torch.randint(-128, 127, (5, 5), dtype=torch.int8),
+            _QParams(
+                torch.randn(1, dtype=torch.float),
+                torch.zeros(1, dtype=torch.int),
+                torch.tensor([-127], dtype=torch.int),
+                torch.tensor([127], dtype=torch.int),
+            ),
+        ),
         torch.randn(1, dtype=torch.float),
-        torch.zeros(1, dtype=torch.int),
-        torch.tensor([-128], dtype=torch.int),
-        torch.tensor([127], dtype=torch.int),
-        torch.randint(-128, 127, (5, 5), dtype=torch.int8),
-        torch.randn(1, dtype=torch.float),
-        torch.zeros(1, dtype=torch.int),
-        torch.tensor([-127], dtype=torch.int),
-        torch.tensor([127], dtype=torch.int),
-        torch.randn(1, dtype=torch.float),
-        torch.randn(1, dtype=torch.float),
-        torch.zeros(1, dtype=torch.int),
-        torch.tensor([-128], dtype=torch.int),
-        torch.tensor([127], dtype=torch.int),
+        _QParams(
+            torch.randn(1, dtype=torch.float),
+            torch.zeros(1, dtype=torch.int),
+            torch.tensor([-128], dtype=torch.int),
+            torch.tensor([127], dtype=torch.int),
+        ),
     )
 
     _DYNAMIC_QUANTIZED_LINEAR_EXAMPLE_INPUTS = (
@@ -1062,9 +1116,33 @@ def reference_representation_rewrite(model: GraphModule) -> GraphModule:
         8,  # group_size
     )
 
+    return _ExampleInputs(
+        quantized_linear=_QUANTIZED_LINEAR_EXAMPLE_INPUTS,
+        dynamic_quantized_linear=_DYNAMIC_QUANTIZED_LINEAR_EXAMPLE_INPUTS,
+        quantized_conv2d=_QUANTIZED_CONV2d_EXAMPLE_INPUTS,
+        quantized_add_or_add_relu=_QUANTIZED_ADD_OR_ADD_RELU_EXAMPLE_INPUTS,
+        quantized_max_pool2d=_QUANTIZED_MAX_POOL2D_EXAMPLE_INPUTS,
+        quantize_per_tensor_int8=_QUANTIZE_PER_TENSOR_INT8_EXAMPLE_INPUTS,
+        dequantize_per_tensor_int8=_DEQUANTIZE_PER_TENSOR_INT8_EXAMPLE_INPUTS,
+        quantize_per_channel_int8=_QUANTIZE_PER_CHANNEL_INT8_EXAMPLE_INPUTS,
+        dequantize_per_channel_int8=_DEQUANTIZE_PER_CHANNEL_INT8_EXAMPLE_INPUTS,
+        dynamic_quantized_linear_4bit_groupwise_1=_DYNAMIC_QUANTIZED_LINEAR_4BIT_GROUPWISE_EXAMPLE_INPUTS_1,
+        dynamic_quantized_linear_4bit_groupwise_2=_DYNAMIC_QUANTIZED_LINEAR_4BIT_GROUPWISE_EXAMPLE_INPUTS_2,
+    )
+
+
+def _get_rewrite_info_list() -> list[_RewriteInfo]:
+    """Build the list of pattern/replacement rewrites applied by
+    :func:`reference_representation_rewrite`.
+
+    Kept as a standalone builder so the driver stays short: it only owns the
+    ``_RewriteInfo`` entries, none of which depend on the model being rewritten.
+    """
+    example_inputs = _get_example_inputs()
+
     _REWRITE_INFO_LIST = [
         _RewriteInfo(
-            _DYNAMIC_QUANTIZED_LINEAR_EXAMPLE_INPUTS,
+            example_inputs.dynamic_quantized_linear,
             WrapperModule(_qdq_dynamic_quantized_linear),
             WrapperModule(_reference_dynamic_quantized_linear),
             partial(
@@ -1077,7 +1155,7 @@ def reference_representation_rewrite(model: GraphModule) -> GraphModule:
             ),
         ),
         _RewriteInfo(
-            _DYNAMIC_QUANTIZED_LINEAR_4BIT_GROUPWISE_EXAMPLE_INPUTS_1,
+            example_inputs.dynamic_quantized_linear_4bit_groupwise_1,
             WrapperModule(_qdq_dynamic_quantized_linear_4bit_groupwise),
             WrapperModule(_reference_dynamic_quantized_linear_4bit_groupwise),
             partial(
@@ -1099,7 +1177,7 @@ def reference_representation_rewrite(model: GraphModule) -> GraphModule:
             port_metadata_fn=_port_metadata_for_dynamic_quantized_linear_4bit_groupwise,
         ),
         _RewriteInfo(
-            _DYNAMIC_QUANTIZED_LINEAR_4BIT_GROUPWISE_EXAMPLE_INPUTS_2,
+            example_inputs.dynamic_quantized_linear_4bit_groupwise_2,
             WrapperModule(_qdq_dynamic_quantized_linear_4bit_groupwise),
             WrapperModule(_reference_dynamic_quantized_linear_4bit_groupwise),
             partial(
@@ -1121,55 +1199,55 @@ def reference_representation_rewrite(model: GraphModule) -> GraphModule:
             port_metadata_fn=_port_metadata_for_dynamic_quantized_linear_4bit_groupwise,
         ),
         _RewriteInfo(
-            _QUANTIZED_LINEAR_EXAMPLE_INPUTS,
+            example_inputs.quantized_linear,
             WrapperModule(_qdq_quantized_linear),
             WrapperModule(_reference_quantized_linear),
             _replace_literals_with_new_placeholders,
             _replace_literals_with_new_placeholders,
         ),
         _RewriteInfo(
-            _QUANTIZED_CONV2d_EXAMPLE_INPUTS,
+            example_inputs.quantized_conv2d,
             WrapperModule(_qdq_quantized_conv2d),
             WrapperModule(_reference_quantized_conv2d),
             partial(_replace_literals_with_new_placeholders, exclude_literals=[-1]),
             partial(_replace_literals_with_new_placeholders, exclude_literals=[-1]),
         ),
         _RewriteInfo(
-            _QUANTIZED_ADD_OR_ADD_RELU_EXAMPLE_INPUTS,
+            example_inputs.quantized_add_or_add_relu,
             WrapperModule(_qdq_quantized_add_relu),
             WrapperModule(_reference_quantized_add_relu),
         ),
         _RewriteInfo(
-            _QUANTIZED_ADD_OR_ADD_RELU_EXAMPLE_INPUTS,
+            example_inputs.quantized_add_or_add_relu,
             WrapperModule(_qdq_quantized_add),
             WrapperModule(_reference_quantized_add),
         ),
         _RewriteInfo(
-            _QUANTIZED_MAX_POOL2D_EXAMPLE_INPUTS,
+            example_inputs.quantized_max_pool2d,
             WrapperModule(_qdq_quantized_max_pool2d),
             WrapperModule(_reference_quantized_max_pool2d),
             _replace_literals_with_new_placeholders,
             _replace_literals_with_new_placeholders,
         ),
         _RewriteInfo(
-            _QUANTIZE_PER_TENSOR_INT8_EXAMPLE_INPUTS,
+            example_inputs.quantize_per_tensor_int8,
             WrapperModule(_quantize_per_tensor_int8),
             WrapperModule(_reference_quantize_per_tensor_int8),
         ),
         _RewriteInfo(
-            _DEQUANTIZE_PER_TENSOR_INT8_EXAMPLE_INPUTS,
+            example_inputs.dequantize_per_tensor_int8,
             WrapperModule(_dequantize_per_tensor_int8),
             WrapperModule(_reference_dequantize_per_tensor_int8),
         ),
         _RewriteInfo(
-            _QUANTIZE_PER_CHANNEL_INT8_EXAMPLE_INPUTS,
+            example_inputs.quantize_per_channel_int8,
             WrapperModule(_quantize_per_channel_int8),
             WrapperModule(_reference_quantize_per_channel_int8),
             _replace_ph_qdq_per_channel_replacement,
             _replace_ph_qdq_per_channel_replacement,
         ),
         _RewriteInfo(
-            _DEQUANTIZE_PER_CHANNEL_INT8_EXAMPLE_INPUTS,
+            example_inputs.dequantize_per_channel_int8,
             WrapperModule(_dequantize_per_channel_int8),
             WrapperModule(_reference_dequantize_per_channel_int8),
             _replace_ph_qdq_per_channel_replacement,
@@ -1177,10 +1255,14 @@ def reference_representation_rewrite(model: GraphModule) -> GraphModule:
         ),
     ]
 
+    return _REWRITE_INFO_LIST
+
+
+def reference_representation_rewrite(model: GraphModule) -> GraphModule:
     remove_tensor_overload_for_qdq_ops(model)
 
     with _disable_aten_to_metadata_assertions():
-        for rewrite_info in _REWRITE_INFO_LIST:
+        for rewrite_info in _get_rewrite_info_list():
             example_inputs = rewrite_info.example_inputs
             pattern = rewrite_info.pattern
             replacement = rewrite_info.replacement
