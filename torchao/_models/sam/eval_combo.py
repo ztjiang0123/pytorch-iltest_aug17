@@ -150,6 +150,30 @@ def build_results_batch(predictor, batch, batch_size, pad_input_image_batch):
     return result_batch, orig_input_image_batch_size, elapsed_time
 
 
+def _maybe_compile_and_warmup(
+    predictor, batch, batch_size, use_compile, use_fullgraph, pad_input_image_batch, batch_runner
+):
+    """Compile the image encoder (if requested) and run a few warmup iterations."""
+    with torch.autograd.profiler.record_function("compilation and warmup"):
+        if str(use_compile) != "False":
+            predictor.model.image_encoder = torch.compile(
+                predictor.model.image_encoder,
+                mode=use_compile,
+                fullgraph=use_fullgraph,
+            )
+        # Run first batch a few times for warmup and exclude it from the final timings
+        for _ in range(5):
+            _ = batch_runner(predictor, batch, batch_size, pad_input_image_batch)
+
+
+def _should_count_timing(num_images):
+    # We consistently exclude the last (512 - filtered) images
+    # Since batch sizes must be powers of two and less than
+    # or equal 512 this ensures consistent timing across varying
+    # batch sizes.
+    return num_images <= 4488
+
+
 def build_results(
     batched_data_iter,
     predictor,
@@ -175,18 +199,15 @@ def build_results(
     for batch in tqdm.tqdm(batched_data_iter):
         with torch.no_grad():
             if batch_idx == 0:
-                with torch.autograd.profiler.record_function("compilation and warmup"):
-                    if str(use_compile) != "False":
-                        predictor.model.image_encoder = torch.compile(
-                            predictor.model.image_encoder,
-                            mode=use_compile,
-                            fullgraph=use_fullgraph,
-                        )
-                    # Run first batch a few times for warmup and exclude it from the final timings
-                    for _ in range(5):
-                        _ = batch_runner(
-                            predictor, batch, batch_size, pad_input_image_batch
-                        )
+                _maybe_compile_and_warmup(
+                    predictor,
+                    batch,
+                    batch_size,
+                    use_compile,
+                    use_fullgraph,
+                    pad_input_image_batch,
+                    batch_runner,
+                )
             result_batch, num_datapoints, kernel_time = batch_runner(
                 predictor, batch, batch_size, pad_input_image_batch
             )
@@ -195,23 +216,19 @@ def build_results(
         # We expect a partial batch to only happens once at the end
         assert not partial_batch
         # Only measure timing on full batches
-        if num_datapoints == batch_size:
+        is_full_batch = num_datapoints == batch_size
+        if not is_full_batch:
+            partial_batch = True
+        else:
             num_images += num_datapoints
             num_batches += 1
-            # We consistently exclude the last (512 - filtered) images
-            # Since batch sizes must be powers of two and less than
-            # or equal 512 this ensures consistent timing across varying
-            # batch sizes.
-            if num_images <= 4488:
+            if _should_count_timing(num_images):
                 elapsed_time += kernel_time
-        else:
-            partial_batch = True
         batch_idx += 1
 
     avg_ms_per_img = None
     if num_images > 0:
-        avg_ms_per_img = elapsed_time
-        avg_ms_per_img = avg_ms_per_img / num_images
+        avg_ms_per_img = elapsed_time / num_images
 
     return results, avg_ms_per_img, num_batches, num_images
 

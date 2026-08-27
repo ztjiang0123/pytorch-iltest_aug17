@@ -802,6 +802,63 @@ def _get_freq_slice_source(node: Node) -> Node:
     return node
 
 
+def _mul_of_two_muls(node, combine_op_aten, combine_op_py):
+    """Return the two mul-node operands if ``node`` is ``combine_op(mul(...), mul(...))``.
+
+    ``node`` must be an add/sub (given by ``combine_op_*``) whose two arguments are
+    both ``aten.mul`` nodes. Returns ``(left_mul, right_mul)`` or ``None``.
+    """
+    if not _is_op(node, combine_op_aten, combine_op_py):
+        return None
+    if len(node.args) < 2:
+        return None
+    left, right = node.args[0], node.args[1]
+    if not isinstance(left, Node) or not isinstance(right, Node):
+        return None
+    if not _is_op(left, torch.ops.aten.mul.Tensor, operator.mul):
+        return None
+    if not _is_op(right, torch.ops.aten.mul.Tensor, operator.mul):
+        return None
+    return left, right
+
+
+def _find_wan_setitem_writes(node: Node):
+    """Scan users of ``empty_like`` for the two stride-2 setitem writes.
+
+    Returns ``(even_val, odd_val)`` for start=0 (even) and start=1 (odd), or
+    ``None`` if either is missing.
+    """
+    even_val = None
+    odd_val = None
+    for user in node.users:
+        si = _get_setitem_stride2_slice(user)
+        if si is None:
+            continue
+        start, value = si
+        if start == 0 and even_val is None:
+            even_val = value
+        elif start == 1 and odd_val is None:
+            odd_val = value
+    if even_val is None or odd_val is None:
+        return None
+    return even_val, odd_val
+
+
+def _order_cos_sin_slices(cos_slice_node, sin_slice_node):
+    """Ensure the cos slice starts at even (0) and the sin slice at odd (1).
+
+    Returns the (possibly swapped) ``(cos_slice_node, sin_slice_node)`` pair, or
+    ``None`` if the starts don't match the expected even/odd layout.
+    """
+    cos_start = _get_freq_slice_start(cos_slice_node)
+    sin_start = _get_freq_slice_start(sin_slice_node)
+    if cos_start == 0 and sin_start == 1:
+        return cos_slice_node, sin_slice_node
+    if sin_start == 0 and cos_start == 1:
+        return sin_slice_node, cos_slice_node
+    return None
+
+
 def _detect_wan_rope(node: Node) -> Optional[RoPEMatch]:
     """Detect Wan-style indexed-write RoPE pattern (Pattern C).
 
@@ -836,45 +893,19 @@ def _detect_wan_rope(node: Node) -> Optional[RoPEMatch]:
     pre_rope_input = node.args[0]
 
     # Find the two stride-2 setitem users: one with start=0 (even), one with start=1 (odd)
-    even_val = None
-    odd_val = None
-    for user in node.users:
-        si = _get_setitem_stride2_slice(user)
-        if si is None:
-            continue
-        start, value = si
-        if start == 0 and even_val is None:
-            even_val = value
-        elif start == 1 and odd_val is None:
-            odd_val = value
-
-    if even_val is None or odd_val is None:
+    writes = _find_wan_setitem_writes(node)
+    if writes is None:
         return None
+    even_val, odd_val = writes
 
     # even_val = sub(mul(x1, cos), mul(x2, sin))
-    if not _is_op(even_val, torch.ops.aten.sub.Tensor, operator.sub):
+    even_muls = _mul_of_two_muls(even_val, torch.ops.aten.sub.Tensor, operator.sub)
+    if even_muls is None:
         return None
-    if len(even_val.args) < 2:
-        return None
-    even_left, even_right = even_val.args[0], even_val.args[1]
-    if not isinstance(even_left, Node) or not isinstance(even_right, Node):
-        return None
-    if not _is_op(even_left, torch.ops.aten.mul.Tensor, operator.mul):
-        return None
-    if not _is_op(even_right, torch.ops.aten.mul.Tensor, operator.mul):
-        return None
+    even_left, even_right = even_muls
 
     # odd_val = add(mul(x1, sin), mul(x2, cos))
-    if not _is_op(odd_val, torch.ops.aten.add.Tensor, operator.add):
-        return None
-    if len(odd_val.args) < 2:
-        return None
-    odd_left, odd_right = odd_val.args[0], odd_val.args[1]
-    if not isinstance(odd_left, Node) or not isinstance(odd_right, Node):
-        return None
-    if not _is_op(odd_left, torch.ops.aten.mul.Tensor, operator.mul):
-        return None
-    if not _is_op(odd_right, torch.ops.aten.mul.Tensor, operator.mul):
+    if _mul_of_two_muls(odd_val, torch.ops.aten.add.Tensor, operator.add) is None:
         return None
 
     # From even_val's mul nodes, identify cos/sin (stride-2 slices) vs x1/x2
@@ -887,14 +918,10 @@ def _detect_wan_rope(node: Node) -> Optional[RoPEMatch]:
     sin_slice_node, _x2 = even_right_match
 
     # Verify cos slice has start=0 (even positions) and sin slice has start=1 (odd positions)
-    cos_start = _get_freq_slice_start(cos_slice_node)
-    sin_start = _get_freq_slice_start(sin_slice_node)
-    if cos_start != 0 or sin_start != 1:
-        # Try swapping
-        if sin_start == 0 and cos_start == 1:
-            cos_slice_node, sin_slice_node = sin_slice_node, cos_slice_node
-        else:
-            return None
+    ordered = _order_cos_sin_slices(cos_slice_node, sin_slice_node)
+    if ordered is None:
+        return None
+    cos_slice_node, sin_slice_node = ordered
 
     # Unwrap stride-2 slices to get original cos/sin tensors
     cos_original = _get_freq_slice_source(cos_slice_node)

@@ -183,30 +183,35 @@ def shard(
     return DTensor.from_local(local_tensor, device_mesh, placements)
 
 
+def _shard_linear_weight(
+    m: torch.nn.Module, mesh: DeviceMesh, shard_dim: int
+) -> torch.nn.Module:
+    """
+    Shard the linear layer weight of ``m`` along ``shard_dim`` and replace the
+    parameter in place. Shared implementation for column-wise and row-wise sharding.
+    """
+    orig_weight = m.linear.weight
+    # Construct DTensor from local shard
+    dtensor = shard(orig_weight, mesh, [Shard(shard_dim)])
+    # Replace parameter in module
+    m.linear.weight = torch.nn.Parameter(dtensor, requires_grad=False)
+    return m
+
+
 def colwise_shard(m: torch.nn.Module, mesh: DeviceMesh) -> torch.nn.Module:
     """
     Shard linear layer of the model in column-wise fashion
     """
-    # Column-wise is wrt to A^T, so for A it is row-wise.
-    orig_weight = m.linear.weight
-    # Construct DTensor from local shard
-    dtensor = shard(orig_weight, mesh, [Shard(0)])
-    # Replace parameter in module
-    m.linear.weight = torch.nn.Parameter(dtensor, requires_grad=False)
-    return m
+    # Column-wise is wrt to A^T, so for A it is row-wise (Shard(0)).
+    return _shard_linear_weight(m, mesh, 0)
 
 
 def rowwise_shard(m: torch.nn.Module, mesh: DeviceMesh) -> torch.nn.Module:
     """
     Shard linear layer of the model in row-wise fashion
     """
-    # Row-wise is wrt to A^T, so for A it is column-wise.
-    orig_weight = m.linear.weight
-    # Construct DTensor from local shard
-    dtensor = shard(orig_weight, mesh, [Shard(1)])
-    # Replace parameter in module
-    m.linear.weight = torch.nn.Parameter(dtensor, requires_grad=False)
-    return m
+    # Row-wise is wrt to A^T, so for A it is column-wise (Shard(1)).
+    return _shard_linear_weight(m, mesh, 1)
 
 
 ########
