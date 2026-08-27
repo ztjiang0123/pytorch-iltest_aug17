@@ -62,23 +62,31 @@ __all__ = [
     "_is_conv_transpose_node",
     "_is_sym_size_node",
     "_filter_sym_size_users",
-    "save_scalar_buffers_to_state_dict",
+    "ScalarBufferStateDictMixin",
 ]
 
 
-def save_scalar_buffers_to_state_dict(module, destination, prefix, names):
+class ScalarBufferStateDictMixin:
     """
-    Serialize scalar-valued attributes that cannot be registered as buffers.
+    Mixin that serializes scalar-valued attributes which cannot be registered
+    as buffers.
 
     ``torch.nn.Module._save_to_state_dict`` does not persist attributes that are
     not registered buffers/parameters, so observers and fake quantizers that hold
     scalar tensors (e.g. ``scale``/``zero_point`` or ``min_val``/``max_val``)
-    must serialize them manually. Callers are expected to invoke the default
-    ``super()._save_to_state_dict(...)`` themselves; this helper writes each
-    attribute in ``names`` into ``destination`` under ``prefix``.
+    must serialize them manually. Subclasses list the attribute names in the
+    ``_scalar_state_dict_buffers`` class attribute; this mixin's
+    ``_save_to_state_dict`` runs the default serialization and then writes each
+    of those attributes into ``destination`` under ``prefix``.
     """
-    for name in names:
-        destination[prefix + name] = getattr(module, name)
+
+    # Subclasses override this with the scalar attribute names to serialize.
+    _scalar_state_dict_buffers: tuple = ()
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        for name in self._scalar_state_dict_buffers:
+            destination[prefix + name] = getattr(self, name)
 
 
 # TODO: remove unused

@@ -33,7 +33,7 @@ from torchao.quantization.pt2e.observer import (
     default_fixed_qparams_range_neg1to1_observer,
 )
 from torchao.quantization.pt2e.utils import (
-    save_scalar_buffers_to_state_dict,
+    ScalarBufferStateDictMixin,
 )
 from torchao.quantization.quant_primitives import (
     _fake_quantize_affine,
@@ -151,7 +151,7 @@ class FakeQuantizeBase(ABC, Module):
         return fake_quant_constructor
 
 
-class FakeQuantize(FakeQuantizeBase):
+class FakeQuantize(ScalarBufferStateDictMixin, FakeQuantizeBase):
     r"""Simulate the quantize and dequantize operations in training time.
 
     The output of this module is given by::
@@ -189,6 +189,10 @@ class FakeQuantize(FakeQuantizeBase):
 
     scale: torch.Tensor
     zero_point: torch.Tensor
+
+    # We cannot currently register scalar values as buffers, so serialize them
+    # manually via ScalarBufferStateDictMixin._save_to_state_dict.
+    _scalar_state_dict_buffers = ("scale", "zero_point")
 
     def __init__(
         self,
@@ -286,14 +290,6 @@ class FakeQuantize(FakeQuantizeBase):
             f"quant_min={self.activation_post_process.quant_min}, quant_max={self.activation_post_process.quant_max}, "
             f"dtype={self.dtype}, qscheme={self.qscheme}, ch_axis={self.ch_axis}, "
             f"scale={self.scale}, zero_point={self.zero_point}"
-        )
-
-    def _save_to_state_dict(self, destination, prefix, keep_vars):
-        # We cannot currently register scalar values as buffers, so need to manually
-        # specify serialization here.
-        super()._save_to_state_dict(destination, prefix, keep_vars)
-        save_scalar_buffers_to_state_dict(
-            self, destination, prefix, ["scale", "zero_point"]
         )
 
     def _load_from_state_dict(
