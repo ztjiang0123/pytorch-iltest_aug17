@@ -64,7 +64,7 @@ import os
 import re
 import sys
 from collections import OrderedDict
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 try:
     from github import Github
@@ -189,6 +189,45 @@ def fetch_pr_labels(commit_lines: List[str]) -> Dict[int, List[str]]:
     return pr_number_to_labels
 
 
+def _insert_category_before_not_user_facing(
+    commits_by_category: OrderedDict,
+    display_name: str,
+) -> OrderedDict:
+    """
+    Return a copy of ``commits_by_category`` with ``display_name`` inserted
+    (as an empty list) immediately before the "Not User Facing" entry.
+    """
+    new_order: OrderedDict = OrderedDict()
+    for category, commits in commits_by_category.items():
+        if category == "Not User Facing":
+            new_order[display_name] = []
+        new_order[category] = commits
+    return new_order
+
+
+def _resolve_category(
+    label: str,
+    commits_by_category: OrderedDict,
+) -> Tuple[str, OrderedDict]:
+    """
+    Resolve ``label`` to its display name, ensuring the category exists.
+
+    Returns ``(display_name, commits_by_category)`` where the returned dict may
+    be re-ordered: known labels map to their fixed display name, while unknown
+    module labels are inserted before "Not User Facing".
+    """
+    known_display_name = GITHUB_MODULE_LABEL_TO_CATEGORY.get(label)
+    if known_display_name is not None:
+        return known_display_name, commits_by_category
+
+    display_name = label.removeprefix("module: ").title()
+    if display_name not in commits_by_category:
+        commits_by_category = _insert_category_before_not_user_facing(
+            commits_by_category, display_name
+        )
+    return display_name, commits_by_category
+
+
 def build_module_categories(
     commit_lines: List[str],
     pr_number_to_labels: Dict[int, List[str]],
@@ -215,19 +254,9 @@ def build_module_categories(
             continue
 
         for label in labels:
-            if label in GITHUB_MODULE_LABEL_TO_CATEGORY:
-                display_name = GITHUB_MODULE_LABEL_TO_CATEGORY[label]
-            else:
-                # New module not in fixed list, add before "Not User Facing"
-                display_name = label.removeprefix("module: ").title()
-                if display_name not in commits_by_category:
-                    # Insert before "Not User Facing"
-                    new_order = OrderedDict()
-                    for k, v in commits_by_category.items():
-                        if k == "Not User Facing":
-                            new_order[display_name] = []
-                        new_order[k] = v
-                    commits_by_category = new_order
+            display_name, commits_by_category = _resolve_category(
+                label, commits_by_category
+            )
             commits_by_category[display_name].append(commit_line)
 
     # Remove empty categories
