@@ -458,23 +458,23 @@ if _cutedsl_runtime_available():
                 tma_bar_ptr=tma_mbar_ptr,
             )
 
-    def make_tile_shape(*, tile_m, tile_k, stage_count, tile_copy_bytes):
-        """Bundle compile-time tile geometry for the MXFP8 kernels."""
-        return SimpleNamespace(
-            tile_m=tile_m,
-            tile_k=tile_k,
-            stage_count=stage_count,
-            tile_copy_bytes=tile_copy_bytes,
-        )
+    def make_tile_shape(**fields):
+        """Bundle compile-time tile geometry for the MXFP8 kernels.
 
-    def make_tma_handles(*, atom_in, tensor_in, atom_out, tensor_out):
-        """Bundle the input/output TMA atoms and tensor views for a kernel."""
-        return SimpleNamespace(
-            atom_in=atom_in,
-            tensor_in=tensor_in,
-            atom_out=atom_out,
-            tensor_out=tensor_out,
-        )
+        Expected fields: ``tile_m``, ``tile_k``, ``stage_count`` and
+        ``tile_copy_bytes``. Uses the generic ``**fields`` form (like
+        ``make_axis_spec`` / ``make_kernel_io``) so it does not duplicate the
+        explicit-field structure of ``make_tma_handles``.
+        """
+        return SimpleNamespace(**fields)
+
+    def make_tma_handles(**fields):
+        """Bundle the input/output TMA atoms and tensor views for a kernel.
+
+        Expected fields: ``atom_in``, ``tensor_in``, ``atom_out``,
+        ``tensor_out``.
+        """
+        return SimpleNamespace(**fields)
 
     def make_axis_spec(**fields):
         """Bundle the axis-role parameters distinguishing 1x32 from 32x1.
