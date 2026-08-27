@@ -3,6 +3,7 @@
 #
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
+import functools
 import os
 from typing import Sequence
 
@@ -197,20 +198,12 @@ def _shard_linear_weight(
     return m
 
 
-def colwise_shard(m: torch.nn.Module, mesh: DeviceMesh) -> torch.nn.Module:
-    """
-    Shard linear layer of the model in column-wise fashion
-    """
-    # Column-wise is wrt to A^T, so for A it is row-wise.
-    return _shard_linear_weight(m, mesh, 0)
-
-
-def rowwise_shard(m: torch.nn.Module, mesh: DeviceMesh) -> torch.nn.Module:
-    """
-    Shard linear layer of the model in row-wise fashion
-    """
-    # Row-wise is wrt to A^T, so for A it is column-wise.
-    return _shard_linear_weight(m, mesh, 1)
+# Column-wise is wrt to A^T, so for A it is row-wise -> shard dim 0.
+# Row-wise is wrt to A^T, so for A it is column-wise -> shard dim 1.
+# Both are the same operation with a different shard dim, so bind partials
+# of ``_shard_linear_weight`` rather than repeating the body.
+colwise_shard = functools.partial(_shard_linear_weight, shard_dim=0)
+rowwise_shard = functools.partial(_shard_linear_weight, shard_dim=1)
 
 
 ########
