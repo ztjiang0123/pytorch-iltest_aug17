@@ -8,7 +8,7 @@
 import contextlib
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, NamedTuple, Optional
 
 import torch
 from torch._higher_order_ops.out_dtype import out_dtype
@@ -41,63 +41,80 @@ __all__ = [
 ]
 
 
+class _QParams(NamedTuple):
+    """Per-tensor affine quantization parameters that travel together.
+
+    Grouping these keeps the linear pattern/replacement signatures small while
+    preserving the traced graph: a ``NamedTuple`` is flattened by PyTorch's
+    pytree into its fields in declaration order, so the flat example inputs and
+    the resulting graph placeholders are unchanged.
+    """
+
+    scale: Any
+    zero_point: Any
+    quant_min: Any
+    quant_max: Any
+
+
+class _QuantizedTensor(NamedTuple):
+    """An int8 tensor bundled with the quant params needed to interpret it.
+
+    Like :class:`_QParams`, this is a ``NamedTuple`` so pytree flattens it into
+    ``(int8, scale, zero_point, quant_min, quant_max)`` in order, leaving the
+    traced pattern/replacement graphs identical to the un-grouped signatures.
+    """
+
+    int8: Any
+    qparams: _QParams
+
+
 def _qdq_quantized_linear(
-    x_i8,
-    x_scale,
-    x_zero_point,
-    x_quant_min,
-    x_quant_max,
-    weight_i8,
-    weight_scale,
-    weight_zero_point,
-    weight_quant_min,
-    weight_quant_max,
+    x: _QuantizedTensor,
+    weight: _QuantizedTensor,
     bias_fp32,
-    out_scale,
-    out_zero_point,
-    out_quant_min,
-    out_quant_max,
+    out_qparams: _QParams,
 ):
     x_fp32 = torch.ops.quantized_decomposed.dequantize_per_tensor(
-        x_i8, x_scale, x_zero_point, x_quant_min, x_quant_max, torch.int8
+        x.int8,
+        x.qparams.scale,
+        x.qparams.zero_point,
+        x.qparams.quant_min,
+        x.qparams.quant_max,
+        torch.int8,
     )
     weight_fp32 = torch.ops.quantized_decomposed.dequantize_per_tensor(
-        weight_i8,
-        weight_scale,
-        weight_zero_point,
-        weight_quant_min,
-        weight_quant_max,
+        weight.int8,
+        weight.qparams.scale,
+        weight.qparams.zero_point,
+        weight.qparams.quant_min,
+        weight.qparams.quant_max,
         torch.int8,
     )
     out_fp32 = torch.ops.aten.linear.default(x_fp32, weight_fp32, bias_fp32)
     out_i8 = torch.ops.quantized_decomposed.quantize_per_tensor(
-        out_fp32, out_scale, out_zero_point, out_quant_min, out_quant_max, torch.int8
+        out_fp32,
+        out_qparams.scale,
+        out_qparams.zero_point,
+        out_qparams.quant_min,
+        out_qparams.quant_max,
+        torch.int8,
     )
     return out_i8
 
 
 def _reference_quantized_linear(
-    x_i8,
-    x_scale,
-    x_zero_point,
-    x_quant_min,
-    x_quant_max,
-    weight_i8,
-    weight_scale,
-    weight_zero_point,
-    weight_quant_min,
-    weight_quant_max,
+    x: _QuantizedTensor,
+    weight: _QuantizedTensor,
     bias_fp32,
-    out_scale,
-    out_zero_point,
-    out_quant_min,
-    out_quant_max,
+    out_qparams: _QParams,
 ):
     # without using quant_min/max in clamp, the traced graph will not have quant_mi/max args.
     # This results in failure to match the pattern.
     # Therefore, we call a torch.ops.aten.clamp here
-    x_i8 = torch.ops.aten.clamp(x_i8, x_quant_min, x_quant_max)
-    weight_i8 = torch.ops.aten.clamp(weight_i8, weight_quant_min, weight_quant_max)
+    x_i8 = torch.ops.aten.clamp(x.int8, x.qparams.quant_min, x.qparams.quant_max)
+    weight_i8 = torch.ops.aten.clamp(
+        weight.int8, weight.qparams.quant_min, weight.qparams.quant_max
+    )
 
     x_i16 = x_i8.to(torch.int16)
     weight_i16 = weight_i8.to(torch.int16)
@@ -106,13 +123,13 @@ def _reference_quantized_linear(
     acc_i32 = out_dtype(
         torch.ops.aten.linear.default,
         torch.int32,
-        x_i16 - x_zero_point,
-        weight_i16 - weight_zero_point,
+        x_i16 - x.qparams.zero_point,
+        weight_i16 - weight.qparams.zero_point,
         None,
     )
     # TODO: change to mul.Scalar
     # Note: we are quantizing bias with these scales without signal from user, but it might be OK
-    bias_scale = x_scale * weight_scale
+    bias_scale = x.qparams.scale * weight.qparams.scale
     bias_i32 = out_dtype(torch.ops.aten.div.Tensor, torch.int32, bias_fp32, bias_scale)
     acc_i32 = acc_i32 + bias_i32
     # TODO: change to mul.Scalar when we make x_scale/weight_scale etc. Scalar values
@@ -121,11 +138,13 @@ def _reference_quantized_linear(
             torch.ops.aten.mul.Tensor,
             torch.int32,
             acc_i32,
-            x_scale * weight_scale / out_scale,
+            x.qparams.scale * weight.qparams.scale / out_qparams.scale,
         )
-        + out_zero_point
+        + out_qparams.zero_point
     )
-    out_i8 = torch.ops.aten.clamp(acc_i32, out_quant_min, out_quant_max).to(torch.int8)
+    out_i8 = torch.ops.aten.clamp(
+        acc_i32, out_qparams.quant_min, out_qparams.quant_max
+    ).to(torch.int8)
     return out_i8
 
 
@@ -930,21 +949,31 @@ class _RewriteInfo:
 
 def reference_representation_rewrite(model: GraphModule) -> GraphModule:
     _QUANTIZED_LINEAR_EXAMPLE_INPUTS = (
-        torch.randint(-128, 127, (2, 5), dtype=torch.int8),
+        _QuantizedTensor(
+            torch.randint(-128, 127, (2, 5), dtype=torch.int8),
+            _QParams(
+                torch.randn(1, dtype=torch.float),
+                torch.zeros(1, dtype=torch.int),
+                torch.tensor([-128], dtype=torch.int),
+                torch.tensor([127], dtype=torch.int),
+            ),
+        ),
+        _QuantizedTensor(
+            torch.randint(-128, 127, (5, 5), dtype=torch.int8),
+            _QParams(
+                torch.randn(1, dtype=torch.float),
+                torch.zeros(1, dtype=torch.int),
+                torch.tensor([-127], dtype=torch.int),
+                torch.tensor([127], dtype=torch.int),
+            ),
+        ),
         torch.randn(1, dtype=torch.float),
-        torch.zeros(1, dtype=torch.int),
-        torch.tensor([-128], dtype=torch.int),
-        torch.tensor([127], dtype=torch.int),
-        torch.randint(-128, 127, (5, 5), dtype=torch.int8),
-        torch.randn(1, dtype=torch.float),
-        torch.zeros(1, dtype=torch.int),
-        torch.tensor([-127], dtype=torch.int),
-        torch.tensor([127], dtype=torch.int),
-        torch.randn(1, dtype=torch.float),
-        torch.randn(1, dtype=torch.float),
-        torch.zeros(1, dtype=torch.int),
-        torch.tensor([-128], dtype=torch.int),
-        torch.tensor([127], dtype=torch.int),
+        _QParams(
+            torch.randn(1, dtype=torch.float),
+            torch.zeros(1, dtype=torch.int),
+            torch.tensor([-128], dtype=torch.int),
+            torch.tensor([127], dtype=torch.int),
+        ),
     )
 
     _DYNAMIC_QUANTIZED_LINEAR_EXAMPLE_INPUTS = (
