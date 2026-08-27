@@ -15,6 +15,7 @@ from torchao.utils import ceil_div
 from .cute_utils import (
     compute_amax,
     compute_scale_from_amax,
+    issue_tma_load,
     load_vals_chunk_full,
     load_vals_chunk_tail,
     quantize_chunk_to_fp8_reg,
@@ -365,29 +366,14 @@ if _CUTLASS_AVAILABLE:
             tma_mbar_ptr: cutlass.Int64,
             warp_idx: cutlass.Int32,
         ):
-            if warp_idx == 0:
-                cta_layout = cute.make_layout((1,))
-                sIN_for_tma_partition = cute.group_modes(sIN_tile, 0, 2)
-                gIN_for_tma_partition = cute.group_modes(gIN_tile, 0, 2)
-                tINs, tINg = cpasync.tma_partition(
-                    tma_atom_in,
-                    0,
-                    cta_layout,
-                    sIN_for_tma_partition,
-                    gIN_for_tma_partition,
-                )
-                tINg_stage0 = tINg[(None, 0)]
-                tINs_stage0 = tINs[(None, 0)]
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        tma_mbar_ptr, self.TILE_COPY_BYTES
-                    )
-                cute.copy(
-                    tma_atom_in,
-                    tINg_stage0,
-                    tINs_stage0,
-                    tma_bar_ptr=tma_mbar_ptr,
-                )
+            # 3D expert-tiled input groups the leading 2 modes (expert, N).
+            issue_tma_load(
+                tma_atom_in,
+                (gIN_tile, sIN_tile),
+                tma_mbar_ptr,
+                warp_idx,
+                (2, self.TILE_COPY_BYTES),
+            )
 
         @cute.jit
         def _issue_tma_store(
@@ -477,16 +463,18 @@ if _CUTLASS_AVAILABLE:
                         )
 
         @cute.jit
-        def _compute_tile(self, warp_ctx, tiles, scales_expert, coords, dims):
+        def _compute_tile(self, warp_ctx, tiles, scales_expert, tile_ctx):
             """Wait on the loaded tile, then scale + quantize it.
 
             ``warp_ctx = (warp_idx, tidx, tma_mbar_ptr, tma_phase)``,
-            ``tiles = (sIN_tile, sOUT_tile)``, ``coords = (k0, n_tile, e)``,
-            ``dims = (K, N, n_blocks)``.
+            ``tiles = (sIN_tile, sOUT_tile)``,
+            ``tile_ctx = (coords, dims)`` with ``coords = (k0, n_tile, e)``
+            and ``dims = (K, N, n_blocks)``.
             """
             warp_idx, tidx, tma_mbar_ptr, tma_phase = warp_ctx
             if warp_idx < 1 or warp_idx > self.compute_warps:
                 return
+            coords, dims = tile_ctx
             k0, n_tile, e = coords
             K, N, n_blocks = dims
 
@@ -664,8 +652,7 @@ if _CUTLASS_AVAILABLE:
                     (warp_idx, tidx, tma_mbar_ptr, tma_phase),
                     (sIN_tile, sOUT_tile),
                     scales_expert,
-                    (k0, n_tile, e),
-                    (K, N, n_blocks),
+                    ((k0, n_tile, e), (K, N, n_blocks)),
                 )
 
                 gOUT_tile = cute.local_tile(
