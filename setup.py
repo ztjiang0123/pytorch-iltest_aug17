@@ -326,23 +326,42 @@ def check_submodules():
         )
 
 
+def _parse_cuda_release(line):
+    """Return the version token following "release" in one nvcc line, or None.
+
+    Handles lines like "Cuda compilation tools, release 12.6, V12.6.20".
+    """
+    parts = line.split()
+    for i, part in enumerate(parts):
+        if part.lower() != "release":
+            continue
+        if i + 1 >= len(parts):
+            continue
+        return parts[i + 1].rstrip(",")
+    return None
+
+
+def _extract_cuda_version(output):
+    """Scan nvcc "--version" output for the first "release X.Y" version."""
+    for line in output.split("\n"):
+        if "release" not in line.lower():
+            continue
+        version = _parse_cuda_release(line)
+        if version is not None:
+            return version
+    return None
+
+
 def get_cuda_version_from_nvcc():
     """Get CUDA version from nvcc if available."""
     try:
         result = subprocess.check_output(
             ["nvcc", "--version"], stderr=subprocess.STDOUT
         )
-        output = result.decode("utf-8")
-        # Look for version line like "release 12.6"
-        for line in output.split("\n"):
-            if "release" in line.lower():
-                parts = line.split()
-                for i, part in enumerate(parts):
-                    if part.lower() == "release" and i + 1 < len(parts):
-                        return parts[i + 1].rstrip(",")
-
     except:
         return None
+
+    return _extract_cuda_version(result.decode("utf-8"))
 
 
 def get_cutlass_build_flags():

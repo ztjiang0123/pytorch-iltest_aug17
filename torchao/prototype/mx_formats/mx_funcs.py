@@ -15,7 +15,7 @@ from typing import Any, Dict
 import torch
 
 from torchao.prototype.mx_formats.mx_ops import _addmm_mx_dispatch
-from torchao.prototype.mx_formats.mx_tensor import (  # noqa: E501
+from torchao.prototype.mx_formats.mx_tensor import (
     MXTensor,
 )
 from torchao.utils import _register_to_op_table
