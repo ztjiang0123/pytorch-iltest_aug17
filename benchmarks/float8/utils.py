@@ -151,120 +151,134 @@ def parse_bw_and_kernel_name(line):
         return None, None
 
 
+def _assert_mkn_unused(shape_gen_name, M, K, N):
+    assert M == K == N == None, (
+        f"M, K, N arguments not supported for shape_gen_name {shape_gen_name}"
+    )
+
+
+def _llama_shapes(shape_gen_name, M, K, N):
+    _assert_mkn_unused(shape_gen_name, M, K, N)
+    bsz, seq_len = 4, 4096
+    M = bsz * seq_len
+    # LLaMa 2 70B single-node weight shapes
+    # assumes fused attn.wqkv and ffn.w13
+    # source: https://fburl.com/gsheet/g8onr7rh
+    return {
+        "attn.wqkv": (M, 8192, 1280),
+        "attn.w0": (M, 1024, 8192),
+        "ffn.w13": (M, 8192, 7168),
+        "ffn.w2": (M, 3584, 8192),
+    }
+
+
+def _pow2_shapes(shape_gen_name, M, K, N):
+    _assert_mkn_unused(shape_gen_name, M, K, N)
+    name_to_shapes = {}
+    min_power_of_2 = 10  # 1024
+    max_power_of_2 = 14  # 16,384
+    for idx, power_of_2 in enumerate(range(min_power_of_2, max_power_of_2 + 1)):
+        val = 2**power_of_2
+        name_to_shapes[idx] = val, val, val
+    return name_to_shapes
+
+
+def _pow2_extended_shapes(shape_gen_name, M, K, N):
+    _assert_mkn_unused(shape_gen_name, M, K, N)
+    name_to_shapes = {}
+    min_power_of_2 = 10  # 1024
+    max_power_of_2 = 14  # 16,384
+    for idx, power_of_2 in enumerate(range(min_power_of_2, max_power_of_2 + 1)):
+        val1 = 2**power_of_2
+        name_to_shapes[idx * 2] = val1, val1, val1
+        val2 = 2**power_of_2 + 2 ** (power_of_2 - 1)
+        name_to_shapes[idx * 2 + 1] = val2, val2, val2
+    return name_to_shapes
+
+
+def _sweep_shapes(shape_gen_name, M, K, N):
+    _assert_mkn_unused(shape_gen_name, M, K, N)
+    name_to_shapes = {}
+    min_p2 = 8  # 256
+    max_p2 = 15  # 32,768
+    counter = 0
+    for M_p2 in range(min_p2, max_p2 + 1):
+        M = 2**M_p2
+        for K_p2 in range(min_p2, max_p2 + 1):
+            K = 2**K_p2
+            for N_p2 in range(min_p2, max_p2 + 1):
+                N = 2**N_p2
+                name_to_shapes[counter] = M, K, N
+                counter += 1
+    return name_to_shapes
+
+
+def _custom_shapes(shape_gen_name, M, K, N):
+    assert M is not None and K is not None and N is not None, (
+        "M, K, N must be specified for custom shape_gen"
+    )
+    return {
+        1: (M, K, N),
+    }
+
+
+def _dsv3_671b_shapes(shape_gen_name, M, K, N):
+    # DeepSeek-V3 671B model shapes
+    assert K == N == None, (
+        f"K, N arguments not supported for shape_gen_name {shape_gen_name}"
+    )
+    # default to local_bs=10, seq_len=8192 -> 81920
+    M = M if M is not None else 81920
+    return {
+        "attn.wq_a": (M, 7168, 1536),
+        "attn.wq_b": (M, 1536, 24576),
+        "attn.wo": (M, 16384, 7168),
+        "attn.wkv_a": (M, 7168, 576),
+        "attn.wkv_b": (M, 512, 32768),
+        "ffn.w1": (M, 7168, 18432),
+        "ffn.w2": (M, 18432, 7168),
+        "ffn.w3": (M, 7168, 18432),
+        "moe.shared_experts.w1": (M, 7168, 2048),
+        "moe.shared_experts.w2": (M, 2048, 7168),
+        "moe.shared_experts.w3": (M, 7168, 2048),
+    }
+
+
+def _dsv3_16b_671b_shapes(shape_gen_name, M, K, N):
+    seq_len = M if M is not None else DSV3_16B_671B_SEQ_LEN
+    dim = K if K is not None else DSV3_16B_671B_DIM
+    inter_dim = N if N is not None else DSV3_16B_671B_INTER_DIM
+    return {
+        "dsv3.ffn.w1": (seq_len, dim, inter_dim),
+        "dsv3.ffn.w2": (seq_len, inter_dim, dim),
+        "dsv3.ffn.w3": (seq_len, dim, inter_dim),
+    }
+
+
+# maps a shape_gen_name to the helper that builds its {name: (M, K, N)} dict
+_SHAPE_GENERATORS = {
+    "llama": _llama_shapes,
+    "pow2": _pow2_shapes,
+    "pow2_extended": _pow2_extended_shapes,
+    "sweep": _sweep_shapes,
+    "custom": _custom_shapes,
+    "dsv3-671b": _dsv3_671b_shapes,
+    DSV3_16B_671B_SHAPE_GEN_NAME: _dsv3_16b_671b_shapes,
+}
+
+
 def get_name_to_shapes_iter(
     shape_gen_name: str,
     M: Optional[int],
     K: Optional[int],
     N: Optional[int],
 ):
-    if shape_gen_name == "llama":
-        assert M == K == N == None, (
-            f"M, K, N arguments not supported for shape_gen_name {shape_gen_name}"
-        )
-        bsz, seq_len = 4, 4096
-        M = bsz * seq_len
-        # LLaMa 2 70B single-node weight shapes
-        # assumes fused attn.wqkv and ffn.w13
-        # source: https://fburl.com/gsheet/g8onr7rh
-        name_to_shapes_70b = {
-            "attn.wqkv": (M, 8192, 1280),
-            "attn.w0": (M, 1024, 8192),
-            "ffn.w13": (M, 8192, 7168),
-            "ffn.w2": (M, 3584, 8192),
-        }
-        return name_to_shapes_70b.items()
-
-    elif shape_gen_name == "pow2":
-        assert M == K == N == None, (
-            f"M, K, N arguments not supported for shape_gen_name {shape_gen_name}"
-        )
-        name_to_shapes = {}
-        min_power_of_2 = 10  # 1024
-        max_power_of_2 = 14  # 16,384
-        for idx, power_of_2 in enumerate(range(min_power_of_2, max_power_of_2 + 1)):
-            val = 2**power_of_2
-            name_to_shapes[idx] = val, val, val
-        return name_to_shapes.items()
-
-    elif shape_gen_name == "pow2_extended":
-        assert M == K == N == None, (
-            f"M, K, N arguments not supported for shape_gen_name {shape_gen_name}"
-        )
-        name_to_shapes = {}
-        min_power_of_2 = 10  # 1024
-        max_power_of_2 = 14  # 16,384
-        for idx, power_of_2 in enumerate(range(min_power_of_2, max_power_of_2 + 1)):
-            val1 = 2**power_of_2
-            name_to_shapes[idx * 2] = val1, val1, val1
-            val2 = 2**power_of_2 + 2 ** (power_of_2 - 1)
-            name_to_shapes[idx * 2 + 1] = val2, val2, val2
-        return name_to_shapes.items()
-
-    elif shape_gen_name == "sweep":
-        assert M == K == N == None, (
-            f"M, K, N arguments not supported for shape_gen_name {shape_gen_name}"
-        )
-        name_to_shapes = {}
-        min_p2 = 8  # 256
-        max_p2 = 15  # 32,768
-        counter = 0
-        for M_p2 in range(min_p2, max_p2 + 1):
-            M = 2**M_p2
-            for K_p2 in range(min_p2, max_p2 + 1):
-                K = 2**K_p2
-                for N_p2 in range(min_p2, max_p2 + 1):
-                    N = 2**N_p2
-                    name_to_shapes[counter] = M, K, N
-                    counter += 1
-        return name_to_shapes.items()
-
-    elif shape_gen_name == "custom":
-        assert M is not None and K is not None and N is not None, (
-            "M, K, N must be specified for custom shape_gen"
-        )
-        name_to_shapes = {
-            1: (M, K, N),
-        }
-        return name_to_shapes.items()
-
-    elif shape_gen_name == "dsv3-671b":
-        # DeepSeek-V3 671B model shapes
-        assert K == N == None, (
-            f"K, N arguments not supported for shape_gen_name {shape_gen_name}"
-        )
-
-        M = (
-            M if M is not None else 81920
-        )  # default to local_bs=10, seq_len=8192 -> 81920
-
-        name_to_shapes = {
-            "attn.wq_a": (M, 7168, 1536),
-            "attn.wq_b": (M, 1536, 24576),
-            "attn.wo": (M, 16384, 7168),
-            "attn.wkv_a": (M, 7168, 576),
-            "attn.wkv_b": (M, 512, 32768),
-            "ffn.w1": (M, 7168, 18432),
-            "ffn.w2": (M, 18432, 7168),
-            "ffn.w3": (M, 7168, 18432),
-            "moe.shared_experts.w1": (M, 7168, 2048),
-            "moe.shared_experts.w2": (M, 2048, 7168),
-            "moe.shared_experts.w3": (M, 7168, 2048),
-        }
-        return name_to_shapes.items()
-
-    elif shape_gen_name == DSV3_16B_671B_SHAPE_GEN_NAME:
-        seq_len = M if M is not None else DSV3_16B_671B_SEQ_LEN
-        dim = K if K is not None else DSV3_16B_671B_DIM
-        inter_dim = N if N is not None else DSV3_16B_671B_INTER_DIM
-
-        name_to_shapes = {
-            "dsv3.ffn.w1": (seq_len, dim, inter_dim),
-            "dsv3.ffn.w2": (seq_len, inter_dim, dim),
-            "dsv3.ffn.w3": (seq_len, dim, inter_dim),
-        }
-        return name_to_shapes.items()
-
-    raise AssertionError(f"unknown shape_gen_name {shape_gen_name}")
+    # Dispatch to the per-generator helper; each returns a {name: (M, K, N)}
+    # dict, so the top-level flow is a single lookup + guard.
+    shape_generator = _SHAPE_GENERATORS.get(shape_gen_name)
+    if shape_generator is None:
+        raise AssertionError(f"unknown shape_gen_name {shape_gen_name}")
+    return shape_generator(shape_gen_name, M, K, N).items()
 
 
 def get_name_to_moe_shapes_iter(

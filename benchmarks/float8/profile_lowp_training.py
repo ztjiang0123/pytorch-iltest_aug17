@@ -279,18 +279,7 @@ def policy_fn(ctx, op, *args, **kwargs):
 context_fn = functools.partial(create_selective_checkpoint_contexts, policy_fn)
 
 
-def main(
-    profile_path_prefix: pathlib.Path,
-    compile: bool = True,
-    float8_recipe_name: Optional[str] = None,
-    mx_recipe_name: Optional[str] = None,
-    model_type: str = "linear",
-    experiment_filter: str = "both",
-    add_inductor_metadata_to_trace: bool = False,
-    enable_activation_checkpointing: bool = False,
-    mode_filter: str = "fwd_bwd",
-    forward_only: bool = False,
-):
+def _validate_main_args(model_type, experiment_filter, mode_filter):
     assert model_type in (
         "linear",
         "ln_linear",
@@ -314,35 +303,29 @@ def main(
     if mode_filter == "cast_only":
         assert experiment_filter == "lowp", "unsupported"
 
+
+def _resolve_config(float8_recipe_name, mx_recipe_name):
     assert not (float8_recipe_name is not None and mx_recipe_name is not None), (
         "either float8_recipe_name or mx_recipe_name can be specified, but not both"
     )
 
-    if float8_recipe_name is None and mx_recipe_name is None:
-        config = Float8LinearConfig()
-    elif float8_recipe_name is not None:
-        config = Float8LinearConfig.from_recipe_name(float8_recipe_name)
-    elif mx_recipe_name is not None:
-        try:
-            config = MXFP8TrainingOpConfig.from_recipe(
-                MXFP8TrainingRecipe(mx_recipe_name)
-            )
-        except ValueError:
-            raise ValueError(
-                f"Unsupported mx_recipe_name: {mx_recipe_name}. "
-                f"Supported values: {[r.value for r in MXFP8TrainingRecipe]}"
-            )
+    if float8_recipe_name is not None:
+        return Float8LinearConfig.from_recipe_name(float8_recipe_name)
 
-    print(f"Compile is set to       | {compile}")
-    print(f"model_type is set to    | {model_type}")
-    print(
-        f"enable_activation_checkpointing is set to {enable_activation_checkpointing}"
-    )
-    print(f"mode_filter is set to {mode_filter}")
-    print(f"config: {config}")
+    if mx_recipe_name is None:
+        return Float8LinearConfig()
 
-    device = "cuda"
-    ref_dtype = torch.bfloat16
+    try:
+        return MXFP8TrainingOpConfig.from_recipe(MXFP8TrainingRecipe(mx_recipe_name))
+    except ValueError:
+        raise ValueError(
+            f"Unsupported mx_recipe_name: {mx_recipe_name}. "
+            f"Supported values: {[r.value for r in MXFP8TrainingRecipe]}"
+        )
+
+
+def _build_ref_model_and_input(model_type, device, ref_dtype):
+    """Return the reference model and its input tensor for the given model_type."""
     if model_type == "ln_linear":
         M, K, N = 4 * 4096, 8192, 7168
         m_ref = LNLinear(K, N)
@@ -377,6 +360,222 @@ def main(
         input_tensor = torch.randn(
             M, K, device=device, dtype=ref_dtype, requires_grad=True
         )
+    return m_ref, input_tensor
+
+
+def _times_to_data(experiment_label, times, profile_iters):
+    """Convert a {kernel_name: time_us} mapping into rows for the summary frame."""
+    total_time_ms = sum(v for v in times.values()) / 1e3 / profile_iters
+    rows = []
+    for k, v in times.items():
+        v_ms = v / 1e3 / profile_iters
+        rows.append(
+            [
+                experiment_label,
+                k,
+                kernel_name_to_category(k),
+                v_ms,
+                v_ms / total_time_ms,
+                None,
+            ]
+        )
+    return rows
+
+
+@dataclass
+class ProfileContext:
+    """Invariant profiling context shared across the ref and lowp experiments."""
+
+    profile_path_prefix: str
+    model_type: str
+    compile: bool
+    profile_iters: int
+    num_leaf_tensors: int
+    add_inductor_metadata_to_trace: bool
+    input_tensor: "torch.Tensor"
+
+
+def _profile_experiment(ctx, experiment_label, tag, forw_backward_fn):
+    """Profile a single (`ref` or `lowp`) experiment and return its summary rows."""
+    print(f"profiling {tag}")
+    trace_suffix = f"_{ctx.model_type}_{tag}_compile_{ctx.compile}.json"
+    logs_suffix = f"_{ctx.model_type}_{tag}_compile_{ctx.compile}.txt"
+    trace_path = ctx.profile_path_prefix + trace_suffix
+    log_path = ctx.profile_path_prefix + logs_suffix
+    trace_modified_path = trace_path.replace(".json", "_modified.json")
+    profile_config = ProfileConfig(
+        trace_path,
+        log_path,
+        trace_modified_path,
+        trace_suffix,
+        iters=ctx.profile_iters,
+        warmup_iters=2,
+        sync=True,
+    )
+    p = profile_function(
+        profile_config,
+        forw_backward_fn,
+        ctx.add_inductor_metadata_to_trace,
+        ctx.input_tensor,
+    )
+    print(f"saved profiling trace to {trace_path}")
+    if ctx.add_inductor_metadata_to_trace:
+        print(f"saved torch logs to {log_path}")
+        print(f"saved modified trace to {trace_modified_path}")
+    times = profiler_output_to_filtered_time_by_kernel_name(
+        p, ctx.profile_iters, ctx.num_leaf_tensors
+    )
+    return _times_to_data(experiment_label, times, ctx.profile_iters)
+
+
+def _populate_triton_bandwidth(data, redirected_output):
+    """Fill in the bandwidth column from the redirected TORCHINDUCTOR_PROFILE output."""
+    for line in redirected_output.split("\n"):
+        maybe_bw, maybe_kernel_name = parse_bw_and_kernel_name(line)
+        if maybe_kernel_name is None:
+            continue
+        # O(N) search, but it's ok since lists are small
+        for datum in data:
+            if datum[1] == maybe_kernel_name:
+                datum[-1] = maybe_bw
+
+
+@dataclass
+class TrainingSetup:
+    """Models, tensors, and cast helpers shared by the ref/lowp experiments."""
+
+    m_ref: "torch.nn.Module"
+    m_lowp: "torch.nn.Module"
+    input_tensor: "torch.Tensor"
+    grad_output: "torch.Tensor"
+    config: object
+    to_mx_func: Callable
+    cast_with_to_blocked: Callable
+    cast_only_dim0_dim1: Callable
+
+
+def _forward(model, x, enable_activation_checkpointing):
+    """Run the forward pass, optionally under activation checkpointing."""
+    if enable_activation_checkpointing:
+        return checkpoint(model, x, use_reentrant=False, context_fn=context_fn)
+    return model(x)
+
+
+def _cast_only_lowp(setup, mode_filter):
+    """Handle the cast-only lowp modes; return True if the mode was handled."""
+    if mode_filter == "cast_only":
+        setup.to_mx_func(
+            setup.input_tensor,
+            setup.config.elem_dtype,
+            setup.config.block_size,
+            gemm_kernel_choice=setup.config.gemm_kernel_choice,
+        )
+        return True
+    if mode_filter == "cast_with_to_blocked":
+        setup.cast_with_to_blocked(setup.input_tensor)
+        return True
+    if mode_filter == "cast_only_dim0_dim1":
+        setup.cast_only_dim0_dim1(setup.input_tensor)
+        return True
+    return False
+
+
+def _build_forw_backward_fns(setup, mode_filter, enable_activation_checkpointing):
+    """Return the ref and lowp forward-backward callables for the profiler."""
+
+    def ref_forw_backward(x):
+        assert mode_filter not in ("cast_only", "cast_with_to_blocked"), "unsupported"
+        out = _forward(setup.m_ref, x, enable_activation_checkpointing)
+        if mode_filter == "fwd_bwd":
+            out.backward(setup.grad_output)
+
+    def lowp_forw_backward_wrapper(x):
+        if _cast_only_lowp(setup, mode_filter):
+            return
+        out = _forward(setup.m_lowp, x, enable_activation_checkpointing)
+        if mode_filter == "fwd_bwd":
+            with record_function("backward"):
+                out.backward(setup.grad_output)
+
+    return ref_forw_backward, lowp_forw_backward_wrapper
+
+
+def _run_experiments(ctx, experiment_filter, ref_forw_backward, lowp_forw_backward):
+    """Run the enabled experiments and return the collected summary rows."""
+    data = []
+    if experiment_filter != "lowp":
+        data.extend(_profile_experiment(ctx, "0_ref", "ref", ref_forw_backward))
+    if experiment_filter != "ref":
+        data.extend(_profile_experiment(ctx, "1_lowp", "lowp", lowp_forw_backward))
+    return data
+
+
+def _summarize(data, experiment_filter):
+    """Build, sort, and print the per-kernel and per-category summary frames."""
+    df = pd.DataFrame(
+        data,
+        columns=[
+            "experiment",
+            "kernel",
+            "category",
+            "time_ms",
+            "pct_gpu_time",
+            "bw_gpbs",
+        ],
+    )
+    df.sort_values(
+        ["experiment", "category", "pct_gpu_time"],
+        ascending=[True, True, False],
+        inplace=True,
+    )
+    print("\nSummary of GPU time by CPU kernel\n\n", df)
+
+    # compare gemm and overhead time
+    df_p = df.pivot_table(
+        columns=["category"],
+        index="experiment",
+        values="time_ms",
+        aggfunc="sum",
+        fill_value=0,
+        margins=True,
+    )
+    # drop last row, which has totals across ref + lowp which does not make sense
+    df_p = df_p[:-1]
+    df_p = df_p.transpose()
+
+    if experiment_filter == "both":
+        df_p["lowp_div_ref"] = df_p["1_lowp"] / df_p["0_ref"]
+        df_p["ref_div_lowp"] = df_p["0_ref"] / df_p["1_lowp"]
+
+    print("\nSummary of time (ms) by kernel category\n\n", df_p)
+
+
+def main(
+    profile_path_prefix: pathlib.Path,
+    compile: bool = True,
+    float8_recipe_name: Optional[str] = None,
+    mx_recipe_name: Optional[str] = None,
+    model_type: str = "linear",
+    experiment_filter: str = "both",
+    add_inductor_metadata_to_trace: bool = False,
+    enable_activation_checkpointing: bool = False,
+    mode_filter: str = "fwd_bwd",
+    forward_only: bool = False,
+):
+    _validate_main_args(model_type, experiment_filter, mode_filter)
+    config = _resolve_config(float8_recipe_name, mx_recipe_name)
+
+    print(f"Compile is set to       | {compile}")
+    print(f"model_type is set to    | {model_type}")
+    print(
+        f"enable_activation_checkpointing is set to {enable_activation_checkpointing}"
+    )
+    print(f"mode_filter is set to {mode_filter}")
+    print(f"config: {config}")
+
+    device = "cuda"
+    ref_dtype = torch.bfloat16
+    m_ref, input_tensor = _build_ref_model_and_input(model_type, device, ref_dtype)
 
     m_ref = m_ref.to(device).to(ref_dtype)
 
@@ -429,42 +628,6 @@ def main(
     print("grad_output.shape", grad_output.shape)
     print()
 
-    def ref_forw_backward(x):
-        assert mode_filter not in ("cast_only", "cast_with_to_blocked"), "unsupported"
-        if enable_activation_checkpointing:
-            out = checkpoint(m_ref, x, use_reentrant=False, context_fn=context_fn)
-        else:
-            out = m_ref(x)
-        if mode_filter == "fwd_bwd":
-            out.backward(grad_output)
-
-    def lowp_forw_backward_wrapper(x):
-        if mode_filter == "cast_only":
-            # just cast and return early
-            _input_tensor_mx = to_mx_func(
-                input_tensor,
-                config.elem_dtype,
-                config.block_size,
-                gemm_kernel_choice=config.gemm_kernel_choice,
-            )
-            return
-        elif mode_filter == "cast_with_to_blocked":
-            _input_tensor_mx, scale = cast_with_to_blocked(input_tensor)
-            return
-        elif mode_filter == "cast_only_dim0_dim1":
-            _input_tensor_mx_dim0, _input_tensor_mx_dim1 = cast_only_dim0_dim1(
-                input_tensor,
-            )
-            return
-
-        if enable_activation_checkpointing:
-            out = checkpoint(m_lowp, x, use_reentrant=False, context_fn=context_fn)
-        else:
-            out = m_lowp(x)
-        if mode_filter == "fwd_bwd":
-            with record_function("backward"):
-                out.backward(grad_output)
-
     if compile:
         m_ref = torch.compile(m_ref, fullgraph=True)
         m_lowp = torch.compile(m_lowp, fullgraph=True)
@@ -472,174 +635,60 @@ def main(
         cast_with_to_blocked = torch.compile(cast_with_to_blocked, fullgraph=True)
         cast_only_dim0_dim1 = torch.compile(cast_only_dim0_dim1, fullgraph=True)
 
+    setup = TrainingSetup(
+        m_ref=m_ref,
+        m_lowp=m_lowp,
+        input_tensor=input_tensor,
+        grad_output=grad_output,
+        config=config,
+        to_mx_func=to_mx_func,
+        cast_with_to_blocked=cast_with_to_blocked,
+        cast_only_dim0_dim1=cast_only_dim0_dim1,
+    )
+    ref_forw_backward, lowp_forw_backward_wrapper = _build_forw_backward_fns(
+        setup, mode_filter, enable_activation_checkpointing
+    )
+
     # if the `TORCHINDUCTOR_PROFILE` env var is enabled, parse its output
     # to populate triton kernel bandwidth further down in the script
-    if os.environ.get("TORCHINDUCTOR_PROFILE", "") == "":
-        context = nullcontext()
-        f = None
-    else:
-        f = io.StringIO()
-        context = redirect_stdout(f)
+    profiling_enabled = os.environ.get("TORCHINDUCTOR_PROFILE", "") != ""
+    f = io.StringIO() if profiling_enabled else None
+    context = redirect_stdout(f) if profiling_enabled else nullcontext()
 
     # if we are skipping forward, enable torch.no_grad()
     maybe_no_grad_context = (
         torch.no_grad() if mode_filter != "fwd_bwd" else nullcontext()
     )
 
+    profile_ctx = ProfileContext(
+        profile_path_prefix=profile_path_prefix,
+        model_type=model_type,
+        compile=compile,
+        profile_iters=5,
+        num_leaf_tensors=1 + len(list(m_ref.parameters())),
+        add_inductor_metadata_to_trace=add_inductor_metadata_to_trace,
+        input_tensor=input_tensor,
+    )
+
     try:
         with context, maybe_no_grad_context:
-            profile_iters = 5
-            ref_times, lowp_times = None, None
-            data = []
-
-            num_leaf_tensors = 1 + len(list(m_ref.parameters()))
-
-            if experiment_filter != "lowp":
-                # Profile Reference Model
-                print("profiling ref")
-                ref_trace_suffix = f"_{model_type}_ref_compile_{compile}.json"
-                ref_logs_suffix = f"_{model_type}_ref_compile_{compile}.txt"
-                trace_ref_path = profile_path_prefix + ref_trace_suffix
-                log_ref_path = profile_path_prefix + ref_logs_suffix
-                trace_ref_modified_path = trace_ref_path.replace(
-                    ".json", "_modified.json"
-                )
-                profile_config = ProfileConfig(
-                    trace_ref_path,
-                    log_ref_path,
-                    trace_ref_modified_path,
-                    ref_trace_suffix,
-                    iters=profile_iters,
-                    warmup_iters=2,
-                    sync=True,
-                )
-                p = profile_function(
-                    profile_config,
-                    ref_forw_backward,
-                    add_inductor_metadata_to_trace,
-                    input_tensor,
-                )
-                print(f"saved profiling trace to {trace_ref_path}")
-                if add_inductor_metadata_to_trace:
-                    print(f"saved torch logs to {log_ref_path}")
-                    print(f"saved modified trace to {trace_ref_modified_path}")
-                ref_times = profiler_output_to_filtered_time_by_kernel_name(
-                    p, profile_iters, num_leaf_tensors
-                )
-                total_time_ms = sum(v for v in ref_times.values()) / 1e3 / profile_iters
-                for k, v in ref_times.items():
-                    v_ms = v / 1e3 / profile_iters
-                    data.append(
-                        [
-                            "0_ref",
-                            k,
-                            kernel_name_to_category(k),
-                            v_ms,
-                            v_ms / total_time_ms,
-                            None,
-                        ]
-                    )
-
-            if experiment_filter != "ref":
-                # Profile lowp Model
-                print("profiling lowp")
-                lowp_trace_suffix = f"_{model_type}_lowp_compile_{compile}.json"
-                lowp_log_suffix = f"_{model_type}_lowp_compile_{compile}.txt"
-                trace_lowp_path = profile_path_prefix + lowp_trace_suffix
-                log_lowp_path = profile_path_prefix + lowp_log_suffix
-                trace_lowp_modified_path = trace_lowp_path.replace(
-                    ".json", "_modified.json"
-                )
-                profile_config = ProfileConfig(
-                    trace_lowp_path,
-                    log_lowp_path,
-                    trace_lowp_modified_path,
-                    lowp_trace_suffix,
-                    iters=profile_iters,
-                    warmup_iters=2,
-                    sync=True,
-                )
-                p = profile_function(
-                    profile_config,
-                    lowp_forw_backward_wrapper,
-                    add_inductor_metadata_to_trace,
-                    input_tensor,
-                )
-                print(f"saved profiling trace to {trace_lowp_path}")
-                if add_inductor_metadata_to_trace:
-                    print(f"saved torch logs to {log_lowp_path}")
-                    print(f"saved modified trace to {trace_lowp_modified_path}")
-                lowp_times = profiler_output_to_filtered_time_by_kernel_name(
-                    p, profile_iters, num_leaf_tensors
-                )
-                total_time_ms = (
-                    sum(v for v in lowp_times.values()) / 1e3 / profile_iters
-                )
-                for k, v in lowp_times.items():
-                    v_ms = v / 1e3 / profile_iters
-                    data.append(
-                        [
-                            "1_lowp",
-                            k,
-                            kernel_name_to_category(k),
-                            v / 1e3 / profile_iters,
-                            v_ms / total_time_ms,
-                            None,
-                        ]
-                    )
-
+            data = _run_experiments(
+                profile_ctx,
+                experiment_filter,
+                ref_forw_backward,
+                lowp_forw_backward_wrapper,
+            )
     finally:
         if f is not None:
             # print the redirected stdout back to regular stdout
             print(f.getvalue())
 
     # TODO(future PR): this seems to no longer work, fix it or delete it
-    if os.environ.get("TORCHINDUCTOR_PROFILE", "") != "":
+    if profiling_enabled:
         # populate the triton kernel bandwidth
-        for line in f.getvalue().split("\n"):
-            maybe_bw, maybe_kernel_name = parse_bw_and_kernel_name(line)
-            if maybe_kernel_name is not None:
-                # O(N) search, but it's ok since lists are small
-                for datum in data:
-                    if datum[1] == maybe_kernel_name:
-                        datum[-1] = maybe_bw
+        _populate_triton_bandwidth(data, f.getvalue())
 
-    df = pd.DataFrame(
-        data,
-        columns=[
-            "experiment",
-            "kernel",
-            "category",
-            "time_ms",
-            "pct_gpu_time",
-            "bw_gpbs",
-        ],
-    )
-    df.sort_values(
-        ["experiment", "category", "pct_gpu_time"],
-        ascending=[True, True, False],
-        inplace=True,
-    )
-    print("\nSummary of GPU time by CPU kernel\n\n", df)
-
-    # compare gemm and overhead time
-    df_p = df.pivot_table(
-        columns=["category"],
-        index="experiment",
-        values="time_ms",
-        aggfunc="sum",
-        fill_value=0,
-        margins=True,
-    )
-    # drop last row, which has totals across ref + lowp which does not make sense
-    df_p = df_p[:-1]
-    df_p = df_p.transpose()
-
-    if experiment_filter == "both":
-        df_p["lowp_div_ref"] = df_p["1_lowp"] / df_p["0_ref"]
-        df_p["ref_div_lowp"] = df_p["0_ref"] / df_p["1_lowp"]
-
-    print("\nSummary of time (ms) by kernel category\n\n", df_p)
+    _summarize(data, experiment_filter)
 
 
 def invoke_main() -> None:
