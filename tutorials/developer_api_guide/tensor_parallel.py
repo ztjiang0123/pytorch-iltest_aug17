@@ -3,6 +3,7 @@
 #
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
+import functools
 import os
 from typing import Sequence
 
@@ -183,30 +184,26 @@ def shard(
     return DTensor.from_local(local_tensor, device_mesh, placements)
 
 
-def colwise_shard(m: torch.nn.Module, mesh: DeviceMesh) -> torch.nn.Module:
+def _shard_linear_weight(
+    m: torch.nn.Module, mesh: DeviceMesh, shard_dim: int
+) -> torch.nn.Module:
     """
-    Shard linear layer of the model in column-wise fashion
+    Shard the linear layer weight of the model along ``shard_dim``.
     """
-    # Column-wise is wrt to A^T, so for A it is row-wise.
     orig_weight = m.linear.weight
     # Construct DTensor from local shard
-    dtensor = shard(orig_weight, mesh, [Shard(0)])
+    dtensor = shard(orig_weight, mesh, [Shard(shard_dim)])
     # Replace parameter in module
     m.linear.weight = torch.nn.Parameter(dtensor, requires_grad=False)
     return m
 
 
-def rowwise_shard(m: torch.nn.Module, mesh: DeviceMesh) -> torch.nn.Module:
-    """
-    Shard linear layer of the model in row-wise fashion
-    """
-    # Row-wise is wrt to A^T, so for A it is column-wise.
-    orig_weight = m.linear.weight
-    # Construct DTensor from local shard
-    dtensor = shard(orig_weight, mesh, [Shard(1)])
-    # Replace parameter in module
-    m.linear.weight = torch.nn.Parameter(dtensor, requires_grad=False)
-    return m
+# Column-wise is wrt to A^T, so for A it is row-wise -> shard dim 0.
+# Row-wise is wrt to A^T, so for A it is column-wise -> shard dim 1.
+# Both are the same operation with a different shard dim, so bind partials
+# of ``_shard_linear_weight`` rather than repeating the body.
+colwise_shard = functools.partial(_shard_linear_weight, shard_dim=0)
+rowwise_shard = functools.partial(_shard_linear_weight, shard_dim=1)
 
 
 ########

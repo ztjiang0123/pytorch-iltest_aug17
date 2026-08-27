@@ -423,18 +423,58 @@ if _cutedsl_runtime_available():
                 "Group sizes must be multiples of 128",
             )
 
-    def make_tile_shape(*, tile_m, tile_k, stage_count):
-        """Bundle compile-time tile geometry for the MXFP8 kernels."""
-        return SimpleNamespace(tile_m=tile_m, tile_k=tile_k, stage_count=stage_count)
+    @cute.jit
+    def issue_tma_load(tma_atom_in, tiles, tma_mbar_ptr, warp_idx, load_cfg):
+        """Issue a TMA G2S load from the producer warp (warp 0 only).
 
-    def make_tma_handles(*, atom_in, tensor_in, atom_out, tensor_out):
-        """Bundle the input/output TMA atoms and tensor views for a kernel."""
-        return SimpleNamespace(
-            atom_in=atom_in,
-            tensor_in=tensor_in,
-            atom_out=atom_out,
-            tensor_out=tensor_out,
-        )
+        Shared by the 2D (1x32/32x1) and 3D MXFP8 kernels so the load body
+        lives in one place. ``tiles = (gIN_tile, sIN_tile)`` and
+        ``load_cfg = (group_mode_end, tile_copy_bytes)`` capture the only
+        per-kernel differences: how many leading modes to group (2 for the
+        3D expert-tiled tensor, 1 for the 2D tensors) and the per-tile TMA
+        transaction byte count.
+        """
+        gIN_tile, sIN_tile = tiles
+        group_mode_end, tile_copy_bytes = load_cfg
+        if warp_idx == 0:
+            cta_layout = cute.make_layout((1,))
+            sIN_for_tma_partition = cute.group_modes(sIN_tile, 0, group_mode_end)
+            gIN_for_tma_partition = cute.group_modes(gIN_tile, 0, group_mode_end)
+            tINs, tINg = _cpasync.tma_partition(
+                tma_atom_in,
+                0,
+                cta_layout,
+                sIN_for_tma_partition,
+                gIN_for_tma_partition,
+            )
+            tINg_stage0 = tINg[(None, 0)]
+            tINs_stage0 = tINs[(None, 0)]
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(tma_mbar_ptr, tile_copy_bytes)
+            cute.copy(
+                tma_atom_in,
+                tINg_stage0,
+                tINs_stage0,
+                tma_bar_ptr=tma_mbar_ptr,
+            )
+
+    def make_tile_shape(**fields):
+        """Bundle compile-time tile geometry for the MXFP8 kernels.
+
+        Expected fields: ``tile_m``, ``tile_k``, ``stage_count`` and
+        ``tile_copy_bytes``. Uses the generic ``**fields`` form (like
+        ``make_axis_spec`` / ``make_kernel_io``) so it does not duplicate the
+        explicit-field structure of ``make_tma_handles``.
+        """
+        return SimpleNamespace(**fields)
+
+    def make_tma_handles(**fields):
+        """Bundle the input/output TMA atoms and tensor views for a kernel.
+
+        Expected fields: ``atom_in``, ``tensor_in``, ``atom_out``,
+        ``tensor_out``.
+        """
+        return SimpleNamespace(**fields)
 
     def make_axis_spec(**fields):
         """Bundle the axis-role parameters distinguishing 1x32 from 32x1.
@@ -546,11 +586,14 @@ if _cutedsl_runtime_available():
 
     def _issue_tile_loads(state, tile_step, tile_eff, sIN_tile, tma_mbar_ptr):
         """Issue the current-tile TMA load and prefetch the next tile's load."""
-        kernel, tma, shape, axis = state.kernel, state.tma, state.shape, state.axis
+        tma, shape, axis = state.tma, state.shape, state.axis
         stage_count = shape.stage_count
         tiles_per_cta = axis.tiles_per_cta
         tile_shape = (shape.tile_m, shape.tile_k)
         warp_idx = state.warp_idx
+
+        # 2D input tensors group a single leading mode.
+        load_cfg = (1, shape.tile_copy_bytes)
 
         if cutlass.const_expr(
             tile_step == 0 or not (stage_count > 1 and tiles_per_cta > 1)
@@ -560,8 +603,8 @@ if _cutedsl_runtime_available():
                 tile_shape,
                 _axis_tile_coord(axis, tile_eff, axis.fixed_tile),
             )
-            kernel._issue_tma_load(
-                tma.atom_in, gIN_tile, sIN_tile, tma_mbar_ptr, warp_idx
+            issue_tma_load(
+                tma.atom_in, (gIN_tile, sIN_tile), tma_mbar_ptr, warp_idx, load_cfg
             )
 
         if cutlass.const_expr(stage_count > 1 and tiles_per_cta > 1):
@@ -577,8 +620,12 @@ if _cutedsl_runtime_available():
                     tile_shape,
                     _axis_tile_coord(axis, tile_next, axis.fixed_tile),
                 )
-                kernel._issue_tma_load(
-                    tma.atom_in, gIN_tile_next, sIN_tile_next, mbar_next, warp_idx
+                issue_tma_load(
+                    tma.atom_in,
+                    (gIN_tile_next, sIN_tile_next),
+                    mbar_next,
+                    warp_idx,
+                    load_cfg,
                 )
 
     def _quantize_lane_full(state, tiles, lane, tile_eff):

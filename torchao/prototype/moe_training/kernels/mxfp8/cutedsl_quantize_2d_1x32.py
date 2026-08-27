@@ -269,54 +269,6 @@ def _compile_mxfp8_quantize_2d_cutedsl(
             sOUT_tile_u32[lane_rel, chunk_base // cutlass.Int32(4)] = q_fp8_vals4_u32[0]
 
         @cute.jit
-        def _issue_tma_load(
-            self,
-            tma_atom_in: cute.CopyAtom,
-            gIN_tile: cute.Tensor,
-            sIN_tile: cute.Tensor,
-            tma_mbar_ptr: cutlass.Int64,
-            warp_idx: cutlass.Int32,
-        ):
-            """Issue TMA load from global memory to shared memory (producer warp only).
-
-            Only warp 0 executes the TMA load and updates the barrier.
-
-            Args:
-                tma_atom_in: TMA copy atom for G2S
-                gIN_tile: Input tile in global memory (TILE_M, TILE_K)
-                sIN_tile: Input tile in shared memory (TILE_M, TILE_K)
-                tma_mbar_ptr: TMA barrier pointer
-                warp_idx: Warp index
-
-            Storage locations:
-                Source: gIN_tile (global memory)
-                Destination: sIN_tile (shared memory)
-            """
-            if warp_idx == 0:
-                cta_layout = cute.make_layout((1,))
-                sIN_for_tma_partition = cute.group_modes(sIN_tile, 0, 1)
-                gIN_for_tma_partition = cute.group_modes(gIN_tile, 0, 1)
-                tINs, tINg = cpasync.tma_partition(
-                    tma_atom_in,
-                    0,
-                    cta_layout,
-                    sIN_for_tma_partition,
-                    gIN_for_tma_partition,
-                )
-                tINg_stage0 = tINg[(None, 0)]
-                tINs_stage0 = tINs[(None, 0)]
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        tma_mbar_ptr, TILE_COPY_BYTES
-                    )
-                cute.copy(
-                    tma_atom_in,
-                    tINg_stage0,
-                    tINs_stage0,
-                    tma_bar_ptr=tma_mbar_ptr,
-                )
-
-        @cute.jit
         def _issue_tma_store(
             self,
             tma_atom_out: cute.CopyAtom,
@@ -395,7 +347,10 @@ def _compile_mxfp8_quantize_2d_cutedsl(
             smem_allocator = utils.SmemAllocator()
             storage = smem_allocator.allocate(SharedStorage)
             shape = make_tile_shape(
-                tile_m=TILE_M, tile_k=TILE_K, stage_count=STAGE_COUNT_VALUE
+                tile_m=TILE_M,
+                tile_k=TILE_K,
+                stage_count=STAGE_COUNT_VALUE,
+                tile_copy_bytes=TILE_COPY_BYTES,
             )
 
             def _axis_1x32(bidx, bidy):
