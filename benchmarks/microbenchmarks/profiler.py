@@ -72,6 +72,52 @@ def generate_model_profile(model, input_data, profile_file_path):
     return profile_file_path
 
 
+def _run_inference_no_grad(model, input_data, iterations=1):
+    """Run the model under no_grad for the given number of iterations."""
+    with torch.no_grad():
+        for _ in range(iterations):
+            _ = model(input_data)
+            torch.cuda.synchronize()
+
+
+def _capture_memory_snapshot(model, input_data, profile_file_path):
+    """Run one profiled inference and dump a memory snapshot.
+
+    Returns:
+        bool: True if a valid snapshot was written, False otherwise.
+    """
+    # Reset again to avoid warm-up effects in final stats
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.memory._record_memory_history(enabled=False)
+    torch.cuda.memory._record_memory_history(max_entries=100000)
+
+    # Run actual profiled inference
+    _run_inference_no_grad(model, input_data)
+
+    # Take memory snapshot after inference and save to temporary pickle file
+    torch.cuda.memory._dump_snapshot(profile_file_path)
+
+    if _validate_pickle_file(profile_file_path):
+        print(f"Saved memory profile to {profile_file_path}")
+        return True
+    return False
+
+
+def _capture_memory_snapshot_with_retries(
+    model, input_data, profile_file_path, attempts=5
+):
+    """Attempt to capture a memory snapshot, retrying on transient errors."""
+    for i in range(attempts):
+        try:
+            if _capture_memory_snapshot(model, input_data, profile_file_path):
+                return
+        except ValueError as e:
+            import time
+
+            print(f"Attempt {i + 1}/{attempts}: {e}, retrying...")
+            time.sleep(3.0)
+
+
 def generate_memory_profile(model, input_data, profile_file_path):
     """Function to generate CUDA memory profile.
 
@@ -102,34 +148,9 @@ def generate_memory_profile(model, input_data, profile_file_path):
         torch.cuda.memory._record_memory_history(max_entries=100000)
 
         # Warm-up
-        with torch.no_grad():
-            for _ in range(3):
-                _ = model(input_data)
-                torch.cuda.synchronize()
+        _run_inference_no_grad(model, input_data, iterations=3)
 
-        for i in range(5):
-            try:
-                # Reset again to avoid warm-up effects in final stats
-                torch.cuda.reset_peak_memory_stats()
-                torch.cuda.memory._record_memory_history(enabled=False)
-                torch.cuda.memory._record_memory_history(max_entries=100000)
-
-                # Run actual profiled inference
-                with torch.no_grad():
-                    _ = model(input_data)
-                    torch.cuda.synchronize()
-
-                # Take memory snapshot after inference and save to temporary pickle file
-                torch.cuda.memory._dump_snapshot(profile_file_path)
-
-                if _validate_pickle_file(profile_file_path):
-                    print(f"Saved memory profile to {profile_file_path}")
-                    break
-            except ValueError as e:
-                import time
-
-                print(f"Attempt {i + 1}/5: {e}, retrying...")
-                time.sleep(3.0)
+        _capture_memory_snapshot_with_retries(model, input_data, profile_file_path)
 
         # Record memory stats
         _memory_stats = torch.cuda.memory_stats()
