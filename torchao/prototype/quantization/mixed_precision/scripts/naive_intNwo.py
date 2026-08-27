@@ -81,7 +81,6 @@ def _intN_weight_only_transform(
             quant_max,
             eps,
             zero_point_dtype=zero_point_dtype,
-            _layout=Layout(),  # noqa: F821
         )  # , preserve_zero=preserve_zero,zero_point_domain=zero_point_domain)
 
     # for symmetric quantization
@@ -105,7 +104,6 @@ def _intN_weight_only_transform(
             quant_max,
             eps=eps,
             zero_point_dtype=zero_point_dtype,
-            _layout=Layout(),  # noqa: F821
         )
 
     assert n in [8, 6, 5, 4, 3, 2], "n must be one of [8, 6, 5, 4, 3, 2]"

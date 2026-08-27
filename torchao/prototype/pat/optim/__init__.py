@@ -8,12 +8,24 @@ import sys
 
 from torch.optim import Optimizer
 
-from .group_lasso import ProxGroupLasso, ProxGroupLassoVectorized  # noqa: F401
-from .lasso import ProxLasso  # noqa: F401
-from .min_sparsity import MinSparsityConstraint, NMSparseConstraint  # noqa: F401
-from .nuclear_norm import ProxNuclearNorm  # noqa: F401
-from .proxmap import ProxMap  # noqa: F401
+from .group_lasso import ProxGroupLasso, ProxGroupLassoVectorized
+from .lasso import ProxLasso
+from .min_sparsity import MinSparsityConstraint, NMSparseConstraint
+from .nuclear_norm import ProxNuclearNorm
+from .proxmap import ProxMap
 from .pruneopt import PruneOptimizer
+
+__all__ = [
+    "ProxGroupLasso",
+    "ProxGroupLassoVectorized",
+    "ProxLasso",
+    "MinSparsityConstraint",
+    "NMSparseConstraint",
+    "ProxNuclearNorm",
+    "ProxMap",
+    "PruneOptimizer",
+    "build_prune_optimizer",
+]
 
 
 def build_prune_optimizer(

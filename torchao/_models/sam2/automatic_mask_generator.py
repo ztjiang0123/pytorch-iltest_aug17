@@ -349,13 +349,14 @@ class SAM2AutomaticMaskGenerator(torch.nn.Module, SAM2HFPretrainedMixin):
 
         return data
 
-    def _process_crop_batch(
+    def _flatten_crops(
         self,
         images: List[np.ndarray],
         all_crop_boxes: List[List[int]],
         all_layer_idxs: List[int],
         all_orig_size_compact: List[Tuple[int, ...]],
-    ) -> List[MaskData]:
+    ) -> Tuple[List[np.ndarray], List[List[int]], List[int], List[Tuple[int, ...]]]:
+        """Flatten the per-image list of crops into parallel per-crop lists."""
         all_image = []
         all_crop_box = []
         all_layer_idx = []
@@ -369,105 +370,111 @@ class SAM2AutomaticMaskGenerator(torch.nn.Module, SAM2HFPretrainedMixin):
                 all_crop_box.append(crop_box)
                 all_layer_idx.append(layer_idx)
                 all_orig_size.append(orig_size)
+        return all_image, all_crop_box, all_layer_idx, all_orig_size
 
-        # # TODO: NOTE: Calling process_crop in a loop like this might be an issue, because the predictor is stateful
+    def _set_predictor_features_for_crop(
+        self, cropped_im: np.ndarray, batch_features: dict, i: int
+    ) -> None:
+        """Point the stateful predictor at the ``i``-th crop's cached features."""
+        self.predictor._orig_hw = [get_image_size(cropped_im)]
+        self.predictor._features = {
+            "image_embed": batch_features["image_embed"][i].unsqueeze(0),
+            "high_res_feats": [
+                b[i].unsqueeze(0) for b in batch_features["high_res_feats"]
+            ],
+        }
+        self.predictor._is_image_set = True
 
-        all_cropped_im = [
-            crop_image(image, crop_box)
-            for image, crop_box in zip(all_image, all_crop_box)
-        ]
+    def _process_batches_for_crop(
+        self,
+        cropped_im_size: Tuple[int, ...],
+        crop_box: List[int],
+        layer_idx: int,
+        orig_size: Tuple[int, ...],
+    ) -> List[MaskData]:
+        """Generate mask data for a single crop, batched over its point grid."""
+        # Get points for this crop
+        points_scale = np.array(cropped_im_size)[None, ::-1]
+        points_for_image = self.point_grids[layer_idx] * points_scale
 
-        with torch.autograd.profiler.record_function("set_batch_image"):
-            self.predictor.set_image_batch(all_cropped_im)
+        # Generate masks for this crop in batches
+        points_per_batch = self.points_per_batch
+        if self.points_per_batch is None:
+            points_per_batch = len(points_for_image)
 
-        i = 0
-        batch_features = self.predictor._features
-        all_crop_data = []
-        for cropped_im, crop_box, layer_idx, orig_size in zip(
-            all_cropped_im, all_crop_box, all_layer_idx, all_orig_size
-        ):
-            cropped_im_size = get_image_size(cropped_im)
-            self.predictor._orig_hw = [get_image_size(cropped_im)]
-            self.predictor._features = {
-                "image_embed": batch_features["image_embed"][i].unsqueeze(0),
-                "high_res_feats": [
-                    b[i].unsqueeze(0) for b in batch_features["high_res_feats"]
-                ],
-            }
-            i += 1
-            self.predictor._is_image_set = True
+        orig_h, orig_w = orig_size
+        orig_box = [0, 0, orig_w, orig_h]
+        orig_box_torch = torch.as_tensor(
+            orig_box, dtype=torch.float, device=self.predictor.device
+        )
+        crop_box_torch = torch.as_tensor(
+            crop_box, dtype=torch.float, device=self.predictor.device
+        )
 
-            # TODO: Batch mask_to_rle_pytorch_2 calls
-            # TODO: Specialize for rle-only return (specify which keys you want in data)
+        all_batch_iterator_data = []
+        with torch.autograd.profiler.record_function("all _process_batch"):
+            for (points,) in batch_iterator(points_per_batch, points_for_image):
+                data = self._process_batch_fullgraph(
+                    points,
+                    cropped_im_size,
+                    crop_box,
+                    crop_box_torch,
+                    orig_size,
+                    True,
+                    orig_box_torch,
+                )
+                all_batch_iterator_data.append(data)
+            self.predictor.reset_predictor()
+        return all_batch_iterator_data
 
-            # all_crop_data.append(self._process_crop_points(cropped_im_size, layer_idx, crop_box, orig_size))
+    def _accumulate_batch_rles(
+        self,
+        data: MaskData,
+        crop_box: List[int],
+        orig_size: Tuple[int, ...],
+        result_data: Optional[MaskData],
+    ) -> MaskData:
+        """Uncrop, RLE-compress, and concatenate one batch's masks into result."""
+        orig_h, orig_w = orig_size
+        # Compress to RLE
+        data["masks"] = uncrop_masks(data["masks"], crop_box, orig_h, orig_w)
+        # TODO: Capture all these masks in a single NT for mask_to_rle_pytorch_2
+        # or at a minimum create a mask_to_rle_pytorch_2_list and use loops
+        # to cause a single DtoH sync
+        data["rles"] = _mask_to_rle_pytorch_2_0(data["masks"])
+        del data["masks"]
 
-            crop_layer_idx = layer_idx
+        with torch.autograd.profiler.record_function("data.cat"):
+            if result_data is None:
+                return data
+            result_data.cat(data)
+            return result_data
 
-            # Get points for this crop
-            points_scale = np.array(cropped_im_size)[None, ::-1]
-            points_for_image = self.point_grids[crop_layer_idx] * points_scale
+    def _collect_crop_rles(
+        self,
+        all_batch_iterator_data: List[MaskData],
+        crop_box: List[int],
+        orig_size: Tuple[int, ...],
+    ) -> Optional[MaskData]:
+        """Reduce a crop's per-batch mask data into a single RLE MaskData."""
+        result_data = None
+        with torch.autograd.profiler.record_function("all mask_to_rle_pytorch_2"):
+            for data in all_batch_iterator_data:
+                result_data = self._accumulate_batch_rles(
+                    data, crop_box, orig_size, result_data
+                )
+            self.predictor.reset_predictor()
+        return result_data
 
-            # Generate masks for this crop in batches
-            points_per_batch = self.points_per_batch
-            if self.points_per_batch is None:
-                points_per_batch = len(points_for_image)
-
-            all_batch_iterator_data = []
-            with torch.autograd.profiler.record_function("all _process_batch"):
-                for (points,) in batch_iterator(points_per_batch, points_for_image):
-                    # batch_data = self._process_batch(
-                    #     points, cropped_im_size, crop_box, orig_size, normalize=True
-                    # )
-
-                    im_size = cropped_im_size
-                    normalize = True
-
-                    orig_h, orig_w = orig_size
-
-                    orig_box = [0, 0, orig_w, orig_h]
-                    orig_box_torch = torch.as_tensor(
-                        orig_box, dtype=torch.float, device=self.predictor.device
-                    )
-                    crop_box_torch = torch.as_tensor(
-                        crop_box, dtype=torch.float, device=self.predictor.device
-                    )
-                    data = self._process_batch_fullgraph(
-                        points,
-                        im_size,
-                        crop_box,
-                        crop_box_torch,
-                        orig_size,
-                        normalize,
-                        orig_box_torch,
-                    )
-                    all_batch_iterator_data.append(data)
-                self.predictor.reset_predictor()
-
-            result_data = None
-            with torch.autograd.profiler.record_function("all mask_to_rle_pytorch_2"):
-                for data in all_batch_iterator_data:
-                    # Compress to RLE
-                    data["masks"] = uncrop_masks(
-                        data["masks"], crop_box, orig_h, orig_w
-                    )
-                    # TODO: Capture all these masks in a single NT for mask_to_rle_pytorch_2
-                    # or at a minimum create a mask_to_rle_pytorch_2_list and use loops
-                    # to cause a single DtoH sync
-                    data["rles"] = _mask_to_rle_pytorch_2_0(data["masks"])
-                    del data["masks"]
-
-                    batch_data = data
-                    with torch.autograd.profiler.record_function("data.cat"):
-                        if result_data is None:
-                            result_data = batch_data
-                        else:
-                            result_data.cat(batch_data)
-                            del batch_data
-                self.predictor.reset_predictor()
-
-            all_crop_data.append(self._process_crop_points_dedup(result_data, crop_box))
-
+    def _regroup_crop_data_by_image(
+        self,
+        all_crop_data: List[MaskData],
+        images: List[np.ndarray],
+        all_orig_size: List[Tuple[int, ...]],
+        all_crop_boxes: List[List[int]],
+        all_layer_idxs: List[int],
+    ) -> List[MaskData]:
+        """Concatenate the flattened per-crop data back into per-image data."""
         i = 0
         all_data = []
         for _, _, crop_boxes, layer_idxs in zip(
@@ -482,6 +489,50 @@ class SAM2AutomaticMaskGenerator(torch.nn.Module, SAM2HFPretrainedMixin):
                 i += 1
             all_data.append(data)
         return all_data
+
+    def _process_crop_batch(
+        self,
+        images: List[np.ndarray],
+        all_crop_boxes: List[List[int]],
+        all_layer_idxs: List[int],
+        all_orig_size_compact: List[Tuple[int, ...]],
+    ) -> List[MaskData]:
+        all_image, all_crop_box, all_layer_idx, all_orig_size = self._flatten_crops(
+            images, all_crop_boxes, all_layer_idxs, all_orig_size_compact
+        )
+
+        # # TODO: NOTE: Calling process_crop in a loop like this might be an issue, because the predictor is stateful
+
+        all_cropped_im = [
+            crop_image(image, crop_box)
+            for image, crop_box in zip(all_image, all_crop_box)
+        ]
+
+        with torch.autograd.profiler.record_function("set_batch_image"):
+            self.predictor.set_image_batch(all_cropped_im)
+
+        batch_features = self.predictor._features
+        all_crop_data = []
+        for i, (cropped_im, crop_box, layer_idx, orig_size) in enumerate(
+            zip(all_cropped_im, all_crop_box, all_layer_idx, all_orig_size)
+        ):
+            cropped_im_size = get_image_size(cropped_im)
+            self._set_predictor_features_for_crop(cropped_im, batch_features, i)
+
+            # TODO: Batch mask_to_rle_pytorch_2 calls
+            # TODO: Specialize for rle-only return (specify which keys you want in data)
+
+            all_batch_iterator_data = self._process_batches_for_crop(
+                cropped_im_size, crop_box, layer_idx, orig_size
+            )
+            result_data = self._collect_crop_rles(
+                all_batch_iterator_data, crop_box, orig_size
+            )
+            all_crop_data.append(self._process_crop_points_dedup(result_data, crop_box))
+
+        return self._regroup_crop_data_by_image(
+            all_crop_data, images, all_orig_size, all_crop_boxes, all_layer_idxs
+        )
 
     def _process_batch_fullgraph(
         self,
