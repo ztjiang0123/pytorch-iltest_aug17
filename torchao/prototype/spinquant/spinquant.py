@@ -267,12 +267,16 @@ def fuse_layernorm_into_linear(model, qkv_split=False):
     _fuse_layernorm_into_linear(model.norm, [model.output])
 
 
-def _rotate_mlp_output(layer, R1):
-    mod = layer.feed_forward.w2
+def _rotate_output_module(mod, R1):
+    # Rotate an output projection module's weight (and bias, if present) by R1.
     _rotate_mod_weight_left(mod, R1)
     if mod.bias is not None:
         b = mod.bias.data.to(dtype=torch.float64)
         mod.bias.data = torch.matmul(R1.T, b).to(dtype=mod.weight.dtype)
+
+
+def _rotate_mlp_output(layer, R1):
+    _rotate_output_module(layer.feed_forward.w2, R1)
 
 
 def _rotate_mlp_input(layer, R1):
@@ -281,11 +285,7 @@ def _rotate_mlp_input(layer, R1):
 
 
 def _rotate_attention_output(layer, R1):
-    mod = layer.attention.wo
-    _rotate_mod_weight_left(mod, R1)
-    if mod.bias is not None:
-        b = mod.bias.data.to(dtype=torch.float64)
-        mod.bias.data = torch.matmul(R1.T, b).to(dtype=mod.weight.dtype)
+    _rotate_output_module(layer.attention.wo, R1)
 
 
 def _rotate_attention_inputs(layer, R1, qkv_split=False):

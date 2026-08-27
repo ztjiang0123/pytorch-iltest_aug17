@@ -282,20 +282,7 @@ struct cublasCommonArgs {
     mata = prepare_matrix_for_cublas(transpose_result ? mat2 : mat1, transpose_a, transpose_result);
     matb = prepare_matrix_for_cublas(transpose_result ? mat1 : mat2, transpose_b, transpose_result);
 
-    // Handle scale tensors if provided
-    if (scale_a && scale_b) {
-      // By default since we return in row-major we run the gemm
-      // as B.T @ A.T, check transpose_result to determine if we flip the scales
-      scale_mata_ptr = transpose_result ? scale_b->data_ptr() : scale_a->data_ptr();
-      scale_mata_dtype = transpose_result ? scale_b->scalar_type() : scale_a->scalar_type();
-      scale_matb_ptr = transpose_result ? scale_a->data_ptr() : scale_b->data_ptr();
-      scale_matb_dtype = transpose_result ? scale_a->scalar_type() : scale_b->scalar_type();
-    }
-
-    if (scale_result) {
-      scale_result_ptr = scale_result->data_ptr();
-      scale_result_dtype = scale_result->scalar_type();
-    }
+    init_scales(transpose_result, scale_a, scale_b, scale_result);
 
     // Update transpose flags
     if (transpose_result) {
@@ -317,6 +304,31 @@ struct cublasCommonArgs {
 
     mata_is_swizzled = transpose_result ? swizzle2 : swizzle1;
     matb_is_swizzled = transpose_result ? swizzle1 : swizzle2;
+  }
+
+  // Populate the scale pointers/dtypes from the optional scale tensors. Kept in
+  // a helper so the constructor stays easy to follow.
+  void init_scales(
+      bool transpose_result,
+      const std::optional<Tensor>& scale_a,
+      const std::optional<Tensor>& scale_b,
+      const std::optional<Tensor>& scale_result) {
+    // Handle scale tensors if provided
+    if (scale_a && scale_b) {
+      // By default since we return in row-major we run the gemm
+      // as B.T @ A.T, check transpose_result to determine if we flip the scales
+      const Tensor& scale_mata = transpose_result ? *scale_b : *scale_a;
+      const Tensor& scale_matb = transpose_result ? *scale_a : *scale_b;
+      scale_mata_ptr = scale_mata.data_ptr();
+      scale_mata_dtype = scale_mata.scalar_type();
+      scale_matb_ptr = scale_matb.data_ptr();
+      scale_matb_dtype = scale_matb.scalar_type();
+    }
+
+    if (scale_result) {
+      scale_result_ptr = scale_result->data_ptr();
+      scale_result_dtype = scale_result->scalar_type();
+    }
   }
 
   // Matrix members

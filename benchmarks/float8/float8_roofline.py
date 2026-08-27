@@ -111,6 +111,106 @@ def get_gpu_kernel_time(m, x, grad_output):
     return total_time_s
 
 
+def _load_gemm_cache(cache_filename):
+    # Note: this is definitely not the best way to build a cache,
+    # but it will do for now.
+    if cache_filename is None:
+        return dict()
+
+    assert False, "TODO retest this for new arguments"
+    if os.path.isfile(cache_filename):
+        # cache already exists, use it
+        with open(cache_filename, "r") as f:
+            return json.load(f)
+    # cache does not exist yet, create it
+    return dict()
+
+
+@dataclass(frozen=True)
+class GemmSpec:
+    """Shape, recipe, and device inputs shared by the gemm timing helpers.
+
+    Grouping these related values keeps the helper signatures short instead of
+    threading ``M, K, N, ..., device`` through every call.
+    """
+
+    M: int
+    K: int
+    N: int
+    fast_accum: bool
+    float8_recipe_name: Optional[str]
+    mx_recipe_name: Optional[str]
+    device: torch.device
+
+
+def _make_bf16_gemm_inputs(spec, bf16_memory_formats):
+    device = spec.device
+    x_bf16 = torch.randn(spec.M, spec.K, dtype=torch.bfloat16, device=device)
+    w_bf16 = torch.randn(spec.K, spec.N, dtype=torch.bfloat16, device=device)
+
+    if bf16_memory_formats == "row_major:col_major":
+        w_bf16 = w_bf16.t().contiguous().t()
+    elif bf16_memory_formats == "col_major:row_major":
+        x_bf16 = x_bf16.t().contiguous().t()
+
+    return x_bf16, w_bf16
+
+
+def _make_f8_scales(spec):
+    device = spec.device
+    if spec.float8_recipe_name == "tensorwise":
+        scale_a = torch.tensor([1.0], device=device)
+        scale_b = torch.tensor([1.0], device=device)
+    elif spec.float8_recipe_name in ("rowwise", "rowwise_with_gw_hp"):
+        scale_a = torch.randn(spec.M, 1, device=device)
+        scale_b = torch.randn(1, spec.N, device=device)
+    elif spec.mx_recipe_name in ("mxfp8_cublas", "mxfp8_cublas_rceil"):
+        M_rounded = round_up(spec.M, 128)
+        K_rounded = round_up(spec.K // 32, 4)
+        N_rounded = round_up(spec.N, 128)
+        scale_a = torch.randint(
+            0,
+            255,
+            (M_rounded, K_rounded),
+            device=device,
+        ).to(torch.float8_e8m0fnu)
+        scale_b = torch.randint(
+            0,
+            255,
+            (N_rounded, K_rounded),
+            device=device,
+        ).to(torch.float8_e8m0fnu)
+    else:
+        assert False, f"unsupported {spec.float8_recipe_name=} {spec.mx_recipe_name=}"
+    return scale_a, scale_b
+
+
+def _get_f8_gemm_time_s(spec):
+    device = spec.device
+    e4m3_dtype = torch.float8_e4m3fn
+    if torch.version.hip and torch.cuda.is_available() and is_MI300():
+        e4m3_dtype = torch.float8_e4m3fnuz
+    d1, d2, d3 = e4m3_dtype, e4m3_dtype, torch.bfloat16
+    finfo = torch.finfo(e4m3_dtype)
+    A = torch.empty(spec.M, spec.K, device=device).uniform_(finfo.min, finfo.max).to(d1)
+    B = (
+        torch.empty(spec.K, spec.N, device=device)
+        .uniform_(finfo.min, finfo.max)
+        .to(d2)
+        .t()
+        .contiguous()
+        .t()
+    )
+    scale_a, scale_b = _make_f8_scales(spec)
+
+    def do_matmul(A, B):
+        return torch._scaled_mm(
+            A, B, scale_a, scale_b, out_dtype=d3, use_fast_accum=spec.fast_accum
+        )
+
+    return get_gpu_kernel_gemm_time_s(do_matmul, A, B)
+
+
 def get_gemm_times(
     gemm_role: str,
     M: int,
@@ -129,88 +229,31 @@ def get_gemm_times(
         "col_major:row_major",
     ), "unsupported"
 
-    # Note: this is definitely not the best way to build a cache,
-    # but it will do for now.
-    if cache_filename is not None:
-        assert False, "TODO retest this for new arguments"
-        if os.path.isfile(cache_filename):
-            # cache already exists, use it
-            with open(cache_filename, "r") as f:
-                cache = json.load(f)
-        else:
-            # cache does not exist yet, create it
-            cache = dict()
-    else:
-        cache = dict()
+    cache = _load_gemm_cache(cache_filename)
     key = f"{M},{K},{N},{fast_accum},{bf16_memory_formats}"
     if key in cache:
         return cache[key]
 
     device = torch.device("cuda")
+    spec = GemmSpec(
+        M=M,
+        K=K,
+        N=N,
+        fast_accum=fast_accum,
+        float8_recipe_name=float8_recipe_name,
+        mx_recipe_name=mx_recipe_name,
+        device=device,
+    )
 
     # bf16 time
-    x_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device=device)
-    # w_bf16 = torch.randn(K, N, dtype=torch.bfloat16, device=device).t().contiguous().t()
-    w_bf16 = torch.randn(K, N, dtype=torch.bfloat16, device=device)
-
-    if bf16_memory_formats == "row_major:col_major":
-        w_bf16 = w_bf16.t().contiguous().t()
-    elif bf16_memory_formats == "col_major:row_major":
-        x_bf16 = x_bf16.t().contiguous().t()
-    elif bf16_memory_formats == "col_major:row_major":
-        x_bf16 = x_bf16.t().contiguous().t()
-
+    x_bf16, w_bf16 = _make_bf16_gemm_inputs(spec, bf16_memory_formats)
     bf16_time_s = get_gpu_kernel_gemm_time_s(torch.mm, x_bf16, w_bf16)
 
     # f8 time
     if float8_recipe_name == "rowwise_with_gw_hp" and gemm_role == "grad_weight":
         f8_time_s = bf16_time_s
     else:
-        e4m3_dtype = torch.float8_e4m3fn
-        if torch.version.hip and torch.cuda.is_available() and is_MI300():
-            e4m3_dtype = torch.float8_e4m3fnuz
-        d1, d2, d3 = e4m3_dtype, e4m3_dtype, torch.bfloat16
-        finfo = torch.finfo(e4m3_dtype)
-        A = torch.empty(M, K, device=device).uniform_(finfo.min, finfo.max).to(d1)
-        B = (
-            torch.empty(K, N, device=device)
-            .uniform_(finfo.min, finfo.max)
-            .to(d2)
-            .t()
-            .contiguous()
-            .t()
-        )
-        if float8_recipe_name == "tensorwise":
-            scale_a = torch.tensor([1.0], device=device)
-            scale_b = torch.tensor([1.0], device=device)
-        elif float8_recipe_name in ("rowwise", "rowwise_with_gw_hp"):
-            scale_a = torch.randn(M, 1, device=device)
-            scale_b = torch.randn(1, N, device=device)
-        elif mx_recipe_name in ("mxfp8_cublas", "mxfp8_cublas_rceil"):
-            M_rounded = round_up(M, 128)
-            K_rounded = round_up(K // 32, 4)
-            N_rounded = round_up(N, 128)
-            scale_a = torch.randint(
-                0,
-                255,
-                (M_rounded, K_rounded),
-                device=device,
-            ).to(torch.float8_e8m0fnu)
-            scale_b = torch.randint(
-                0,
-                255,
-                (N_rounded, K_rounded),
-                device=device,
-            ).to(torch.float8_e8m0fnu)
-        else:
-            assert False, f"unsupported {float8_recipe_name=} {mx_recipe_name=}"
-
-        def do_matmul(A, B):
-            return torch._scaled_mm(
-                A, B, scale_a, scale_b, out_dtype=d3, use_fast_accum=fast_accum
-            )
-
-        f8_time_s = get_gpu_kernel_gemm_time_s(do_matmul, A, B)
+        f8_time_s = _get_f8_gemm_time_s(spec)
 
     # save to cache if needed
     if cache_filename is not None:
