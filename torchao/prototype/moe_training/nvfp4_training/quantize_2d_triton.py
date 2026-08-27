@@ -7,7 +7,7 @@ from torchao.utils import torch_version_at_least
 
 if torch_version_at_least("2.10.0") and has_triton():
     import itertools
-    from typing import Tuple
+    from typing import NamedTuple, Tuple
 
     import triton
     import triton.language as tl
@@ -19,6 +19,27 @@ if torch_version_at_least("2.10.0") and has_triton():
         prepare_for_cuda_graph,
     )
     from torchao.utils import is_sm_at_least_100
+
+    # Kernel argument bundles. Triton @triton.jit kernels cannot take dataclasses, but
+    # they do accept (named)tuples, which Triton flattens into their leaf pointers/ints
+    # and exposes as compile-time-indexable fields inside the kernel. Grouping the
+    # tensors and shape this way keeps the persistent quantization kernel's parameter
+    # list small while every tensor/scalar still travels together to the launch.
+    class Quantize2DTensors(NamedTuple):
+        """The input and four output tensors of the 2D NVFP4 weight quantization."""
+
+        a: torch.Tensor  # (M, N) bf16 input
+        global_amax: torch.Tensor  # scalar f32 global amax
+        row_codes: torch.Tensor  # (M, N//2) uint8 rowwise FP4 codes
+        row_scales: torch.Tensor  # (M//128, N//64, 32, 16) f8e4m3 rowwise scales
+        col_codes: torch.Tensor  # (N, M//2) uint8 colwise FP4 codes
+        col_scales: torch.Tensor  # (N//128, M//64, 32, 16) f8e4m3 colwise scales
+
+    class Quantize2DShape(NamedTuple):
+        """The logical (M, N) shape of the input tensor A."""
+
+        M: int
+        N: int
 
     # L2-cache-friendly tile grouping along N for the persistent grid-stride loop.
     # Constant across all launches, so it lives here instead of as a kernel parameter.
@@ -97,55 +118,57 @@ if torch_version_at_least("2.10.0") and has_triton():
 
     @triton.autotune(
         configs=QUANTIZE_2D_CONFIGS,
-        key=["M", "N"],
+        # Tune per distinct (M, N); the shape tuple is hashable so autotune keys on it
+        # exactly as it would on separate M and N arguments.
+        key=["shape"],
     )
     @triton.jit
     def triton_quantize_2d_weight(
-        a_ptr,
-        out_ptr,
-        scales_ptr,
-        a_t_fp4_ptr,
-        a_t_sf_ptr,
-        global_amax_ptr,
-        M,
-        N,
+        tensors: Quantize2DTensors,
+        shape: Quantize2DShape,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         NUM_STAGES: tl.constexpr,
     ):
         """2D (16×16) NVFP4 E2M1 weight quantization — one tile per CTA.
 
+        Args:
+            tensors: the input plus four output tensors (see ``Quantize2DTensors``).
+            shape: the logical ``(M, N)`` shape of the input (see ``Quantize2DShape``).
+
         The persistent grid is launched with one program per SM, so the grid-stride
         step is ``tl.num_programs(0)`` and the L2 grouping factor is the module-level
         ``QUANTIZE_2D_GROUP_SIZE_N`` constant — neither needs to be a kernel parameter.
         """
+        M, N = shape.M, shape.N
+
         # Create TMA descriptors in-kernel from raw pointers, shape, and stride
         a_desc = tl.make_tensor_descriptor(
-            a_ptr,
+            tensors.a,
             shape=[M, N],
             strides=[N, 1],
             block_shape=[BLOCK_M, BLOCK_N],
         )
         out_desc = tl.make_tensor_descriptor(
-            out_ptr,
+            tensors.row_codes,
             shape=[M, N // 2],
             strides=[N // 2, 1],
             block_shape=[BLOCK_M, BLOCK_N // 2],
         )
         sf_desc = tl.make_tensor_descriptor(
-            scales_ptr,
+            tensors.row_scales,
             shape=[M // 128, N // 64, 32, 16],
             strides=[(N // 64) * 32 * 16, 32 * 16, 16, 1],
             block_shape=[BLOCK_M // 128, BLOCK_N // 64, 32, 16],
         )
         a_t_fp4_desc = tl.make_tensor_descriptor(
-            a_t_fp4_ptr,
+            tensors.col_codes,
             shape=[N, M // 2],
             strides=[M // 2, 1],
             block_shape=[BLOCK_N, BLOCK_M // 2],
         )
         a_t_sf_desc = tl.make_tensor_descriptor(
-            a_t_sf_ptr,
+            tensors.col_scales,
             shape=[N // 128, M // 64, 32, 16],
             strides=[(M // 64) * 32 * 16, 32 * 16, 16, 1],
             block_shape=[BLOCK_N // 128, BLOCK_M // 64, 32, 16],
@@ -161,7 +184,7 @@ if torch_version_at_least("2.10.0") and has_triton():
         num_tiles = num_pid_m * num_pid_n
 
         # Load global amax scalar once
-        global_amax = tl.load(global_amax_ptr)
+        global_amax = tl.load(tensors.global_amax)
 
         for tile_id in tl.range(
             start_pid,
@@ -274,16 +297,19 @@ if torch_version_at_least("2.10.0") and has_triton():
         try:
             # Launch one program per SM; the kernel reads the SM count back via
             # tl.num_programs(0) and uses the module-level QUANTIZE_2D_GROUP_SIZE_N,
-            # so neither is passed as a kernel argument.
+            # so neither is passed as a kernel argument. Tensors and shape are grouped
+            # into namedtuples that Triton flattens back into the individual pointers
+            # and ints at launch.
             triton_quantize_2d_weight[(NUM_SMS,)](
-                A,
-                a_fp4,
-                a_sf,
-                a_t_fp4,
-                a_t_sf,
-                global_amax,
-                M,
-                N,
+                Quantize2DTensors(
+                    a=A,
+                    global_amax=global_amax,
+                    row_codes=a_fp4,
+                    row_scales=a_sf,
+                    col_codes=a_t_fp4,
+                    col_scales=a_t_sf,
+                ),
+                Quantize2DShape(M=M, N=N),
             )
         finally:
             if hasattr(triton, "set_allocator"):
