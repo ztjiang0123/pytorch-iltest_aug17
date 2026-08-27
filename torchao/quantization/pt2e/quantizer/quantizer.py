@@ -34,7 +34,7 @@ __all__ = [
 Q_ANNOTATION_KEY = "quantization_annotation"
 
 
-class QuantizationSpecBase(ABC):  # noqa: B024
+class QuantizationSpecBase(ABC):
     """Base class for different types of quantization specs that allows users to
     specify how to quantize a Tensor (input/output of a Node) in the model
     """
