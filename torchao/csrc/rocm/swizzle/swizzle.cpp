@@ -919,18 +919,36 @@ _scaled_mm_out(const Tensor& mat1, const Tensor& mat2,
   return out;
 }
 
+// Groups the operands, their scales, and the swizzle/output options that
+// travel together through the scaled matmul so the entry point does not need
+// a long, easy-to-misorder parameter list.
+struct SwizzleScaledMMParams {
+  const Tensor& mat_a;
+  const Tensor& mat_b;
+  bool mat1_is_swizzled;
+  bool mat2_is_swizzled;
+  const Tensor& scale_a;
+  const Tensor& scale_b;
+  const std::optional<at::Tensor>& bias;
+  const std::optional<at::Tensor>& scale_result;
+  std::optional<c10::ScalarType> out_dtype;
+};
+
 Tensor
-swizzle_scaled_mm(const Tensor& mat_a, const Tensor& mat_b,
-          bool mat1_is_swizzled,
-          bool mat2_is_swizzled,
-          const Tensor& scale_a,
-          const Tensor& scale_b,
-          const std::optional<at::Tensor>& bias,
-          const std::optional<at::Tensor>& scale_result,
-          std::optional<c10::ScalarType> out_dtype) {
-  const auto out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
-  Tensor out = at::empty({0}, mat_a.options().dtype(out_dtype_));
-  return _scaled_mm_out(mat_a, mat_b, mat1_is_swizzled, mat2_is_swizzled, scale_a, scale_b, bias, scale_result, out_dtype, out);
+swizzle_scaled_mm(const SwizzleScaledMMParams& params) {
+  const auto out_dtype_ = params.out_dtype.value_or(params.mat_a.scalar_type());
+  Tensor out = at::empty({0}, params.mat_a.options().dtype(out_dtype_));
+  return _scaled_mm_out(
+      params.mat_a,
+      params.mat_b,
+      params.mat1_is_swizzled,
+      params.mat2_is_swizzled,
+      params.scale_a,
+      params.scale_b,
+      params.bias,
+      params.scale_result,
+      params.out_dtype,
+      out);
 }
 
 // Registers a sequence of (schema name, implementation) pairs into a
@@ -947,12 +965,37 @@ static void register_swizzle_impls(
   }
 }
 
+// Adapts the flat schema argument list to the grouped `SwizzleScaledMMParams`
+// so the registered kernel matches `torchao::swizzle_scaled_mm` while the
+// implementation keeps a single, cohesive parameter.
+static Tensor swizzle_scaled_mm_kernel(
+    const Tensor& mat_a,
+    const Tensor& mat_b,
+    bool mat1_is_swizzled,
+    bool mat2_is_swizzled,
+    const Tensor& scale_a,
+    const Tensor& scale_b,
+    const std::optional<at::Tensor>& bias,
+    const std::optional<at::Tensor>& scale_result,
+    std::optional<c10::ScalarType> out_dtype) {
+  return swizzle_scaled_mm(SwizzleScaledMMParams{
+      mat_a,
+      mat_b,
+      mat1_is_swizzled,
+      mat2_is_swizzled,
+      scale_a,
+      scale_b,
+      bias,
+      scale_result,
+      out_dtype});
+}
+
 TORCH_LIBRARY_IMPL(torchao, CUDA, m) {
   register_swizzle_impls(
       m,
       "torchao::swizzle_mm",
       &swizzle_mm,
       "torchao::swizzle_scaled_mm",
-      &swizzle_scaled_mm);
+      &swizzle_scaled_mm_kernel);
 }
 #endif // USE_ROCM
