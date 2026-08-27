@@ -514,57 +514,19 @@ def generate_shape_configs(K, N, G):
 
 
 # =============================================================================
-# Main function
+# Benchmark sections
 # =============================================================================
 
 
-def run(
-    K: int = 4096,
-    N: int = 4096,
-    G: int = 8,
-    breakdown_M: int = None,
-    outfile_speedup: str = "roofline_speedup_results.csv",
-    outfile_quant_2d: str = "roofline_quant_2d_results.csv",
-    outfile_quant_3d: str = "roofline_quant_3d_results.csv",
-    plot_file: str = "roofline_unified.png",
-    gpu_name: str = "NVIDIA B200",
-    power_limit_percent: float = 100.0,
-):
-    """
-    Generate unified roofline analysis for MXFP8 grouped GEMM.
-
-    Args:
-        K: Reduction dimension (default: 4096)
-        N: Output dimension per group (default: 4096)
-        G: Number of groups (default: 8)
-        breakdown_M: M value to use for kernel breakdown analysis (default: None, uses largest M from configs)
-        outfile_speedup: CSV file for speedup results
-        outfile_quant_2d: CSV file for 2D quantization results
-        outfile_quant_3d: CSV file for 3D quantization results
-        plot_file: PNG file to save unified plot
-        gpu_name: GPU model (default: B200)
-        power_limit_percent: Power limit as percentage (0-100, default: 100.0)
-    """
-    print(f"GPU: {gpu_name}")
-    print(f"Torch version: {torch.__version__}")
-    print(f"\nFixed dimensions: K={K}, N={N}, G={G}")
-    print(f"Power limit: {power_limit_percent}%")
-
-    model = RooflineModel(gpu_name=gpu_name, power_limit_percent=power_limit_percent)
-
-    print("\nGPU Specs:")
-    print(f"  BF16 TFLOPS: {model.bf16_tflops}")
-    print(f"  MXFP8 TFLOPS: {model.mxfp8_tflops}")
-    print(f"  Memory Bandwidth: {model.memory_bandwidth_gbs} GB/s")
-
-    configs = generate_shape_configs(K, N, G)
-
-    # =============================================================================
-    # 1. Net Speedup Analysis
-    # =============================================================================
+def _print_section_header(title):
     print("\n" + "=" * 80)
-    print("NET SPEEDUP ANALYSIS (BF16 vs MXFP8)")
+    print(title)
     print("=" * 80)
+
+
+def run_net_speedup_analysis(model, configs, outfile_speedup):
+    """Benchmark BF16 vs MXFP8 net speedup for each shape config."""
+    _print_section_header("NET SPEEDUP ANALYSIS (BF16 vs MXFP8)")
 
     speedup_results = []
     for M, K_val, N_val, G_val, desc in configs:
@@ -624,13 +586,12 @@ def run(
     df_speedup = pd.DataFrame(speedup_results)
     df_speedup.to_csv(outfile_speedup, index=False)
     print(f"\nSpeedup results saved to {outfile_speedup}")
+    return df_speedup
 
-    # =============================================================================
-    # 2. 2D Quantization Kernel Analysis
-    # =============================================================================
-    print("\n" + "=" * 80)
-    print("2D QUANTIZATION KERNELS (Forward Pass)")
-    print("=" * 80)
+
+def run_quant_2d_analysis(model, configs, outfile_quant_2d):
+    """Benchmark the 2D (forward-pass) quantization kernels."""
+    _print_section_header("2D QUANTIZATION KERNELS (Forward Pass)")
 
     quant_2d_results = []
     for M, K_val, _, _, desc in configs:
@@ -690,13 +651,14 @@ def run(
     df_quant_2d = pd.DataFrame(quant_2d_results)
     df_quant_2d.to_csv(outfile_quant_2d, index=False)
     print(f"\n2D quantization results saved to {outfile_quant_2d}")
+    return df_quant_2d
 
-    # =============================================================================
-    # 3. 3D Quantization Kernel Analysis
-    # =============================================================================
-    print("\n" + "=" * 80)
-    print("3D QUANTIZATION KERNELS (Direct Transposed-Weight Quantization)")
-    print("=" * 80)
+
+def run_quant_3d_analysis(model, configs, outfile_quant_3d):
+    """Benchmark the 3D transposed-weight quantization kernel."""
+    _print_section_header(
+        "3D QUANTIZATION KERNELS (Direct Transposed-Weight Quantization)"
+    )
 
     quant_3d_results = []
     for M, K_val, N_val, G_val, desc in configs:
@@ -747,13 +709,12 @@ def run(
     df_quant_3d = pd.DataFrame(quant_3d_results)
     df_quant_3d.to_csv(outfile_quant_3d, index=False)
     print(f"\n3D quantization results saved to {outfile_quant_3d}")
+    return df_quant_3d
 
-    # =============================================================================
-    # 4. 2D Rearrange Kernels Analysis (Scale Blocking for Grouped GEMM)
-    # =============================================================================
-    print("\n" + "=" * 80)
-    print("2D SCALE REARRANGE KERNELS (Scale Blocking for Grouped GEMM)")
-    print("=" * 80)
+
+def run_rearrange_2d_analysis(model, configs, G):
+    """Benchmark the 2D scale-rearrange (block format) kernels."""
+    _print_section_header("2D SCALE REARRANGE KERNELS (Scale Blocking for Grouped GEMM)")
 
     block_size = 32
     num_groups = G
@@ -891,14 +852,14 @@ def run(
 
     df_rearrange = pd.DataFrame(rearrange_results)
     print("\n2D rearrange results completed")
+    return df_rearrange
 
-    # =============================================================================
-    # 4b. 3D Rearrange Kernels Analysis (Per-Group Scale Blocking)
-    # =============================================================================
-    print("\n" + "=" * 80)
-    print("3D SCALE REARRANGE KERNELS (Per-Group Scale Blocking)")
-    print("=" * 80)
 
+def run_rearrange_3d_analysis(model, configs):
+    """Benchmark the 3D per-group scale-rearrange kernel."""
+    _print_section_header("3D SCALE REARRANGE KERNELS (Per-Group Scale Blocking)")
+
+    block_size = 32
     rearrange_3d_results = []
     for M, K_val, N_val, G_val, desc in configs:
         K_blocks = K_val // block_size
@@ -963,13 +924,12 @@ def run(
 
     df_rearrange_3d = pd.DataFrame(rearrange_3d_results)
     print("\n3D rearrange results completed")
+    return df_rearrange_3d
 
-    # =============================================================================
-    # 5. Grouped GEMM Kernel Analysis
-    # =============================================================================
-    print("\n" + "=" * 80)
-    print("GROUPED GEMM KERNEL ANALYSIS")
-    print("=" * 80)
+
+def run_grouped_gemm_analysis(model, configs):
+    """Benchmark the 2D/3D grouped GEMM kernel (BF16 vs MXFP8)."""
+    _print_section_header("GROUPED GEMM KERNEL ANALYSIS")
 
     grouped_gemm_results = []
     for M, K_val, N_val, G_val, desc in configs:
@@ -1058,14 +1018,12 @@ def run(
         del x_scales_blocked, w_scales_blocked
         torch.cuda.empty_cache()
 
-    df_grouped_gemm = pd.DataFrame(grouped_gemm_results)
+    return pd.DataFrame(grouped_gemm_results)
 
-    # =============================================================================
-    # 6. 2D/2D Grouped GEMM Kernel Analysis (Backward Weight)
-    # =============================================================================
-    print("\n" + "=" * 80)
-    print("2D/2D GROUPED GEMM KERNEL ANALYSIS (Backward Weight)")
-    print("=" * 80)
+
+def run_grouped_gemm_2d_2d_analysis(model, configs):
+    """Benchmark the 2D/2D (backward-weight) grouped GEMM kernel."""
+    _print_section_header("2D/2D GROUPED GEMM KERNEL ANALYSIS (Backward Weight)")
 
     grouped_gemm_2d_2d_results = []
     for M, K_val, N_val, G_val, desc in configs:
@@ -1189,225 +1147,33 @@ def run(
         del grad_out_t_scales_blocked, x_t_scales_blocked
         torch.cuda.empty_cache()
 
-    df_grouped_gemm_2d_2d = pd.DataFrame(grouped_gemm_2d_2d_results)
+    return pd.DataFrame(grouped_gemm_2d_2d_results)
 
-    # =============================================================================
-    # 7. Generate Unified Plots
-    # =============================================================================
-    print("\n" + "=" * 80)
-    print("GENERATING UNIFIED PLOTS")
-    print("=" * 80)
 
-    fig, axes = plt.subplots(2, 3, figsize=(24, 12))
-
-    # Plot 1: Net Speedup
-    ax1 = axes[0, 0]
-    ax1.plot(
-        df_speedup["M"],
-        df_speedup["roofline_speedup"],
-        marker="o",
-        linewidth=2,
-        linestyle=":",
-        label="Roofline Model",
-    )
-    ax1.plot(
-        df_speedup["M"],
-        df_speedup["actual_speedup"],
-        marker="s",
-        linewidth=2,
-        linestyle="-",
-        label="Actual Implementation",
-        color="purple",
-    )
-    ax1.axhline(
-        y=1.0,
-        color="red",
-        linestyle=":",
-        linewidth=1.5,
-        label="1x Baseline (No Speedup)",
-    )
-    ax1.set_xlabel("Local Batch Size x Sequence Length (M)", fontsize=12)
-    ax1.set_ylabel("Speedup (MXFP8 vs BF16)", fontsize=12)
-    ax1.set_title(f"Net Speedup vs Batch Size (K={K}, N={N}, G={G})", fontsize=13)
-    ax1.set_ylim(0, 2)
-    ax1.set_xscale("log", base=2)
-    ax1.set_xticks(df_speedup["M"])
-    ax1.set_xticklabels([f"{int(m):,}" for m in df_speedup["M"]])
-    ax1.grid(True, alpha=0.3)
-    ax1.legend()
-
-    # Plot 2: 2D Quantization + Rearrange Kernels (Bandwidth %)
-    ax2 = axes[0, 1]
-    # 2D Quantization kernels
-    ax2.plot(
-        df_quant_2d["M"],
-        df_quant_2d["triton_dim0_efficiency_pct"],
-        marker="s",
-        linewidth=2,
-        linestyle="-",
-        label="triton_to_mxfp8_dim0",
-        color="blue",
-    )
-    ax2.plot(
-        df_quant_2d["M"],
-        df_quant_2d["cuda_dim1_efficiency_pct"],
-        marker="d",
-        linewidth=2,
-        linestyle="-",
-        label="to_mxfp8_dim1_cuda",
-        color="orange",
-    )
-    # 2D Rearrange kernels
-    df_m_groups = df_rearrange[df_rearrange["kernel_type"] == "M_groups"]
-    df_k_groups = df_rearrange[df_rearrange["kernel_type"] == "K_groups"]
-    ax2.plot(
-        df_m_groups["M"],
-        df_m_groups["cuda_efficiency_pct"],
-        marker="^",
-        linewidth=2,
-        linestyle="--",
-        label="CUDA M-groups scale blocked format",
-        color="purple",
-    )
-    ax2.plot(
-        df_k_groups["M"],
-        df_k_groups["triton_efficiency_pct"],
-        marker="d",
-        linewidth=2,
-        linestyle="--",
-        label="triton K-groups scale blocked format",
-        color="red",
-    )
-    ax2.set_xlabel("Local Batch Size x Sequence Length (M)", fontsize=12)
-    ax2.set_ylabel("Bandwidth Utilization (% of Peak)", fontsize=12)
-    ax2.set_title(f"2D Quantization + Block Format Kernels (K={K}, N={N})", fontsize=13)
-    ax2.set_xscale("log", base=2)
-    ax2.set_xticks(df_quant_2d["M"])
-    ax2.set_xticklabels([f"{int(m):,}" for m in df_quant_2d["M"]])
-    ax2.set_ylim(0, 100)
-    ax2.legend(fontsize=9)
-    ax2.grid(True, alpha=0.3)
-
-    # Plot 3: Grouped GEMM Kernel Speedup (MXFP8 vs BF16)
-    ax3 = axes[1, 0]
-    # Calculate speedup for 2D/3D grouped GEMM
-    speedup_2d_3d = (
-        df_grouped_gemm["mxfp8_actual_tflops"] / df_grouped_gemm["bf16_actual_tflops"]
-    )
-    # Calculate speedup for 2D/2D grouped GEMM
-    speedup_2d_2d = (
-        df_grouped_gemm_2d_2d["mxfp8_2d_2d_actual_tflops"]
-        / df_grouped_gemm_2d_2d["bf16_2d_2d_actual_tflops"]
-    )
-
-    ax3.plot(
-        df_grouped_gemm["M"],
-        speedup_2d_3d,
-        marker="s",
-        linewidth=2,
-        linestyle="-",
-        label="2D/3D GEMM (fwd/bwd input)",
-        color="purple",
-    )
-    ax3.plot(
-        df_grouped_gemm_2d_2d["M"],
-        speedup_2d_2d,
-        marker="d",
-        linewidth=2,
-        linestyle="--",
-        label="2D/2D GEMM (bwd weight)",
-        color="orange",
-    )
-    ax3.axhline(
-        y=1.0,
-        color="red",
-        linestyle=":",
-        linewidth=1.5,
-        label="1x (No Speedup)",
-    )
-    ax3.set_xlabel("Local Batch Size x Sequence Length (M)", fontsize=12)
-    ax3.set_ylabel("Speedup (MXFP8 vs BF16)", fontsize=12)
-    ax3.set_title(
-        f"Grouped GEMM Kernel Speedup: MXFP8 over BF16 (K={K}, N={N}, G={G})",
-        fontsize=13,
-    )
-    ax3.set_xscale("log", base=2)
-    ax3.set_xticks(df_grouped_gemm["M"])
-    ax3.set_xticklabels([f"{int(m):,}" for m in df_grouped_gemm["M"]])
-    # Calculate y-axis limits to ensure all data points are visible
-    all_speedups = pd.concat([speedup_2d_3d, speedup_2d_2d])
-    max_speedup = all_speedups.max()
-    min_speedup = all_speedups.min()
-    y_margin = (max_speedup - min_speedup) * 0.1  # 10% margin
-    ax3.set_ylim(max(0, min_speedup - y_margin), max_speedup + y_margin)
-    ax3.legend(fontsize=9)
-    ax3.grid(True, alpha=0.3)
-
-    # Plot 4: Empty placeholder (reserved for future use)
-    ax4 = axes[0, 2]
-    ax4.text(
-        0.5,
-        0.5,
-        "Reserved for Future Analysis",
-        horizontalalignment="center",
-        verticalalignment="center",
-        transform=ax4.transAxes,
-        fontsize=14,
-        color="gray",
-    )
-    ax4.set_xticks([])
-    ax4.set_yticks([])
-    ax4.grid(False)
-
-    # Plot 5: 3D Quantization + Rearrange Kernels (Bandwidth %)
-    ax5 = axes[1, 1]
-    m_values = [int(desc.split("M=")[1]) for desc in df_quant_3d["description"]]
-    # 3D Quantization kernel
-    ax5.plot(
-        m_values,
-        df_quant_3d["cuda_3d_efficiency_pct"],
-        marker="s",
-        linewidth=2,
-        linestyle="-",
-        label="mxfp8_quantize_cuda_3d",
-        color="red",
-    )
-    # 3D Rearrange kernel
-    ax5.plot(
-        df_rearrange_3d["M"],
-        df_rearrange_3d["triton_efficiency_pct"],
-        marker="^",
-        linewidth=2,
-        linestyle="--",
-        label="triton per-group 3D scale blocked format",
-        color="purple",
-    )
-    ax5.set_xlabel("Local Batch Size x Sequence Length (M)", fontsize=12)
-    ax5.set_ylabel("Bandwidth Utilization (% of Peak)", fontsize=12)
-    ax5.set_title(
-        f"3D Quantization + Block Format Kernels (E={G}, N={N}, K={K})", fontsize=13
-    )
-    ax5.set_xscale("log", base=2)
-    ax5.set_xticks(m_values)
-    ax5.set_xticklabels([f"{int(m):,}" for m in m_values])
-    ax5.set_ylim(0, 100)
-    ax5.legend(fontsize=9)
-    ax5.grid(True, alpha=0.3)
-
-    # Plot 6: Kernel Breakdown Stacked Bar Chart
-    ax6 = axes[1, 2]
-
-    # Use configurable M value for detailed kernel breakdown
+def _resolve_breakdown_M(configs, breakdown_M):
+    """Choose the M value used for the kernel-breakdown plot."""
     if breakdown_M is None:
-        M_large = configs[-1][0]  # Default: Last config has largest M
-    else:
-        M_large = breakdown_M
-        # Validate that breakdown_M exists in configs
-        if M_large not in [config[0] for config in configs]:
-            print(
-                f"\nWarning: breakdown_M={M_large} not in benchmark configs. Using default M={configs[-1][0]}"
-            )
-            M_large = configs[-1][0]
+        return configs[-1][0]  # Default: Last config has largest M
+
+    if breakdown_M not in [config[0] for config in configs]:
+        print(
+            f"\nWarning: breakdown_M={breakdown_M} not in benchmark configs. Using default M={configs[-1][0]}"
+        )
+        return configs[-1][0]
+    return breakdown_M
+
+
+def _compute_kernel_breakdown(
+    dfs, M_large, K, N, G
+):
+    """Assemble the per-pass kernel time breakdown for the stacked bar chart."""
+    (
+        df_quant_2d,
+        df_quant_3d,
+        df_rearrange,
+        df_grouped_gemm,
+        df_grouped_gemm_2d_2d,
+    ) = dfs
 
     K_val = K
     N_val = N
@@ -1522,27 +1288,245 @@ def run(
     )
     torch.cuda.empty_cache()
 
+    # BF16 GEMM baselines for reference lines
+    # Forward and Backward Input use 2D/3D GEMM
+    bf16_fwd_gemm_ms = df_grouped_gemm.loc[idx_gemm, "bf16_gemm_time_ms"]
+    # Backward Weight uses 2D/2D GEMM
+    bf16_bwd_weight_gemm_ms = df_grouped_gemm_2d_2d.loc[
+        idx_gemm_2d2d, "bf16_2d_2d_gemm_time_ms"
+    ]
+
+    return {
+        "quant_1": [
+            fwd_input_quant_ms,
+            bwd_input_grad_quant_ms,
+            bwd_weight_grad_quant_ms,
+        ],
+        "quant_2": [
+            fwd_weight_quant_ms,
+            bwd_input_weight_quant_ms,
+            bwd_weight_input_quant_ms,
+        ],
+        "rearrange_1": [
+            fwd_input_scale_rearrange_ms,
+            bwd_input_grad_scale_rearrange_ms,
+            bwd_weight_grad_scale_rearrange_ms,
+        ],
+        "rearrange_2": [
+            fwd_weight_scale_rearrange_ms,
+            bwd_input_weight_scale_rearrange_ms,
+            bwd_weight_input_scale_rearrange_ms,
+        ],
+        "gemm": [fwd_gemm_ms, bwd_input_gemm_ms, bwd_weight_gemm_ms],
+        "bf16_fwd_gemm_ms": bf16_fwd_gemm_ms,
+        "bf16_bwd_weight_gemm_ms": bf16_bwd_weight_gemm_ms,
+    }
+
+
+def _plot_net_speedup(ax, df_speedup, K, N, G):
+    ax.plot(
+        df_speedup["M"],
+        df_speedup["roofline_speedup"],
+        marker="o",
+        linewidth=2,
+        linestyle=":",
+        label="Roofline Model",
+    )
+    ax.plot(
+        df_speedup["M"],
+        df_speedup["actual_speedup"],
+        marker="s",
+        linewidth=2,
+        linestyle="-",
+        label="Actual Implementation",
+        color="purple",
+    )
+    ax.axhline(
+        y=1.0,
+        color="red",
+        linestyle=":",
+        linewidth=1.5,
+        label="1x Baseline (No Speedup)",
+    )
+    ax.set_xlabel("Local Batch Size x Sequence Length (M)", fontsize=12)
+    ax.set_ylabel("Speedup (MXFP8 vs BF16)", fontsize=12)
+    ax.set_title(f"Net Speedup vs Batch Size (K={K}, N={N}, G={G})", fontsize=13)
+    ax.set_ylim(0, 2)
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(df_speedup["M"])
+    ax.set_xticklabels([f"{int(m):,}" for m in df_speedup["M"]])
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+
+def _plot_quant_2d_and_rearrange(ax, df_quant_2d, df_rearrange, K, N):
+    # 2D Quantization kernels
+    ax.plot(
+        df_quant_2d["M"],
+        df_quant_2d["triton_dim0_efficiency_pct"],
+        marker="s",
+        linewidth=2,
+        linestyle="-",
+        label="triton_to_mxfp8_dim0",
+        color="blue",
+    )
+    ax.plot(
+        df_quant_2d["M"],
+        df_quant_2d["cuda_dim1_efficiency_pct"],
+        marker="d",
+        linewidth=2,
+        linestyle="-",
+        label="to_mxfp8_dim1_cuda",
+        color="orange",
+    )
+    # 2D Rearrange kernels
+    df_m_groups = df_rearrange[df_rearrange["kernel_type"] == "M_groups"]
+    df_k_groups = df_rearrange[df_rearrange["kernel_type"] == "K_groups"]
+    ax.plot(
+        df_m_groups["M"],
+        df_m_groups["cuda_efficiency_pct"],
+        marker="^",
+        linewidth=2,
+        linestyle="--",
+        label="CUDA M-groups scale blocked format",
+        color="purple",
+    )
+    ax.plot(
+        df_k_groups["M"],
+        df_k_groups["triton_efficiency_pct"],
+        marker="d",
+        linewidth=2,
+        linestyle="--",
+        label="triton K-groups scale blocked format",
+        color="red",
+    )
+    ax.set_xlabel("Local Batch Size x Sequence Length (M)", fontsize=12)
+    ax.set_ylabel("Bandwidth Utilization (% of Peak)", fontsize=12)
+    ax.set_title(f"2D Quantization + Block Format Kernels (K={K}, N={N})", fontsize=13)
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(df_quant_2d["M"])
+    ax.set_xticklabels([f"{int(m):,}" for m in df_quant_2d["M"]])
+    ax.set_ylim(0, 100)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+
+def _plot_grouped_gemm_speedup(ax, df_grouped_gemm, df_grouped_gemm_2d_2d, K, N, G):
+    # Calculate speedup for 2D/3D grouped GEMM
+    speedup_2d_3d = (
+        df_grouped_gemm["mxfp8_actual_tflops"] / df_grouped_gemm["bf16_actual_tflops"]
+    )
+    # Calculate speedup for 2D/2D grouped GEMM
+    speedup_2d_2d = (
+        df_grouped_gemm_2d_2d["mxfp8_2d_2d_actual_tflops"]
+        / df_grouped_gemm_2d_2d["bf16_2d_2d_actual_tflops"]
+    )
+
+    ax.plot(
+        df_grouped_gemm["M"],
+        speedup_2d_3d,
+        marker="s",
+        linewidth=2,
+        linestyle="-",
+        label="2D/3D GEMM (fwd/bwd input)",
+        color="purple",
+    )
+    ax.plot(
+        df_grouped_gemm_2d_2d["M"],
+        speedup_2d_2d,
+        marker="d",
+        linewidth=2,
+        linestyle="--",
+        label="2D/2D GEMM (bwd weight)",
+        color="orange",
+    )
+    ax.axhline(
+        y=1.0,
+        color="red",
+        linestyle=":",
+        linewidth=1.5,
+        label="1x (No Speedup)",
+    )
+    ax.set_xlabel("Local Batch Size x Sequence Length (M)", fontsize=12)
+    ax.set_ylabel("Speedup (MXFP8 vs BF16)", fontsize=12)
+    ax.set_title(
+        f"Grouped GEMM Kernel Speedup: MXFP8 over BF16 (K={K}, N={N}, G={G})",
+        fontsize=13,
+    )
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(df_grouped_gemm["M"])
+    ax.set_xticklabels([f"{int(m):,}" for m in df_grouped_gemm["M"]])
+    # Calculate y-axis limits to ensure all data points are visible
+    all_speedups = pd.concat([speedup_2d_3d, speedup_2d_2d])
+    max_speedup = all_speedups.max()
+    min_speedup = all_speedups.min()
+    y_margin = (max_speedup - min_speedup) * 0.1  # 10% margin
+    ax.set_ylim(max(0, min_speedup - y_margin), max_speedup + y_margin)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+
+def _plot_reserved_placeholder(ax):
+    ax.text(
+        0.5,
+        0.5,
+        "Reserved for Future Analysis",
+        horizontalalignment="center",
+        verticalalignment="center",
+        transform=ax.transAxes,
+        fontsize=14,
+        color="gray",
+    )
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.grid(False)
+
+
+def _plot_quant_3d_and_rearrange(ax, df_quant_3d, df_rearrange_3d, K, N, G):
+    m_values = [int(desc.split("M=")[1]) for desc in df_quant_3d["description"]]
+    # 3D Quantization kernel
+    ax.plot(
+        m_values,
+        df_quant_3d["cuda_3d_efficiency_pct"],
+        marker="s",
+        linewidth=2,
+        linestyle="-",
+        label="mxfp8_quantize_cuda_3d",
+        color="red",
+    )
+    # 3D Rearrange kernel
+    ax.plot(
+        df_rearrange_3d["M"],
+        df_rearrange_3d["triton_efficiency_pct"],
+        marker="^",
+        linewidth=2,
+        linestyle="--",
+        label="triton per-group 3D scale blocked format",
+        color="purple",
+    )
+    ax.set_xlabel("Local Batch Size x Sequence Length (M)", fontsize=12)
+    ax.set_ylabel("Bandwidth Utilization (% of Peak)", fontsize=12)
+    ax.set_title(
+        f"3D Quantization + Block Format Kernels (E={G}, N={N}, K={K})", fontsize=13
+    )
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(m_values)
+    ax.set_xticklabels([f"{int(m):,}" for m in m_values])
+    ax.set_ylim(0, 100)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+
+def _plot_kernel_breakdown(ax, breakdown, M_large):
     # Data for stacked bars
     passes = ["Forward", "Backward\nInput", "Backward\nWeight"]
 
     # Stack components (bottom to top)
-    quant_1 = [fwd_input_quant_ms, bwd_input_grad_quant_ms, bwd_weight_grad_quant_ms]
-    quant_2 = [
-        fwd_weight_quant_ms,
-        bwd_input_weight_quant_ms,
-        bwd_weight_input_quant_ms,
-    ]
-    rearrange_1 = [
-        fwd_input_scale_rearrange_ms,
-        bwd_input_grad_scale_rearrange_ms,
-        bwd_weight_grad_scale_rearrange_ms,
-    ]
-    rearrange_2 = [
-        fwd_weight_scale_rearrange_ms,
-        bwd_input_weight_scale_rearrange_ms,
-        bwd_weight_input_scale_rearrange_ms,
-    ]
-    gemm = [fwd_gemm_ms, bwd_input_gemm_ms, bwd_weight_gemm_ms]
+    quant_1 = breakdown["quant_1"]
+    quant_2 = breakdown["quant_2"]
+    rearrange_1 = breakdown["rearrange_1"]
+    rearrange_2 = breakdown["rearrange_2"]
+    gemm = breakdown["gemm"]
 
     # Calculate cumulative bottoms for stacking
     bottom_quant_2 = quant_1
@@ -1554,8 +1538,8 @@ def run(
     x_pos = range(len(passes))
     bar_width = 0.6
 
-    ax6.bar(x_pos, quant_1, bar_width, label="Input/Grad Quant", color="#1f77b4")
-    ax6.bar(
+    ax.bar(x_pos, quant_1, bar_width, label="Input/Grad Quant", color="#1f77b4")
+    ax.bar(
         x_pos,
         quant_2,
         bar_width,
@@ -1563,7 +1547,7 @@ def run(
         label="Weight Quant",
         color="#ff7f0e",
     )
-    ax6.bar(
+    ax.bar(
         x_pos,
         rearrange_1,
         bar_width,
@@ -1571,7 +1555,7 @@ def run(
         label="Input/Grad Rearrange",
         color="#2ca02c",
     )
-    ax6.bar(
+    ax.bar(
         x_pos,
         rearrange_2,
         bar_width,
@@ -1579,34 +1563,31 @@ def run(
         label="Weight Rearrange",
         color="#d62728",
     )
-    ax6.bar(x_pos, gemm, bar_width, bottom=bottom_gemm, label="GEMM", color="#9467bd")
+    ax.bar(x_pos, gemm, bar_width, bottom=bottom_gemm, label="GEMM", color="#9467bd")
 
     # Formatting
-    ax6.set_ylabel("Time (ms)", fontsize=12)
-    ax6.set_title(f"Kernel Breakdown (M={M_large:,})", fontsize=13)
-    ax6.set_xticks(x_pos)
-    ax6.set_xticklabels(passes, fontsize=10)
-    ax6.grid(True, alpha=0.3, axis="y")
+    ax.set_ylabel("Time (ms)", fontsize=12)
+    ax.set_title(f"Kernel Breakdown (M={M_large:,})", fontsize=13)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(passes, fontsize=10)
+    ax.grid(True, alpha=0.3, axis="y")
 
     # Add total time labels on top of each bar
     totals = [
         sum([quant_1[i], quant_2[i], rearrange_1[i], rearrange_2[i], gemm[i]])
         for i in range(3)
     ]
-    for i, (pos, total) in enumerate(zip(x_pos, totals)):
-        ax6.text(pos, total, f"{total:.1f}", ha="center", va="bottom", fontsize=9)
+    for pos, total in zip(x_pos, totals):
+        ax.text(pos, total, f"{total:.1f}", ha="center", va="bottom", fontsize=9)
 
     # Add BF16 GEMM baseline reference lines
-    # Forward and Backward Input use 2D/3D GEMM
-    bf16_fwd_gemm_ms = df_grouped_gemm.loc[idx_gemm, "bf16_gemm_time_ms"]
-    # Backward Weight uses 2D/2D GEMM
-    bf16_bwd_weight_gemm_ms = df_grouped_gemm_2d_2d.loc[
-        idx_gemm_2d2d, "bf16_2d_2d_gemm_time_ms"
-    ]
+    bf16_fwd_gemm_ms = breakdown["bf16_fwd_gemm_ms"]
+    bf16_bwd_weight_gemm_ms = breakdown["bf16_bwd_weight_gemm_ms"]
 
     # Draw horizontal lines for BF16 baseline at each bar position
     bar_width_visual = 0.4  # Visual width for the line
-    ax6.plot(
+    x_pos = list(x_pos)
+    ax.plot(
         [x_pos[0] - bar_width_visual, x_pos[0] + bar_width_visual],
         [bf16_fwd_gemm_ms, bf16_fwd_gemm_ms],
         color="red",
@@ -1614,14 +1595,14 @@ def run(
         linewidth=2,
         label="BF16 GEMM baseline",
     )
-    ax6.plot(
+    ax.plot(
         [x_pos[1] - bar_width_visual, x_pos[1] + bar_width_visual],
         [bf16_fwd_gemm_ms, bf16_fwd_gemm_ms],
         color="red",
         linestyle="--",
         linewidth=2,
     )
-    ax6.plot(
+    ax.plot(
         [x_pos[2] - bar_width_visual, x_pos[2] + bar_width_visual],
         [bf16_bwd_weight_gemm_ms, bf16_bwd_weight_gemm_ms],
         color="red",
@@ -1630,16 +1611,59 @@ def run(
     )
 
     # Add legend after all plot elements are added
-    ax6.legend(loc="upper right", fontsize=8)
+    ax.legend(loc="upper right", fontsize=8)
+
+
+def generate_unified_plots(dfs, configs, breakdown_M, plot_file, K, N, G):
+    """Render the six-panel unified roofline figure and save it to disk."""
+    _print_section_header("GENERATING UNIFIED PLOTS")
+
+    (
+        df_speedup,
+        df_quant_2d,
+        df_quant_3d,
+        df_rearrange,
+        df_rearrange_3d,
+        df_grouped_gemm,
+        df_grouped_gemm_2d_2d,
+    ) = dfs
+
+    fig, axes = plt.subplots(2, 3, figsize=(24, 12))
+
+    _plot_net_speedup(axes[0, 0], df_speedup, K, N, G)
+    _plot_quant_2d_and_rearrange(axes[0, 1], df_quant_2d, df_rearrange, K, N)
+    _plot_grouped_gemm_speedup(
+        axes[1, 0], df_grouped_gemm, df_grouped_gemm_2d_2d, K, N, G
+    )
+    _plot_reserved_placeholder(axes[0, 2])
+    _plot_quant_3d_and_rearrange(axes[1, 1], df_quant_3d, df_rearrange_3d, K, N, G)
+
+    M_large = _resolve_breakdown_M(configs, breakdown_M)
+    breakdown = _compute_kernel_breakdown(
+        (df_quant_2d, df_quant_3d, df_rearrange, df_grouped_gemm, df_grouped_gemm_2d_2d),
+        M_large,
+        K,
+        N,
+        G,
+    )
+    _plot_kernel_breakdown(axes[1, 2], breakdown, M_large)
 
     plt.tight_layout()
     plt.savefig(plot_file, dpi=150, bbox_inches="tight")
     print(f"\nUnified plot saved to {plot_file}")
 
-    # Print summary statistics
-    print("\n" + "=" * 80)
-    print("SUMMARY STATISTICS")
-    print("=" * 80)
+
+def print_summary_statistics(dfs, K, N, G, model, power_limit_percent):
+    """Print aggregate roofline summary statistics."""
+    (
+        df_speedup,
+        df_quant_2d,
+        df_quant_3d,
+        df_grouped_gemm,
+        df_grouped_gemm_2d_2d,
+    ) = dfs
+
+    _print_section_header("SUMMARY STATISTICS")
     print(
         f"""
 Net Speedup Analysis:
@@ -1669,6 +1693,109 @@ Configuration:
 """
     )
     print("=" * 80)
+
+
+# =============================================================================
+# Main function
+# =============================================================================
+
+
+def run(
+    K: int = 4096,
+    N: int = 4096,
+    G: int = 8,
+    breakdown_M: int = None,
+    outfile_speedup: str = "roofline_speedup_results.csv",
+    outfile_quant_2d: str = "roofline_quant_2d_results.csv",
+    outfile_quant_3d: str = "roofline_quant_3d_results.csv",
+    plot_file: str = "roofline_unified.png",
+    gpu_name: str = "NVIDIA B200",
+    power_limit_percent: float = 100.0,
+):
+    """
+    Generate unified roofline analysis for MXFP8 grouped GEMM.
+
+    Args:
+        K: Reduction dimension (default: 4096)
+        N: Output dimension per group (default: 4096)
+        G: Number of groups (default: 8)
+        breakdown_M: M value to use for kernel breakdown analysis (default: None, uses largest M from configs)
+        outfile_speedup: CSV file for speedup results
+        outfile_quant_2d: CSV file for 2D quantization results
+        outfile_quant_3d: CSV file for 3D quantization results
+        plot_file: PNG file to save unified plot
+        gpu_name: GPU model (default: B200)
+        power_limit_percent: Power limit as percentage (0-100, default: 100.0)
+    """
+    print(f"GPU: {gpu_name}")
+    print(f"Torch version: {torch.__version__}")
+    print(f"\nFixed dimensions: K={K}, N={N}, G={G}")
+    print(f"Power limit: {power_limit_percent}%")
+
+    model = RooflineModel(gpu_name=gpu_name, power_limit_percent=power_limit_percent)
+
+    print("\nGPU Specs:")
+    print(f"  BF16 TFLOPS: {model.bf16_tflops}")
+    print(f"  MXFP8 TFLOPS: {model.mxfp8_tflops}")
+    print(f"  Memory Bandwidth: {model.memory_bandwidth_gbs} GB/s")
+
+    configs = generate_shape_configs(K, N, G)
+
+    # 1. Net speedup: BF16 vs MXFP8
+    df_speedup = run_net_speedup_analysis(model, configs, outfile_speedup)
+
+    # 2. 2D quantization kernels (forward pass)
+    df_quant_2d = run_quant_2d_analysis(model, configs, outfile_quant_2d)
+
+    # 3. 3D quantization kernels (transposed weight)
+    df_quant_3d = run_quant_3d_analysis(model, configs, outfile_quant_3d)
+
+    # 4. 2D scale rearrange kernels
+    df_rearrange = run_rearrange_2d_analysis(model, configs, G)
+
+    # 4b. 3D per-group scale rearrange kernels
+    df_rearrange_3d = run_rearrange_3d_analysis(model, configs)
+
+    # 5. 2D/3D grouped GEMM kernels
+    df_grouped_gemm = run_grouped_gemm_analysis(model, configs)
+
+    # 6. 2D/2D grouped GEMM kernels (backward weight)
+    df_grouped_gemm_2d_2d = run_grouped_gemm_2d_2d_analysis(model, configs)
+
+    # 7. Unified plots
+    generate_unified_plots(
+        (
+            df_speedup,
+            df_quant_2d,
+            df_quant_3d,
+            df_rearrange,
+            df_rearrange_3d,
+            df_grouped_gemm,
+            df_grouped_gemm_2d_2d,
+        ),
+        configs,
+        breakdown_M,
+        plot_file,
+        K,
+        N,
+        G,
+    )
+
+    # 8. Summary statistics
+    print_summary_statistics(
+        (
+            df_speedup,
+            df_quant_2d,
+            df_quant_3d,
+            df_grouped_gemm,
+            df_grouped_gemm_2d_2d,
+        ),
+        K,
+        N,
+        G,
+        model,
+        power_limit_percent,
+    )
 
 
 if __name__ == "__main__":

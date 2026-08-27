@@ -184,6 +184,15 @@ class ProfileConfig:
     memory_profile_path: Optional[str] = None
 
 
+def _run_profiled_iters(config, name_context, func, *args, **kwargs):
+    """Run the profiled iterations, syncing after each call when requested."""
+    for _ in range(config.iters):
+        with name_context:
+            func(*args, **kwargs)
+            if config.sync:
+                torch.cuda.synchronize()
+
+
 def profile_function(
     config: ProfileConfig,
     func: Callable,
@@ -237,11 +246,7 @@ def profile_function(
         with_stack=profile_memory,
         **config.extra_kwargs,
     ) as prof:
-        for _ in range(config.iters):
-            with name_context:
-                func(*args, **kwargs)
-                if config.sync:
-                    torch.cuda.synchronize()
+        _run_profiled_iters(config, name_context, func, *args, **kwargs)
 
     if config.trace_file_path is not None:
         prof.export_chrome_trace(config.trace_file_path)
