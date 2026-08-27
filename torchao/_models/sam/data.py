@@ -12,6 +12,47 @@ from pycocotools.coco import COCO
 from scipy import ndimage
 
 
+def _distance_to_boundary(mask, row_idx, col_idx, direction):
+    """
+    From (row_idx, col_idx), walk in ``direction`` (0/90/180/270 degrees for
+    up/right/down/left) until leaving the mask, and return how far we traveled
+    while still inside the mask.
+    """
+    if direction == 0:
+        # UP
+        cur_row_idx = row_idx
+        while cur_row_idx >= 0 and mask[cur_row_idx, col_idx]:
+            cur_row_idx -= 1
+        cur_row_idx += 1
+        return row_idx - cur_row_idx
+
+    if direction == 90:
+        # RIGHT
+        cur_col_idx = col_idx
+        while cur_col_idx <= mask.shape[1] - 1 and mask[row_idx, cur_col_idx]:
+            cur_col_idx += 1
+        cur_col_idx -= 1
+        return cur_col_idx - col_idx
+
+    if direction == 180:
+        # DOWN
+        cur_row_idx = row_idx
+        while cur_row_idx <= mask.shape[0] - 1 and mask[cur_row_idx, col_idx]:
+            cur_row_idx += 1
+        cur_row_idx -= 1
+        return cur_row_idx - row_idx
+
+    if direction == 270:
+        # LEFT
+        cur_col_idx = col_idx
+        while cur_col_idx >= 0 and mask[row_idx, cur_col_idx]:
+            cur_col_idx -= 1
+        cur_col_idx += 1
+        return col_idx - cur_col_idx
+
+    raise ValueError(f"unsupported direction: {direction}")
+
+
 def _get_center_point(mask, ann_id, cache):
     """
     This is a rudimentary version of https://arxiv.org/pdf/2304.02643.pdf,
@@ -64,59 +105,16 @@ def _get_center_point(mask, ann_id, cache):
     #   with all shapes properly (there could be multiple boundaries).
     for row_idx in range(mask.shape[0]):
         for col_idx in range(mask.shape[1]):
-            cur_point = mask[row_idx, col_idx]
-
             # skip points inside bounding box but outside mask
-            if not cur_point:
+            if not mask[row_idx, col_idx]:
                 continue
 
-            max_distances = []
-            for direction in distances_to_check_deg:
-                # TODO(future) binary search instead of brute forcing it if we
-                # need a speedup, with the cache it doesn't really matter though
-                if direction == 0:
-                    # UP
-                    cur_row_idx = row_idx
-
-                    while cur_row_idx >= 0 and mask[cur_row_idx, col_idx]:
-                        cur_row_idx = cur_row_idx - 1
-                    cur_row_idx += 1
-                    distance = row_idx - cur_row_idx
-                    max_distances.append(distance)
-
-                elif direction == 90:
-                    # RIGHT
-                    cur_col_idx = col_idx
-
-                    while (
-                        cur_col_idx <= mask.shape[1] - 1 and mask[row_idx, cur_col_idx]
-                    ):
-                        cur_col_idx += 1
-                    cur_col_idx -= 1
-                    distance = cur_col_idx - col_idx
-                    max_distances.append(distance)
-
-                elif direction == 180:
-                    # DOWN
-                    cur_row_idx = row_idx
-                    while (
-                        cur_row_idx <= mask.shape[0] - 1 and mask[cur_row_idx, col_idx]
-                    ):
-                        cur_row_idx = cur_row_idx + 1
-                    cur_row_idx -= 1
-                    distance = cur_row_idx - row_idx
-                    max_distances.append(distance)
-
-                elif direction == 270:
-                    # LEFT
-                    cur_col_idx = col_idx
-                    while cur_col_idx >= 0 and mask[row_idx, cur_col_idx]:
-                        cur_col_idx -= 1
-                    cur_col_idx += 1
-                    distance = col_idx - cur_col_idx
-                    max_distances.append(distance)
-
-            min_max_distance = min(max_distances)
+            # TODO(future) binary search instead of brute forcing it if we
+            # need a speedup, with the cache it doesn't really matter though
+            min_max_distance = min(
+                _distance_to_boundary(mask, row_idx, col_idx, direction)
+                for direction in distances_to_check_deg
+            )
             if min_max_distance > global_min_max_distance:
                 global_min_max_distance = min_max_distance
                 global_coords = (col_idx, row_idx)
