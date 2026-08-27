@@ -62,8 +62,9 @@ def _make_sparse_tensor(m, k, n, dtype, args):
     raise ValueError(f"Unknown sparsity: {args.sparsity}")
 
 
-def _make_scaled_mm_funcs(A, A_sparse, x):
+def _make_scaled_mm_funcs(tensors, x):
     """Build dense/sparse eval functions for float8 scaled matmul."""
+    A, A_sparse = tensors
     scale_a = torch.tensor([1.0], device="cuda")
     scale_b = torch.tensor([1.0], device="cuda")
 
@@ -84,8 +85,9 @@ def _make_scaled_mm_funcs(A, A_sparse, x):
     return dense_func, sparse_func
 
 
-def _make_eval_funcs(A, A_sparse, x, m, dtype, args):
+def _make_eval_funcs(tensors, x, m, dtype, args):
     """Build the dense/sparse eval function pair selected by ``args.eval_fn``."""
+    A, A_sparse = tensors
     if args.eval_fn == "linear":
         b = torch.randn(m, dtype=dtype).cuda()
 
@@ -101,7 +103,7 @@ def _make_eval_funcs(A, A_sparse, x, m, dtype, args):
     if args.eval_fn == "mm":
         x = x.t()
         if dtype == torch.float8_e4m3fn:
-            return _make_scaled_mm_funcs(A, A_sparse, x)
+            return _make_scaled_mm_funcs(tensors, x)
 
         def dense_func():
             return torch.mm(A, x)
@@ -120,8 +122,8 @@ def run_gpu_sparse_benchmark(m, k, n, args):
 
         x = torch.randn(n, k).to(dtype).cuda()
 
-        A, A_sparse = _make_sparse_tensor(m, k, n, dtype, args)
-        dense_func, sparse_func = _make_eval_funcs(A, A_sparse, x, m, dtype, args)
+        tensors = _make_sparse_tensor(m, k, n, dtype, args)
+        dense_func, sparse_func = _make_eval_funcs(tensors, x, m, dtype, args)
 
         dense_time = benchmark_model_with_warmup(dense_func, "dense.json.gz")
         sparse_time = benchmark_model_with_warmup(sparse_func, "sparse.json.gz")
