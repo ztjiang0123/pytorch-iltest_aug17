@@ -12,9 +12,6 @@ import torch
 from torchao.utils import ceil_div
 
 from .cute_utils import (
-    F8_MAX,
-    load_vals_chunk_full,
-    load_vals_chunk_tail,
     make_axis_spec,
     make_kernel_io,
     make_quant_opts,
@@ -236,140 +233,30 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
             self,
             q_fp8_vals4: cute.Tensor,
             sOUT_tile: cute.Tensor,
-            m_base: cutlass.Int32,
-            k_rel: cutlass.Int32,
-            sout_stride: cutlass.Int32,
+            lane_rel: cutlass.Int32,
+            chunk_base: cutlass.Int32,
         ):
-            """Store 4 FP8 values from registers to shared memory.
+            """Store 4 quantized FP8 values from registers to shared memory.
 
-            For 32x1 scaling with column-major SMEM, we store 4 values along the M dimension.
+            For 32x1 scaling with column-major SMEM, the 4 values are stored along
+            the M dimension. Called by the shared ``quantize_block_store_full``/
+            ``_tail`` loops in ``cute_utils`` with the canonical
+            ``(lane_rel, chunk_base)`` coordinate pair; for the 32x1 kernel the
+            axes are transposed relative to 1x32, so the lane is the tile column
+            (K) and ``chunk_base`` the starting M index of the chunk.
 
             Args:
-                q_fp8_vals4: 4 FP8 values in register memory
+                q_fp8_vals4: 4 quantized FP8 values in register memory
                 sOUT_tile: Output tile in shared memory (TILE_M, TILE_K) with column-major layout
-                m_base: Starting M index for this chunk within tile
-                k_rel: Column index within tile
-                sout_stride: Stride for storing values
+                lane_rel: Column index within tile (K)
+                chunk_base: Starting M index for this chunk within tile
 
             Storage locations:
                 Input: q_fp8_vals4 (registers)
                 Output: sOUT_tile (shared memory, column-major)
             """
             for i in range(4):
-                sOUT_tile[m_base + i, k_rel] = q_fp8_vals4[i]
-
-        @cute.jit
-        def _quantize_then_store_reg_to_smem(
-            self,
-            vals_chunk: cute.Tensor,
-            inv_scale: cutlass.Float32,
-            sOUT_tile: cute.Tensor,
-            m_base: cutlass.Int32,
-            k_rel: cutlass.Int32,
-            USE_RCEIL: cutlass.Constexpr[bool],
-        ):
-            """Quantize 4 input elements to FP8 and store to shared memory.
-
-            Applies inverse scale, optional clamping (FLOOR mode), and converts to FP8.
-
-            Args:
-                vals_chunk: 4 input elements in register memory
-                inv_scale: Inverse scale in register memory
-                sOUT_tile: Output tile in shared memory (TILE_M, TILE_K)
-                m_base: Starting M index for this chunk within tile
-                k_rel: Column index within tile
-                USE_RCEIL: Whether using RCEIL mode (no clamping) or FLOOR mode (clamp to ±448)
-
-            Storage locations:
-                Inputs: vals_chunk, inv_scale (registers)
-                Output: sOUT_tile (shared memory)
-            """
-            q_vals4_vec = vals_chunk.load() * inv_scale
-            if not cutlass.const_expr(USE_RCEIL):
-                q_vals4_vec = cute.where(q_vals4_vec > F8_MAX, F8_MAX, q_vals4_vec)
-                q_vals4_vec = cute.where(q_vals4_vec < -F8_MAX, -F8_MAX, q_vals4_vec)
-            q_fp8_vec4 = q_vals4_vec.to(cutlass.Float8E4M3FN)
-            q_fp8_vals4 = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
-            q_fp8_vals4.store(q_fp8_vec4)
-            self._store_q_fp8_reg_to_smem(q_fp8_vals4, sOUT_tile, m_base, k_rel, 1)
-
-        @cute.jit
-        def _quantize_block_then_store_reg_to_smem_full(
-            self,
-            vals_block: cute.Tensor,
-            inv_scale: cutlass.Float32,
-            sOUT_tile: cute.Tensor,
-            k_rel: cutlass.Int32,
-            m_base: cutlass.Int32,
-            USE_RCEIL: cutlass.Constexpr[bool],
-        ):
-            """Quantize and store a full 32-element block by processing 8 chunks of 4 elements.
-
-            For 32x1 scaling, process 32 elements along M dimension.
-
-            Args:
-                vals_block: 32 input elements in register memory
-                inv_scale: Inverse scale in register memory
-                sOUT_tile: Output tile in shared memory (TILE_M, TILE_K)
-                k_rel: Column index within tile
-                m_base: Starting M index for this block within tile
-                USE_RCEIL: Whether using RCEIL mode or FLOOR mode
-
-            Storage locations:
-                Inputs: vals_block, inv_scale (registers)
-                Output: sOUT_tile (shared memory)
-            """
-            chunk_vec = 4
-            num_chunks = SCALE_DIM_M_VALUE // chunk_vec
-            for c in range(num_chunks):
-                local_base = c * chunk_vec
-                sout_m_base = m_base + local_base
-                vals_chunk = load_vals_chunk_full(vals_block, local_base)
-                self._quantize_then_store_reg_to_smem(
-                    vals_chunk, inv_scale, sOUT_tile, sout_m_base, k_rel, USE_RCEIL
-                )
-
-        @cute.jit
-        def _quantize_block_then_store_reg_to_smem_tail(
-            self,
-            vals_block: cute.Tensor,
-            inv_scale: cutlass.Float32,
-            sOUT_tile: cute.Tensor,
-            m0: cutlass.Int64,
-            k_rel: cutlass.Int32,
-            m_base: cutlass.Int32,
-            M: cutlass.Int64,
-            USE_RCEIL: cutlass.Constexpr[bool],
-        ):
-            """Quantize and store a 32-element block with bounds checking by processing 8 chunks.
-
-            Out-of-bounds elements are handled in the chunk loading stage.
-
-            Args:
-                vals_block: 32 input elements in register memory
-                inv_scale: Inverse scale in register memory
-                sOUT_tile: Output tile in shared memory (TILE_M, TILE_K)
-                m0: Global M offset for this tile
-                k_rel: Column index within tile
-                m_base: Starting M index for this block within tile
-                M: Total M dimension size for bounds checking
-                USE_RCEIL: Whether using RCEIL mode or FLOOR mode
-
-            Storage locations:
-                Inputs: vals_block, inv_scale (registers)
-                Output: sOUT_tile (shared memory)
-            """
-            chunk_vec = 4
-            num_chunks = SCALE_DIM_M_VALUE // chunk_vec
-            for c in range(num_chunks):
-                local_base = c * chunk_vec
-                sout_m_base = m_base + local_base
-                vals_chunk = load_vals_chunk_tail(
-                    vals_block, m0, sout_m_base, local_base, M
-                )
-                self._quantize_then_store_reg_to_smem(
-                    vals_chunk, inv_scale, sOUT_tile, sout_m_base, k_rel, USE_RCEIL
-                )
+                sOUT_tile[chunk_base + i, lane_rel] = q_fp8_vals4[i]
 
         @cute.jit
         def _issue_tma_load(
