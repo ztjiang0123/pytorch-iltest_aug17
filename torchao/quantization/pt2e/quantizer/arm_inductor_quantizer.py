@@ -33,9 +33,6 @@ from torchao.quantization.pt2e.quantizer.quantizer import (
     QuantizationAnnotation,
     QuantizationSpec,
 )
-from torchao.quantization.pt2e.quantizer.utils import (
-    set_module_name_qconfig as _set_module_name_qconfig,
-)
 
 from .x86_inductor_quantizer import (
     X86InductorQuantizer,
@@ -246,20 +243,7 @@ class ArmInductorQuantizer(X86InductorQuantizer):
             )
         return self
 
-    @_config_checker
-    def set_module_name_qconfig(
-        self, module_name: str, quantization_config: Optional[QuantizationConfig]
-    ):
-        """Set quantization_config for a submodule with name: `module_name`, for example:
-        quantizer.set_module_name_qconfig("blocks.sub"), it will quantize all supported operator/operator
-        patterns in the submodule with this module name with the given `quantization_config`
-
-        The supported operators include `quantizable_ops` only.
-        """
-        _set_module_name_qconfig(
-            self.module_name_qconfig, module_name, quantization_config
-        )
-        return self
+    # set_module_name_qconfig is inherited unchanged from X86InductorQuantizer.
 
     def _set_aten_operator_qconfig(
         self,

@@ -114,17 +114,16 @@ def _sweep_shapes(name, shape_config, default_min, default_max, increasing_only)
     """
     min_p2 = shape_config.get("min_power", default_min)
     max_p2 = shape_config.get("max_power", default_max)
-    shapes = []
-    counter = 0
     powers = [2**p for p in range(min_p2, max_p2 + 1)]
-    for M in powers:
-        for K in powers:
-            for N in powers:
-                if increasing_only and not (M <= K <= N):
-                    continue
-                shapes.append((f"{name}_{counter}", [M, K, N]))
-                counter += 1
-    return shapes
+
+    triples = product(powers, repeat=3)
+    if increasing_only:
+        triples = (t for t in triples if t[0] <= t[1] <= t[2])
+
+    return [
+        (f"{name}_{counter}", [M, K, N])
+        for counter, (M, K, N) in enumerate(triples)
+    ]
 
 
 def get_shapes_for_config(

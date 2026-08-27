@@ -154,21 +154,6 @@ def get_module_name_filter(module_name: str):
     return module_name_filter
 
 
-def set_module_name_qconfig(
-    module_name_qconfig: dict,
-    module_name: str,
-    quantization_config: Optional[QuantizationConfig],
-) -> None:
-    """Record the ``quantization_config`` to use for the submodule named
-    ``module_name`` in the given ``module_name_qconfig`` mapping.
-
-    This is the shared implementation behind the ``set_module_name_qconfig``
-    methods of the inductor quantizers, all of which quantize the supported
-    operator/operator patterns in a submodule with the given config.
-    """
-    module_name_qconfig[module_name] = quantization_config
-
-
 def is_valid_annotation(annotation: QuantizationAnnotation) -> bool:
     if annotation is None:
         return False

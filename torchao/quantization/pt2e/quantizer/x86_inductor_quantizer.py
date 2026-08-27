@@ -44,9 +44,6 @@ from torchao.quantization.pt2e.quantizer import (
     get_output_act_qspec,
     get_weight_qspec,
 )
-from torchao.quantization.pt2e.quantizer.utils import (
-    set_module_name_qconfig as _set_module_name_qconfig,
-)
 
 FilterFn: TypeAlias = Callable[[list[Node]], bool]
 
@@ -552,10 +549,10 @@ class X86InductorQuantizer(Quantizer):
         patterns in the submodule with this module name with the given `quantization_config`
 
         The supported operators include `quantizable_ops` and `propagation_quantizable_ops`.
+
+        Note: this method is inherited unchanged by ``ArmInductorQuantizer``.
         """
-        _set_module_name_qconfig(
-            self.module_name_qconfig, module_name, quantization_config
-        )
+        self.module_name_qconfig[module_name] = quantization_config
         return self
 
     def _set_aten_operator_qconfig(
