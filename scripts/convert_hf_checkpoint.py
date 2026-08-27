@@ -17,6 +17,41 @@ from safetensors.torch import load_file as load_safetensors_file
 from torchao._models.llama.model import ModelArgs
 
 
+def find_model_map_json(checkpoint_dir: Path) -> Path:
+    """
+    Locate the weight-mapping index file in ``checkpoint_dir``.
+
+    Prefers the safetensors index and falls back to the pytorch index.
+    Raises if neither is present.
+    """
+    candidates = [
+        (checkpoint_dir / "model.safetensors.index.json", "safetensors"),
+        (checkpoint_dir / "pytorch_model.bin.index.json", "pytorch"),
+    ]
+    for path, kind in candidates:
+        if path.is_file():
+            print(f"Found {kind} index at {path}")
+            return path
+        print(f"{path} not found")
+    raise Exception("No model map found!")
+
+
+def convert_layer_key(key: str, weight_map: dict) -> Optional[str]:
+    """
+    Translate a HuggingFace layer weight ``key`` into its target name.
+
+    Returns ``None`` when the key maps to nothing (e.g. rotary embeddings).
+    """
+    if "layers" in key:
+        abstract_key = re.sub(r"(\d+)", "{}", key)
+        layer_num = re.search(r"\d+", key).group(0)
+        new_key = weight_map[abstract_key]
+        if new_key is None:
+            return None
+        return new_key.format(layer_num)
+    return weight_map[key]
+
+
 @torch.inference_mode()
 def convert_hf_checkpoint(
     *,
@@ -31,26 +66,7 @@ def convert_hf_checkpoint(
     print(f"Model config {config.__dict__}")
 
     # Load the json file containing weight mapping
-    model_map_json_safetensors = checkpoint_dir / "model.safetensors.index.json"
-    model_map_json_pytorch = checkpoint_dir / "pytorch_model.bin.index.json"
-    model_map_json = None
-
-    try:
-        assert model_map_json_safetensors.is_file()
-        model_map_json = model_map_json_safetensors
-        print(f"Found safetensors index at {model_map_json_safetensors}")
-    except AssertionError:
-        print(f"{model_map_json_safetensors} not found")
-    if model_map_json is None:
-        try:
-            assert model_map_json_pytorch.is_file()
-            model_map_json = model_map_json_pytorch
-            print(f"Found pytorch index at {model_map_json_pytorch}")
-        except AssertionError:
-            print(f"{model_map_json_pytorch} not found")
-
-    if model_map_json is None:
-        raise Exception("No model map found!")
+    model_map_json = find_model_map_json(checkpoint_dir)
 
     with open(model_map_json) as json_map:
         bin_index = json.load(json_map)
@@ -98,40 +114,45 @@ def convert_hf_checkpoint(
 
     final_result = {}
     for key, value in merged_result.items():
-        if "layers" in key:
-            abstract_key = re.sub(r"(\d+)", "{}", key)
-            layer_num = re.search(r"\d+", key).group(0)
-            new_key = weight_map[abstract_key]
-            if new_key is None:
-                continue
-            new_key = new_key.format(layer_num)
-        else:
-            new_key = weight_map[key]
-
+        new_key = convert_layer_key(key, weight_map)
+        if new_key is None:
+            continue
         final_result[new_key] = value
 
     for key in tuple(final_result.keys()):
-        if "wq" in key:
-            q = final_result[key]
-            k = final_result[key.replace("wq", "wk")]
-            v = final_result[key.replace("wq", "wv")]
-            q = permute(q, config.n_head)
-            k = permute(k, config.n_local_heads)
-            final_result[key.replace("wq", "wqkv")] = torch.cat([q, k, v])
-            del final_result[key]
-            del final_result[key.replace("wq", "wk")]
-            del final_result[key.replace("wq", "wv")]
+        if "wq" not in key:
+            continue
+        q = permute(final_result[key], config.n_head)
+        k = permute(final_result[key.replace("wq", "wk")], config.n_local_heads)
+        v = final_result[key.replace("wq", "wv")]
+        final_result[key.replace("wq", "wqkv")] = torch.cat([q, k, v])
+        del final_result[key]
+        del final_result[key.replace("wq", "wk")]
+        del final_result[key.replace("wq", "wv")]
     print(f"Saving checkpoint to {checkpoint_dir / 'model.pth'}")
     torch.save(final_result, checkpoint_dir / "model.pth")
-    if any([x in model_name.lower() for x in ["llama-3-", "llama-3.1-", "llama-3.2-"]]):
-        if "llama-3.1-405b" in model_name.lower():
-            original_dir = checkpoint_dir / "original" / "mp16"
-        else:
-            original_dir = checkpoint_dir / "original"
-        tokenizer_model = original_dir / "tokenizer.model"
-        tokenizer_model_tiktoken = checkpoint_dir / "tokenizer.model"
-        print(f"Copying {tokenizer_model} to {tokenizer_model_tiktoken}")
-        shutil.copy(tokenizer_model, tokenizer_model_tiktoken)
+
+    _maybe_copy_llama3_tokenizer(checkpoint_dir, model_name)
+
+
+def _maybe_copy_llama3_tokenizer(checkpoint_dir: Path, model_name: str) -> None:
+    """
+    Copy the original tokenizer model into ``checkpoint_dir`` for Llama 3 models.
+
+    Does nothing for other model families.
+    """
+    llama3_prefixes = ["llama-3-", "llama-3.1-", "llama-3.2-"]
+    if not any(prefix in model_name.lower() for prefix in llama3_prefixes):
+        return
+
+    if "llama-3.1-405b" in model_name.lower():
+        original_dir = checkpoint_dir / "original" / "mp16"
+    else:
+        original_dir = checkpoint_dir / "original"
+    tokenizer_model = original_dir / "tokenizer.model"
+    tokenizer_model_tiktoken = checkpoint_dir / "tokenizer.model"
+    print(f"Copying {tokenizer_model} to {tokenizer_model_tiktoken}")
+    shutil.copy(tokenizer_model, tokenizer_model_tiktoken)
 
 
 if __name__ == "__main__":
