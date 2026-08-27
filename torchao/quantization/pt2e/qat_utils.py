@@ -346,20 +346,35 @@ def _no_conv_bias_filter(
     return not _has_conv_bias_filter(match, original_graph, pattern_graph)
 
 
+def _is_quant_op(n: Node, op_ns) -> bool:
+    """Return True if ``n`` targets one of the per-tensor/per-channel ops in ``op_ns``.
+
+    ``op_ns`` is either ``quantize_*`` or ``dequantize_*`` overload packet group,
+    passed as a triple of overloads to check against.
+    """
+    return n.target in op_ns
+
+
 def _is_quantize(n: Node) -> bool:
-    return n.target in [
-        torch.ops.quantized_decomposed.quantize_per_tensor.default,
-        torch.ops.quantized_decomposed.quantize_per_tensor.tensor,
-        torch.ops.quantized_decomposed.quantize_per_channel.default,
-    ]
+    return _is_quant_op(
+        n,
+        (
+            torch.ops.quantized_decomposed.quantize_per_tensor.default,
+            torch.ops.quantized_decomposed.quantize_per_tensor.tensor,
+            torch.ops.quantized_decomposed.quantize_per_channel.default,
+        ),
+    )
 
 
 def _is_dequantize(n: Node) -> bool:
-    return n.target in [
-        torch.ops.quantized_decomposed.dequantize_per_tensor.default,
-        torch.ops.quantized_decomposed.dequantize_per_tensor.tensor,
-        torch.ops.quantized_decomposed.dequantize_per_channel.default,
-    ]
+    return _is_quant_op(
+        n,
+        (
+            torch.ops.quantized_decomposed.dequantize_per_tensor.default,
+            torch.ops.quantized_decomposed.dequantize_per_tensor.tensor,
+            torch.ops.quantized_decomposed.dequantize_per_channel.default,
+        ),
+    )
 
 
 def _get_conv_bn_pattern_nodes(r: ReplacedPatterns) -> dict[str, tuple[Node, Node]]:
