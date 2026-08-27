@@ -23,7 +23,7 @@ from torchao.quantization.transform_module import (
 )
 from torchao.utils import TorchAOBaseTensor
 
-from .int8 import quantize_int8_rowwise
+from .int8 import _cast_linear_args_for_autocast, quantize_int8_rowwise
 
 if has_triton():
     from .int8_mm import scaled_int8_mm
@@ -142,9 +142,7 @@ class BitNetTrainingLinearWeight(TorchAOBaseTensor):
 
 @BitNetTrainingLinearWeight.implements_torch_function(F.linear)
 def _(func, types, args, kwargs):
-    if torch.is_autocast_enabled("cuda"):
-        dtype = torch.get_autocast_gpu_dtype()
-        args = tuple(x.to(dtype) if x is not None else x for x in args)
+    args = _cast_linear_args_for_autocast(args)
     return _BitNetTrainingLinear.apply(*args, **kwargs)
 
 

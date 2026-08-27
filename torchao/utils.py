@@ -799,6 +799,23 @@ def _get_to_kwargs(self, *args, **kwargs):
     return kwargs
 
 
+def _format_codebook_repr(tensor, extra_fields: dict) -> str:
+    """Build the ``__repr__`` string shared by the codebook quantized tensors.
+
+    The codebook variants only differ in a few middle fields (``scales`` vs
+    ``code_dtype`` etc.); ``extra_fields`` carries those in order while the common
+    ``codes``/``codebook`` prefix and the ``shape``/``device``/``dtype``/
+    ``requires_grad`` suffix are formatted here so both classes stay in sync.
+    """
+    middle = "".join(f"{name}={value}, " for name, value in extra_fields.items())
+    return (
+        f"{tensor.__class__.__name__}(codes={tensor.codes}, "
+        f"codebook={tensor.codebook}, {middle}"
+        f"shape={tensor.shape}, device={tensor.device}, dtype={tensor.dtype}, "
+        f"requires_grad={tensor.requires_grad})"
+    )
+
+
 class TorchAOBaseTensor(torch.Tensor):
     r"""A util tensor subclass that provides commonly used functions
     new tensor subclass can inherit to get all the utility functions

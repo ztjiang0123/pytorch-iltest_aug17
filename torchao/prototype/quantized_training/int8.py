@@ -21,6 +21,19 @@ c10d_functional = torch.ops.c10d_functional
 _c10d_functional = torch.ops._c10d_functional
 
 
+def _cast_linear_args_for_autocast(args: Tuple[Any, ...]) -> Tuple[Any, ...]:
+    """Cast ``F.linear`` args to the active CUDA autocast dtype when enabled.
+
+    Shared by the quantized-training linear overrides so their autocast handling
+    stays in one place. ``None`` entries (e.g. an absent bias) are passed through
+    unchanged.
+    """
+    if torch.is_autocast_enabled("cuda"):
+        dtype = torch.get_autocast_gpu_dtype()
+        args = tuple(x.to(dtype) if x is not None else x for x in args)
+    return args
+
+
 @torch.no_grad()
 def quantize_int8_rowwise(
     tensor: Tensor, stochastic_rounding: bool = False, eps: float = 1e-12

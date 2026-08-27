@@ -43,6 +43,13 @@ def _is_op(node: Node, *targets) -> bool:
     return False
 
 
+def _positional_or_kwarg(node: Node, index: int, name: str, default=None):
+    """Read an FX node argument that may be passed positionally or by keyword."""
+    if len(node.args) > index:
+        return node.args[index]
+    return node.kwargs.get(name, default)
+
+
 def _get_fake_tensor(node: Node) -> Optional[torch.Tensor]:
     """Get the FakeTensor metadata from a node (pre-grad or post-grad)."""
     for key in ("val", "example_value"):
@@ -539,12 +546,8 @@ def _extract_last_dim_slice(idx) -> Optional[slice]:
     return None
 
 
-def _detect_interleaved_rotation(node: Node) -> Optional[Node]:
-    """Detect the FLUX-style interleaved rotation pattern.
-
-    Pattern: x.reshape(..., -1, 2).unbind(-1) -> stack([-x_imag, x_real], dim=-1).flatten(3)
-    Returns the source tensor x, or None.
-    """
+def _stack_of_two_at_last_dim(node: Node) -> Optional[Tuple[Node, Node]]:
+    """Match ``flatten(stack([a, b], dim=-1))`` and return the two stacked nodes."""
     if not _is_op(node, torch.ops.aten.flatten.using_ints, "flatten"):
         return None
     if len(node.args) < 1:
@@ -553,35 +556,35 @@ def _detect_interleaved_rotation(node: Node) -> Optional[Node]:
     stack_node = node.args[0]
     if not isinstance(stack_node, Node):
         return None
-
     if not _is_op(stack_node, torch.ops.aten.stack.default, torch.stack):
         return None
     if len(stack_node.args) < 1:
         return None
 
-    tensors_list = stack_node.args[0]
-    if len(stack_node.args) >= 2:
-        stack_dim = stack_node.args[1]
-    else:
-        stack_dim = stack_node.kwargs.get("dim", 0)
-    if stack_dim != -1:
+    if _positional_or_kwarg(stack_node, 1, "dim", default=0) != -1:
         return None
 
+    tensors_list = stack_node.args[0]
     if not isinstance(tensors_list, (list, tuple)) or len(tensors_list) != 2:
         return None
 
-    neg_part = tensors_list[0]
-    pos_part = tensors_list[1]
+    neg_part, pos_part = tensors_list
     if not isinstance(neg_part, Node) or not isinstance(pos_part, Node):
         return None
+    return neg_part, pos_part
 
+
+def _shared_unbind_of_imag_real(neg_part: Node, pos_part: Node) -> Optional[Node]:
+    """Match ``stack([-imag, real])`` where imag/real are ``unbind(...)[1]``/``[0]``.
+
+    Returns the shared ``unbind`` node that both halves index into, or None.
+    """
     if not _is_op(neg_part, torch.ops.aten.neg.default, operator.neg, torch.neg):
         return None
 
     x_imag = neg_part.args[0]
     if not isinstance(x_imag, Node):
         return None
-
     if not _is_op(pos_part, operator.getitem) or not _is_op(x_imag, operator.getitem):
         return None
 
@@ -592,17 +595,14 @@ def _detect_interleaved_rotation(node: Node) -> Optional[Node]:
     if pos_part.args[1] != 0 or x_imag.args[1] != 1:
         return None
 
-    unbind_node = real_source
-    if not isinstance(unbind_node, Node):
-        return None
+    return real_source if isinstance(real_source, Node) else None
+
+
+def _reshape_source_of_unbind(unbind_node: Node) -> Optional[Node]:
+    """Match ``reshape/view(x).unbind(-1)`` and return the source tensor ``x``."""
     if not _is_op(unbind_node, torch.ops.aten.unbind.int, "unbind"):
         return None
-
-    if len(unbind_node.args) >= 2:
-        unbind_dim = unbind_node.args[1]
-    else:
-        unbind_dim = unbind_node.kwargs.get("dim", 0)
-    if unbind_dim != -1:
+    if _positional_or_kwarg(unbind_node, 1, "dim", default=0) != -1:
         return None
 
     reshape_node = unbind_node.args[0]
@@ -619,6 +619,23 @@ def _detect_interleaved_rotation(node: Node) -> Optional[Node]:
 
     source_x = reshape_node.args[0]
     return source_x if isinstance(source_x, Node) else None
+
+
+def _detect_interleaved_rotation(node: Node) -> Optional[Node]:
+    """Detect the FLUX-style interleaved rotation pattern.
+
+    Pattern: x.reshape(..., -1, 2).unbind(-1) -> stack([-x_imag, x_real], dim=-1).flatten(3)
+    Returns the source tensor x, or None.
+    """
+    stacked = _stack_of_two_at_last_dim(node)
+    if stacked is None:
+        return None
+
+    unbind_node = _shared_unbind_of_imag_real(*stacked)
+    if unbind_node is None:
+        return None
+
+    return _reshape_source_of_unbind(unbind_node)
 
 
 def _detect_rotation(node: Node) -> Optional[Tuple[Node, bool]]:
