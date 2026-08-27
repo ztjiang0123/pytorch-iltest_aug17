@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
+from dataclasses import dataclass
 
 import torch
 from lm_eval import evaluator
@@ -19,19 +20,31 @@ from ..utils import get_size_of_dir
 from .utils import string_to_calibration_config
 
 
+@dataclass
+class CalibrationConfig:
+    """Calibration inputs that travel together through the workflow.
+
+    Groups the evaluation tasks and per-task example limit so callers pass a
+    single calibration spec instead of parallel ``tasks``/``limit`` arguments.
+    """
+
+    tasks: list[str]
+    limit: int
+
+
 def _apply_calibration(
-    model, config_class, base_config, tasks, limit, tokenizer, filter_fn=None
+    model, config_class, base_config, calibration, tokenizer, filter_fn=None
 ):
     """Apply prepare->calibrate->convert workflow for AWQ/SmoothQuant."""
     # Prepare
     quantize_(model, config_class(base_config, step="prepare"), filter_fn=filter_fn)
-    print(f"Calibrating with tasks={tasks}, limit={limit}")
+    print(f"Calibrating with tasks={calibration.tasks}, limit={calibration.limit}")
 
     # Calibrate
     evaluator.simple_evaluate(
         HFLM(pretrained=model, tokenizer=tokenizer),
-        tasks=tasks,
-        limit=limit,
+        tasks=calibration.tasks,
+        limit=calibration.limit,
         batch_size=1,
     )
     quantize_(model, config_class(base_config, step="convert"), filter_fn=filter_fn)
@@ -44,8 +57,7 @@ def quantize_model_and_save(
     recipe: str,
     base_config_cls: dict,
     output_dir: str,
-    tasks: list[str],
-    limit: int,
+    calibration: CalibrationConfig,
 ):
     """Quantize model with calibration and save."""
     tokenizer = AutoTokenizer.from_pretrained(model)
@@ -56,10 +68,10 @@ def quantize_model_and_save(
     if base_config_cls is None:
         pass
     elif recipe == "awq_int4_weight_only":
-        _apply_calibration(model, AWQConfig, base_config_cls, tasks, limit, tokenizer)
+        _apply_calibration(model, AWQConfig, base_config_cls, calibration, tokenizer)
     elif recipe == "smoothquant_int8":
         _apply_calibration(
-            model, SmoothQuantConfig, base_config_cls, tasks, limit, tokenizer
+            model, SmoothQuantConfig, base_config_cls, calibration, tokenizer
         )
     else:
         raise AssertionError(f"unsupported recipe: {recipe}")
@@ -91,8 +103,10 @@ if __name__ == "__main__":
         args.recipe,
         base_config,
         args.output_dir,
-        args.calibration_tasks,
-        args.calibration_limit,
+        CalibrationConfig(
+            tasks=args.calibration_tasks,
+            limit=args.calibration_limit,
+        ),
     )
     print(f"Saved to {args.output_dir}")
     print(f"Size: {get_size_of_dir(args.output_dir) / 1e9:.2f} GB")

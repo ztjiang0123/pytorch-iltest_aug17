@@ -12,6 +12,7 @@ import torch
 import triton
 
 from benchmarks.prototype.nvfp4_training.bench_common import (
+    BenchmarkHarness,
     build_representative_model_configs,
     print_results,
     run_benchmark_main,
@@ -114,13 +115,15 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult | None:
 
 def main():
     run_benchmark_main(
-        get_configs=get_configs,
-        get_representative_model_configs=get_representative_model_configs,
-        run_experiment=run_experiment,
-        make_experiment=lambda config, result: Experiment(
-            config=config, result=result
-        ),
-        print_results=print_results,
+        BenchmarkHarness(
+            get_configs=get_configs,
+            get_representative_model_configs=get_representative_model_configs,
+            run_experiment=run_experiment,
+            make_experiment=lambda config, result: Experiment(
+                config=config, result=result
+            ),
+            print_results=print_results,
+        )
     )
 
 
