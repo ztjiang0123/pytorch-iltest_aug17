@@ -93,6 +93,52 @@ def _extract_row_metrics(
             metrics[metric_key] = value
 
 
+def _parse_throughput_line(line: str) -> Optional[Dict[str, float]]:
+    """Return the throughput data for a ``Throughput:`` ``line``, or ``None``."""
+    # Format: Throughput: 7.50 requests/s, 30939.86 total tokens/s, 239.84 output tokens/s
+    match = re.match(
+        r"Throughput:\s+([\d.]+)\s+requests/s,\s+([\d.]+)\s+total tokens/s,\s+([\d.]+)\s+output tokens/s",
+        line,
+    )
+    if not match:
+        return None
+    return {
+        "requests_per_sec": float(match.group(1)),
+        "total_tokens_per_sec": float(match.group(2)),
+        "output_tokens_per_sec": float(match.group(3)),
+    }
+
+
+def _classify_throughput(section_lines: List[str], index: int) -> Optional[str]:
+    """Return ``"prefill"``/``"decode"`` for the throughput line at ``index``.
+
+    Determines the phase by looking backwards for the benchmark command:
+    prefill has ``--input_len 4096 --output_len 32`` and decode has
+    ``--input_len 32 --output_len 2048``. Returns ``None`` if no marker is found.
+    """
+    for j in range(max(0, index - 50), index):
+        if "benchmarking vllm prefill performance" in section_lines[j]:
+            return "prefill"
+        if "benchmarking vllm decode performance" in section_lines[j]:
+            return "decode"
+    return None
+
+
+def _assign_throughput(
+    metrics: Dict[str, Optional[Dict[str, float]]],
+    phase: Optional[str],
+    throughput_data: Dict[str, float],
+) -> None:
+    """Store ``throughput_data`` under its ``phase`` (or by order if unknown)."""
+    if phase is not None:
+        metrics[phase] = throughput_data
+    elif metrics["prefill"] is None:
+        # If we can't find the marker, assign based on order.
+        metrics["prefill"] = throughput_data
+    elif metrics["decode"] is None:
+        metrics["decode"] = throughput_data
+
+
 def parse_throughput_metrics(
     section_lines: List[str],
 ) -> Dict[str, Optional[Dict[str, float]]]:
@@ -102,37 +148,15 @@ def parse_throughput_metrics(
         "decode": None,
     }
 
-    # Find throughput lines
     for i, line in enumerate(section_lines):
-        # Format: Throughput: 7.50 requests/s, 30939.86 total tokens/s, 239.84 output tokens/s
-        if line.startswith("Throughput:"):
-            match = re.match(
-                r"Throughput:\s+([\d.]+)\s+requests/s,\s+([\d.]+)\s+total tokens/s,\s+([\d.]+)\s+output tokens/s",
-                line,
-            )
-            if match:
-                throughput_data = {
-                    "requests_per_sec": float(match.group(1)),
-                    "total_tokens_per_sec": float(match.group(2)),
-                    "output_tokens_per_sec": float(match.group(3)),
-                }
+        if not line.startswith("Throughput:"):
+            continue
+        throughput_data = _parse_throughput_line(line)
+        if throughput_data is None:
+            continue
 
-                # Determine if this is prefill or decode by looking backwards for the benchmark command
-                # Prefill has --input_len 4096 --output_len 32
-                # Decode has --input_len 32 --output_len 2048
-                for j in range(max(0, i - 50), i):
-                    if "benchmarking vllm prefill performance" in section_lines[j]:
-                        metrics["prefill"] = throughput_data
-                        break
-                    elif "benchmarking vllm decode performance" in section_lines[j]:
-                        metrics["decode"] = throughput_data
-                        break
-                else:
-                    # If we can't find the marker, assign based on order
-                    if metrics["prefill"] is None:
-                        metrics["prefill"] = throughput_data
-                    elif metrics["decode"] is None:
-                        metrics["decode"] = throughput_data
+        phase = _classify_throughput(section_lines, i)
+        _assign_throughput(metrics, phase, throughput_data)
 
     return metrics
 

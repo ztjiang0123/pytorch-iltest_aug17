@@ -35,7 +35,7 @@ def get_bits(x: torch.Tensor) -> str:
     # Numpy has a nice function to get the string representation of binary.
     # Since we are using ints as views of floats, need to specify the width
     # to avoid numpy from using two's complement for negative numbers.
-    return np.binary_repr(x.cpu().numpy(), width=x.element_size() * bits_per_byte)  # noqa: E501
+    return np.binary_repr(x.cpu().numpy(), width=x.element_size() * bits_per_byte)
 
 
 EBITS_F32, MBITS_F32 = 8, 23

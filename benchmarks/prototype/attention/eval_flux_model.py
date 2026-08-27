@@ -176,6 +176,296 @@ def generate_image(
     return image
 
 
+def _load_prompts(debug_prompt: Optional[str], num_prompts: int) -> list:
+    """Return the list of prompts to benchmark."""
+    if debug_prompt is not None:
+        print(f"Using debug prompt: {debug_prompt}")
+        return [debug_prompt]
+
+    print("Loading DrawBench dataset...")
+    dataset = load_dataset("sayakpaul/drawbench", split="train")
+    all_prompts = [item["Prompts"] for item in dataset]
+    prompts = all_prompts[:num_prompts]
+    print(
+        f"Using {len(prompts)} prompts from DrawBench "
+        f"(total available: {len(all_prompts)})"
+    )
+    return prompts
+
+
+def _load_pipeline_and_lpips(device: str, compile: bool):
+    """Load the FLUX pipeline and the LPIPS loss model.
+
+    Returns ``(pipe, loss_fn, orig_transformer)``.
+    """
+    print(f"\nLoading FLUX.1-schnell from {MODEL_ID}...")
+    pipe = FluxPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,
+    )
+    pipe = pipe.to(device)
+    pipe.set_progress_bar_config(disable=True)
+
+    print("Loading LPIPS model (VGG)...")
+    loss_fn = lpips.LPIPS(net="vgg").to(device)
+
+    orig_transformer = pipe.transformer
+
+    if compile:
+        pipe.vae.decode = torch.compile(pipe.vae.decode)
+
+    return pipe, loss_fn, orig_transformer
+
+
+def _warmup(
+    pipe,
+    backend_name: str,
+    warmup_prompt: str,
+    device: str,
+    num_inference_steps: int,
+    height: int,
+    width: int,
+    flash_impl: Optional[str],
+    sdpa_backend: Optional[SDPBackend],
+    warmup_iters: int,
+) -> None:
+    """Run warmup iterations for a backend."""
+    print(f"Warming up {backend_name} with {warmup_iters} iterations...")
+    for i in range(warmup_iters):
+        _ = generate_image(
+            pipe,
+            warmup_prompt,
+            RANDOM_SEED,
+            device,
+            num_inference_steps,
+            height=height,
+            width=width,
+            flash_impl=flash_impl,
+            sdpa_backend=sdpa_backend,
+        )
+        print(f"  Warmup {i + 1}/{warmup_iters} complete")
+
+
+def _timed_generate(
+    pipe,
+    prompt: str,
+    device: str,
+    num_inference_steps: int,
+    height: int,
+    width: int,
+    flash_impl: Optional[str],
+    sdpa_backend: Optional[SDPBackend],
+):
+    """Generate an image and return ``(image, elapsed_ms)``."""
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    start_event.record()
+    image = generate_image(
+        pipe,
+        prompt,
+        RANDOM_SEED,
+        device,
+        num_inference_steps,
+        height=height,
+        width=width,
+        flash_impl=flash_impl,
+        sdpa_backend=sdpa_backend,
+    )
+    end_event.record()
+    torch.cuda.synchronize()
+    elapsed_ms = start_event.elapsed_time(end_event)
+    return image, elapsed_ms
+
+
+def _run_baseline_phase(
+    pipe,
+    baseline_backend: str,
+    orig_transformer,
+    prompts: list,
+    device: str,
+    num_inference_steps: int,
+    height: int,
+    width: int,
+    warmup_iters: int,
+    compile: bool,
+):
+    """Generate baseline images. Returns ``(baseline_data, avg_baseline_ms)``.
+
+    ``baseline_data`` is a list of ``(prompt, cpu_tensor)`` tuples.
+    """
+    print("\n" + "-" * 80)
+    print(f"Phase 1: Generating images ({baseline_backend})")
+    print("-" * 80)
+
+    flash_impl, sdpa_backend = setup_backend(
+        pipe,
+        baseline_backend,
+        compile,
+        orig_transformer,
+    )
+
+    _warmup(
+        pipe,
+        baseline_backend,
+        prompts[0],
+        device,
+        num_inference_steps,
+        height,
+        width,
+        flash_impl,
+        sdpa_backend,
+        warmup_iters,
+    )
+
+    baseline_data = []
+    baseline_times_ms = []
+
+    for idx, prompt in enumerate(prompts):
+        print(f"[{idx + 1}/{len(prompts)}] {baseline_backend}: {prompt[:50]}...")
+        baseline_img, elapsed_ms = _timed_generate(
+            pipe,
+            prompt,
+            device,
+            num_inference_steps,
+            height,
+            width,
+            flash_impl,
+            sdpa_backend,
+        )
+
+        baseline_tensor = pil_to_lpips_tensor(baseline_img, device)
+        # Store tensors on CPU to free GPU memory for the test phase.
+        baseline_data.append((prompt, baseline_tensor.cpu()))
+        baseline_times_ms.append(elapsed_ms)
+
+    avg_baseline_ms = sum(baseline_times_ms) / len(baseline_times_ms)
+    print(
+        f"\n{baseline_backend} complete. Avg time per image: {avg_baseline_ms:.1f} ms"
+    )
+    return baseline_data, avg_baseline_ms
+
+
+def _run_test_phase(
+    pipe,
+    test_backend: str,
+    orig_transformer,
+    baseline_data: list,
+    loss_fn,
+    device: str,
+    num_inference_steps: int,
+    height: int,
+    width: int,
+    warmup_iters: int,
+    compile: bool,
+):
+    """Generate test images and compute LPIPS. Returns ``(lpips_values, avg_test_ms)``."""
+    print("\n" + "-" * 80)
+    print(f"Phase 2: Generating images ({test_backend})")
+    print("-" * 80)
+
+    flash_impl, sdpa_backend = setup_backend(
+        pipe,
+        test_backend,
+        compile,
+        orig_transformer,
+    )
+
+    _warmup(
+        pipe,
+        test_backend,
+        baseline_data[0][0],
+        device,
+        num_inference_steps,
+        height,
+        width,
+        flash_impl,
+        sdpa_backend,
+        warmup_iters,
+    )
+
+    lpips_values = []
+    test_times_ms = []
+
+    for idx, (prompt, baseline_tensor_cpu) in enumerate(baseline_data):
+        print(f"[{idx + 1}/{len(baseline_data)}] {test_backend}: {prompt[:50]}...")
+        test_img, elapsed_ms = _timed_generate(
+            pipe,
+            prompt,
+            device,
+            num_inference_steps,
+            height,
+            width,
+            flash_impl,
+            sdpa_backend,
+        )
+        test_times_ms.append(elapsed_ms)
+
+        test_tensor = pil_to_lpips_tensor(test_img, device)
+        lpips_value = loss_fn(baseline_tensor_cpu.to(device), test_tensor).item()
+        lpips_values.append(lpips_value)
+
+        print(f"    LPIPS: {lpips_value:.4f}, Time: {elapsed_ms:.1f} ms")
+
+    avg_test_ms = sum(test_times_ms) / len(test_times_ms)
+    return lpips_values, avg_test_ms
+
+
+def _report_results(
+    lpips_values: list,
+    avg_baseline_ms: float,
+    avg_test_ms: float,
+    baseline_backend: str,
+    test_backend: str,
+    num_prompts: int,
+    num_inference_steps: int,
+    height: int,
+    width: int,
+    compile: bool,
+) -> dict:
+    """Print benchmark statistics and return the summary dict."""
+    print("\n" + "=" * 80)
+    print("BENCHMARK RESULTS")
+    print("=" * 80)
+
+    avg_lpips = sum(lpips_values) / len(lpips_values)
+    max_lpips = max(lpips_values)
+    min_lpips = min(lpips_values)
+    std_lpips = np.std(lpips_values)
+
+    print("\nLPIPS Statistics (lower is better, 0 = identical):")
+    print(f"  Average LPIPS: {avg_lpips:.4f}")
+    print(f"  Std Dev:       {std_lpips:.4f}")
+    print(f"  Min LPIPS:     {min_lpips:.4f}")
+    print(f"  Max LPIPS:     {max_lpips:.4f}")
+
+    print("\nTiming Statistics:")
+    print(f"  Avg {baseline_backend} time:  {avg_baseline_ms:.1f} ms per image")
+    print(f"  Avg {test_backend} time: {avg_test_ms:.1f} ms per image")
+    print(f"  Speedup:                {avg_baseline_ms / avg_test_ms:.2f}x")
+
+    print("\nBenchmark Configuration:")
+    print(f"  Baseline backend:  {baseline_backend}")
+    print(f"  Test backend:      {test_backend}")
+    print(f"  torch.compile:     {compile}")
+    print(f"  Model:             {MODEL_ID}")
+    print(f"  Prompts tested:    {num_prompts}")
+    print(f"  Inference steps:   {num_inference_steps}")
+    print(f"  Generation size:   {width}x{height}")
+    print(f"  LPIPS resize:      {IMAGE_SIZE[0]}x{IMAGE_SIZE[1]}")
+    print(f"  Random seed:       {RANDOM_SEED}")
+    print("=" * 80)
+
+    return {
+        "avg_lpips": avg_lpips,
+        "std_lpips": std_lpips,
+        "min_lpips": min_lpips,
+        "max_lpips": max_lpips,
+        "speedup": avg_baseline_ms / avg_test_ms,
+        "lpips_values": lpips_values,
+    }
+
+
 @torch.inference_mode()
 def run_benchmark(
     baseline_backend: str = "fa3",
@@ -202,204 +492,51 @@ def run_benchmark(
 
     device = "cuda"
 
-    # ----- Load prompts -----
-    if debug_prompt is not None:
-        prompts = [debug_prompt]
-        print(f"Using debug prompt: {debug_prompt}")
-    else:
-        print("Loading DrawBench dataset...")
-        dataset = load_dataset("sayakpaul/drawbench", split="train")
-        all_prompts = [item["Prompts"] for item in dataset]
-        prompts = all_prompts[:num_prompts]
-        print(
-            f"Using {len(prompts)} prompts from DrawBench "
-            f"(total available: {len(all_prompts)})"
-        )
+    prompts = _load_prompts(debug_prompt, num_prompts)
+    pipe, loss_fn, orig_transformer = _load_pipeline_and_lpips(device, compile)
 
-    # ----- Load model and LPIPS -----
-    print(f"\nLoading FLUX.1-schnell from {MODEL_ID}...")
-    pipe = FluxPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.bfloat16,
-    )
-    pipe = pipe.to(device)
-    pipe.set_progress_bar_config(disable=True)
-
-    print("Loading LPIPS model (VGG)...")
-    loss_fn = lpips.LPIPS(net="vgg").to(device)
-
-    orig_transformer = pipe.transformer
-
-    if compile:
-        pipe.vae.decode = torch.compile(pipe.vae.decode)
-
-    # ----- Phase 1: Baseline backend -----
-    print("\n" + "-" * 80)
-    print(f"Phase 1: Generating images ({baseline_backend})")
-    print("-" * 80)
-
-    baseline_flash_impl, baseline_sdpa = setup_backend(
+    baseline_data, avg_baseline_ms = _run_baseline_phase(
         pipe,
         baseline_backend,
-        compile,
         orig_transformer,
-    )
-
-    print(f"Warming up {baseline_backend} with {warmup_iters} iterations...")
-    warmup_prompt = prompts[0]
-    for i in range(warmup_iters):
-        _ = generate_image(
-            pipe,
-            warmup_prompt,
-            RANDOM_SEED,
-            device,
-            num_inference_steps,
-            height=height,
-            width=width,
-            flash_impl=baseline_flash_impl,
-            sdpa_backend=baseline_sdpa,
-        )
-        print(f"  Warmup {i + 1}/{warmup_iters} complete")
-
-    baseline_data = []
-    baseline_times_ms = []
-
-    for idx, prompt in enumerate(prompts):
-        print(f"[{idx + 1}/{len(prompts)}] {baseline_backend}: {prompt[:50]}...")
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-
-        start_event.record()
-        baseline_img = generate_image(
-            pipe,
-            prompt,
-            RANDOM_SEED,
-            device,
-            num_inference_steps,
-            height=height,
-            width=width,
-            flash_impl=baseline_flash_impl,
-            sdpa_backend=baseline_sdpa,
-        )
-        end_event.record()
-        torch.cuda.synchronize()
-        elapsed_ms = start_event.elapsed_time(end_event)
-
-        baseline_tensor = pil_to_lpips_tensor(baseline_img, device)
-        # Store tensors on CPU to free GPU memory for the test phase.
-        baseline_data.append((prompt, baseline_tensor.cpu()))
-        baseline_times_ms.append(elapsed_ms)
-
-    avg_baseline_ms = sum(baseline_times_ms) / len(baseline_times_ms)
-    print(
-        f"\n{baseline_backend} complete. Avg time per image: {avg_baseline_ms:.1f} ms"
+        prompts,
+        device,
+        num_inference_steps,
+        height,
+        width,
+        warmup_iters,
+        compile,
     )
 
     # ----- Cleanup before test phase -----
     cleanup_gpu()
 
-    # ----- Phase 2: Test backend -----
-    print("\n" + "-" * 80)
-    print(f"Phase 2: Generating images ({test_backend})")
-    print("-" * 80)
-
-    test_flash_impl, test_sdpa = setup_backend(
+    lpips_values, avg_test_ms = _run_test_phase(
         pipe,
         test_backend,
-        compile,
         orig_transformer,
+        baseline_data,
+        loss_fn,
+        device,
+        num_inference_steps,
+        height,
+        width,
+        warmup_iters,
+        compile,
     )
 
-    print(f"Warming up {test_backend} with {warmup_iters} iterations...")
-    for i in range(warmup_iters):
-        _ = generate_image(
-            pipe,
-            warmup_prompt,
-            RANDOM_SEED,
-            device,
-            num_inference_steps,
-            height=height,
-            width=width,
-            flash_impl=test_flash_impl,
-            sdpa_backend=test_sdpa,
-        )
-        print(f"  Warmup {i + 1}/{warmup_iters} complete")
-
-    lpips_values = []
-    test_times_ms = []
-
-    for idx, (prompt, baseline_tensor_cpu) in enumerate(baseline_data):
-        print(f"[{idx + 1}/{len(prompts)}] {test_backend}: {prompt[:50]}...")
-
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-
-        start_event.record()
-        test_img = generate_image(
-            pipe,
-            prompt,
-            RANDOM_SEED,
-            device,
-            num_inference_steps,
-            height=height,
-            width=width,
-            flash_impl=test_flash_impl,
-            sdpa_backend=test_sdpa,
-        )
-        end_event.record()
-        torch.cuda.synchronize()
-        elapsed_ms = start_event.elapsed_time(end_event)
-        test_times_ms.append(elapsed_ms)
-
-        test_tensor = pil_to_lpips_tensor(test_img, device)
-        lpips_value = loss_fn(baseline_tensor_cpu.to(device), test_tensor).item()
-        lpips_values.append(lpips_value)
-
-        print(f"    LPIPS: {lpips_value:.4f}, Time: {elapsed_ms:.1f} ms")
-
-    avg_test_ms = sum(test_times_ms) / len(test_times_ms)
-
-    # ----- Results -----
-    print("\n" + "=" * 80)
-    print("BENCHMARK RESULTS")
-    print("=" * 80)
-
-    avg_lpips = sum(lpips_values) / len(lpips_values)
-    max_lpips = max(lpips_values)
-    min_lpips = min(lpips_values)
-    std_lpips = np.std(lpips_values)
-
-    print("\nLPIPS Statistics (lower is better, 0 = identical):")
-    print(f"  Average LPIPS: {avg_lpips:.4f}")
-    print(f"  Std Dev:       {std_lpips:.4f}")
-    print(f"  Min LPIPS:     {min_lpips:.4f}")
-    print(f"  Max LPIPS:     {max_lpips:.4f}")
-
-    print("\nTiming Statistics:")
-    print(f"  Avg {baseline_backend} time:  {avg_baseline_ms:.1f} ms per image")
-    print(f"  Avg {test_backend} time: {avg_test_ms:.1f} ms per image")
-    print(f"  Speedup:                {avg_baseline_ms / avg_test_ms:.2f}x")
-
-    print("\nBenchmark Configuration:")
-    print(f"  Baseline backend:  {baseline_backend}")
-    print(f"  Test backend:      {test_backend}")
-    print(f"  torch.compile:     {compile}")
-    print(f"  Model:             {MODEL_ID}")
-    print(f"  Prompts tested:    {len(prompts)}")
-    print(f"  Inference steps:   {num_inference_steps}")
-    print(f"  Generation size:   {width}x{height}")
-    print(f"  LPIPS resize:      {IMAGE_SIZE[0]}x{IMAGE_SIZE[1]}")
-    print(f"  Random seed:       {RANDOM_SEED}")
-    print("=" * 80)
-
-    return {
-        "avg_lpips": avg_lpips,
-        "std_lpips": std_lpips,
-        "min_lpips": min_lpips,
-        "max_lpips": max_lpips,
-        "speedup": avg_baseline_ms / avg_test_ms,
-        "lpips_values": lpips_values,
-    }
+    return _report_results(
+        lpips_values,
+        avg_baseline_ms,
+        avg_test_ms,
+        baseline_backend,
+        test_backend,
+        len(prompts),
+        num_inference_steps,
+        height,
+        width,
+        compile,
+    )
 
 
 def main():
