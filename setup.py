@@ -493,6 +493,32 @@ def add_options_for_x86(extra_compile_args):
             )
 
 
+def detect_hipblaslt_extended_enums(rocm_home):
+    """Scan hipblaslt.h headers for extended enum support.
+
+    Returns a tuple ``(found_col16, found_vec_ext, found_outer_vec)`` indicating
+    which HIPBLASLT feature macros are present in any discovered header.
+    """
+    found_col16 = False
+    found_vec_ext = False
+    found_outer_vec = False
+    hipblaslt_headers = list(
+        glob.glob(os.path.join(rocm_home, "include", "hipblaslt", "hipblaslt.h"))
+    )
+    print("hipblaslt_headers", hipblaslt_headers)
+    for header in hipblaslt_headers:
+        with open(header) as f:
+            text = f.read()
+        found_col16 = found_col16 or "HIPBLASLT_ORDER_COL16" in text
+        found_vec_ext = (
+            found_vec_ext or "HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER_VEC_EXT" in text
+        )
+        found_outer_vec = (
+            found_outer_vec or "HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F" in text
+        )
+    return found_col16, found_vec_ext, found_outer_vec
+
+
 def get_extensions():
     # Skip building C++ extensions if USE_CPP is set to "0"
     if use_cpp == "0":
@@ -562,23 +588,10 @@ def get_extensions():
 
     if use_rocm:
         # naive search for hipblalst.h, if any found contain HIPBLASLT_ORDER_COL16 and VEC_EXT
-        found_col16 = False
-        found_vec_ext = False
-        found_outer_vec = False
         print("ROCM_HOME", ROCM_HOME)
-        hipblaslt_headers = list(
-            glob.glob(os.path.join(ROCM_HOME, "include", "hipblaslt", "hipblaslt.h"))
+        found_col16, found_vec_ext, found_outer_vec = detect_hipblaslt_extended_enums(
+            ROCM_HOME
         )
-        print("hipblaslt_headers", hipblaslt_headers)
-        for header in hipblaslt_headers:
-            with open(header) as f:
-                text = f.read()
-                if "HIPBLASLT_ORDER_COL16" in text:
-                    found_col16 = True
-                if "HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER_VEC_EXT" in text:
-                    found_vec_ext = True
-                if "HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F" in text:
-                    found_outer_vec = True
         if found_col16:
             extra_compile_args["cxx"].append("-DHIPBLASLT_HAS_ORDER_COL16")
             print("hipblaslt found extended col order enums")
