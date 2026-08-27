@@ -469,19 +469,19 @@ class SAM2AutomaticMaskGenerator(torch.nn.Module, SAM2HFPretrainedMixin):
     def _regroup_crop_data_by_image(
         self,
         all_crop_data: List[MaskData],
-        images: List[np.ndarray],
-        all_orig_size: List[Tuple[int, ...]],
         all_crop_boxes: List[List[int]],
-        all_layer_idxs: List[int],
     ) -> List[MaskData]:
-        """Concatenate the flattened per-crop data back into per-image data."""
+        """Concatenate the flattened per-crop data back into per-image data.
+
+        ``all_crop_boxes`` is the per-image list of crop boxes, so its per-image
+        lengths tell us how many entries of the flattened ``all_crop_data`` to
+        merge back into each image's result.
+        """
         i = 0
         all_data = []
-        for _, _, crop_boxes, layer_idxs in zip(
-            images, all_orig_size, all_crop_boxes, all_layer_idxs
-        ):
+        for crop_boxes in all_crop_boxes:
             data = None
-            for _, _ in zip(crop_boxes, layer_idxs):
+            for _ in crop_boxes:
                 if data is None:
                     data = all_crop_data[i]
                 else:
@@ -530,9 +530,7 @@ class SAM2AutomaticMaskGenerator(torch.nn.Module, SAM2HFPretrainedMixin):
             )
             all_crop_data.append(self._process_crop_points_dedup(result_data, crop_box))
 
-        return self._regroup_crop_data_by_image(
-            all_crop_data, images, all_orig_size, all_crop_boxes, all_layer_idxs
-        )
+        return self._regroup_crop_data_by_image(all_crop_data, all_crop_boxes)
 
     def _process_batch_fullgraph(
         self,

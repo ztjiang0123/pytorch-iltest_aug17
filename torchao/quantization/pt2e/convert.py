@@ -11,7 +11,7 @@
 import copy
 import operator
 import warnings
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, NamedTuple, Optional, Union
 
 import torch
 from torch.ao.quantization.backend_config import (
@@ -174,10 +174,18 @@ def _static_qparams_decomposed(activation_post_process, dtype):
     return quantize_op, dequantize_op, qparams
 
 
-def _replace_observer_static_decomposed(
-    model, graph, node, activation_post_process, dtype, module_path, prefix, model_device
-):
+class _StaticQParamContext(NamedTuple):
+    """Bundle the module context needed to register static qparam buffers."""
+
+    model: torch.fx.GraphModule
+    module_path: str
+    prefix: str
+    model_device: Optional[torch.device]
+
+
+def _replace_observer_static_decomposed(ctx, node, activation_post_process, dtype):
     """uint8/int8/int32 static quantization branch."""
+    graph = ctx.model.graph
     quantize_op, dequantize_op, qparams = _static_qparams_decomposed(
         activation_post_process, dtype
     )
@@ -201,11 +209,11 @@ def _replace_observer_static_decomposed(
                 # sure that the default overload can be used.
                 # TODO: maybe need more complex attr name here
                 qparam_node = create_getattr_from_value(
-                    model,
+                    ctx.model,
                     graph,
-                    module_path + prefix + key,
+                    ctx.module_path + ctx.prefix + key,
                     value_or_node,
-                    model_device,
+                    ctx.model_device,
                 )
                 quantize_op_inputs.append(qparam_node)
             else:
@@ -405,14 +413,10 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
         # TODO: probably should cleanup this condition check, it's hard
         # to reason about this if and the following elif
         _replace_observer_static_decomposed(
-            model,
-            graph,
+            _StaticQParamContext(model, module_path, prefix, model_device),
             node,
             activation_post_process,
             dtype,
-            module_path,
-            prefix,
-            model_device,
         )
     elif is_dynamic:
         _replace_observer_dynamic_decomposed(
