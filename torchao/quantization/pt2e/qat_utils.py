@@ -346,20 +346,25 @@ def _no_conv_bias_filter(
     return not _has_conv_bias_filter(match, original_graph, pattern_graph)
 
 
+_QUANTIZE_TARGETS = [
+    torch.ops.quantized_decomposed.quantize_per_tensor.default,
+    torch.ops.quantized_decomposed.quantize_per_tensor.tensor,
+    torch.ops.quantized_decomposed.quantize_per_channel.default,
+]
+
+_DEQUANTIZE_TARGETS = [
+    torch.ops.quantized_decomposed.dequantize_per_tensor.default,
+    torch.ops.quantized_decomposed.dequantize_per_tensor.tensor,
+    torch.ops.quantized_decomposed.dequantize_per_channel.default,
+]
+
+
 def _is_quantize(n: Node) -> bool:
-    return n.target in [
-        torch.ops.quantized_decomposed.quantize_per_tensor.default,
-        torch.ops.quantized_decomposed.quantize_per_tensor.tensor,
-        torch.ops.quantized_decomposed.quantize_per_channel.default,
-    ]
+    return n.target in _QUANTIZE_TARGETS
 
 
 def _is_dequantize(n: Node) -> bool:
-    return n.target in [
-        torch.ops.quantized_decomposed.dequantize_per_tensor.default,
-        torch.ops.quantized_decomposed.dequantize_per_tensor.tensor,
-        torch.ops.quantized_decomposed.dequantize_per_channel.default,
-    ]
+    return n.target in _DEQUANTIZE_TARGETS
 
 
 def _get_conv_bn_pattern_nodes(r: ReplacedPatterns) -> dict[str, tuple[Node, Node]]:

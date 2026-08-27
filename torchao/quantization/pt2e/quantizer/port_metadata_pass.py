@@ -13,7 +13,7 @@ from torch._export.error import InternalError
 from torch.fx.passes.infra.pass_base import PassBase, PassResult
 
 from torchao.quantization.pt2e.quantizer.quantizer import Q_ANNOTATION_KEY
-from torchao.quantization.pt2e.utils import _filter_sym_size_users
+from torchao.quantization.pt2e.utils import _filter_sym_size_users, _is_connected
 from torchao.quantization.quant_primitives import quant_lib  # noqa: F401
 
 from .quantizer import QuantizationSpecBase
@@ -77,21 +77,18 @@ def _find_choose_qparams_node(node: torch.fx.Node) -> Optional[torch.fx.Node]:
     return None
 
 
-def _is_connected(source: torch.fx.Node, dest: torch.fx.Node) -> bool:
+def _connected(source: torch.fx.Node, dest: torch.fx.Node) -> bool:
     """
     Assuming dest is one of the ops inserted by quant workflow, this function
     finds if source and dest are connected. Assumption is that only quant workflow
-    inserted ops exist between source and dest
+    inserted ops exist between source and dest.
+
+    Delegates to the shared :func:`_is_connected` helper, passing this module's
+    quant-workflow ops (which additionally include the ``torchao`` affine ops).
     """
     quant_workflow_ops = _QUANTIZE_OPS + _DEQUANTIZE_OPS
     quant_workflow_ops.append(torch.ops.quantized_decomposed.choose_qparams.tensor)
-    while dest.target in quant_workflow_ops:
-        if not isinstance(dest.args[0], torch.fx.Node):
-            raise ValueError(
-                f"expected arg[0] of quant workflow ops to be a node but found {dest.args[0]}"
-            )
-        dest = dest.args[0]
-    return dest == source
+    return _is_connected(source, dest, quant_workflow_ops)
 
 
 def _find_q_dq_node_for_user(
@@ -109,7 +106,7 @@ def _find_q_dq_node_for_user(
             and n.op == "call_function"
             and n.target in _DEQUANTIZE_OPS
         ):
-            if _is_connected(produer, n):
+            if _connected(produer, n):
                 dq_node = n
                 break
     if dq_node is None:
@@ -119,7 +116,7 @@ def _find_q_dq_node_for_user(
                 and n.op == "call_function"
                 and n.target in _DEQUANTIZE_OPS
             ):
-                if _is_connected(produer, n):
+                if _connected(produer, n):
                     dq_node = n
                     break
     if dq_node is None:

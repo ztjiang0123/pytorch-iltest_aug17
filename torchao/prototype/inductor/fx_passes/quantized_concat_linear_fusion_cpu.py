@@ -224,6 +224,410 @@ def _find_node_with_qparam_kwargs_on_single_user_chain(start_node, qparam_kwarg_
             return cur
 
 
+def _is_fusable_qlinear_node(node: torch.fx.Node, processed: set) -> bool:
+    """Return True if ``node`` is an unprocessed CPU qlinear op we can fuse."""
+    if node.op != "call_function" or not _is_qlinear_target(node.target):
+        return False
+    if node in processed or node._erased:
+        return False
+    val = node.meta.get("val")
+    if not isinstance(val, torch.Tensor):
+        return False
+    return val.device.type == "cpu" and val.dtype in (
+        torch.uint8,
+        torch.float8_e4m3fn,
+    )
+
+
+def _compute_fused_output_qparams(qlinear_users, dtype, gm):
+    """Compute the fused output scale and zero point for a group of qlinears."""
+    if dtype != torch.uint8:
+        fused_output_scale = float(
+            max(
+                _to_scalar(_get_node_arg(qlinear_node, "output_scale", 7), gm, float)
+                for qlinear_node in qlinear_users
+            )
+        )
+        fused_output_zero_point = _get_node_arg(
+            qlinear_users[0], "output_zero_point", 8
+        )
+        return fused_output_scale, fused_output_zero_point
+
+    qmin = 0
+    qmax = 255
+    global_min = None
+    global_max = None
+    for qlinear_node in qlinear_users:
+        scale = _to_scalar(_get_node_arg(qlinear_node, "output_scale", 7), gm, float)
+        zp = _to_scalar(_get_node_arg(qlinear_node, "output_zero_point", 8), gm, int)
+        cur_min = (qmin - zp) * scale
+        cur_max = (qmax - zp) * scale
+        global_min = cur_min if global_min is None else min(global_min, cur_min)
+        global_max = cur_max if global_max is None else max(global_max, cur_max)
+    assert global_min is not None and global_max is not None
+    eps = 1e-12
+    fused_output_scale = max((global_max - global_min) / float(qmax - qmin), eps)
+    fused_output_zero_point = int(round(qmin - global_min / fused_output_scale))
+    fused_output_zero_point = max(qmin, min(qmax, fused_output_zero_point))
+    return fused_output_scale, fused_output_zero_point
+
+
+def _build_concat_weight_input(qlinear_users, dtype, gm, dense_wgts, w_scale_args):
+    """
+    Build the concatenated weight tensor and, when weights use per-tensor
+    scales, the fused per-tensor scale/zero-point that re-quantize it.
+
+    Returns a tuple of (concat_wgt_input, fused_w_scale, fused_w_zp) where the
+    scale/zero-point are ``None`` when they are not needed (per-channel path).
+    """
+    per_tensor_fp8 = dtype == torch.float8_e4m3fn
+    if per_tensor_fp8:
+        fp8_info = torch.finfo(torch.float8_e4m3fn)
+        real_wgts = [
+            dense_wgt.float() * _to_scalar(w_scale, gm, float)
+            for dense_wgt, w_scale in zip(dense_wgts, w_scale_args)
+        ]
+        real_concat_wgt = torch.cat(real_wgts, dim=0)
+        fused_w_scale = torch.max(torch.abs(real_concat_wgt)).item() / fp8_info.max
+        concat_wgt_input = torch.clamp(
+            real_concat_wgt / fused_w_scale,
+            fp8_info.min,
+            fp8_info.max,
+        ).to(torch.float8_e4m3fn)
+        return concat_wgt_input, fused_w_scale, None
+
+    qmin = 0
+    qmax = 255
+    w_zp_args = [_get_node_arg(user, "w_zp", 5) for user in qlinear_users]
+    w_zp_numels = [_numel(w_zp, gm) for w_zp in w_zp_args]
+    assert all(numel == 1 for numel in w_zp_numels)
+    real_wgts = [
+        (dense_wgt.float() - _to_scalar(w_zp, gm, int)) * _to_scalar(w_scale, gm, float)
+        for dense_wgt, w_scale, w_zp in zip(dense_wgts, w_scale_args, w_zp_args)
+    ]
+    real_concat_wgt = torch.cat(real_wgts, dim=0)
+    eps = 1e-12
+    global_min = real_concat_wgt.min().item()
+    global_max = real_concat_wgt.max().item()
+    fused_w_scale = max((global_max - global_min) / float(qmax - qmin), eps)
+    fused_w_zp = int(round(qmin - global_min / fused_w_scale))
+    fused_w_zp = max(qmin, min(qmax, fused_w_zp))
+    concat_wgt_input = torch.clamp(
+        torch.round(real_concat_wgt / fused_w_scale + fused_w_zp),
+        qmin,
+        qmax,
+    ).to(torch.uint8)
+    return concat_wgt_input, fused_w_scale, fused_w_zp
+
+
+def _build_fused_qlinear_node(graph, node, node_before_linear, qlinear_kwargs):
+    """Create the fused qlinear node, using positional args for C++ overloads."""
+    if node.target in QLINEAR_TARGETS:
+        qlinear_args = (
+            qlinear_kwargs["x"],
+            qlinear_kwargs["x_scale"],
+            qlinear_kwargs["x_zp"],
+            qlinear_kwargs["packed_weight"],
+            qlinear_kwargs["w_scale"],
+            qlinear_kwargs["w_zp"],
+            qlinear_kwargs["b"],
+            qlinear_kwargs["output_scale"],
+            qlinear_kwargs["output_zero_point"],
+            qlinear_kwargs["output_dtype"],
+            qlinear_kwargs["postop_name"],
+            qlinear_kwargs["postop_args"],
+            qlinear_kwargs["postop_algorithm"],
+        )
+        with graph.inserting_after(node_before_linear):
+            return graph.create_node("call_function", node.target, qlinear_args)
+    with graph.inserting_after(node_before_linear):
+        return graph.create_node("call_function", node.target, (), qlinear_kwargs)
+
+
+def _rewrite_dequant_qparams(
+    dequant_node,
+    dtype,
+    fused_output_scale,
+    fused_output_zero_point,
+    fused_dequant_scale,
+):
+    """Patch a dequant node so it uses the fused output qparams."""
+    if dtype == torch.uint8:
+        dequant_node.args = (
+            dequant_node.args[0],
+            fused_output_scale,
+            fused_output_zero_point,
+            dequant_node.args[3],
+            dequant_node.args[4],
+            dequant_node.args[5],
+        )
+    elif "scale" in dequant_node.kwargs:
+        new_kwargs = dict(dequant_node.kwargs)
+        new_kwargs["scale"] = fused_dequant_scale
+        dequant_node.kwargs = new_kwargs
+    else:
+        assert len(dequant_node.args) >= 2
+        dequant_node.args = (
+            dequant_node.args[0],
+            fused_dequant_scale,
+            *dequant_node.args[2:],
+        )
+
+
+def _rewrite_split_output_qparams(
+    graph,
+    gm,
+    computation_node_0,
+    split_outputs,
+    dtype,
+    fused_output_scale,
+    fused_output_zero_point,
+    delayed_erase_nodes,
+):
+    """Update dequant / qparam-carrying nodes downstream of each split output."""
+    fused_dequant_scale = fused_output_scale
+    if dtype != torch.uint8:
+        with graph.inserting_after(split_outputs[-1]):
+            fused_dequant_scale = _create_constant_tensor_node(
+                graph,
+                gm,
+                f"{_get_node_arg(computation_node_0, 'packed_weight', 3).target}_output_scale",
+                torch.tensor([fused_output_scale]),
+            )
+
+    for split_out in split_outputs:
+        dequant_node = _collect_first_dequant_on_single_user_chain(split_out, dtype)
+        if dequant_node is not None:
+            _rewrite_dequant_qparams(
+                dequant_node,
+                dtype,
+                fused_output_scale,
+                fused_output_zero_point,
+                fused_dequant_scale,
+            )
+
+        qdq_pair = _collect_quant_dequant_pair_on_single_user_chain(split_out, dtype)
+        if qdq_pair is not None:
+            quant_node, dequant_node = qdq_pair
+            dequant_node.replace_input_with(quant_node, quant_node.args[0])
+            delayed_erase_nodes.append(quant_node)
+
+    qparam_kwarg_keys = (
+        ("q_scale", "q_zp", "k_scale", "k_zp", "v_scale", "v_zp")
+        if dtype == torch.uint8
+        else ("q_scale", "k_scale", "v_scale")
+    )
+    qparam_nodes = [
+        _find_node_with_qparam_kwargs_on_single_user_chain(split_out, qparam_kwarg_keys)
+        for split_out in split_outputs
+    ]
+    if qparam_nodes[0] is not None and (
+        qparam_nodes[0] == qparam_nodes[1] == qparam_nodes[2]
+    ):
+        new_kwargs = dict(qparam_nodes[0].kwargs)
+        for key in qparam_kwarg_keys:
+            if dtype == torch.uint8 and not key.endswith("scale"):
+                new_kwargs[key] = fused_output_zero_point
+            else:
+                new_kwargs[key] = fused_output_scale
+        qparam_nodes[0].kwargs = new_kwargs
+
+
+def _build_concat_scale_zp_nodes(
+    graph,
+    gm,
+    computation_node_0,
+    qlinear_users,
+    dtype,
+    per_tensor_w_scale,
+    w_scale_args,
+    concat_w_node,
+    fused_w_scale,
+    fused_w_zp,
+):
+    """
+    Create the concatenated weight-scale and weight-zero-point constant nodes.
+
+    Returns (scales_node, qzeros_node, node_before_linear) where qzeros_node is
+    ``None`` for the fp8 path.
+    """
+    packed_weight_name = _get_node_arg(computation_node_0, "packed_weight", 3).target
+    with graph.inserting_after(concat_w_node):
+        if per_tensor_w_scale:
+            concat_wgt_scales_node = _create_constant_tensor_node(
+                graph,
+                gm,
+                f"{packed_weight_name}_scales_concat",
+                torch.tensor([fused_w_scale]),
+            )
+        else:
+            concat_wgt_scales_node = _build_concat_arg(
+                graph,
+                gm,
+                w_scale_args,
+                f"{packed_weight_name}_scales_concat",
+            )
+
+    if dtype != torch.uint8:
+        return concat_wgt_scales_node, None, concat_wgt_scales_node
+
+    with graph.inserting_after(concat_wgt_scales_node):
+        if per_tensor_w_scale:
+            concat_wgt_qzeros_node = _create_constant_tensor_node(
+                graph,
+                gm,
+                f"{packed_weight_name}_qzeros_concat",
+                torch.tensor([fused_w_zp], dtype=torch.int32),
+            )
+        else:
+            concat_wgt_qzeros_node = _build_concat_arg(
+                graph,
+                gm,
+                [_get_node_arg(user, "w_zp", 5) for user in qlinear_users],
+                f"{packed_weight_name}_qzeros_concat",
+            )
+    return concat_wgt_scales_node, concat_wgt_qzeros_node, concat_wgt_qzeros_node
+
+
+def _fuse_qlinear_group(graph, gm, node, dtype, qlinear_users):
+    """Fuse a validated group of qlinear users sharing the same activation."""
+    w_scale_args = [_get_node_arg(user, "w_scale", 4) for user in qlinear_users]
+    w_scale_numels = [_numel(w_scale, gm) for w_scale in w_scale_args]
+    assert all(numel == w_scale_numels[0] for numel in w_scale_numels)
+    per_tensor_w_scale = w_scale_numels[0] == 1
+
+    counters["inductor"]["quantized_concat_linear_fusion"] += 1
+    fused_output_scale, fused_output_zero_point = _compute_fused_output_qparams(
+        qlinear_users, dtype, gm
+    )
+
+    act = _get_node_arg(node, "x", 0)
+    with graph.inserting_before(node):
+        computation_node_0 = qlinear_users[0]
+        packed_wgts = [
+            getattr(gm, _get_node_arg(user, "packed_weight", 3).target)
+            for user in qlinear_users
+        ]
+        act_shape = list(act.meta["val"].shape)
+        with_bias = _get_node_arg(qlinear_users[0], "b", 6) is not None
+        dense_wgts = [_as_dense_tensor(w) for w in packed_wgts]
+        out_feature_size_list = [w.size(0) for w in dense_wgts]
+
+        fused_w_scale = None
+        fused_w_zp = None
+        if per_tensor_w_scale:
+            concat_wgt_input, fused_w_scale, fused_w_zp = _build_concat_weight_input(
+                qlinear_users, dtype, gm, dense_wgts, w_scale_args
+            )
+        else:
+            concat_wgt_input = torch.cat(dense_wgts, dim=0)
+
+        concat_wgt = torch.ops.onednn.qlinear_prepack(concat_wgt_input, act_shape)
+        concat_w_node = _create_constant_tensor_node(
+            graph,
+            gm,
+            f"{_get_node_arg(computation_node_0, 'packed_weight', 3).target}_concat",
+            concat_wgt,
+        )
+
+        (
+            concat_wgt_scales_node,
+            concat_wgt_qzeros_node,
+            node_before_linear,
+        ) = _build_concat_scale_zp_nodes(
+            graph,
+            gm,
+            computation_node_0,
+            qlinear_users,
+            dtype,
+            per_tensor_w_scale,
+            w_scale_args,
+            concat_w_node,
+            fused_w_scale,
+            fused_w_zp,
+        )
+
+        if with_bias:
+            with graph.inserting_after(node_before_linear):
+                concat_bias_node = _build_concat_arg(
+                    graph,
+                    gm,
+                    [_get_node_arg(user, "b", 6) for user in qlinear_users],
+                    "concat_bias",
+                )
+            node_before_linear = concat_bias_node
+        else:
+            concat_bias_node = None
+
+        qlinear_kwargs = {
+            "x": act,
+            "x_scale": _get_node_arg(qlinear_users[0], "x_scale", 1),
+            "x_zp": _get_node_arg(qlinear_users[0], "x_zp", 2)
+            if dtype == torch.uint8
+            else None,
+            "packed_weight": concat_w_node,
+            "w_scale": concat_wgt_scales_node,
+            "w_zp": concat_wgt_qzeros_node,
+            "b": concat_bias_node,
+            "output_scale": fused_output_scale,
+            "output_zero_point": fused_output_zero_point,
+            "output_dtype": _get_node_arg(qlinear_users[0], "output_dtype", 9),
+            "postop_name": _get_node_arg(qlinear_users[0], "postop_name", 10),
+            "postop_args": _get_node_arg(qlinear_users[0], "postop_args", 11),
+            "postop_algorithm": _get_node_arg(qlinear_users[0], "postop_algorithm", 12),
+        }
+        new_qlinear_node = _build_fused_qlinear_node(
+            graph, node, node_before_linear, qlinear_kwargs
+        )
+
+        old_vals = [user.meta["val"] for user in qlinear_users]
+        out_shape = list(old_vals[0].shape)
+        out_shape[-1] = sum(out_feature_size_list)
+        new_val = old_vals[0].new_empty(tuple(out_shape))
+        new_qlinear_node.meta["val"] = new_val
+        new_qlinear_node.meta["tensor_meta"] = _extract_tensor_metadata(new_val)
+        with graph.inserting_after(new_qlinear_node):
+            split_node = graph.create_node(
+                "call_function",
+                torch.ops.aten.split_with_sizes.default,
+                (
+                    new_qlinear_node,
+                    out_feature_size_list,
+                    -1,  # split along the out feature dimension
+                ),
+            )
+
+        delayed_erase_nodes = []
+        split_outputs = []
+        with graph.inserting_after(split_node):
+            for gemm_idx, user in enumerate(qlinear_users):
+                get_item = graph.create_node(
+                    "call_function",
+                    operator.getitem,
+                    (
+                        split_node,
+                        gemm_idx,
+                    ),
+                )
+                split_outputs.append(get_item)
+                user.replace_all_uses_with(get_item)
+                delayed_erase_nodes.append(user)
+
+        _rewrite_split_output_qparams(
+            graph,
+            gm,
+            computation_node_0,
+            split_outputs,
+            dtype,
+            fused_output_scale,
+            fused_output_zero_point,
+            delayed_erase_nodes,
+        )
+
+        for old_node in delayed_erase_nodes:
+            graph.erase_node(old_node)
+
+
 def _concat_linear_quantized_cpu(graph: torch.fx.Graph):
     """
     Concat Linear optimization pass for quantized qlinear on CPU.
@@ -239,365 +643,22 @@ def _concat_linear_quantized_cpu(graph: torch.fx.Graph):
     processed = set()
 
     for node in list(graph.nodes):
-        if (
-            node.op == "call_function"
-            and _is_qlinear_target(node.target)
-            and node not in processed
-            and not node._erased
-            and isinstance(node.meta.get("val"), torch.Tensor)
-            and node.meta["val"].device.type == "cpu"
-            and node.meta["val"].dtype in (torch.uint8, torch.float8_e4m3fn)
-        ):
-            dtype = node.meta["val"].dtype
-            act = _get_node_arg(node, "x", 0)
-            qlinear_users = [
-                u
-                for u in act.users
-                if u.op == "call_function" and _is_qlinear_target(u.target)
-            ][::-1]
+        if not _is_fusable_qlinear_node(node, processed):
+            continue
 
-            if _is_valid_concat_linear_quantized_fusion(qlinear_users, dtype):
-                w_scale_args = [
-                    _get_node_arg(user, "w_scale", 4) for user in qlinear_users
-                ]
-                w_scale_numels = [_numel(w_scale, gm) for w_scale in w_scale_args]
-                assert all(numel == w_scale_numels[0] for numel in w_scale_numels)
-                per_tensor_w_scale = w_scale_numels[0] == 1
+        dtype = node.meta["val"].dtype
+        act = _get_node_arg(node, "x", 0)
+        qlinear_users = [
+            u
+            for u in act.users
+            if u.op == "call_function" and _is_qlinear_target(u.target)
+        ][::-1]
 
-                counters["inductor"]["quantized_concat_linear_fusion"] += 1
-                if dtype == torch.uint8:
-                    qmin = 0
-                    qmax = 255
-                    global_min = None
-                    global_max = None
-                    for qlinear_node in qlinear_users:
-                        scale = _to_scalar(
-                            _get_node_arg(qlinear_node, "output_scale", 7), gm, float
-                        )
-                        zp = _to_scalar(
-                            _get_node_arg(qlinear_node, "output_zero_point", 8), gm, int
-                        )
-                        cur_min = (qmin - zp) * scale
-                        cur_max = (qmax - zp) * scale
-                        global_min = (
-                            cur_min if global_min is None else min(global_min, cur_min)
-                        )
-                        global_max = (
-                            cur_max if global_max is None else max(global_max, cur_max)
-                        )
-                    assert global_min is not None and global_max is not None
-                    eps = 1e-12
-                    fused_output_scale = max(
-                        (global_max - global_min) / float(qmax - qmin), eps
-                    )
-                    fused_output_zero_point = int(
-                        round(qmin - global_min / fused_output_scale)
-                    )
-                    fused_output_zero_point = max(
-                        qmin, min(qmax, fused_output_zero_point)
-                    )
-                else:
-                    fused_output_scale = float(
-                        max(
-                            _to_scalar(
-                                _get_node_arg(qlinear_node, "output_scale", 7),
-                                gm,
-                                float,
-                            )
-                            for qlinear_node in qlinear_users
-                        )
-                    )
-                    fused_output_zero_point = _get_node_arg(
-                        qlinear_users[0], "output_zero_point", 8
-                    )
+        if not _is_valid_concat_linear_quantized_fusion(qlinear_users, dtype):
+            continue
 
-                with graph.inserting_before(node):
-                    computation_node_0 = qlinear_users[0]
-                    packed_wgts = [
-                        getattr(gm, _get_node_arg(user, "packed_weight", 3).target)
-                        for user in qlinear_users
-                    ]
-                    act_shape = list(act.meta["val"].shape)
-                    with_bias = _get_node_arg(qlinear_users[0], "b", 6) is not None
-                    dense_wgts = [_as_dense_tensor(w) for w in packed_wgts]
-                    out_feature_size_list = [w.size(0) for w in dense_wgts]
-
-                    if per_tensor_w_scale and dtype == torch.float8_e4m3fn:
-                        fp8_info = torch.finfo(torch.float8_e4m3fn)
-                        real_wgts = [
-                            dense_wgt.float() * _to_scalar(w_scale, gm, float)
-                            for dense_wgt, w_scale in zip(dense_wgts, w_scale_args)
-                        ]
-                        real_concat_wgt = torch.cat(real_wgts, dim=0)
-                        fused_w_scale = (
-                            torch.max(torch.abs(real_concat_wgt)).item() / fp8_info.max
-                        )
-                        concat_wgt_input = torch.clamp(
-                            real_concat_wgt / fused_w_scale,
-                            fp8_info.min,
-                            fp8_info.max,
-                        ).to(torch.float8_e4m3fn)
-                    elif per_tensor_w_scale:
-                        qmin = 0
-                        qmax = 255
-                        w_zp_args = [
-                            _get_node_arg(user, "w_zp", 5) for user in qlinear_users
-                        ]
-                        w_zp_numels = [_numel(w_zp, gm) for w_zp in w_zp_args]
-                        assert all(numel == 1 for numel in w_zp_numels)
-                        real_wgts = [
-                            (dense_wgt.float() - _to_scalar(w_zp, gm, int))
-                            * _to_scalar(w_scale, gm, float)
-                            for dense_wgt, w_scale, w_zp in zip(
-                                dense_wgts, w_scale_args, w_zp_args
-                            )
-                        ]
-                        real_concat_wgt = torch.cat(real_wgts, dim=0)
-                        eps = 1e-12
-                        global_min = real_concat_wgt.min().item()
-                        global_max = real_concat_wgt.max().item()
-                        fused_w_scale = max(
-                            (global_max - global_min) / float(qmax - qmin), eps
-                        )
-                        fused_w_zp = int(round(qmin - global_min / fused_w_scale))
-                        fused_w_zp = max(qmin, min(qmax, fused_w_zp))
-                        concat_wgt_input = torch.clamp(
-                            torch.round(real_concat_wgt / fused_w_scale + fused_w_zp),
-                            qmin,
-                            qmax,
-                        ).to(torch.uint8)
-                    else:
-                        concat_wgt_input = torch.cat(dense_wgts, dim=0)
-
-                    concat_wgt = torch.ops.onednn.qlinear_prepack(
-                        concat_wgt_input, act_shape
-                    )
-
-                    concat_w_node = _create_constant_tensor_node(
-                        graph,
-                        gm,
-                        f"{_get_node_arg(computation_node_0, 'packed_weight', 3).target}_concat",
-                        concat_wgt,
-                    )
-
-                    with graph.inserting_after(concat_w_node):
-                        if per_tensor_w_scale:
-                            concat_wgt_scales_node = _create_constant_tensor_node(
-                                graph,
-                                gm,
-                                f"{_get_node_arg(computation_node_0, 'packed_weight', 3).target}_scales_concat",
-                                torch.tensor([fused_w_scale]),
-                            )
-                        else:
-                            concat_wgt_scales_node = _build_concat_arg(
-                                graph,
-                                gm,
-                                w_scale_args,
-                                f"{_get_node_arg(computation_node_0, 'packed_weight', 3).target}_scales_concat",
-                            )
-
-                    if dtype == torch.uint8:
-                        with graph.inserting_after(concat_wgt_scales_node):
-                            if per_tensor_w_scale:
-                                concat_wgt_qzeros_node = _create_constant_tensor_node(
-                                    graph,
-                                    gm,
-                                    f"{_get_node_arg(computation_node_0, 'packed_weight', 3).target}_qzeros_concat",
-                                    torch.tensor([fused_w_zp], dtype=torch.int32),
-                                )
-                            else:
-                                concat_wgt_qzeros_node = _build_concat_arg(
-                                    graph,
-                                    gm,
-                                    [
-                                        _get_node_arg(user, "w_zp", 5)
-                                        for user in qlinear_users
-                                    ],
-                                    f"{_get_node_arg(computation_node_0, 'packed_weight', 3).target}_qzeros_concat",
-                                )
-                        node_before_linear = concat_wgt_qzeros_node
-                    else:
-                        concat_wgt_qzeros_node = None
-                        node_before_linear = concat_wgt_scales_node
-
-                    if with_bias:
-                        with graph.inserting_after(node_before_linear):
-                            concat_bias_node = _build_concat_arg(
-                                graph,
-                                gm,
-                                [_get_node_arg(user, "b", 6) for user in qlinear_users],
-                                "concat_bias",
-                            )
-                        node_before_linear = concat_bias_node
-                    else:
-                        concat_bias_node = None
-
-                    qlinear_kwargs = {
-                        "x": act,
-                        "x_scale": _get_node_arg(qlinear_users[0], "x_scale", 1),
-                        "x_zp": _get_node_arg(qlinear_users[0], "x_zp", 2)
-                        if dtype == torch.uint8
-                        else None,
-                        "packed_weight": concat_w_node,
-                        "w_scale": concat_wgt_scales_node,
-                        "w_zp": concat_wgt_qzeros_node,
-                        "b": concat_bias_node,
-                        "output_scale": fused_output_scale,
-                        "output_zero_point": fused_output_zero_point,
-                        "output_dtype": _get_node_arg(
-                            qlinear_users[0], "output_dtype", 9
-                        ),
-                        "postop_name": _get_node_arg(
-                            qlinear_users[0], "postop_name", 10
-                        ),
-                        "postop_args": _get_node_arg(
-                            qlinear_users[0], "postop_args", 11
-                        ),
-                        "postop_algorithm": _get_node_arg(
-                            qlinear_users[0], "postop_algorithm", 12
-                        ),
-                    }
-                    if node.target in QLINEAR_TARGETS:
-                        qlinear_args = (
-                            qlinear_kwargs["x"],
-                            qlinear_kwargs["x_scale"],
-                            qlinear_kwargs["x_zp"],
-                            qlinear_kwargs["packed_weight"],
-                            qlinear_kwargs["w_scale"],
-                            qlinear_kwargs["w_zp"],
-                            qlinear_kwargs["b"],
-                            qlinear_kwargs["output_scale"],
-                            qlinear_kwargs["output_zero_point"],
-                            qlinear_kwargs["output_dtype"],
-                            qlinear_kwargs["postop_name"],
-                            qlinear_kwargs["postop_args"],
-                            qlinear_kwargs["postop_algorithm"],
-                        )
-                        with graph.inserting_after(node_before_linear):
-                            new_qlinear_node = graph.create_node(
-                                "call_function", node.target, qlinear_args
-                            )
-                    else:
-                        with graph.inserting_after(node_before_linear):
-                            new_qlinear_node = graph.create_node(
-                                "call_function", node.target, (), qlinear_kwargs
-                            )
-                    old_vals = [user.meta["val"] for user in qlinear_users]
-                    out_shape = list(old_vals[0].shape)
-                    out_shape[-1] = sum(out_feature_size_list)
-                    new_val = old_vals[0].new_empty(tuple(out_shape))
-                    new_qlinear_node.meta["val"] = new_val
-                    new_qlinear_node.meta["tensor_meta"] = _extract_tensor_metadata(
-                        new_val
-                    )
-                    with graph.inserting_after(new_qlinear_node):
-                        split_node = graph.create_node(
-                            "call_function",
-                            torch.ops.aten.split_with_sizes.default,
-                            (
-                                new_qlinear_node,
-                                out_feature_size_list,
-                                -1,  # split along the out feature dimension
-                            ),
-                        )
-
-                    delayed_erase_nodes = []
-                    split_outputs = []
-                    with graph.inserting_after(split_node):
-                        for gemm_idx, user in enumerate(qlinear_users):
-                            get_item = graph.create_node(
-                                "call_function",
-                                operator.getitem,
-                                (
-                                    split_node,
-                                    gemm_idx,
-                                ),
-                            )
-                            split_outputs.append(get_item)
-                            user.replace_all_uses_with(get_item)
-
-                            delayed_erase_nodes.append(user)
-
-                    fused_dequant_scale = fused_output_scale
-                    if dtype != torch.uint8:
-                        with graph.inserting_after(split_outputs[-1]):
-                            fused_dequant_scale = _create_constant_tensor_node(
-                                graph,
-                                gm,
-                                f"{_get_node_arg(computation_node_0, 'packed_weight', 3).target}_output_scale",
-                                torch.tensor([fused_output_scale]),
-                            )
-
-                    for split_out in split_outputs:
-                        dequant_node = _collect_first_dequant_on_single_user_chain(
-                            split_out, dtype
-                        )
-                        if dequant_node is not None:
-                            if dtype == torch.uint8:
-                                dequant_node.args = (
-                                    dequant_node.args[0],
-                                    fused_output_scale,
-                                    fused_output_zero_point,
-                                    dequant_node.args[3],
-                                    dequant_node.args[4],
-                                    dequant_node.args[5],
-                                )
-                            else:
-                                if "scale" in dequant_node.kwargs:
-                                    new_kwargs = dict(dequant_node.kwargs)
-                                    new_kwargs["scale"] = fused_dequant_scale
-                                    dequant_node.kwargs = new_kwargs
-                                else:
-                                    assert len(dequant_node.args) >= 2
-                                    dequant_node.args = (
-                                        dequant_node.args[0],
-                                        fused_dequant_scale,
-                                        *dequant_node.args[2:],
-                                    )
-
-                        qdq_pair = _collect_quant_dequant_pair_on_single_user_chain(
-                            split_out, dtype
-                        )
-                        if qdq_pair is not None:
-                            quant_node, dequant_node = qdq_pair
-                            dequant_node.replace_input_with(
-                                quant_node, quant_node.args[0]
-                            )
-                            delayed_erase_nodes.append(quant_node)
-
-                    qparam_kwarg_keys = (
-                        ("q_scale", "q_zp", "k_scale", "k_zp", "v_scale", "v_zp")
-                        if dtype == torch.uint8
-                        else ("q_scale", "k_scale", "v_scale")
-                    )
-                    qparam_nodes = [
-                        _find_node_with_qparam_kwargs_on_single_user_chain(
-                            split_out,
-                            qparam_kwarg_keys,
-                        )
-                        for split_out in split_outputs
-                    ]
-                    if (
-                        qparam_nodes[0] is not None
-                        and qparam_nodes[0] == qparam_nodes[1] == qparam_nodes[2]
-                    ):
-                        new_kwargs = dict(qparam_nodes[0].kwargs)
-                        if dtype == torch.uint8:
-                            for key in qparam_kwarg_keys:
-                                new_kwargs[key] = (
-                                    fused_output_scale
-                                    if key.endswith("scale")
-                                    else fused_output_zero_point
-                                )
-                        else:
-                            for key in qparam_kwarg_keys:
-                                new_kwargs[key] = fused_output_scale
-                        qparam_nodes[0].kwargs = new_kwargs
-
-                    for old_node in delayed_erase_nodes:
-                        graph.erase_node(old_node)
-
-                processed.update(qlinear_users)
+        _fuse_qlinear_group(graph, gm, node, dtype, qlinear_users)
+        processed.update(qlinear_users)
 
 
 def register_quantized_concat_linear_cpu_pass():

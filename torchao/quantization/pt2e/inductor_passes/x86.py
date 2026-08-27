@@ -396,20 +396,27 @@ def _check_node_kwarg_arg_value(check_node, kwarg_name, args_index, expected_val
         return actual_value == expected_value
 
 
-def _is_valid_quantized_conv_optimization_pattern():
+def _is_valid_quantized_op_optimization_pattern(qop, output_dtype_arg_index):
     def fn(match):
         output_dtype = _get_pattern_output_dtype(match)
         if output_dtype in [torch.float32, torch.bfloat16]:
             # Only keep matched pattern with same output_dtype
-            qconv_node_after_weight_prepack = filter_nodes(
-                match.nodes, torch.ops.onednn.qconv_pointwise
-            )[0]
+            qop_node_after_weight_prepack = filter_nodes(match.nodes, qop)[0]
             return _check_node_kwarg_arg_value(
-                qconv_node_after_weight_prepack, "output_dtype", 13, output_dtype
+                qop_node_after_weight_prepack,
+                "output_dtype",
+                output_dtype_arg_index,
+                output_dtype,
             )
         return True
 
     return fn
+
+
+def _is_valid_quantized_conv_optimization_pattern():
+    return _is_valid_quantized_op_optimization_pattern(
+        torch.ops.onednn.qconv_pointwise, 13
+    )
 
 
 def _is_valid_qconv_post_op_fusion_pattern(has_binary_post_op=False):
@@ -421,19 +428,9 @@ def _is_valid_qconv_post_op_fusion_pattern(has_binary_post_op=False):
 
 
 def _is_valid_quantized_linear_optimization_pattern():
-    def fn(match):
-        output_dtype = _get_pattern_output_dtype(match)
-        if output_dtype in [torch.float32, torch.bfloat16]:
-            # Only keep matched pattern with same output_dtype
-            qlinear_node_after_weight_prepack = filter_nodes(
-                match.nodes, torch.ops.onednn.qlinear_pointwise
-            )[0]
-            return _check_node_kwarg_arg_value(
-                qlinear_node_after_weight_prepack, "output_dtype", 9, output_dtype
-            )
-        return True
-
-    return fn
+    return _is_valid_quantized_op_optimization_pattern(
+        torch.ops.onednn.qlinear_pointwise, 9
+    )
 
 
 def _is_valid_qlinear_post_op_fusion_pattern(has_binary_post_op=False):
