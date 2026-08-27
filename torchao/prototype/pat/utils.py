@@ -60,6 +60,48 @@ def instantiate_module(module_name: str):
     return module
 
 
+def _match_regex_group(param_name, re_pats, prune_config):
+    """Return ``(group_key, group_val)`` for the first matching regex, else None."""
+    for re_pat in re_pats:
+        if re_pat.match(param_name):
+            group_key = re_pat.pattern
+            return group_key, prune_config[f"{RE_PREFIX}{group_key}"]
+    return None
+
+
+def _default_group_key_val(
+    param_name, param_basename, module_cls, prune_config, skip_wd_names
+):
+    """Classify a parameter that did not match any regex group."""
+    skip_wd = param_basename == "bias" or (
+        bool(skip_wd_names) and param_basename in skip_wd_names
+    )
+    if param_name in prune_config:
+        group_key, group_val = param_name, None
+    elif (module_cls, param_basename) in prune_config:
+        group_key, group_val = (module_cls, param_basename), None
+    elif skip_wd:
+        group_key, group_val = "no_wd", {"weight_decay": 0}
+    else:
+        group_key, group_val = "wd", {}
+
+    if group_val is None:
+        group_val = prune_config[group_key]
+    return group_key, group_val
+
+
+def _classify_param(
+    param_name, param_basename, parent_module, re_pats, prune_config, skip_wd_names
+):
+    """Determine the ``(group_key, group_val)`` a single parameter belongs to."""
+    matched = _match_regex_group(param_name, re_pats, prune_config)
+    if matched is not None:
+        return matched
+    return _default_group_key_val(
+        param_name, param_basename, parent_module.__class__, prune_config, skip_wd_names
+    )
+
+
 def get_param_groups(
     model: nn.Module,
     prune_config: dict[tuple[nn.Module, str], Any],
@@ -82,32 +124,14 @@ def get_param_groups(
             continue
         seen_tensors.add(param)
 
-        group_key, group_val = None, None
-        for re_pat in re_pats:
-            if re_pat.match(param_name):
-                group_key = re_pat.pattern
-                group_val = prune_config[f"{RE_PREFIX}{group_key}"]
-                break
-
-        # Check for exact parameter or module name matches
-        if group_key is None:
-            module_cls = parent_module.__class__
-            if param_name in prune_config:
-                group_key = param_name
-            elif (module_cls, param_basename) in prune_config:
-                group_key = (module_cls, param_basename)
-            elif (
-                param_basename == "bias"
-                or skip_wd_names
-                and param_basename in skip_wd_names
-            ):
-                group_key, group_val = "no_wd", {"weight_decay": 0}
-            else:
-                group_key, group_val = "wd", {}
-
-            if group_val is None:
-                group_val = prune_config[group_key]
-
+        group_key, group_val = _classify_param(
+            param_name,
+            param_basename,
+            parent_module,
+            re_pats,
+            prune_config,
+            skip_wd_names,
+        )
         param_dict.setdefault(group_key, group_val).setdefault("params", []).append(
             param
         )
