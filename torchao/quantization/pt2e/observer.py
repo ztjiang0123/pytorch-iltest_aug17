@@ -1562,9 +1562,7 @@ class RecordingObserver(ObserverBase):
 
     @torch.jit.export
     def calculate_qparams(self):
-        raise Exception(  # noqa: TRY002
-            "calculate_qparams should not be called for RecordingObserver"
-        )
+        raise Exception("calculate_qparams should not be called for RecordingObserver")
 
     @torch.jit.export
     def get_tensor_value(self):
