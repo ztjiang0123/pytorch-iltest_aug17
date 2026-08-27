@@ -844,10 +844,8 @@ def _reference_dequantize_per_tensor_int8(
     return ((x_i8.to(torch.float32) - zero_point) * scale).to(dtype=torch.float32)
 
 
-def _apply_per_channel_int8_op(
-    op, x, scales, zero_points, ch_axis, quant_min, quant_max
-):
-    return op(x, scales, zero_points, ch_axis, quant_min, quant_max, torch.int8)
+def _apply_per_channel_int8_op(op, *args):
+    return op(*args, torch.int8)
 
 
 def _quantize_per_channel_int8(

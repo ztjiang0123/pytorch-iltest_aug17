@@ -49,12 +49,10 @@ class OperatorConfig(NamedTuple):
     operators: list[OperatorPatternType]
 
 
-def _get_act_qspec(
-    quantization_config: Optional[QuantizationConfig],
-    activation: Optional[QuantizationSpec],
-):
+def _get_act_qspec(quantization_config: Optional[QuantizationConfig], field_name: str):
     if quantization_config is None:
         return None
+    activation = getattr(quantization_config, field_name)
     if activation is None:
         return None
     quantization_spec: QuantizationSpec = activation
@@ -66,21 +64,11 @@ def _get_act_qspec(
 
 
 def get_input_act_qspec(quantization_config: Optional[QuantizationConfig]):
-    activation = (
-        quantization_config.input_activation
-        if quantization_config is not None
-        else None
-    )
-    return _get_act_qspec(quantization_config, activation)
+    return _get_act_qspec(quantization_config, "input_activation")
 
 
 def get_output_act_qspec(quantization_config: Optional[QuantizationConfig]):
-    activation = (
-        quantization_config.output_activation
-        if quantization_config is not None
-        else None
-    )
-    return _get_act_qspec(quantization_config, activation)
+    return _get_act_qspec(quantization_config, "output_activation")
 
 
 def get_weight_qspec(quantization_config: Optional[QuantizationConfig]):

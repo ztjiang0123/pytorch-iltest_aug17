@@ -7,6 +7,7 @@
 import sys
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -27,6 +28,44 @@ from ..distributed_utils import (
 from ..utils import get_index_linspace, instantiate_module
 from .group_lasso import ProxGroupLasso, ProxGroupLassoVectorized
 from .iterative_reweight import IterativeReweight
+
+
+@dataclass
+class _StepContext:
+    """Step-wide context shared by every param processed in one ``step`` call."""
+
+    init_sigma_reweight: bool
+    update_tau_reweight: bool
+    dist_is_init: bool
+    zeros_buf: list = field(default_factory=list)
+    factored_size_buf: list = field(default_factory=list)
+
+
+@dataclass
+class _GroupContext:
+    """Per-param-group context reused for every param in the group."""
+
+    group: dict
+    prox_map: Any
+    grouper_cls: Any
+    grouper_kwargs: dict
+    prox_kwargs: dict
+
+
+@dataclass
+class _SizeTotals:
+    """Running accumulators for regularized-size statistics over a step."""
+
+    zeros: float = 0
+    params: int = 0
+    factored_size: int = 0
+    unfactored_size: int = 0
+
+    def add(self, contribution: "_SizeTotals") -> None:
+        self.zeros += contribution.zeros
+        self.params += contribution.params
+        self.factored_size += contribution.factored_size
+        self.unfactored_size += contribution.unfactored_size
 
 
 class PruneOptimizer(BaseWrappedOptimizer):
@@ -470,15 +509,49 @@ class PruneOptimizer(BaseWrappedOptimizer):
         if "sigma" in state and update_tau_reweight:
             state["tau_reweight"] = self.iterative_reweight(group_norm, state["sigma"])
 
-    def _svd_size_contribution(self, group, grouper, zero_elts) -> tuple:
-        """Return (zeros, params, factored_size, unfactored_size) for SVD groupers."""
+    def _svd_size_contribution(self, group, grouper, zero_elts) -> _SizeTotals:
+        """Return the size contribution for an SVD grouper (summed variant)."""
         unfactored_size = grouper.U.size(0) * grouper.Vh.size(1)
         n_singular_vals = grouper.p.numel() - zero_elts
         factored_size = (grouper.U.size(0) + grouper.Vh.size(1)) * n_singular_vals
         group["factored_frac"] = factored_size / unfactored_size
         # Only factor matrices if it reduces params
         zeros = max(unfactored_size - factored_size, 0)
-        return zeros, unfactored_size, factored_size, unfactored_size
+        return _SizeTotals(zeros, unfactored_size, factored_size, unfactored_size)
+
+    def _make_group_context(self, group) -> _GroupContext:
+        self._set_gamma(group)
+        # apply shrinkage to latent parameters in place
+        prox_map = instantiate_module(
+            f"torchao.prototype.pat.optim.{group['prox_type']}"
+        )(group["reg_lambda"], **self._get_prox_kwargs(group))
+        # grouper is a context manager that reshapes p if needed
+        grouper_cls = instantiate_module(
+            f"torchao.prototype.pat.group.{group['group_type']}"
+        )
+        return _GroupContext(
+            group=group,
+            prox_map=prox_map,
+            grouper_cls=grouper_cls,
+            grouper_kwargs=self._get_grouper_kwargs(group),
+            prox_kwargs=self._make_prox_kwargs(group),
+        )
+
+    def _record_relative_stats(self, totals: _SizeTotals, sctx: _StepContext) -> None:
+        if sctx.dist_is_init and _is_main_process():
+            totals.zeros += _sum_async_streams(sctx.zeros_buf)
+            totals.factored_size += _sum_async_streams(sctx.factored_size_buf)
+
+        if not _is_main_process():
+            return
+        self.relative_sparsity = (
+            totals.zeros / totals.params if totals.params > 0 else 0.0
+        )
+        self.relative_factored_frac = (
+            totals.factored_size / totals.unfactored_size
+            if totals.unfactored_size > 0
+            else 0.0
+        )
 
     @torch.no_grad()
     def step(self, closure: Callable[[], float] | None = None) -> float | None:
@@ -501,128 +574,53 @@ class PruneOptimizer(BaseWrappedOptimizer):
         self._restore_temporary_state()
 
         init_sigma_reweight, update_tau_reweight = self._reweight_flags()
+        sctx = _StepContext(
+            init_sigma_reweight=init_sigma_reweight,
+            update_tau_reweight=update_tau_reweight,
+            dist_is_init=torch.distributed.is_initialized(),
+        )
 
-        regularized_params = 0
-        regularized_unfactored_size = 0
-        dist_is_init = torch.distributed.is_initialized()
-        regularized_zeros_buf = []
-        regularized_factored_size_buf = []
-
-        regularized_zeros = 0
-        regularized_factored_size = 0
+        totals = _SizeTotals()
         for group in self.regularized_param_groups():
-            self._set_gamma(group)
-
-            # apply shrinkage to latent parameters in place
-            prox_map = instantiate_module(
-                f"torchao.prototype.pat.optim.{group['prox_type']}"
-            )(group["reg_lambda"], **self._get_prox_kwargs(group))
-
-            # grouper is a context manager that reshapes p if needed
-            grouper_cls = instantiate_module(
-                f"torchao.prototype.pat.group.{group['group_type']}"
-            )
-            grouper_kwargs = self._get_grouper_kwargs(group)
-            prox_kwargs = self._make_prox_kwargs(group)
+            gctx = self._make_group_context(group)
             for p in group["params"]:
                 if not p.requires_grad:
                     continue
-
-                contribution = self._process_param(
-                    group,
-                    p,
-                    prox_map,
-                    grouper_cls,
-                    grouper_kwargs,
-                    prox_kwargs,
-                    init_sigma_reweight,
-                    update_tau_reweight,
-                    dist_is_init,
-                    regularized_zeros_buf,
-                    regularized_factored_size_buf,
-                )
-                regularized_zeros += contribution[0]
-                regularized_params += contribution[1]
-                regularized_factored_size += contribution[2]
-                regularized_unfactored_size += contribution[3]
+                totals.add(self._process_param(p, gctx, sctx))
 
         self.num_steps += 1
 
-        if dist_is_init and _is_main_process():
-            regularized_zeros += _sum_async_streams(regularized_zeros_buf)
-            regularized_factored_size += _sum_async_streams(
-                regularized_factored_size_buf
-            )
-
-        if _is_main_process():
-            self.relative_sparsity = (
-                regularized_zeros / regularized_params
-                if regularized_params > 0
-                else 0.0
-            )
-            self.relative_factored_frac = (
-                regularized_factored_size / regularized_unfactored_size
-                if regularized_unfactored_size > 0
-                else 0.0
-            )
+        self._record_relative_stats(totals, sctx)
 
         return loss
 
-    def _process_param(
-        self,
-        group,
-        p,
-        prox_map,
-        grouper_cls,
-        grouper_kwargs,
-        prox_kwargs,
-        init_sigma_reweight,
-        update_tau_reweight,
-        dist_is_init,
-        regularized_zeros_buf,
-        regularized_factored_size_buf,
-    ) -> tuple:
+    def _process_param(self, p, gctx: _GroupContext, sctx: _StepContext) -> _SizeTotals:
         """Apply the prox map to one param and return its size contribution.
 
-        Returns ``(zeros, params, factored_size, unfactored_size)`` accumulator
-        deltas; each is 0 when this rank does not run the grouper.
+        The contribution is all-zero when this rank does not run the grouper.
         """
         # save latent parameters
         state = self.state[p]
         state["latent"].copy_(p)
 
         # store the number of non-zero singular values
-        if prox_kwargs["is_svd_grouper"]:
-            npack = grouper_kwargs.get("npack", 1)
+        if gctx.prox_kwargs["is_svd_grouper"]:
+            npack = gctx.grouper_kwargs.get("npack", 1)
             state.setdefault(
                 "sv_count", torch.zeros(npack, dtype=torch.int, device=p.device)
             )
 
         # update the full tensor if sharded
         sharded_p = None
-        if _is_dtensor(p) and prox_kwargs["is_svd_grouper"]:
+        if _is_dtensor(p) and gctx.prox_kwargs["is_svd_grouper"]:
             sharded_p = p
             p = p.full_tensor()
 
         # only rank 0 of the device mesh should run the grouper
         sv_count = state.get("sv_count")
-        zeros = params = factored_size = unfactored_size = 0
+        totals = _SizeTotals()
         if sharded_p is None or sharded_p.device_mesh.get_rank() == 0:
-            zeros, params, factored_size, unfactored_size = self._run_grouper(
-                group,
-                p,
-                state,
-                prox_map,
-                grouper_cls,
-                grouper_kwargs,
-                prox_kwargs,
-                sv_count,
-                init_sigma_reweight,
-                update_tau_reweight,
-                dist_is_init,
-                regularized_zeros_buf,
-                regularized_factored_size_buf,
-            )
+            totals = self._run_grouper(p, state, gctx, sctx)
 
         # copy the updated full tensor to the sharded tensor
         if sharded_p is not None:
@@ -637,61 +635,48 @@ class PruneOptimizer(BaseWrappedOptimizer):
                 )
             )
 
-        return zeros, params, factored_size, unfactored_size
+        return totals
 
     def _run_grouper(
-        self,
-        group,
-        p,
-        state,
-        prox_map,
-        grouper_cls,
-        grouper_kwargs,
-        prox_kwargs,
-        sv_count,
-        init_sigma_reweight,
-        update_tau_reweight,
-        dist_is_init,
-        regularized_zeros_buf,
-        regularized_factored_size_buf,
-    ) -> tuple:
+        self, p, state, gctx: _GroupContext, sctx: _StepContext
+    ) -> _SizeTotals:
         """Run the grouper/prox map on rank 0 and return the size contribution."""
-        grouper = grouper_cls(p, **grouper_kwargs)
+        grouper = gctx.grouper_cls(p, **gctx.grouper_kwargs)
         zero_elts, group_norm, zeros_are_summed = self._apply_prox(
             grouper,
-            prox_map,
+            gctx.prox_map,
             p,
             tau_reweight=state.get("tau_reweight", 1.0),
-            sv_count=sv_count,
-            **prox_kwargs,
+            sv_count=state.get("sv_count"),
+            **gctx.prox_kwargs,
         )
 
         if zeros_are_summed:
             state["sparsity_frac"] = zero_elts / grouper.p.numel()
-        elif dist_is_init:
-            _maybe_async_aggregate(regularized_zeros_buf, zero_elts)
+        elif sctx.dist_is_init:
+            _maybe_async_aggregate(sctx.zeros_buf, zero_elts)
 
         if torch.is_tensor(zero_elts):
             zero_elts = zero_elts.item()
 
         self._update_reweight_state(
-            state, group_norm, init_sigma_reweight, update_tau_reweight
+            state, group_norm, sctx.init_sigma_reweight, sctx.update_tau_reweight
         )
 
-        if not prox_kwargs["is_svd_grouper"]:
-            return zero_elts, grouper.p.numel(), 0, 0
+        if not gctx.prox_kwargs["is_svd_grouper"]:
+            return _SizeTotals(zeros=zero_elts, params=grouper.p.numel())
 
-        zeros, params, factored_size, unfactored_size = self._svd_size_contribution(
-            group, grouper, zero_elts
-        )
-        # Only aggregate factored size if not already globally summed
+        totals = self._svd_size_contribution(gctx.group, grouper, zero_elts)
+        # Only aggregate factored size directly if not already globally summed
         if zeros_are_summed:
-            return zeros, params, factored_size, unfactored_size
+            return totals
         _maybe_async_aggregate(
-            regularized_factored_size_buf,
-            torch.tensor(factored_size, dtype=torch.int, device=p.device),
+            sctx.factored_size_buf,
+            torch.tensor(totals.factored_size, dtype=torch.int, device=p.device),
         )
-        return zeros, params, 0, unfactored_size
+        # factored_size is aggregated asynchronously instead of added directly
+        totals.factored_size = 0
+        return totals
 
     @torch._disable_dynamo
     def save_latent_params(self) -> None:
