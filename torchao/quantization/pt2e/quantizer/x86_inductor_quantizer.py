@@ -549,6 +549,8 @@ class X86InductorQuantizer(Quantizer):
         patterns in the submodule with this module name with the given `quantization_config`
 
         The supported operators include `quantizable_ops` and `propagation_quantizable_ops`.
+
+        Note: this method is inherited unchanged by ``ArmInductorQuantizer``.
         """
         self.module_name_qconfig[module_name] = quantization_config
         return self

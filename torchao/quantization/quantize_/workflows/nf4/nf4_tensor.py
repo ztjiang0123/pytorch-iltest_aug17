@@ -197,15 +197,24 @@ def clone(func, *args, **kwargs):
     return to_nf4(args[0][0].get_original_weight())
 
 
+def _nf4_apply_op_to_inner_tensors(aten_op, args, kwargs=None):
+    """Apply ``aten_op`` to each inner tensor of an NF4Tensor and rebuild it.
+
+    Shared by ops (e.g. ``detach`` and ``_pin_memory``) that simply forward
+    themselves to the inner tensors and reconstruct the wrapper unchanged.
+    """
+    nf4tensor = args[0]
+    updated_attrs = apply_to_inner_tensors(nf4tensor, aten_op, args[1:], kwargs)
+    return NF4Tensor(*construct_nf4_args(nf4tensor, updated_attrs))
+
+
 @implements(
     [
         aten.detach.default,
     ]
 )
 def nf4_detach(aten_op, args, kwargs=None):
-    nf4tensor = args[0]
-    updated_attrs = apply_to_inner_tensors(nf4tensor, aten_op, args[1:], kwargs)
-    return NF4Tensor(*construct_nf4_args(nf4tensor, updated_attrs))
+    return _nf4_apply_op_to_inner_tensors(aten_op, args, kwargs)
 
 
 @implements(
@@ -478,9 +487,7 @@ def nf4_is_pinned(aten_op, args, kwargs=None):
     ]
 )
 def nf4_pin_memory(aten_op, args, kwargs=None):
-    nf4tensor = args[0]
-    updated_attrs = apply_to_inner_tensors(nf4tensor, aten_op, args[1:], kwargs)
-    return NF4Tensor(*construct_nf4_args(nf4tensor, updated_attrs))
+    return _nf4_apply_op_to_inner_tensors(aten_op, args, kwargs)
 
 
 @implements(
