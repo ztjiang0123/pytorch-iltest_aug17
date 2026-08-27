@@ -89,6 +89,22 @@ class ConvGeometry:
 
 
 @dataclass(frozen=True)
+class Shape:
+    """A concrete GEMM shape ``(M, K, N)`` for a single benchmark iteration.
+
+    For conv these correspond to ``(batch, in_channels, out_channels)``.
+    Grouped so the shape triple travels as one value instead of three params.
+    """
+
+    M: int
+    K: int
+    N: int
+
+    def as_tuple(self) -> tuple:
+        return (self.M, self.K, self.N)
+
+
+@dataclass(frozen=True)
 class ShapeConfig:
     """Selects how benchmark shapes are generated.
 
@@ -542,6 +558,326 @@ def _create_model_and_input(
     return m_orig, x
 
 
+@dataclass(frozen=True)
+class RooflineModel:
+    """The roofline sympy model: its symbols and the four time expressions.
+
+    These are built once per run and evaluated per shape, so they travel as one
+    object (keeping the evaluator's parameter list short).
+    """
+
+    symbols: tuple  # (M, K, N) sympy symbols
+    bf16_gemm: object
+    bf16_ovhd: object
+    fp8_gemm: object
+    fp8_ovhd: object
+
+    def eval_times(self, gemm_vals, bf16_ovhd_vals):
+        """Evaluate the roofline expressions at concrete (M, K, N) values.
+
+        ``gemm_vals`` feeds the gemm terms and the fp8 overhead term;
+        ``bf16_ovhd_vals`` feeds the bf16 overhead term. For linear they are
+        identical; for conv the gemm terms use the equivalent implicit-GEMM dims
+        while the bf16 overhead uses the original (batch, in_channels,
+        out_channels). Returns the six roofline scalars in results-column order.
+        """
+        M, K, N = self.symbols
+
+        def _eval(expr, vals):
+            # cast from sympy.core.numbers.Float to float for pandas formatting
+            return float(expr.subs(M, vals[0]).subs(K, vals[1]).subs(N, vals[2]))
+
+        r_bf16_gemm_time_s = _eval(self.bf16_gemm, gemm_vals)
+        r_fp8_gemm_time_s = _eval(self.fp8_gemm, gemm_vals)
+        r_bf16_ovhd_time_s = _eval(self.bf16_ovhd, bf16_ovhd_vals)
+        r_fp8_ovhd_time_s = _eval(self.fp8_ovhd, gemm_vals)
+        r_fp8_gemm_and_ovhd_s = r_fp8_gemm_time_s + r_fp8_ovhd_time_s
+        r_speedup = (r_bf16_gemm_time_s + r_bf16_ovhd_time_s) / (
+            r_fp8_gemm_time_s + r_fp8_ovhd_time_s
+        )
+        return (
+            r_bf16_gemm_time_s,
+            r_fp8_gemm_time_s,
+            r_bf16_ovhd_time_s,
+            r_fp8_ovhd_time_s,
+            r_fp8_gemm_and_ovhd_s,
+            r_speedup,
+        )
+
+
+def _conv_geometry_for_shape(conv: ConvConfig, shape: Shape) -> ConvGeometry:
+    """Build a per-shape ``ConvGeometry`` from the run's conv config and shape."""
+    return ConvGeometry(
+        op_name=conv.op_name,
+        batch=shape.M,
+        in_channels=shape.K,
+        out_channels=shape.N,
+        kernel_size=conv.kernel_size,
+        D=conv.D,
+        H=conv.H,
+        W=conv.W,
+        stride=conv.stride,
+        padding=conv.padding,
+    )
+
+
+def _validate_run_ops(recipe_name, conv: ConvConfig):
+    """Validate that the requested op/recipe/spatial-dims combination is supported."""
+    op_name = conv.op_name
+    _SUPPORTED_OPS = ["linear", "conv2d", "conv3d"]
+    assert op_name in _SUPPORTED_OPS, (
+        f"Unsupported op: {op_name}, supported are: {_SUPPORTED_OPS}"
+    )
+
+    is_conv = op_name in ("conv2d", "conv3d")
+    if is_conv:
+        _SUPPORTED_CONV_RECIPES = ["tensorwise"]
+        assert recipe_name in _SUPPORTED_CONV_RECIPES, (
+            f"Recipe '{recipe_name}' is not supported for {op_name}. "
+            f"Supported recipes for conv operations: {_SUPPORTED_CONV_RECIPES}. "
+        )
+
+    if op_name == "conv2d":
+        assert conv.H is not None and conv.W is not None, (
+            "Expected D, H, W to be specified for conv2d"
+        )
+        assert conv.kernel_size is not None, (
+            "Expected kernel_size to be specified for conv2d"
+        )
+    elif op_name == "conv3d":
+        assert conv.D is not None and conv.H is not None and conv.W is not None, (
+            "Expected D, H, W to be specified for conv3d"
+        )
+        assert conv.kernel_size is not None, (
+            "Expected kernel_size to be specified for conv3d"
+        )
+
+
+def _build_roofline_model(symbols, recipe_name, op_name, enable_fusion_modeling):
+    """Build the ``RooflineModel`` (fp8/bf16 gemm and overhead time expressions)."""
+    M, K, N = symbols
+    fp8_ovhd_time_sympy = get_inference_float8_mem_sympy(
+        M,
+        K,
+        N,
+        recipe_name,
+        # TODO(future): also enable fusion modeling here
+    )
+    bf16_gemm_time_sympy = get_inference_gemm_time_sympy(M, K, N, torch.bfloat16, None)
+    if enable_fusion_modeling and op_name == "linear":
+        bf16_ovhd_time_sympy = get_inference_bf16_activation_mem_sympy(M, K, N)
+    else:
+        # multiply by M to ensure we get a sympy symbol
+        bf16_ovhd_time_sympy = M * 0
+
+    if recipe_name and recipe_name.startswith(("nvfp4", "mxfp4")):
+        fp8_gemm_time_sympy = get_inference_gemm_time_sympy(
+            M, K, N, torch.float4_e2m1fn_x2, recipe_name
+        )
+    else:
+        gemm_recipe_name = "mxfp8" if recipe_name.startswith("mxfp8") else None
+        fp8_gemm_time_sympy = get_inference_gemm_time_sympy(
+            M, K, N, torch.float8_e4m3fn, gemm_recipe_name
+        )
+    return RooflineModel(
+        symbols=symbols,
+        bf16_gemm=bf16_gemm_time_sympy,
+        bf16_ovhd=bf16_ovhd_time_sympy,
+        fp8_gemm=fp8_gemm_time_sympy,
+        fp8_ovhd=fp8_ovhd_time_sympy,
+    )
+
+
+def _build_quant_config(recipe_name):
+    """Map a recipe name to its quantization config, plus an optional calibration config.
+
+    Returns ``(config, config_calib)`` where ``config_calib`` is None unless the
+    recipe requires a calibration pass before conversion.
+    """
+    if recipe_name == "tensorwise":
+        return Float8DynamicActivationFloat8WeightConfig(granularity=PerTensor()), None
+    if recipe_name == "rowwise":
+        return (
+            Float8DynamicActivationFloat8WeightConfig(
+                granularity=PerRow(),
+                # for now, use TORCH. In the future might be interesting
+                # to benchmark AUTO and MSLK.
+                kernel_preference=KernelPreference.TORCH,
+            ),
+            None,
+        )
+    if recipe_name == "mxfp8_cublas":
+        return (
+            MXDynamicActivationMXWeightConfig(
+                activation_dtype=torch.float8_e4m3fn,
+                weight_dtype=torch.float8_e4m3fn,
+                kernel_preference=KernelPreference.AUTO,
+            ),
+            None,
+        )
+    if recipe_name == "mxfp4_cutlass":
+        return (
+            MXDynamicActivationMXWeightConfig(
+                activation_dtype=torch.float4_e2m1fn_x2,
+                weight_dtype=torch.float4_e2m1fn_x2,
+                kernel_preference=KernelPreference.AUTO,
+            ),
+            None,
+        )
+    if recipe_name == "nvfp4":
+        return (
+            NVFP4DynamicActivationNVFP4WeightConfig(use_dynamic_per_tensor_scale=True),
+            None,
+        )
+    if recipe_name == "nvfp4_no_global_scale":
+        return (
+            NVFP4DynamicActivationNVFP4WeightConfig(use_dynamic_per_tensor_scale=False),
+            None,
+        )
+    if recipe_name == "nvfp4_static":
+        config_calib = NVFP4DynamicActivationNVFP4WeightConfig(step="prepare")
+        config = NVFP4DynamicActivationNVFP4WeightConfig(step="convert")
+        return config, config_calib
+    assert False, "unsupported"
+
+
+def _quantize_model_for_op(m_fp8_dyn, op_name, config):
+    """Apply ``quantize_`` to the model, filtering to the layer type for the op."""
+    if op_name == "linear":
+        quantize_(m_fp8_dyn, config)
+    elif op_name == "conv2d":
+        _is_conv2d = lambda m, fqn: isinstance(m, torch.nn.Conv2d)
+        quantize_(m_fp8_dyn, config, filter_fn=_is_conv2d)
+    else:
+        _is_conv3d = lambda m, fqn: isinstance(m, torch.nn.Conv3d)
+        quantize_(m_fp8_dyn, config, filter_fn=_is_conv3d)
+
+
+def _roofline_and_gemm_linear(
+    roofline: RooflineModel, shape: Shape, recipe_name, do_benchmarks
+):
+    """Roofline scalars + optional measured gemm times/ratios for a linear shape."""
+    vals = shape.as_tuple()
+    times = roofline.eval_times(vals, vals)
+    r_bf16_gemm_time_s, r_fp8_gemm_time_s = times[0], times[1]
+
+    # if enabled, also measure observed gemm time
+    b_bf16_gemm_time_s, b_fp8_gemm_time_s = 0, 0
+    rb_bf16_gemm_ratio = -1
+    rb_fp8_gemm_ratio = -1
+    if do_benchmarks:
+        # TODO(future): make the bf16 gemm times exactly match the e2e
+        # benchmarks, there is a slight deviation, probably related to gemm
+        # operand memory formats/transpositions below not exactly matching
+        # what PyTorch core is doing for `torch.mm`
+        # input @ weight_t = output
+        b_bf16_gemm_time_s, b_fp8_gemm_time_s = get_gemm_times(
+            shape.M,
+            shape.K,
+            shape.N,
+            True,
+            recipe_name,
+        )
+        rb_bf16_gemm_ratio = r_bf16_gemm_time_s / b_bf16_gemm_time_s
+        rb_fp8_gemm_ratio = r_fp8_gemm_time_s / b_fp8_gemm_time_s
+
+    return times, (
+        b_bf16_gemm_time_s,
+        b_fp8_gemm_time_s,
+        rb_bf16_gemm_ratio,
+        rb_fp8_gemm_ratio,
+    )
+
+
+def _roofline_and_gemm_conv(
+    roofline: RooflineModel, shape: Shape, conv: ConvConfig, recipe_name, do_benchmarks
+):
+    """Roofline scalars + optional measured conv kernel times/ratios for a conv shape."""
+    # For conv ops, compute equivalent GEMM dimensions
+    # shape.M=batch, shape.K=in_channels, shape.N=out_channels
+    conv_geometry = _conv_geometry_for_shape(conv, shape)
+    gemm_vals = get_conv_equivalent_gemm_dims(conv_geometry)
+    times = roofline.eval_times(gemm_vals, shape.as_tuple())
+    r_bf16_gemm_time_s, r_fp8_gemm_time_s = times[0], times[1]
+
+    # measure actual conv kernel times (without quant overhead)
+    b_bf16_gemm_time_s, b_fp8_gemm_time_s = 0, 0
+    rb_bf16_gemm_ratio = -1
+    rb_fp8_gemm_ratio = -1
+    if do_benchmarks:
+        b_bf16_gemm_time_s, b_fp8_gemm_time_s = get_conv_times(
+            conv_geometry,
+            fast_accum=True,
+            recipe_name=recipe_name,
+        )
+        if b_bf16_gemm_time_s > 0:
+            rb_bf16_gemm_ratio = r_bf16_gemm_time_s / b_bf16_gemm_time_s
+        if b_fp8_gemm_time_s > 0:
+            rb_fp8_gemm_ratio = r_fp8_gemm_time_s / b_fp8_gemm_time_s
+
+    return times, (
+        b_bf16_gemm_time_s,
+        b_fp8_gemm_time_s,
+        rb_bf16_gemm_ratio,
+        rb_fp8_gemm_ratio,
+    )
+
+
+def _benchmark_e2e(shape: Shape, conv: ConvConfig, bench: BenchmarkConfig, recipe_name):
+    """Measure e2e bf16 and fp8 gpu kernel times for one shape.
+
+    Returns ``(b_bf16_e2e_time_s, b_fp8_e2e_time_s)``; both are 0 when the op is
+    an unsupported conv on the current GPU.
+    """
+    op_name = conv.op_name
+    if op_name in ("conv2d", "conv3d") and not is_sm_at_least_100():
+        print(
+            f"WARNING: Skipping {op_name} benchmarks for shape ({shape.M}, {shape.K}, {shape.N}). "
+            f"Float8 convolution requires SM 10.0+ (Blackwell/B100 GPUs). "
+            f"Current GPU: {torch.cuda.get_device_name(0)} with SM {torch.cuda.get_device_capability()}. "
+            f"Roofline model estimates are still valid."
+        )
+        return 0, 0
+
+    model_geometry = _conv_geometry_for_shape(conv, shape)
+    m_orig, x = _create_model_and_input(model_geometry, bench.enable_fusion_modeling)
+
+    # get the bf16 gpu kernel time
+    torch._dynamo.reset()
+    m_bf16 = torch.compile(copy.deepcopy(m_orig))
+
+    trace_prefix = f"{bench.outfile}_{shape.M}_{shape.K}_{shape.N}"
+    bf16_trace_filename = None
+    if bench.save_profile_traces:
+        bf16_trace_filename = f"{trace_prefix}_bf16.json"
+    b_bf16_e2e_time_s = get_gpu_kernel_time(m_bf16, x, bf16_trace_filename)
+
+    # get the float8 dynamic scaling gpu kernel time
+    torch._dynamo.reset()
+
+    config, config_calib = _build_quant_config(recipe_name)
+
+    m_fp8_dyn = copy.deepcopy(m_orig)
+
+    if config_calib is not None:
+        # calibrate with sample data
+        # this benchmark is performance-only, so a toy datum is fine
+        quantize_(m_fp8_dyn, config_calib)
+        toy_datum = torch.randn(shape.M, shape.K, dtype=torch.bfloat16, device="cuda")
+        m_fp8_dyn(toy_datum)
+
+    _quantize_model_for_op(m_fp8_dyn, op_name, config)
+
+    m_fp8_dyn = torch.compile(m_fp8_dyn)
+
+    fp8_trace_filename = None
+    if bench.save_profile_traces:
+        fp8_trace_filename = f"{trace_prefix}_fp8.json"
+    b_fp8_e2e_time_s = get_gpu_kernel_time(m_fp8_dyn, x, fp8_trace_filename)
+
+    return b_bf16_e2e_time_s, b_fp8_e2e_time_s
+
+
 def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
     """
     Args:
@@ -579,37 +915,10 @@ def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
     outfile = bench.outfile
     do_benchmarks = bench.do_benchmarks
     n_limit = bench.n_limit
-    save_profile_traces = bench.save_profile_traces
     enable_fusion_modeling = bench.enable_fusion_modeling
     skip_printing_detailed_metrics = bench.skip_printing_detailed_metrics
 
-    _SUPPORTED_OPS = ["linear", "conv2d", "conv3d"]
-    assert op_name in _SUPPORTED_OPS, (
-        f"Unsupported op: {op_name}, supported are: {_SUPPORTED_OPS}"
-    )
-
-    # Validate recipe compatibility with conv operations
-    if op_name in ("conv2d", "conv3d"):
-        _SUPPORTED_CONV_RECIPES = ["tensorwise"]
-        assert recipe_name in _SUPPORTED_CONV_RECIPES, (
-            f"Recipe '{recipe_name}' is not supported for {op_name}. "
-            f"Supported recipes for conv operations: {_SUPPORTED_CONV_RECIPES}. "
-        )
-
-    if op_name == "conv2d":
-        assert H is not None and W is not None, (
-            "Expected D, H, W to be specified for conv2d"
-        )
-        assert kernel_size is not None, (
-            "Expected kernel_size to be specified for conv2d"
-        )
-    elif op_name == "conv3d":
-        assert D is not None and H is not None and W is not None, (
-            "Expected D, H, W to be specified for conv3d"
-        )
-        assert kernel_size is not None, (
-            "Expected kernel_size to be specified for conv3d"
-        )
+    _validate_run_ops(recipe_name, conv)
 
     config_table = [
         ["GPU", torch.cuda.get_device_name(0)],
@@ -635,33 +944,13 @@ def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
 
     # Roofline model setup: linear uses M/K/N directly, conv uses equivalent
     # implicit GEMM dimensions (computed per-iteration in the loop below)
-    fp8_ovhd_time_sympy = get_inference_float8_mem_sympy(
-        M,
-        K,
-        N,
-        recipe_name,
-        # TODO(future): also enable fusion modeling here
+    roofline_model = _build_roofline_model(
+        (M, K, N), recipe_name, op_name, enable_fusion_modeling
     )
-    bf16_gemm_time_sympy = get_inference_gemm_time_sympy(M, K, N, torch.bfloat16, None)
-    if enable_fusion_modeling and op_name == "linear":
-        bf16_ovhd_time_sympy = get_inference_bf16_activation_mem_sympy(M, K, N)
-    else:
-        # multiply by M to ensure we get a sympy symbol
-        bf16_ovhd_time_sympy = M * 0
-
-    if recipe_name and recipe_name.startswith(("nvfp4", "mxfp4")):
-        fp8_gemm_time_sympy = get_inference_gemm_time_sympy(
-            M, K, N, torch.float4_e2m1fn_x2, recipe_name
-        )
-    else:
-        gemm_recipe_name = "mxfp8" if recipe_name.startswith("mxfp8") else None
-        fp8_gemm_time_sympy = get_inference_gemm_time_sympy(
-            M, K, N, torch.float8_e4m3fn, gemm_recipe_name
-        )
-    print("bf16_gemm_time_sympy", bf16_gemm_time_sympy)
-    print("bf16_ovhd_time_sympy", bf16_ovhd_time_sympy)
-    print("fp8_gemm_time_sympy", fp8_gemm_time_sympy)
-    print("fp8_ovhd_time_sympy", fp8_ovhd_time_sympy)
+    print("bf16_gemm_time_sympy", roofline_model.bf16_gemm)
+    print("bf16_ovhd_time_sympy", roofline_model.bf16_ovhd)
+    print("fp8_gemm_time_sympy", roofline_model.fp8_gemm)
+    print("fp8_ovhd_time_sympy", roofline_model.fp8_ovhd)
     print()
 
     headers = [
@@ -707,209 +996,36 @@ def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
         if n_limit is not None and idx >= n_limit:
             break
 
+        shape = Shape(M_val, K_val, N_val)
         if op_name == "linear":
-            # use roofline model to estimate gemm time
-            # note: cast from sympy.core.numbers.Float to float to make pandas formatting work
-            r_bf16_gemm_time_s = float(
-                bf16_gemm_time_sympy.subs(M, M_val).subs(K, K_val).subs(N, N_val)
+            times, gemm_bench = _roofline_and_gemm_linear(
+                roofline_model, shape, recipe_name, do_benchmarks
             )
-            r_fp8_gemm_time_s = float(
-                fp8_gemm_time_sympy.subs(M, M_val).subs(K, K_val).subs(N, N_val)
-            )
-
-            # note: cast from sympy.core.numbers.Float to float to make pandas formatting work
-            r_bf16_ovhd_time_s = float(
-                bf16_ovhd_time_sympy.subs(M, M_val).subs(K, K_val).subs(N, N_val)
-            )
-            r_fp8_ovhd_time_s = float(
-                fp8_ovhd_time_sympy.subs(M, M_val).subs(K, K_val).subs(N, N_val)
-            )
-            r_fp8_gemm_and_ovhd_s = r_fp8_gemm_time_s + r_fp8_ovhd_time_s
-            r_speedup = (r_bf16_gemm_time_s + r_bf16_ovhd_time_s) / (
-                r_fp8_gemm_time_s + r_fp8_ovhd_time_s
-            )
-
-            # if enabled, also measured observed gemm time
-            b_bf16_gemm_time_s, b_fp8_gemm_time_s = 0, 0
-            rb_bf16_gemm_ratio = -1
-            rb_fp8_gemm_ratio = -1
-            if do_benchmarks:
-                # TODO(future): make the bf16 gemm times exactly match the e2e
-                # benchmarks, there is a slight deviation, probably related to gemm
-                # operand memory formats/transpositions below not exactly matching
-                # what PyTorch core is doing for `torch.mm`
-                # input @ weight_t = output
-                bf16_g1, f8_g1 = get_gemm_times(
-                    M_val,
-                    K_val,
-                    N_val,
-                    True,
-                    recipe_name,
-                )
-                b_bf16_gemm_time_s = bf16_g1
-                b_fp8_gemm_time_s = f8_g1
-                rb_bf16_gemm_ratio = r_bf16_gemm_time_s / b_bf16_gemm_time_s
-                rb_fp8_gemm_ratio = r_fp8_gemm_time_s / b_fp8_gemm_time_s
-
         else:
-            # For conv ops, compute equivalent GEMM dimensions
-            # M_val=batch, K_val=in_channels, N_val=out_channels
-            conv_geometry = ConvGeometry(
-                op_name=op_name,
-                batch=M_val,
-                in_channels=K_val,
-                out_channels=N_val,
-                kernel_size=kernel_size,
-                D=D,
-                H=H,
-                W=W,
-                stride=stride,
-                padding=padding,
-            )
-            gemm_M, gemm_K, gemm_N = get_conv_equivalent_gemm_dims(conv_geometry)
-
-            # use roofline model to estimate gemm time using equivalent GEMM dims
-            r_bf16_gemm_time_s = float(
-                bf16_gemm_time_sympy.subs(M, gemm_M).subs(K, gemm_K).subs(N, gemm_N)
-            )
-            r_fp8_gemm_time_s = float(
-                fp8_gemm_time_sympy.subs(M, gemm_M).subs(K, gemm_K).subs(N, gemm_N)
-            )
-            r_bf16_ovhd_time_s = float(
-                bf16_ovhd_time_sympy.subs(M, M_val).subs(K, K_val).subs(N, N_val)
-            )
-            r_fp8_ovhd_time_s = float(
-                fp8_ovhd_time_sympy.subs(M, gemm_M).subs(K, gemm_K).subs(N, gemm_N)
-            )
-            r_fp8_gemm_and_ovhd_s = r_fp8_gemm_time_s + r_fp8_ovhd_time_s
-            r_speedup = (r_bf16_gemm_time_s + r_bf16_ovhd_time_s) / (
-                r_fp8_gemm_time_s + r_fp8_ovhd_time_s
+            times, gemm_bench = _roofline_and_gemm_conv(
+                roofline_model, shape, conv, recipe_name, do_benchmarks
             )
 
-            # measure actual conv kernel times (without quant overhead)
-            b_bf16_gemm_time_s, b_fp8_gemm_time_s = 0, 0
-            rb_bf16_gemm_ratio = -1
-            rb_fp8_gemm_ratio = -1
-            if do_benchmarks:
-                bf16_c1, f8_c1 = get_conv_times(
-                    conv_geometry,
-                    fast_accum=True,
-                    recipe_name=recipe_name,
-                )
-                b_bf16_gemm_time_s = bf16_c1
-                b_fp8_gemm_time_s = f8_c1
-                if b_bf16_gemm_time_s > 0:
-                    rb_bf16_gemm_ratio = r_bf16_gemm_time_s / b_bf16_gemm_time_s
-                if b_fp8_gemm_time_s > 0:
-                    rb_fp8_gemm_ratio = r_fp8_gemm_time_s / b_fp8_gemm_time_s
+        (
+            r_bf16_gemm_time_s,
+            r_fp8_gemm_time_s,
+            r_bf16_ovhd_time_s,
+            r_fp8_ovhd_time_s,
+            r_fp8_gemm_and_ovhd_s,
+            r_speedup,
+        ) = times
+        (
+            b_bf16_gemm_time_s,
+            b_fp8_gemm_time_s,
+            rb_bf16_gemm_ratio,
+            rb_fp8_gemm_ratio,
+        ) = gemm_bench
 
         b_bf16_e2e_time_s, b_fp8_e2e_time_s = 0, 0
-
         if do_benchmarks:
-            if op_name in ("conv2d", "conv3d") and not is_sm_at_least_100():
-                print(
-                    f"WARNING: Skipping {op_name} benchmarks for shape ({M_val}, {K_val}, {N_val}). "
-                    f"Float8 convolution requires SM 10.0+ (Blackwell/B100 GPUs). "
-                    f"Current GPU: {torch.cuda.get_device_name(0)} with SM {torch.cuda.get_device_capability()}. "
-                    f"Roofline model estimates are still valid."
-                )
-            else:
-                model_geometry = ConvGeometry(
-                    op_name=op_name,
-                    batch=M_val,
-                    in_channels=K_val,
-                    out_channels=N_val,
-                    kernel_size=kernel_size,
-                    D=D,
-                    H=H,
-                    W=W,
-                    stride=stride,
-                    padding=padding,
-                )
-                m_orig, x = _create_model_and_input(
-                    model_geometry,
-                    enable_fusion_modeling,
-                )
-
-                # get the bf16 gpu kernel time
-                torch._dynamo.reset()
-                m_bf16 = torch.compile(copy.deepcopy(m_orig))
-
-                bf16_trace_filename = None
-                if save_profile_traces:
-                    bf16_trace_filename = f"{outfile}_{M_val}_{K_val}_{N_val}_bf16.json"
-                b_bf16_e2e_time_s = get_gpu_kernel_time(m_bf16, x, bf16_trace_filename)
-
-                # get the float8 dynamic scaling gpu kernel time
-                torch._dynamo.reset()
-
-                if recipe_name == "tensorwise":
-                    config = Float8DynamicActivationFloat8WeightConfig(
-                        granularity=PerTensor(),
-                    )
-                elif recipe_name == "rowwise":
-                    config = Float8DynamicActivationFloat8WeightConfig(
-                        granularity=PerRow(),
-                        # for now, use TORCH. In the future might be interesting
-                        # to benchmark AUTO and MSLK.
-                        kernel_preference=KernelPreference.TORCH,
-                    )
-                elif recipe_name == "mxfp8_cublas":
-                    config = MXDynamicActivationMXWeightConfig(
-                        activation_dtype=torch.float8_e4m3fn,
-                        weight_dtype=torch.float8_e4m3fn,
-                        kernel_preference=KernelPreference.AUTO,
-                    )
-                elif recipe_name == "mxfp4_cutlass":
-                    config = MXDynamicActivationMXWeightConfig(
-                        activation_dtype=torch.float4_e2m1fn_x2,
-                        weight_dtype=torch.float4_e2m1fn_x2,
-                        kernel_preference=KernelPreference.AUTO,
-                    )
-                elif recipe_name == "nvfp4":
-                    config = NVFP4DynamicActivationNVFP4WeightConfig(
-                        use_dynamic_per_tensor_scale=True,
-                    )
-                elif recipe_name == "nvfp4_no_global_scale":
-                    config = NVFP4DynamicActivationNVFP4WeightConfig(
-                        use_dynamic_per_tensor_scale=False,
-                    )
-                elif recipe_name == "nvfp4_static":
-                    config_calib = NVFP4DynamicActivationNVFP4WeightConfig(
-                        step="prepare",
-                    )
-                    config = NVFP4DynamicActivationNVFP4WeightConfig(
-                        step="convert",
-                    )
-                else:
-                    assert False, "unsupported"
-
-                m_fp8_dyn = copy.deepcopy(m_orig)
-
-                if recipe_name == "nvfp4_static":
-                    # calibrate with sample data
-                    # this benchmark is performance-only, so a toy datum is fine
-                    quantize_(m_fp8_dyn, config_calib)
-                    toy_datum = torch.randn(
-                        M_val, K_val, dtype=torch.bfloat16, device="cuda"
-                    )
-                    m_fp8_dyn(toy_datum)
-
-                if op_name == "linear":
-                    quantize_(m_fp8_dyn, config)
-                elif op_name == "conv2d":
-                    _is_conv2d = lambda m, fqn: isinstance(m, torch.nn.Conv2d)
-                    quantize_(m_fp8_dyn, config, filter_fn=_is_conv2d)
-                else:
-                    _is_conv3d = lambda m, fqn: isinstance(m, torch.nn.Conv3d)
-                    quantize_(m_fp8_dyn, config, filter_fn=_is_conv3d)
-
-                m_fp8_dyn = torch.compile(m_fp8_dyn)
-
-                fp8_trace_filename = None
-                if save_profile_traces:
-                    fp8_trace_filename = f"{outfile}_{M_val}_{K_val}_{N_val}_fp8.json"
-                b_fp8_e2e_time_s = get_gpu_kernel_time(m_fp8_dyn, x, fp8_trace_filename)
+            b_bf16_e2e_time_s, b_fp8_e2e_time_s = _benchmark_e2e(
+                shape, conv, bench, recipe_name
+            )
 
         # Calculate e2e speedup if benchmarks were run, otherwise -1
         if b_bf16_e2e_time_s > 0 and b_fp8_e2e_time_s > 0:
