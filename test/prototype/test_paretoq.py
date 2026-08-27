@@ -12,6 +12,7 @@ from torchao.prototype.paretoq.models.utils_quant import (
     LsqBinaryTernaryExtension,
     QuantizeLinear,
     StretchedElasticQuant,
+    WeightQuantConfig,
 )
 
 
@@ -32,8 +33,7 @@ class TestParetoQ(unittest.TestCase):
             m.linear = QuantizeLinear(
                 m.linear.in_features,
                 m.linear.out_features,
-                bias=False,
-                w_bits=w_bits,
+                weight_quant_config=WeightQuantConfig(w_bits=w_bits),
             )
             m(example_inputs)
 
