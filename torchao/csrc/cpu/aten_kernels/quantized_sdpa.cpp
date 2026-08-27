@@ -1935,6 +1935,190 @@ struct Fp8SdpaThreadBuffers {
   scalar_t* query_t_padding_ptr;
 };
 
+// One (i, j, query-block m, kv-block n) work item and its derived block sizes.
+struct Fp8SdpaBlock {
+  int64_t i;
+  int64_t j;
+  int64_t m;            // query block start row
+  int64_t n;            // kv block start
+  int64_t qBlockSize;
+  int64_t kvBlockSize;
+  int64_t ekvBlockSize;
+  int64_t num_keys;
+};
+
+// qk <- q @ k.T for this kv block, then fill the causal-masked tail with -inf.
+template <typename scalar_t, typename mask_t>
+inline void fp8_sdpa_qk_gemm(
+    const Fp8SdpaContext<scalar_t, mask_t>& ctx,
+    const Fp8SdpaThreadBuffers<scalar_t>& bufs,
+    const Fp8SdpaBlock& b) {
+  using accum_t = float;
+  at::native::cpublas::brgemm(
+    b.qBlockSize,
+    b.kvBlockSize,
+    ctx.eheadSize,
+    ctx.headSize_even ? ctx.qStrideM : ctx.eheadSize,
+    b.kvBlockSize,
+    b.kvBlockSize,
+    false,
+    !ctx.headSize_even
+        ? bufs.query_t_padding_ptr
+        : ctx.q_data + b.i * ctx.qStrideB + b.j * ctx.qStrideH + b.m * ctx.qStrideM,
+    ctx.key_reorder_ptr + b.i * ctx.num_head * ctx.eheadSize * ctx.kvSize +
+        b.j * ctx.eheadSize * ctx.kvSize + b.n * ctx.eheadSize,
+    bufs.qk_data);
+  // Apply causal mask, fill unused with -inf
+  if (!(ctx.is_causal && b.num_keys - b.n <= ctx.kvSplitSize)) {
+    return;
+  }
+  for (const auto row : c10::irange(b.qBlockSize)) {
+    int64_t last_col = b.m + row - b.n;
+    accum_t* row_ptr = bufs.qk_data + row * b.kvBlockSize;
+    fill_stub(row_ptr + last_col + 1,
+        -std::numeric_limits<accum_t>::infinity(),
+        b.kvBlockSize - last_col - 1);
+  }
+}
+
+// qk <- qk * scaling + attn_mask (dequantized) for this kv block.
+template <typename scalar_t, typename mask_t>
+inline void fp8_sdpa_apply_attn_mask(
+    const Fp8SdpaContext<scalar_t, mask_t>& ctx,
+    const Fp8SdpaThreadBuffers<scalar_t>& bufs,
+    const Fp8SdpaBlock& b) {
+  const float scale = ctx.scaling_factor * ctx.scales.q_scale * ctx.scales.k_scale;
+  const bool stride0 = ctx.mStrideN == 0;
+  for (int64_t row = 0; row < b.qBlockSize; ++row) {
+    float* qk_row = bufs.qk_data + row * b.kvBlockSize;
+    mask_t* mask_row = ctx.mask_data + b.i * ctx.mStrideB + b.j * ctx.mStrideH +
+        (b.m + row) * ctx.mStrideM + (stride0 ? 0 : b.n);
+    if (stride0) {
+      _scale_dequant_attn_mask_fusion_kernel</*is_stride_0*/ true>(
+        qk_row, mask_row, b.kvBlockSize, qk_row, scale);
+    } else {
+      _scale_dequant_attn_mask_fusion_kernel</*is_stride_0*/ false>(
+        qk_row, mask_row, b.kvBlockSize, qk_row, scale);
+    }
+  }
+}
+
+// Online-softmax update of one row against this kv block; also zero-pads the
+// reduced (VNNI) row tail so the @v GEMM can consume it.
+template <typename scalar_t, typename mask_t>
+inline void fp8_sdpa_softmax_row(
+    const Fp8SdpaContext<scalar_t, mask_t>& ctx,
+    const Fp8SdpaThreadBuffers<scalar_t>& bufs,
+    const Fp8SdpaBlock& b,
+    int64_t row) {
+  using accum_t = float;
+  using Vec = at::vec::Vectorized<accum_t>;
+  const int64_t headSize = ctx.headSize;
+  accum_t* qk_data = bufs.qk_data;
+  accum_t* qk_max_data = bufs.qk_max_data;
+  accum_t* qk_sum_data = bufs.qk_sum_data;
+  accum_t* dst_data = bufs.dst_data;
+  scalar_t* qk_reduced_data = bufs.qk_reduced_data;
+
+  accum_t tmp_max;
+  if (ctx.has_attn_mask) {
+    // max per row
+    tmp_max = at::vec::reduce_all<accum_t>(
+        [](Vec& x, Vec& y) { return at::vec::maximum(x, y); },
+        qk_data + row * b.kvBlockSize,
+        b.kvBlockSize);
+  } else {
+    // apply scaling factor and max per row in fusion
+    _mul_reduce_max_fusion_kernel(
+        qk_data + row * b.kvBlockSize,
+        ctx.scaling_factor * ctx.scales.q_scale * ctx.scales.k_scale,
+        b.kvBlockSize,
+        qk_data + row * b.kvBlockSize,
+        tmp_max);
+  }
+  tmp_max = qk_max_data[row] > tmp_max ? qk_max_data[row] : tmp_max;
+  if (tmp_max == -std::numeric_limits<accum_t>::infinity()) {
+    // to avoid `nan = exp2f(-inf - (-inf))`
+    fill_stub(qk_reduced_data + row * b.ekvBlockSize,
+      static_cast<scalar_t>(0), b.kvBlockSize);
+  } else {
+    accum_t tmp_sum = tmp_max;
+    // qk <- exp(qk - max) and sum per row
+    _fp8_exp_reduce_sum_quant_fusion_kernel(
+        qk_data + row * b.kvBlockSize, b.kvBlockSize,
+        qk_reduced_data + row * b.ekvBlockSize,
+        tmp_sum,
+        1.0 / ctx.scales.a_scale);
+    // exp_tmp <- exp(max[row] - max)
+    accum_t exp_tmp = std::exp(qk_max_data[row] - tmp_max);
+    // sum[row] <- sum + exp_tmp * sum[row]
+    qk_sum_data[row] = tmp_sum + exp_tmp * qk_sum_data[row];
+    // max[row] <- max
+    qk_max_data[row] = tmp_max;
+    // dst <- dst * exp_tmp
+    if (b.n > 0) {
+      at::vec::map<accum_t>(
+        [exp_tmp](Vec x) { return x * Vec(exp_tmp); },
+        dst_data + row * headSize,
+        dst_data + row * headSize,
+        headSize);
+    }
+  }
+  if (b.kvBlockSize % 4 != 0) {
+    // Pad: [qSplitSize, kvBlockSize] -> [qSplitSize, kvBlockSize + 4 - kvBlockSize / 4]
+    for (int64_t psize = b.kvBlockSize; psize < b.ekvBlockSize; ++psize) {
+      *(qk_reduced_data + row * b.ekvBlockSize + psize) = scalar_t(0);
+    }
+  }
+}
+
+// dst <- Softmax(q @ k.T) @ v for this kv block (accumulating across blocks).
+template <typename scalar_t, typename mask_t>
+inline void fp8_sdpa_av_gemm(
+    const Fp8SdpaContext<scalar_t, mask_t>& ctx,
+    const Fp8SdpaThreadBuffers<scalar_t>& bufs,
+    const Fp8SdpaBlock& b) {
+  const int64_t headSize = ctx.headSize;
+  int64_t psize = b.n / ctx.kvSplitSize * ctx.ekvSplitSize;
+  at::native::cpublas::brgemm(
+    b.qBlockSize,
+    headSize,
+    b.ekvBlockSize,
+    b.ekvBlockSize,
+    headSize,
+    headSize,
+    b.n > 0,
+    bufs.qk_reduced_data,
+    ctx.value_reorder_ptr +
+        b.i * ctx.num_head * ctx.kv_padding_size * headSize +
+        b.j * ctx.kv_padding_size * headSize + psize * headSize,
+    bufs.dst_data);
+}
+
+// dst <- dst / sum[row], then dequant+quant into the strided output.
+template <typename scalar_t, typename mask_t>
+inline void fp8_sdpa_finalize_output(
+    const Fp8SdpaContext<scalar_t, mask_t>& ctx,
+    const Fp8SdpaThreadBuffers<scalar_t>& bufs,
+    const Fp8SdpaBlock& b) {
+  using accum_t = float;
+  const int64_t headSize = ctx.headSize;
+  const float a_scale = ctx.scales.a_scale, v_scale = ctx.scales.v_scale, o_scale = ctx.scales.o_scale;
+  for (int64_t row = 0; row < b.qBlockSize; ++row) {
+    // Row sums for full masked out rows are 0, we set them to 1
+    // in order to avoid NaNs in the output and instead set fully
+    // masked out rows to 0
+    bufs.qk_max_data[row] = bufs.qk_max_data[row] == -std::numeric_limits<accum_t>::infinity() ? 0 : bufs.qk_max_data[row];
+    bufs.qk_sum_data[row] = bufs.qk_sum_data[row] == 0 ? 1 : bufs.qk_sum_data[row];
+    accum_t sum_reciprocal = 1 / bufs.qk_sum_data[row];
+    _fp8_dequant_quant_fusion_kernel(
+      bufs.dst_data + row * headSize,
+      headSize,
+      ctx.out_data + b.i * ctx.oStrideB + b.j * ctx.oStrideH + b.m * ctx.oStrideM + row * ctx.oStrideM,
+      sum_reciprocal * a_scale * v_scale / o_scale);
+  }
+}
+
 // Attend a single query block (i, j, block starting at row m): q@k.T, causal
 // mask, attn mask, softmax, @v accumulation, and the final requantized store.
 template <typename scalar_t, typename mask_t>
@@ -1945,177 +2129,44 @@ inline void fp8_sdpa_attend_query_block(
     int64_t m,
     const Fp8SdpaThreadBuffers<scalar_t>& bufs) {
   using accum_t = float;
-  using Vec = at::vec::Vectorized<accum_t>;
-  const int64_t kvSize = ctx.kvSize, num_head = ctx.num_head, headSize = ctx.headSize;
-  const int64_t qSplitSize = ctx.qSplitSize, kvSplitSize = ctx.kvSplitSize, eheadSize = ctx.eheadSize;
-  const bool headSize_even = ctx.headSize_even, is_causal = ctx.is_causal, has_attn_mask = ctx.has_attn_mask;
-  const accum_t scaling_factor = ctx.scaling_factor;
-  const float q_scale = ctx.scales.q_scale, k_scale = ctx.scales.k_scale;
-  const float a_scale = ctx.scales.a_scale;
-  accum_t* qk_data = bufs.qk_data;
-  accum_t* qk_max_data = bufs.qk_max_data;
-  accum_t* qk_sum_data = bufs.qk_sum_data;
-  accum_t* dst_data = bufs.dst_data;
-  scalar_t* qk_reduced_data = bufs.qk_reduced_data;
-  scalar_t* query_t_padding_ptr = bufs.query_t_padding_ptr;
-
-  int64_t qBlockSize = std::min(qSplitSize, ctx.qSize - m);
+  const int64_t qBlockSize = std::min(ctx.qSplitSize, ctx.qSize - m);
   // Initialize max and sum
-  fill_stub(qk_max_data,
+  fill_stub(bufs.qk_max_data,
       -std::numeric_limits<accum_t>::infinity(), qBlockSize);
-  fill_stub(qk_sum_data,
+  fill_stub(bufs.qk_sum_data,
       static_cast<accum_t>(0), qBlockSize);
-  int64_t num_keys = is_causal ? std::min(m + qBlockSize, kvSize) : kvSize;
-  if (!headSize_even) {
-    // Pad query if headSize is not even
-    // [qBlockSize, headSize] -> [qBlockSize, eheadSize]
+  const int64_t num_keys =
+      ctx.is_causal ? std::min(m + qBlockSize, ctx.kvSize) : ctx.kvSize;
+  if (!ctx.headSize_even) {
+    // Pad query if headSize is not even: [qBlockSize, headSize] -> [qBlockSize, eheadSize]
     copy_value_with_pad<scalar_t>(
       ctx.q_data + i * ctx.qStrideB + j * ctx.qStrideH + m * ctx.qStrideM,
-      query_t_padding_ptr,
-      qBlockSize,
-      headSize,
-      qBlockSize,
-      eheadSize,
-      ctx.qStrideM
-    );
-  }
-  for (int64_t n = 0; n < num_keys; n += kvSplitSize) {
-    int64_t kvBlockSize = std::min(kvSplitSize, kvSize - n);
-    int64_t ekvBlockSize = (kvBlockSize % 4 != 0) ? kvBlockSize + 4 - kvBlockSize % 4 : kvBlockSize;
-    // Calculate scale * q @ k.T
-    at::native::cpublas::brgemm(
-      qBlockSize,
-      kvBlockSize,
-      eheadSize,
-      headSize_even ? ctx.qStrideM : eheadSize,
-      kvBlockSize,
-      kvBlockSize,
-      false,
-      !headSize_even
-          ? query_t_padding_ptr
-          : ctx.q_data + i * ctx.qStrideB + j * ctx.qStrideH + m * ctx.qStrideM,
-      ctx.key_reorder_ptr + i * num_head * eheadSize * kvSize +
-          j * eheadSize * kvSize + n * eheadSize,
-      qk_data);
-    // Apply causal mask, fill unused with -inf
-    if (is_causal && num_keys - n <= kvSplitSize) {
-      for (const auto row : c10::irange(qBlockSize)) {
-        int64_t last_col = m + row - n;
-        accum_t* row_ptr = qk_data + row * kvBlockSize;
-        fill_stub(row_ptr + last_col + 1,
-            -std::numeric_limits<accum_t>::infinity(),
-            kvBlockSize - last_col - 1);
-      }
-    }
-    // Update attention weights with attention mask
-    // And apply scaling factor
-    // qk <- qk * scaling + attn_mask
-    if (has_attn_mask) {
-      for (int64_t row = 0; row < qBlockSize; ++row) {
-          if (ctx.mStrideN == 0) {
-            _scale_dequant_attn_mask_fusion_kernel</*is_stride_0*/ true>(
-              qk_data + row * kvBlockSize,
-              ctx.mask_data + i * ctx.mStrideB + j * ctx.mStrideH +
-                  (m + row) * ctx.mStrideM,
-              kvBlockSize,
-              qk_data + row * kvBlockSize,
-              scaling_factor * q_scale * k_scale);
-          } else {
-            _scale_dequant_attn_mask_fusion_kernel</*is_stride_0*/ false>(
-              qk_data + row * kvBlockSize,
-              ctx.mask_data + i * ctx.mStrideB + j * ctx.mStrideH +
-                  (m + row) * ctx.mStrideM + n,
-              kvBlockSize,
-              qk_data + row * kvBlockSize,
-              scaling_factor * q_scale * k_scale);
-          }
-      }
-    }
-    // Update coefficients with Softmax
-    accum_t tmp_max = 0, tmp_sum = 0, exp_tmp = 0;
-    for (int64_t row = 0; row < qBlockSize; ++row) {
-      if (has_attn_mask) {
-        // max per row
-        tmp_max = at::vec::reduce_all<accum_t>(
-            [](Vec& x, Vec& y) { return at::vec::maximum(x, y); },
-            qk_data + row * kvBlockSize,
-            kvBlockSize);
-      } else {
-        // apply scaling factor and max per row in fusion
-        _mul_reduce_max_fusion_kernel(
-            qk_data + row * kvBlockSize,
-            scaling_factor * q_scale * k_scale,
-            kvBlockSize,
-            qk_data + row * kvBlockSize,
-            tmp_max);
-      }
-      tmp_max = qk_max_data[row] > tmp_max ? qk_max_data[row] : tmp_max;
-      if (tmp_max == -std::numeric_limits<accum_t>::infinity()) {
-        // to avoid `nan = exp2f(-inf - (-inf))`
-        fill_stub(qk_reduced_data + row * ekvBlockSize,
-          static_cast<scalar_t>(0), kvBlockSize);
-      } else {
-        tmp_sum = tmp_max;
-        // qk <- exp(qk - max) and sum per row
-        _fp8_exp_reduce_sum_quant_fusion_kernel(
-            qk_data + row * kvBlockSize, kvBlockSize,
-            qk_reduced_data + row * ekvBlockSize,
-            tmp_sum,
-            1.0 / a_scale);
-        // exp_tmp <- exp(max[row] - max)
-        exp_tmp = std::exp(qk_max_data[row] - tmp_max);
-        // sum[row] <- sum + exp_tmp * sum[row]
-        qk_sum_data[row] = tmp_sum + exp_tmp * qk_sum_data[row];
-        // max[row] <- max
-        qk_max_data[row] = tmp_max;
-        // dst <- dst * exp_tmp
-        if (n > 0) {
-          at::vec::map<accum_t>(
-            [exp_tmp](Vec x) { return x * Vec(exp_tmp); },
-            dst_data + row * headSize,
-            dst_data + row * headSize,
-            headSize);
-        }
-      }
-      if (kvBlockSize % 4 != 0) {
-        // Pad: [qSplitSize, kvBlockSize] -> [qSplitSize, kvBlockSize + 4 - kvBlockSize / 4]
-        for (int64_t psize = kvBlockSize; psize < ekvBlockSize; ++psize) {
-          *(qk_reduced_data + row * ekvBlockSize + psize) = scalar_t(0);
-        }
-      }
-    }
-    // Calculate Softmax(q @ k.T) @ v
-    int64_t psize = n / kvSplitSize * ctx.ekvSplitSize;
-    at::native::cpublas::brgemm(
-      qBlockSize,
-      headSize,
-      ekvBlockSize,
-      ekvBlockSize,
-      headSize,
-      headSize,
-      n > 0,
-      qk_reduced_data,
-      ctx.value_reorder_ptr +
-          i * num_head * ctx.kv_padding_size * headSize +
-          j * ctx.kv_padding_size * headSize + psize * headSize,
-      dst_data);
+      bufs.query_t_padding_ptr,
+      qBlockSize, ctx.headSize, qBlockSize, ctx.eheadSize, ctx.qStrideM);
   }
 
-  // dst <- dst / sum[row]
-  // reorder MHA output with strides
-  for (int64_t row = 0; row < qBlockSize; ++row) {
-    // Row sums for full masked out rows are 0, we set them to 1
-    // in order to avoid NaNs in the output and instead set fully
-    // masked out rows to 0
-    qk_max_data[row] = qk_max_data[row] == -std::numeric_limits<accum_t>::infinity() ? 0 : qk_max_data[row];
-    qk_sum_data[row] = qk_sum_data[row] == 0 ? 1 : qk_sum_data[row];
-    accum_t sum_reciprocal = 1 / qk_sum_data[row];
-    _fp8_dequant_quant_fusion_kernel(
-      dst_data + row * headSize,
-      headSize,
-      ctx.out_data + i * ctx.oStrideB + j * ctx.oStrideH + m * ctx.oStrideM + row * ctx.oStrideM,
-      sum_reciprocal * a_scale * ctx.scales.v_scale / ctx.scales.o_scale);
+  for (int64_t n = 0; n < num_keys; n += ctx.kvSplitSize) {
+    const int64_t kvBlockSize = std::min(ctx.kvSplitSize, ctx.kvSize - n);
+    const int64_t ekvBlockSize =
+        (kvBlockSize % 4 != 0) ? kvBlockSize + 4 - kvBlockSize % 4 : kvBlockSize;
+    const Fp8SdpaBlock b{i, j, m, n, qBlockSize, kvBlockSize, ekvBlockSize, num_keys};
+    // Calculate scale * q @ k.T (+ causal mask)
+    fp8_sdpa_qk_gemm(ctx, bufs, b);
+    // Update attention weights with attention mask and scaling factor
+    if (ctx.has_attn_mask) {
+      fp8_sdpa_apply_attn_mask(ctx, bufs, b);
+    }
+    // Update coefficients with Softmax (one row at a time)
+    for (int64_t row = 0; row < qBlockSize; ++row) {
+      fp8_sdpa_softmax_row(ctx, bufs, b, row);
+    }
+    // Calculate Softmax(q @ k.T) @ v
+    fp8_sdpa_av_gemm(ctx, bufs, b);
   }
+
+  // dst <- dst / sum[row]; reorder MHA output with strides
+  const Fp8SdpaBlock out_block{i, j, m, 0, qBlockSize, 0, 0, num_keys};
+  fp8_sdpa_finalize_output(ctx, bufs, out_block);
 }
 
 // Flash-attention compute over the reordered K/V: iterate query blocks per
