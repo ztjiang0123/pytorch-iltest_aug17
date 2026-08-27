@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
@@ -11,6 +12,25 @@ import torch.distributed as dist
 from torch.distributed._functional_collectives import AsyncCollectiveTensor, all_reduce
 
 from torchao.float8.config import ScalingGranularity
+
+
+@dataclass
+class AmaxReductionConfig:
+    """Groups the options that control how ``tensor_to_amax`` computes and
+    reduces the absolute max, since they always travel together.
+
+    Args:
+        reduce_amax: whether to reduce the amax across distributed ranks.
+        device_mesh: optional device mesh used for the distributed reduction.
+        scaling_granularity: defines the scaling granularity.
+        axiswise_dim: if axiswise granularity is used, the dim to scale across.
+    """
+
+    reduce_amax: bool = False
+    device_mesh: Optional["torch.distributed.device_mesh.DeviceMesh"] = None
+    scaling_granularity: ScalingGranularity = ScalingGranularity.TENSORWISE
+    axiswise_dim: Optional[int] = None
+
 
 # Helpful visualizer for debugging (only supports fp32):
 # https://www.h-schmidt.net/FloatConverter/IEEE754.html
@@ -56,23 +76,22 @@ def amax_to_scale(
 @torch.no_grad()
 def tensor_to_amax(
     x: torch.Tensor,
-    reduce_amax: bool = False,
-    device_mesh=None,
-    scaling_granularity: ScalingGranularity = ScalingGranularity.TENSORWISE,
-    axiswise_dim: Optional[int] = None,
+    config: Optional[AmaxReductionConfig] = None,
 ) -> torch.Tensor:
-    if scaling_granularity is ScalingGranularity.TENSORWISE:
+    if config is None:
+        config = AmaxReductionConfig()
+    if config.scaling_granularity is ScalingGranularity.TENSORWISE:
         amax = torch.max(torch.abs(x))
     else:
-        assert scaling_granularity is ScalingGranularity.AXISWISE, "unsupported"
-        assert axiswise_dim is not None, "unsupported"
-        amax = torch.amax(torch.abs(x), dim=axiswise_dim, keepdim=True)
+        assert config.scaling_granularity is ScalingGranularity.AXISWISE, "unsupported"
+        assert config.axiswise_dim is not None, "unsupported"
+        amax = torch.amax(torch.abs(x), dim=config.axiswise_dim, keepdim=True)
 
     # If the user asked for distributed reduction, do it.
     # If the user did not ask for it, assume that it will
     # happen elsewhere.
-    if reduce_amax and dist.is_initialized():
-        pg = device_mesh.get_group() if device_mesh is not None else None
+    if config.reduce_amax and dist.is_initialized():
+        pg = config.device_mesh.get_group() if config.device_mesh is not None else None
         # dist.all_reduce(amax, op=dist.ReduceOp.MAX, group=pg)
         group = list(range(dist.get_world_size())) if pg is None else pg
         amax = all_reduce(amax, "MAX", group)
@@ -105,10 +124,12 @@ def tensor_to_scale(
     """
     amax = tensor_to_amax(
         hp_tensor,
-        reduce_amax,
-        device_mesh,
-        scaling_granularity,
-        axiswise_dim,
+        AmaxReductionConfig(
+            reduce_amax=reduce_amax,
+            device_mesh=device_mesh,
+            scaling_granularity=scaling_granularity,
+            axiswise_dim=axiswise_dim,
+        ),
     )
     return amax_to_scale(
         amax, float8_dtype, round_scales_to_power_of_2=round_scales_to_power_of_2

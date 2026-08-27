@@ -6,6 +6,8 @@
 import logging
 import os
 import pathlib
+from dataclasses import dataclass
+from typing import List, Optional
 
 import torch
 import triton
@@ -13,24 +15,11 @@ import triton
 AUTOTUNER_DATA_PATH = os.getenv("TORCHAO_AUTOTUNER_DATA_PATH", None)
 
 
-def do_bench_triton(
-    fn,
-    warmup=25,
-    rep=100,
-    grad_to_none=None,
-    quantiles=None,
-    fast_flush=True,
-    return_mode="mean",
-):
-    assert return_mode in ["min", "max", "mean", "median"]
-    import torch
+@dataclass
+class BenchTritonConfig:
+    """Groups the tuning options for :func:`do_bench_triton`, which always
+    travel together when benchmarking a kernel.
 
-    """
-    Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
-    the 20-th and 80-th performance percentile.
-
-    :param fn: Function to benchmark
-    :type fn: Callable
     :param warmup: Warmup time (in ms)
     :type warmup: int
     :param rep: Repetition time (in ms)
@@ -41,7 +30,43 @@ def do_bench_triton(
     :type quantiles: list[float]
     :param fast_flush: Use faster kernel to flush L2 between measurements
     :type fast_flush: bool
+    :param return_mode: How to aggregate the recorded times.
+    :type return_mode: str
     """
+
+    warmup: int = 25
+    rep: int = 100
+    grad_to_none: Optional[List[torch.Tensor]] = None
+    quantiles: Optional[List[float]] = None
+    fast_flush: bool = True
+    return_mode: str = "mean"
+
+    def __post_init__(self):
+        assert self.return_mode in ["min", "max", "mean", "median"]
+
+
+def do_bench_triton(
+    fn,
+    config: Optional[BenchTritonConfig] = None,
+):
+    """
+    Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
+    the 20-th and 80-th performance percentile.
+
+    :param fn: Function to benchmark
+    :type fn: Callable
+    :param config: Benchmark tuning options, see :class:`BenchTritonConfig`.
+    :type config: BenchTritonConfig, optional
+    """
+    if config is None:
+        config = BenchTritonConfig()
+    warmup = config.warmup
+    rep = config.rep
+    grad_to_none = config.grad_to_none
+    quantiles = config.quantiles
+    fast_flush = config.fast_flush
+    return_mode = config.return_mode
+    import torch
 
     fn()
     torch.cuda.synchronize()

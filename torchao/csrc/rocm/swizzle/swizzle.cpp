@@ -8,6 +8,7 @@
 #include <ATen/OpMathType.h>
 #include <ATen/TensorUtils.h>
 #include <ATen/core/Tensor.h>
+#include <ATen/core/stack.h>
 #include <ATen/hip/HIPDataType.h>
 #include <ATen/hip/HIPBlas.h>
 #include <ATen/native/Resize.h>
@@ -919,18 +920,36 @@ _scaled_mm_out(const Tensor& mat1, const Tensor& mat2,
   return out;
 }
 
+// Groups the operands, their scales, and the swizzle/output options that
+// travel together through the scaled matmul so the entry point does not need
+// a long, easy-to-misorder parameter list.
+struct SwizzleScaledMMParams {
+  const Tensor& mat_a;
+  const Tensor& mat_b;
+  bool mat1_is_swizzled;
+  bool mat2_is_swizzled;
+  const Tensor& scale_a;
+  const Tensor& scale_b;
+  const std::optional<at::Tensor>& bias;
+  const std::optional<at::Tensor>& scale_result;
+  std::optional<c10::ScalarType> out_dtype;
+};
+
 Tensor
-swizzle_scaled_mm(const Tensor& mat_a, const Tensor& mat_b,
-          bool mat1_is_swizzled,
-          bool mat2_is_swizzled,
-          const Tensor& scale_a,
-          const Tensor& scale_b,
-          const std::optional<at::Tensor>& bias,
-          const std::optional<at::Tensor>& scale_result,
-          std::optional<c10::ScalarType> out_dtype) {
-  const auto out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
-  Tensor out = at::empty({0}, mat_a.options().dtype(out_dtype_));
-  return _scaled_mm_out(mat_a, mat_b, mat1_is_swizzled, mat2_is_swizzled, scale_a, scale_b, bias, scale_result, out_dtype, out);
+swizzle_scaled_mm(const SwizzleScaledMMParams& params) {
+  const auto out_dtype_ = params.out_dtype.value_or(params.mat_a.scalar_type());
+  Tensor out = at::empty({0}, params.mat_a.options().dtype(out_dtype_));
+  return _scaled_mm_out(
+      params.mat_a,
+      params.mat_b,
+      params.mat1_is_swizzled,
+      params.mat2_is_swizzled,
+      params.scale_a,
+      params.scale_b,
+      params.bias,
+      params.scale_result,
+      params.out_dtype,
+      out);
 }
 
 // Registers a sequence of (schema name, implementation) pairs into a
@@ -947,12 +966,45 @@ static void register_swizzle_impls(
   }
 }
 
+// Boxed adapter for `torchao::swizzle_scaled_mm`. Reading the flat schema
+// arguments off the dispatcher stack (rather than declaring them as a long
+// parameter list) lets the grouped `SwizzleScaledMMParams` stay the only
+// operand plumbing while still matching the registered schema.
+static void swizzle_scaled_mm_boxed(
+    const c10::OperatorHandle& /*op*/,
+    c10::Stack* stack) {
+  // Argument order mirrors the torchao::swizzle_scaled_mm schema.
+  auto [mat_a, mat_b, mat1_is_swizzled, mat2_is_swizzled, scale_a, scale_b,
+        bias, scale_result, out_dtype] =
+      torch::jit::pop<
+          Tensor,
+          Tensor,
+          bool,
+          bool,
+          Tensor,
+          Tensor,
+          std::optional<at::Tensor>,
+          std::optional<at::Tensor>,
+          std::optional<c10::ScalarType>>(stack);
+  Tensor out = swizzle_scaled_mm(SwizzleScaledMMParams{
+      mat_a,
+      mat_b,
+      mat1_is_swizzled,
+      mat2_is_swizzled,
+      scale_a,
+      scale_b,
+      bias,
+      scale_result,
+      out_dtype});
+  torch::jit::push(stack, std::move(out));
+}
+
 TORCH_LIBRARY_IMPL(torchao, CUDA, m) {
   register_swizzle_impls(
       m,
       "torchao::swizzle_mm",
       &swizzle_mm,
       "torchao::swizzle_scaled_mm",
-      &swizzle_scaled_mm);
+      torch::CppFunction::makeFromBoxedFunction<&swizzle_scaled_mm_boxed>());
 }
 #endif // USE_ROCM
