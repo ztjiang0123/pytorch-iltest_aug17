@@ -211,46 +211,74 @@ def _get_f8_gemm_time_s(spec):
     return get_gpu_kernel_gemm_time_s(do_matmul, A, B)
 
 
+@dataclass(frozen=True)
+class GemmInvocation:
+    """One gemm's role and shape for :func:`get_gemm_times`.
+
+    These six values describe a single gemm to time and always travel together,
+    so they are grouped into one value object instead of being passed as
+    separate positional arguments.
+
+    * ``gemm_role``: `output`, `grad_input`, or `grad_weight`.
+    * ``M``, ``K``, ``N``: gemm dimensions.
+    * ``fast_accum``: whether to use fast accumulation for the float8 gemm.
+    * ``bf16_memory_formats``: memory-format pair for the bf16 operands, one of
+      `row_major:col_major`, `row_major:row_major`, or `col_major:row_major`.
+    """
+
+    gemm_role: str
+    M: int
+    K: int
+    N: int
+    fast_accum: bool
+    bf16_memory_formats: str
+
+
 def get_gemm_times(
-    gemm_role: str,
-    M: int,
-    K: int,
-    N: int,
-    fast_accum: bool,
-    bf16_memory_formats: str,
+    invocation: GemmInvocation,
     float8_recipe_name: Optional[str],
     mx_recipe_name: Optional[str],
     cache_filename=None,
 ):
-    assert gemm_role in ("output", "grad_input", "grad_weight"), "unsupported"
-    assert bf16_memory_formats in (
+    assert invocation.gemm_role in (
+        "output",
+        "grad_input",
+        "grad_weight",
+    ), "unsupported"
+    assert invocation.bf16_memory_formats in (
         "row_major:col_major",
         "row_major:row_major",
         "col_major:row_major",
     ), "unsupported"
 
     cache = _load_gemm_cache(cache_filename)
-    key = f"{M},{K},{N},{fast_accum},{bf16_memory_formats}"
+    key = (
+        f"{invocation.M},{invocation.K},{invocation.N},"
+        f"{invocation.fast_accum},{invocation.bf16_memory_formats}"
+    )
     if key in cache:
         return cache[key]
 
     device = torch.device("cuda")
     spec = GemmSpec(
-        M=M,
-        K=K,
-        N=N,
-        fast_accum=fast_accum,
+        M=invocation.M,
+        K=invocation.K,
+        N=invocation.N,
+        fast_accum=invocation.fast_accum,
         float8_recipe_name=float8_recipe_name,
         mx_recipe_name=mx_recipe_name,
         device=device,
     )
 
     # bf16 time
-    x_bf16, w_bf16 = _make_bf16_gemm_inputs(spec, bf16_memory_formats)
+    x_bf16, w_bf16 = _make_bf16_gemm_inputs(spec, invocation.bf16_memory_formats)
     bf16_time_s = get_gpu_kernel_gemm_time_s(torch.mm, x_bf16, w_bf16)
 
     # f8 time
-    if float8_recipe_name == "rowwise_with_gw_hp" and gemm_role == "grad_weight":
+    if (
+        float8_recipe_name == "rowwise_with_gw_hp"
+        and invocation.gemm_role == "grad_weight"
+    ):
         f8_time_s = bf16_time_s
     else:
         f8_time_s = _get_f8_gemm_time_s(spec)
@@ -312,36 +340,42 @@ def _benchmark_gemm_times(config, float8_recipe_name, M_val, K_val, N_val):
     # what PyTorch core is doing for `torch.mm`
     # input @ weight_t = output
     bf16_g1, f8_g1 = get_gemm_times(
-        "output",
-        M_val,
-        K_val,
-        N_val,
-        True,
-        "row_major:col_major",
+        GemmInvocation(
+            gemm_role="output",
+            M=M_val,
+            K=K_val,
+            N=N_val,
+            fast_accum=True,
+            bf16_memory_formats="row_major:col_major",
+        ),
         float8_recipe_name,
         config.mx_recipe_name,
         config.gemm_cache_filename,
     )
     # grad_output @ weight = grad_input
     bf16_g2, f8_g2 = get_gemm_times(
-        "grad_input",
-        M_val,
-        N_val,
-        K_val,
-        False,
-        "row_major:row_major",
+        GemmInvocation(
+            gemm_role="grad_input",
+            M=M_val,
+            K=N_val,
+            N=K_val,
+            fast_accum=False,
+            bf16_memory_formats="row_major:row_major",
+        ),
         float8_recipe_name,
         config.mx_recipe_name,
         config.gemm_cache_filename,
     )
     # input_t @ grad_output = grad_weight
     bf16_g3, f8_g3 = get_gemm_times(
-        "grad_weight",
-        K_val,
-        M_val,
-        N_val,
-        False,
-        "col_major:row_major",
+        GemmInvocation(
+            gemm_role="grad_weight",
+            M=K_val,
+            K=M_val,
+            N=N_val,
+            fast_accum=False,
+            bf16_memory_formats="col_major:row_major",
+        ),
         float8_recipe_name,
         config.mx_recipe_name,
         config.gemm_cache_filename,
