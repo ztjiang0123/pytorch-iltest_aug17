@@ -1816,24 +1816,54 @@ int8_sdpa_fused_kernel_impl(
 }
 
 #if defined(CPUBLAS_BRGEMM_F8F8F32)
+// Attention input/output tensors that travel together through the FP8 kernels.
+struct Fp8SdpaTensors {
+  const at::Tensor& output;
+  const at::Tensor& q;
+  const at::Tensor& k;
+  const at::Tensor& v;
+};
+
+// Attention configuration shared by the FP8 kernels.
+struct Fp8SdpaConfig {
+  double dropout_p;
+  bool is_causal;
+  std::optional<at::Tensor> attn_mask;
+  std::optional<double> scale;
+};
+
+// Per-tensor quantization scales for the FP8 attention computation.
+struct Fp8SdpaScales {
+  float q_scale;
+  float k_scale;
+  float v_scale;
+  float a_scale;
+  float o_scale;
+};
+
 // FP8 - kernel with f8f8f8 GEMM
 template <typename scalar_t, typename mask_t,
           int64_t q_split_size, int64_t kv_split_size>
 inline typename std::enable_if_t<std::is_same_v<scalar_t, at::Float8_e4m3fn>, void>
 fp8_sdpa_fused_kernel_impl(
-    const at::Tensor& output,
-    const at::Tensor& q,
-    const at::Tensor& k,
-    const at::Tensor& v,
-    double dropout_p,
-    bool is_causal,
-    std::optional<at::Tensor> attn_mask,
-    std::optional<double> scale,
-    float q_scale,
-    float k_scale,
-    float v_scale,
-    float a_scale,
-    float o_scale) {
+    const Fp8SdpaTensors& tensors,
+    const Fp8SdpaConfig& config,
+    const Fp8SdpaScales& scales) {
+  const at::Tensor& output = tensors.output;
+  const at::Tensor& q = tensors.q;
+  const at::Tensor& k = tensors.k;
+  const at::Tensor& v = tensors.v;
+  [[maybe_unused]] const double dropout_p = config.dropout_p;
+  const bool is_causal = config.is_causal;
+  // Local mutable copy: reshape_attn_mask_to_4d rewrites the mask in place and
+  // must not affect the caller's optional (matching the original by-value param).
+  std::optional<at::Tensor> attn_mask = config.attn_mask;
+  const std::optional<double>& scale = config.scale;
+  const float q_scale = scales.q_scale;
+  const float k_scale = scales.k_scale;
+  const float v_scale = scales.v_scale;
+  const float a_scale = scales.a_scale;
+  const float o_scale = scales.o_scale;
   // Query (Batch x Num_heads  x Q_seq_len  x Dim_per_head)
   //    -> (Batch x Q_seq_len  x Num_heads  x Dim_per_head)
   // Key   (Batch x Num_heads  x KV_seq_len x Dim_per_head)
@@ -2386,52 +2416,32 @@ void fp8_sdpa_fused_kernel(
     q_split_size = 128;
   }
 
+  Fp8SdpaTensors tensors{output, query, key, value};
+  Fp8SdpaConfig config{dropout_p, is_causal, attn_mask, scale};
+  Fp8SdpaScales scales{q_scale, k_scale, v_scale, a_scale, o_scale};
+
   if (!attn_mask.has_value()) {
     if (q_split_size == 256) {
       fp8_sdpa_fused_kernel_impl<at::Float8_e4m3fn, float, 256, 512>(
-        output, query, key, value,
-        dropout_p, is_causal, attn_mask, scale,
-        q_scale, k_scale,
-        v_scale, a_scale,
-        o_scale);
+        tensors, config, scales);
     } else if (q_split_size == 128) {
       fp8_sdpa_fused_kernel_impl<at::Float8_e4m3fn, float, 128, 512>(
-        output, query, key, value,
-        dropout_p, is_causal, attn_mask, scale,
-        q_scale, k_scale,
-        v_scale, a_scale,
-        o_scale);
+        tensors, config, scales);
     } else {
       fp8_sdpa_fused_kernel_impl<at::Float8_e4m3fn, float, 32, 512>(
-        output, query, key, value,
-        dropout_p, is_causal, attn_mask, scale,
-        q_scale, k_scale,
-        v_scale, a_scale,
-        o_scale);
+        tensors, config, scales);
     }
   } else {
     AT_DISPATCH_MASK_TYPES(attn_mask.value().scalar_type(), "sdpa_mask", [&]() {
       if (q_split_size == 256) {
         fp8_sdpa_fused_kernel_impl<at::Float8_e4m3fn, mask_t, 256, 512>(
-          output, query, key, value,
-          dropout_p, is_causal, attn_mask, scale,
-          q_scale, k_scale,
-          v_scale, a_scale,
-          o_scale);
+          tensors, config, scales);
       } else if (q_split_size == 128) {
         fp8_sdpa_fused_kernel_impl<at::Float8_e4m3fn, mask_t, 128, 512>(
-          output, query, key, value,
-          dropout_p, is_causal, attn_mask, scale,
-          q_scale, k_scale,
-          v_scale, a_scale,
-          o_scale);
+          tensors, config, scales);
       } else {
         fp8_sdpa_fused_kernel_impl<at::Float8_e4m3fn, mask_t, 32, 512>(
-          output, query, key, value,
-          dropout_p, is_causal, attn_mask, scale,
-          q_scale, k_scale,
-          v_scale, a_scale,
-          o_scale);
+          tensors, config, scales);
       }
     });
   }
