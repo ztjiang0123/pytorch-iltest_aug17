@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import dataclass
 from typing import Tuple
 
 import fire
@@ -56,24 +57,31 @@ def scale_dim0_dim1_reference(
     return x_hp_d0_normalized, x_hp_d1_normalized.t(), amax_dim0, amax_dim1
 
 
-def to_mx_dim0_reference(
-    x_hp,
-    block_size,
-    scaling_mode=ScaleCalculationMode.FLOOR,
-    target_dtype=torch.float8_e4m3fn,
-):
-    scale_d0, data_d0 = to_mx(x_hp, target_dtype, block_size, scaling_mode=scaling_mode)
+@dataclass(frozen=True)
+class MXQuantConfig:
+    """Quantization knobs for the ``to_mx`` references.
+
+    ``scaling_mode`` and ``target_dtype`` travel together as the configuration
+    of a single quantization; grouping them keeps the reference signatures
+    short and makes call sites self-documenting.
+    """
+
+    scaling_mode: ScaleCalculationMode = ScaleCalculationMode.FLOOR
+    target_dtype: torch.dtype = torch.float8_e4m3fn
+
+
+def to_mx_dim0_reference(x_hp, block_size, config=MXQuantConfig()):
+    scale_d0, data_d0 = to_mx(
+        x_hp, config.target_dtype, block_size, scaling_mode=config.scaling_mode
+    )
     return data_d0, scale_d0
 
 
-def to_mx_dim1_reference(
-    x_hp,
-    block_size,
-    scaling_mode=ScaleCalculationMode.FLOOR,
-    target_dtype=torch.float8_e4m3fn,
-):
+def to_mx_dim1_reference(x_hp, block_size, config=MXQuantConfig()):
     x_hp = x_hp.t().contiguous()
-    scale_d1, data_d1 = to_mx(x_hp, target_dtype, block_size, scaling_mode=scaling_mode)
+    scale_d1, data_d1 = to_mx(
+        x_hp, config.target_dtype, block_size, scaling_mode=config.scaling_mode
+    )
     return data_d1.t(), scale_d1
 
 
@@ -193,11 +201,13 @@ _NVFP4 = (torch.uint8, torch.float8_e4m3fn)
 
 def _to_mx_dim0_fn(scaling_mode=ScaleCalculationMode.FLOOR, target_dtype=None):
     compiled = torch.compile(to_mx_dim0_reference)
+    if target_dtype is not None:
+        config = MXQuantConfig(scaling_mode=scaling_mode, target_dtype=target_dtype)
+    else:
+        config = MXQuantConfig(scaling_mode=scaling_mode)
 
     def fn(x, block_size):
-        if target_dtype is not None:
-            return compiled(x, block_size, scaling_mode, target_dtype=target_dtype)
-        return compiled(x, block_size, scaling_mode)
+        return compiled(x, block_size, config)
 
     return fn
 
