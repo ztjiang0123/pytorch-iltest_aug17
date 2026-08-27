@@ -230,6 +230,12 @@ def profile_function(
     # warm up
     func(*args, **kwargs)
 
+    def run_one_iter():
+        with name_context:
+            func(*args, **kwargs)
+            if config.sync:
+                torch.cuda.synchronize()
+
     with profile(
         activities=activities,
         profile_memory=profile_memory,
@@ -238,10 +244,7 @@ def profile_function(
         **config.extra_kwargs,
     ) as prof:
         for _ in range(config.iters):
-            with name_context:
-                func(*args, **kwargs)
-                if config.sync:
-                    torch.cuda.synchronize()
+            run_one_iter()
 
     if config.trace_file_path is not None:
         prof.export_chrome_trace(config.trace_file_path)
