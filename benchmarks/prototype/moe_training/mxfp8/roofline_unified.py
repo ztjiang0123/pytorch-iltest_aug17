@@ -12,6 +12,8 @@ This script provides a centralized view of:
 2. Individual quantization kernel bandwidth utilization
 """
 
+from dataclasses import dataclass
+
 import fire
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -516,6 +518,15 @@ def generate_shape_configs(K, N, G):
 # =============================================================================
 # Benchmark sections
 # =============================================================================
+
+
+@dataclass
+class RooflineDims:
+    """Fixed problem dimensions shared across every benchmark section."""
+
+    K: int
+    N: int
+    G: int
 
 
 def _print_section_header(title):
@@ -1163,9 +1174,7 @@ def _resolve_breakdown_M(configs, breakdown_M):
     return breakdown_M
 
 
-def _compute_kernel_breakdown(
-    dfs, M_large, K, N, G
-):
+def _compute_kernel_breakdown(dfs, M_large, dims):
     """Assemble the per-pass kernel time breakdown for the stacked bar chart."""
     (
         df_quant_2d,
@@ -1175,9 +1184,9 @@ def _compute_kernel_breakdown(
         df_grouped_gemm_2d_2d,
     ) = dfs
 
-    K_val = K
-    N_val = N
-    G_val = G
+    K_val = dims.K
+    N_val = dims.N
+    G_val = dims.G
     block_size = 32
 
     # Extract actual measured times from benchmark results (in ms)
@@ -1323,7 +1332,8 @@ def _compute_kernel_breakdown(
     }
 
 
-def _plot_net_speedup(ax, df_speedup, K, N, G):
+def _plot_net_speedup(ax, df_speedup, dims):
+    K, N, G = dims.K, dims.N, dims.G
     ax.plot(
         df_speedup["M"],
         df_speedup["roofline_speedup"],
@@ -1359,7 +1369,8 @@ def _plot_net_speedup(ax, df_speedup, K, N, G):
     ax.legend()
 
 
-def _plot_quant_2d_and_rearrange(ax, df_quant_2d, df_rearrange, K, N):
+def _plot_quant_2d_and_rearrange(ax, df_quant_2d, df_rearrange, dims):
+    K, N = dims.K, dims.N
     # 2D Quantization kernels
     ax.plot(
         df_quant_2d["M"],
@@ -1411,7 +1422,8 @@ def _plot_quant_2d_and_rearrange(ax, df_quant_2d, df_rearrange, K, N):
     ax.grid(True, alpha=0.3)
 
 
-def _plot_grouped_gemm_speedup(ax, df_grouped_gemm, df_grouped_gemm_2d_2d, K, N, G):
+def _plot_grouped_gemm_speedup(ax, df_grouped_gemm, df_grouped_gemm_2d_2d, dims):
+    K, N, G = dims.K, dims.N, dims.G
     # Calculate speedup for 2D/3D grouped GEMM
     speedup_2d_3d = (
         df_grouped_gemm["mxfp8_actual_tflops"] / df_grouped_gemm["bf16_actual_tflops"]
@@ -1482,7 +1494,8 @@ def _plot_reserved_placeholder(ax):
     ax.grid(False)
 
 
-def _plot_quant_3d_and_rearrange(ax, df_quant_3d, df_rearrange_3d, K, N, G):
+def _plot_quant_3d_and_rearrange(ax, df_quant_3d, df_rearrange_3d, dims):
+    K, N, G = dims.K, dims.N, dims.G
     m_values = [int(desc.split("M=")[1]) for desc in df_quant_3d["description"]]
     # 3D Quantization kernel
     ax.plot(
@@ -1614,7 +1627,7 @@ def _plot_kernel_breakdown(ax, breakdown, M_large):
     ax.legend(loc="upper right", fontsize=8)
 
 
-def generate_unified_plots(dfs, configs, breakdown_M, plot_file, K, N, G):
+def generate_unified_plots(dfs, configs, breakdown_M, plot_file, dims):
     """Render the six-panel unified roofline figure and save it to disk."""
     _print_section_header("GENERATING UNIFIED PLOTS")
 
@@ -1630,21 +1643,19 @@ def generate_unified_plots(dfs, configs, breakdown_M, plot_file, K, N, G):
 
     fig, axes = plt.subplots(2, 3, figsize=(24, 12))
 
-    _plot_net_speedup(axes[0, 0], df_speedup, K, N, G)
-    _plot_quant_2d_and_rearrange(axes[0, 1], df_quant_2d, df_rearrange, K, N)
+    _plot_net_speedup(axes[0, 0], df_speedup, dims)
+    _plot_quant_2d_and_rearrange(axes[0, 1], df_quant_2d, df_rearrange, dims)
     _plot_grouped_gemm_speedup(
-        axes[1, 0], df_grouped_gemm, df_grouped_gemm_2d_2d, K, N, G
+        axes[1, 0], df_grouped_gemm, df_grouped_gemm_2d_2d, dims
     )
     _plot_reserved_placeholder(axes[0, 2])
-    _plot_quant_3d_and_rearrange(axes[1, 1], df_quant_3d, df_rearrange_3d, K, N, G)
+    _plot_quant_3d_and_rearrange(axes[1, 1], df_quant_3d, df_rearrange_3d, dims)
 
     M_large = _resolve_breakdown_M(configs, breakdown_M)
     breakdown = _compute_kernel_breakdown(
         (df_quant_2d, df_quant_3d, df_rearrange, df_grouped_gemm, df_grouped_gemm_2d_2d),
         M_large,
-        K,
-        N,
-        G,
+        dims,
     )
     _plot_kernel_breakdown(axes[1, 2], breakdown, M_large)
 
@@ -1653,7 +1664,7 @@ def generate_unified_plots(dfs, configs, breakdown_M, plot_file, K, N, G):
     print(f"\nUnified plot saved to {plot_file}")
 
 
-def print_summary_statistics(dfs, K, N, G, model, power_limit_percent):
+def print_summary_statistics(dfs, dims, model, power_limit_percent):
     """Print aggregate roofline summary statistics."""
     (
         df_speedup,
@@ -1662,6 +1673,7 @@ def print_summary_statistics(dfs, K, N, G, model, power_limit_percent):
         df_grouped_gemm,
         df_grouped_gemm_2d_2d,
     ) = dfs
+    K, N, G = dims.K, dims.N, dims.G
 
     _print_section_header("SUMMARY STATISTICS")
     print(
@@ -1739,6 +1751,7 @@ def run(
     print(f"  MXFP8 TFLOPS: {model.mxfp8_tflops}")
     print(f"  Memory Bandwidth: {model.memory_bandwidth_gbs} GB/s")
 
+    dims = RooflineDims(K=K, N=N, G=G)
     configs = generate_shape_configs(K, N, G)
 
     # 1. Net speedup: BF16 vs MXFP8
@@ -1776,9 +1789,7 @@ def run(
         configs,
         breakdown_M,
         plot_file,
-        K,
-        N,
-        G,
+        dims,
     )
 
     # 8. Summary statistics
@@ -1790,9 +1801,7 @@ def run(
             df_grouped_gemm,
             df_grouped_gemm_2d_2d,
         ),
-        K,
-        N,
-        G,
+        dims,
         model,
         power_limit_percent,
     )
