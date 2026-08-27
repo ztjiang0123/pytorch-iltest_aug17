@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-from .group import (  # noqa: F401
+from .group import (
     AttentionHeadGrouperDim0,
     AttentionHeadGrouperDim1,
     ConvFilterGrouper,
@@ -15,10 +15,27 @@ from .group import (  # noqa: F401
     PackedSVDGrouper,
     SVDGrouper,
 )
-from .optim import (  # noqa: F401
+from .optim import (
     ProxGroupLasso,
     ProxGroupLassoVectorized,
     ProxLasso,
     ProxNuclearNorm,
     PruneOptimizer,
 )
+
+__all__ = [
+    "AttentionHeadGrouperDim0",
+    "AttentionHeadGrouperDim1",
+    "ConvFilterGrouper",
+    "Dim0Grouper",
+    "Dim1Grouper",
+    "ElemGrouper",
+    "LayerGrouper",
+    "PackedSVDGrouper",
+    "SVDGrouper",
+    "ProxGroupLasso",
+    "ProxGroupLassoVectorized",
+    "ProxLasso",
+    "ProxNuclearNorm",
+    "PruneOptimizer",
+]

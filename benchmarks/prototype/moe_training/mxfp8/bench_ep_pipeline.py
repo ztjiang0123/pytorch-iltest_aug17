@@ -223,19 +223,16 @@ def mse_loss_and_bwd(output: torch.Tensor, labels: torch.Tensor):
     loss.backward()
 
 
-def run_experiment(
-    config: ExperimentConfig, args: argparse.Namespace
-) -> ExperimentResult:
-    """Run a single experiment comparing both pipelines."""
-    num_tokens = config.num_tokens
-    dim = config.dim
-    hidden_dim = config.hidden_dim
-    num_experts = config.num_experts
+def _make_input_tensors(config: ExperimentConfig):
+    """Create the input activations and expert weights for an experiment.
 
-    # Create input tensors
+    Returns two (tensor, ref_tensor) pairs; the ``ref_`` variants are
+    independent clones used for the BF16 pipeline so its autograd graph does
+    not interfere with the MXFP8 pipeline's.
+    """
     input_tensor = torch.randn(
-        num_tokens,
-        dim,
+        config.num_tokens,
+        config.dim,
         dtype=torch.bfloat16,
         device=device,
         requires_grad=True,
@@ -243,26 +240,27 @@ def run_experiment(
     ref_input_tensor = input_tensor.detach().clone().requires_grad_(True)
 
     expert_weights = torch.randn(
-        num_experts,
-        hidden_dim,
-        dim,
+        config.num_experts,
+        config.hidden_dim,
+        config.dim,
         dtype=torch.bfloat16,
         device=device,
         requires_grad=True,
     )
     ref_expert_weights = expert_weights.detach().clone().requires_grad_(True)
 
-    # Generate token distribution
-    ep_degree = dist.get_world_size()
-    total_experts = ep_degree * num_experts
-    assert num_tokens % total_experts == 0
-    uniform_group_size = num_tokens // total_experts
+    return input_tensor, ref_input_tensor, expert_weights, ref_expert_weights
+
+
+def _compute_token_distribution(config: ExperimentConfig, ep_degree: int, group):
+    """Build the uniform token distribution and all-to-all splits."""
+    total_experts = ep_degree * config.num_experts
+    assert config.num_tokens % total_experts == 0
+    uniform_group_size = config.num_tokens // total_experts
     num_tokens_per_expert = torch.full(
         (total_experts,), uniform_group_size, dtype=torch.int32, device="cuda"
     )
 
-    # Compute splits for all-to-all
-    group = dist.group.WORLD
     with torch.no_grad():
         num_tokens_per_expert_group = all_to_all_single(
             num_tokens_per_expert,
@@ -284,32 +282,148 @@ def run_experiment(
             .to(torch.device("cpu"), non_blocking=False)
         )
 
-    input_splits_list = input_splits.tolist()
-    output_splits_list = output_splits.tolist()
+    return (
+        num_tokens_per_expert,
+        num_tokens_per_expert_group,
+        input_splits.tolist(),
+        output_splits.tolist(),
+    )
 
-    # Warmup function
-    def warmup(func_no_args, n=2):
-        for _ in range(n):
-            func_no_args()
 
-    def make_bwd_warmup(fwd_fn, input_t, weight_t):
-        # Build a backward-warmup closure for a given pipeline: reset grads,
-        # run the forward pass, then run loss + backward so kernels compile.
-        def bwd_warmup():
-            input_t.grad = None
-            weight_t.grad = None
-            output = fwd_fn(input_t, weight_t.transpose(-2, -1))
-            labels = torch.ones_like(output)
-            mse_loss_and_bwd(output, labels)
+def _warmup(func_no_args, n=2):
+    for _ in range(n):
+        func_no_args()
 
-        return bwd_warmup
 
-    # Set seed for deterministic execution across both pipelines
+def _make_bwd_warmup(fwd_fn, input_t, weight_t):
+    # Build a backward-warmup closure for a given pipeline: reset grads,
+    # run the forward pass, then run loss + backward so kernels compile.
+    def bwd_warmup():
+        input_t.grad = None
+        weight_t.grad = None
+        output = fwd_fn(input_t, weight_t.transpose(-2, -1))
+        labels = torch.ones_like(output)
+        mse_loss_and_bwd(output, labels)
+
+    return bwd_warmup
+
+
+def _time_forward(fwd_fn, input_t, weight_t) -> float:
+    """Warm up then time a single forward pass, in milliseconds."""
+    _warmup(lambda: fwd_fn(input_t, weight_t.transpose(-2, -1)))
+    torch.cuda.synchronize()
+    start_sec = time.perf_counter()
+    _ = fwd_fn(input_t, weight_t.transpose(-2, -1))
+    torch.cuda.synchronize()
+    end_sec = time.perf_counter()
+    return (end_sec - start_sec) * 1e3
+
+
+def _time_backward(fwd_fn, input_t, weight_t):
+    """Warm up then time a single backward pass, in milliseconds.
+
+    Returns the elapsed time and the labels tensor used, so callers can reuse
+    the labels for profiling.
+    """
+    _warmup(_make_bwd_warmup(fwd_fn, input_t, weight_t))
+
+    # Do a fresh forward pass right before timing backward
+    input_t.grad = None
+    weight_t.grad = None
+    output_for_bwd = fwd_fn(input_t, weight_t.transpose(-2, -1))
+    labels = torch.ones_like(output_for_bwd)
+    torch.cuda.synchronize()
+    start_sec = time.perf_counter()
+    mse_loss_and_bwd(output_for_bwd, labels)
+    torch.cuda.synchronize()
+    end_sec = time.perf_counter()
+    return (end_sec - start_sec) * 1e3, labels
+
+
+def _profile_pipeline(fwd_fn, config: ExperimentConfig, labels, profile_name: str):
+    """Profile a full forward+backward pass on fresh tensors."""
+
+    def fwd_bwd(input_t, weight_t, labels):
+        output = fwd_fn(input_t, weight_t)
+        mse_loss_and_bwd(output, labels)
+
+    # Create fresh tensors for profiling to avoid autograd graph conflicts
+    input_tensor_profile = torch.randn(
+        config.num_tokens,
+        config.dim,
+        dtype=torch.bfloat16,
+        device=device,
+        requires_grad=True,
+    )
+    expert_weights_profile = torch.randn(
+        config.num_experts,
+        config.hidden_dim,
+        config.dim,
+        dtype=torch.bfloat16,
+        device=device,
+        requires_grad=True,
+    )
+    profile_fn(
+        fwd_bwd,
+        input_tensor_profile,
+        expert_weights_profile.transpose(-2, -1),
+        labels,
+        distributed=True,
+        profile_name=profile_name,
+    )
+
+
+@dataclass
+class _PipelineInputs:
+    """Bundles the tensors and config a pipeline benchmark needs."""
+
+    experiment: ExperimentConfig
+    input_t: torch.Tensor
+    weight_t: torch.Tensor
+
+
+def _benchmark_pipeline(
+    fwd_fn,
+    inputs: _PipelineInputs,
+    args: argparse.Namespace,
+    profile_name: str,
+):
+    """Benchmark forward and backward for a single pipeline.
+
+    The random seed is reset first so both pipelines see the same random state.
+    Returns (fwd_ms, bwd_ms).
+    """
     torch.manual_seed(42)
 
-    # === Benchmark Standard BF16 Pipeline ===
+    fwd_ms = _time_forward(fwd_fn, inputs.input_t, inputs.weight_t)
+    bwd_ms, labels = _time_backward(fwd_fn, inputs.input_t, inputs.weight_t)
 
-    # BF16 Forward
+    if args.profile:
+        _profile_pipeline(fwd_fn, inputs.experiment, labels, profile_name)
+
+    return fwd_ms, bwd_ms
+
+
+def run_experiment(
+    config: ExperimentConfig, args: argparse.Namespace
+) -> ExperimentResult:
+    """Run a single experiment comparing both pipelines."""
+    (
+        input_tensor,
+        ref_input_tensor,
+        expert_weights,
+        ref_expert_weights,
+    ) = _make_input_tensors(config)
+
+    ep_degree = dist.get_world_size()
+    group = dist.group.WORLD
+    (
+        num_tokens_per_expert,
+        num_tokens_per_expert_group,
+        input_splits_list,
+        output_splits_list,
+    ) = _compute_token_distribution(config, ep_degree, group)
+
     def bf16_fwd(input_t, weight_t):
         return standard_pipeline(
             input_t,
@@ -319,74 +433,10 @@ def run_experiment(
             input_splits_list,
             output_splits_list,
             ep_degree,
-            num_experts,
+            config.num_experts,
             group,
         )
 
-    warmup(lambda: bf16_fwd(ref_input_tensor, ref_expert_weights.transpose(-2, -1)))
-    torch.cuda.synchronize()
-    start_sec = time.perf_counter()
-    _ = bf16_fwd(ref_input_tensor, ref_expert_weights.transpose(-2, -1))
-    torch.cuda.synchronize()
-    end_sec = time.perf_counter()
-    fwd_bf16_ms = (end_sec - start_sec) * 1e3
-
-    # BF16 Backward
-    # Warmup backward pass
-    warmup(make_bwd_warmup(bf16_fwd, ref_input_tensor, ref_expert_weights))
-
-    # Do a fresh forward pass right before timing backward
-    ref_input_tensor.grad = None
-    ref_expert_weights.grad = None
-    bf16_output_for_bwd = bf16_fwd(
-        ref_input_tensor, ref_expert_weights.transpose(-2, -1)
-    )
-    bf16_labels = torch.ones_like(bf16_output_for_bwd)
-    torch.cuda.synchronize()
-    start_sec = time.perf_counter()
-    mse_loss_and_bwd(bf16_output_for_bwd, bf16_labels)
-    torch.cuda.synchronize()
-    end_sec = time.perf_counter()
-    bwd_bf16_ms = (end_sec - start_sec) * 1e3
-
-    # BF16 Forward + Backward
-    def bf16_fwd_bwd(input_t, weight_t, labels):
-        output = bf16_fwd(input_t, weight_t)
-        mse_loss_and_bwd(output, labels)
-
-    if args.profile:
-        # Create fresh tensors for profiling to avoid autograd graph conflicts
-        ref_input_tensor_profile = torch.randn(
-            num_tokens,
-            dim,
-            dtype=torch.bfloat16,
-            device=device,
-            requires_grad=True,
-        )
-        ref_expert_weights_profile = torch.randn(
-            num_experts,
-            hidden_dim,
-            dim,
-            dtype=torch.bfloat16,
-            device=device,
-            requires_grad=True,
-        )
-        # Profile backward using fresh tensors
-        profile_fn(
-            bf16_fwd_bwd,
-            ref_input_tensor_profile,
-            ref_expert_weights_profile.transpose(-2, -1),
-            bf16_labels,
-            distributed=True,
-            profile_name="bf16_pipeline",
-        )
-
-    # === Benchmark MXFP8 Pipeline ===
-
-    # Reset seed to ensure same random state as BF16 pipeline
-    torch.manual_seed(42)
-
-    # MXFP8 Forward
     def mxfp8_fwd(input_t, weight_t):
         return mxfp8_pipeline(
             input_t,
@@ -396,65 +446,25 @@ def run_experiment(
             input_splits_list,
             output_splits_list,
             ep_degree,
-            num_experts,
+            config.num_experts,
             group,
         )
 
-    warmup(lambda: mxfp8_fwd(input_tensor, expert_weights.transpose(-2, -1)))
-    torch.cuda.synchronize()
-    start_sec = time.perf_counter()
-    _ = mxfp8_fwd(input_tensor, expert_weights.transpose(-2, -1))
-    torch.cuda.synchronize()
-    end_sec = time.perf_counter()
-    fwd_mxfp8_ms = (end_sec - start_sec) * 1e3
+    # === Benchmark Standard BF16 Pipeline ===
+    fwd_bf16_ms, bwd_bf16_ms = _benchmark_pipeline(
+        bf16_fwd,
+        _PipelineInputs(config, ref_input_tensor, ref_expert_weights),
+        args,
+        "bf16_pipeline",
+    )
 
-    # MXFP8 Backward
-    # Warmup backward pass to compile Triton kernels
-    warmup(make_bwd_warmup(mxfp8_fwd, input_tensor, expert_weights))
-
-    # Do a fresh forward pass right before timing backward
-    input_tensor.grad = None
-    expert_weights.grad = None
-    mxfp8_output_for_bwd = mxfp8_fwd(input_tensor, expert_weights.transpose(-2, -1))
-    mxfp8_labels = torch.ones_like(mxfp8_output_for_bwd)
-    torch.cuda.synchronize()
-    start_sec = time.perf_counter()
-    mse_loss_and_bwd(mxfp8_output_for_bwd, mxfp8_labels)
-    torch.cuda.synchronize()
-    end_sec = time.perf_counter()
-    bwd_mxfp8_ms = (end_sec - start_sec) * 1e3
-
-    # MXFP8 Forward + Backward
-    def mxfp8_fwd_bwd(input_t, weight_t, labels):
-        output = mxfp8_fwd(input_t, weight_t)
-        mse_loss_and_bwd(output, labels)
-
-    if args.profile:
-        # Create fresh tensors for profiling to avoid autograd graph conflicts
-        input_tensor_profile = torch.randn(
-            num_tokens,
-            dim,
-            dtype=torch.bfloat16,
-            device=device,
-            requires_grad=True,
-        )
-        expert_weights_profile = torch.randn(
-            num_experts,
-            hidden_dim,
-            dim,
-            dtype=torch.bfloat16,
-            device=device,
-            requires_grad=True,
-        )
-        # Profile backward using fresh tensors
-        profile_fn(
-            mxfp8_fwd_bwd,
-            input_tensor_profile,
-            expert_weights_profile.transpose(-2, -1),
-            mxfp8_labels,
-            distributed=True,
-            profile_name="mxfp8_pipeline",
-        )
+    # === Benchmark MXFP8 Pipeline ===
+    fwd_mxfp8_ms, bwd_mxfp8_ms = _benchmark_pipeline(
+        mxfp8_fwd,
+        _PipelineInputs(config, input_tensor, expert_weights),
+        args,
+        "mxfp8_pipeline",
+    )
 
     # Calculate speedups
     fwd_speedup = fwd_bf16_ms / fwd_mxfp8_ms
