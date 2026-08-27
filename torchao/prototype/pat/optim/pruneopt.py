@@ -371,6 +371,223 @@ class PruneOptimizer(BaseWrappedOptimizer):
                     continue
                 state["latent"] = p.detach().clone()
 
+    def _collect_healing_masks(self) -> dict:
+        """Zero grads of pruned params during healing and return masks to re-zero.
+
+        Returns an empty dict outside the healing period.
+        """
+        healing_masks = {}
+        if self.num_steps < self.healing_start_step:
+            return healing_masks
+        for group in self.regularized_param_groups():
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                mask = p.ne(0)
+                healing_masks[id(p)] = mask
+                if _is_dtensor(p):
+                    p.grad.mul_(mask)
+                else:
+                    p.grad.masked_fill_(~mask, 0)
+        return healing_masks
+
+    def _run_base_optimizer_only(self, closure, healing_masks):
+        """Warmup/healing path: step the base optimizer and re-zero pruned params."""
+        loss = self.base_optimizer.step(closure=closure)  # pyre-ignore[6]
+        for group in self.regularized_param_groups():
+            for p in group["params"]:
+                mask = healing_masks.get(id(p))
+                if mask is None:
+                    continue
+                if _is_dtensor(p):
+                    p.mul_(mask)
+                else:
+                    p.masked_fill_(~mask, 0)
+        self._init_latent_state()
+        self.num_steps += 1
+        return loss
+
+    def _reweight_flags(self):
+        """Return ``(init_sigma_reweight, update_tau_reweight)`` for this step."""
+        if self.iterative_reweight is None:
+            return False, False
+        init_sigma_reweight = self.num_steps == self.warmup_steps
+        # offset by 1 since we update tau_reweight for the next step's prox map
+        update_tau_reweight = self.iterative_reweight.should_update(self.num_steps + 1)
+        return init_sigma_reweight, update_tau_reweight
+
+    @staticmethod
+    def _make_prox_kwargs(group):
+        return {
+            "gamma": group["gamma"],
+            "gamma_index_slope": group.get("gamma_index_slope", 0.0),
+            "disable_vmap": group["group_type"].endswith(
+                ("ElemGrouper", "LayerGrouper")
+            ),
+            "is_svd_grouper": group["group_type"].endswith("SVDGrouper"),
+            "zero_elts_are_counts": group["prox_type"]
+            in ("NMSparseConstraint", "MinSparsityConstraint"),
+        }
+
+    def _accumulate_svd_sizes(self, grouper, p, zero_elts, group, acc):
+        """Update SVD factored/unfactored size accumulators for one parameter."""
+        unfactored_size = grouper.U.size(0) * grouper.Vh.size(1)
+        n_singular_vals = grouper.p.numel() - zero_elts
+        factored_size = (grouper.U.size(0) + grouper.Vh.size(1)) * n_singular_vals
+        group["factored_frac"] = factored_size / unfactored_size
+        # Only aggregate if not already globally summed
+        if acc["zeros_are_summed"]:
+            acc["regularized_factored_size"] += factored_size
+        else:
+            _maybe_async_aggregate(
+                acc["regularized_factored_size_buf"],
+                torch.tensor(factored_size, dtype=torch.int, device=p.device),
+            )
+        acc["regularized_unfactored_size"] += unfactored_size
+        # Only factor matrices if it reduces params
+        acc["regularized_zeros"] += max(unfactored_size - factored_size, 0)
+        acc["regularized_params"] += unfactored_size
+
+    def _update_grouped_param(
+        self,
+        p,
+        state,
+        group,
+        grouper_cls,
+        grouper_kwargs,
+        prox_map,
+        prox_kwargs,
+        sv_count,
+        ctx,
+        acc,
+    ):
+        """Run the grouper/prox map for one param on rank 0 and accumulate stats."""
+        grouper = grouper_cls(p, **grouper_kwargs)
+        zero_elts, group_norm, zeros_are_summed = self._apply_prox(
+            grouper,
+            prox_map,
+            p,
+            tau_reweight=state.get("tau_reweight", 1.0),
+            sv_count=sv_count,
+            **prox_kwargs,
+        )
+        acc["zeros_are_summed"] = zeros_are_summed
+
+        if zeros_are_summed:
+            state["sparsity_frac"] = zero_elts / grouper.p.numel()
+        elif ctx["dist_is_init"]:
+            _maybe_async_aggregate(acc["regularized_zeros_buf"], zero_elts)
+
+        if torch.is_tensor(zero_elts):
+            zero_elts = zero_elts.item()
+
+        if self.iterative_reweight is not None:
+            if ctx["init_sigma_reweight"]:
+                state["sigma"] = group_norm
+            if "sigma" in state and ctx["update_tau_reweight"]:
+                state["tau_reweight"] = self.iterative_reweight(
+                    group_norm, state["sigma"]
+                )
+
+        if prox_kwargs["is_svd_grouper"]:
+            self._accumulate_svd_sizes(grouper, p, zero_elts, group, acc)
+        else:
+            acc["regularized_zeros"] += zero_elts
+            acc["regularized_params"] += grouper.p.numel()
+
+    def _step_regularized_param(
+        self, p, group, grouper_cls, grouper_kwargs, prox_map, prox_kwargs, ctx, acc
+    ):
+        """Process a single regularized parameter (save latent, group, prox, sync)."""
+        if not p.requires_grad:
+            return
+
+        # save latent parameters
+        state = self.state[p]
+        state["latent"].copy_(p)
+
+        # store the number of non-zero singular values
+        if prox_kwargs["is_svd_grouper"]:
+            npack = grouper_kwargs.get("npack", 1)
+            state.setdefault(
+                "sv_count", torch.zeros(npack, dtype=torch.int, device=p.device)
+            )
+
+        # update the full tensor if sharded
+        sharded_p = None
+        if _is_dtensor(p) and prox_kwargs["is_svd_grouper"]:
+            sharded_p = p
+            p = p.full_tensor()
+
+        # only rank 0 of the device mesh should run the grouper
+        sv_count = state.get("sv_count")
+        if sharded_p is None or sharded_p.device_mesh.get_rank() == 0:
+            self._update_grouped_param(
+                p,
+                state,
+                group,
+                grouper_cls,
+                grouper_kwargs,
+                prox_map,
+                prox_kwargs,
+                sv_count,
+                ctx,
+                acc,
+            )
+
+        # copy the updated full tensor to the sharded tensor
+        if sharded_p is not None:
+            torch.distributed.barrier()
+            if isinstance(sv_count, Tensor):
+                torch.distributed.broadcast(sv_count, src=0)
+            sharded_p.copy_(
+                distribute_tensor(
+                    p,
+                    device_mesh=sharded_p.device_mesh,
+                    placements=sharded_p.placements,
+                )
+            )
+
+    def _step_regularized_group(self, group, ctx, acc):
+        """Set up prox map / grouper for a group and process each of its params."""
+        self._set_gamma(group)
+
+        # apply shrinkage to latent parameters in place
+        prox_map = instantiate_module(
+            f"torchao.prototype.pat.optim.{group['prox_type']}"
+        )(group["reg_lambda"], **self._get_prox_kwargs(group))
+
+        # grouper is a context manager that reshapes p if needed
+        grouper_cls = instantiate_module(
+            f"torchao.prototype.pat.group.{group['group_type']}"
+        )
+        grouper_kwargs = self._get_grouper_kwargs(group)
+        prox_kwargs = self._make_prox_kwargs(group)
+        for p in group["params"]:
+            self._step_regularized_param(
+                p, group, grouper_cls, grouper_kwargs, prox_map, prox_kwargs, ctx, acc
+            )
+
+    def _finalize_step_stats(self, acc):
+        """Aggregate distributed buffers and record relative sparsity/factoring."""
+        if torch.distributed.is_initialized() and _is_main_process():
+            acc["regularized_zeros"] += _sum_async_streams(acc["regularized_zeros_buf"])
+            acc["regularized_factored_size"] += _sum_async_streams(
+                acc["regularized_factored_size_buf"]
+            )
+
+        if _is_main_process():
+            self.relative_sparsity = (
+                acc["regularized_zeros"] / acc["regularized_params"]
+                if acc["regularized_params"] > 0
+                else 0.0
+            )
+            self.relative_factored_frac = (
+                acc["regularized_factored_size"] / acc["regularized_unfactored_size"]
+                if acc["regularized_unfactored_size"] > 0
+                else 0.0
+            )
+
     @torch.no_grad()
     def step(self, closure: Callable[[], float] | None = None) -> float | None:
         """Performs a single optimization step.
@@ -381,38 +598,14 @@ class PruneOptimizer(BaseWrappedOptimizer):
         """
         # during healing, zero grads of pruned params and save masks to re-zero
         # them after the step (momentum may push them non-zero)
-        healing_masks = {}
-        if self.num_steps >= self.healing_start_step:
-            for group in self.regularized_param_groups():
-                for p in group["params"]:
-                    if p.grad is None:
-                        continue
-                    mask = p.ne(0)
-                    healing_masks[id(p)] = mask
-                    if _is_dtensor(p):
-                        p.grad.mul_(mask)
-                    else:
-                        p.grad.masked_fill_(~mask, 0)
+        healing_masks = self._collect_healing_masks()
 
         if (
             self.num_steps < self.warmup_steps
             or self.num_steps >= self.healing_start_step
         ):
             # run base optimizer only during warmup and healing periods
-            loss = self.base_optimizer.step(closure=closure)  # pyre-ignore[6]
-            # re-zero pruned params after step
-            for group in self.regularized_param_groups():
-                for p in group["params"]:
-                    mask = healing_masks.get(id(p))
-                    if mask is not None:
-                        if _is_dtensor(p):
-                            p.mul_(mask)
-                        else:
-                            p.masked_fill_(~mask, 0)
-            del healing_masks
-            self._init_latent_state()
-            self.num_steps += 1
-            return loss
+            return self._run_base_optimizer_only(closure, healing_masks)
 
         if self.num_steps == self.warmup_steps:
             # first PAT step: save latent params
@@ -431,156 +624,28 @@ class PruneOptimizer(BaseWrappedOptimizer):
                 self.base_optimizer.state[p]["latent"] = self._state[p]["latent"]
             del self._state
 
-        init_sigma_reweight, update_tau_reweight = False, False
-        if self.iterative_reweight is not None:
-            init_sigma_reweight = self.num_steps == self.warmup_steps
-            # offset by 1 since we update tau_reweight for the next step's prox map
-            update_tau_reweight = self.iterative_reweight.should_update(
-                self.num_steps + 1
-            )
-
-        regularized_params = 0
-        regularized_unfactored_size = 0
+        init_sigma_reweight, update_tau_reweight = self._reweight_flags()
         dist_is_init = torch.distributed.is_initialized()
-        if dist_is_init:
-            regularized_zeros_buf = []
-            regularized_factored_size_buf = []
+        ctx = {
+            "init_sigma_reweight": init_sigma_reweight,
+            "update_tau_reweight": update_tau_reweight,
+            "dist_is_init": dist_is_init,
+        }
+        acc = {
+            "regularized_params": 0,
+            "regularized_unfactored_size": 0,
+            "regularized_zeros": 0,
+            "regularized_factored_size": 0,
+            "regularized_zeros_buf": [],
+            "regularized_factored_size_buf": [],
+            "zeros_are_summed": False,
+        }
 
-        regularized_zeros = 0
-        regularized_factored_size = 0
         for group in self.regularized_param_groups():
-            self._set_gamma(group)
-
-            # apply shrinkage to latent parameters in place
-            prox_map = instantiate_module(
-                f"torchao.prototype.pat.optim.{group['prox_type']}"
-            )(group["reg_lambda"], **self._get_prox_kwargs(group))
-
-            # grouper is a context manager that reshapes p if needed
-            grouper_cls = instantiate_module(
-                f"torchao.prototype.pat.group.{group['group_type']}"
-            )
-            grouper_kwargs = self._get_grouper_kwargs(group)
-            prox_kwargs = {
-                "gamma": group["gamma"],
-                "gamma_index_slope": group.get("gamma_index_slope", 0.0),
-                "disable_vmap": group["group_type"].endswith(
-                    ("ElemGrouper", "LayerGrouper")
-                ),
-                "is_svd_grouper": group["group_type"].endswith("SVDGrouper"),
-                "zero_elts_are_counts": group["prox_type"]
-                in ("NMSparseConstraint", "MinSparsityConstraint"),
-            }
-            for p in group["params"]:
-                if not p.requires_grad:
-                    continue
-
-                # save latent parameters
-                state = self.state[p]
-                state["latent"].copy_(p)
-
-                # store the number of non-zero singular values
-                if prox_kwargs["is_svd_grouper"]:
-                    npack = grouper_kwargs.get("npack", 1)
-                    state.setdefault(
-                        "sv_count", torch.zeros(npack, dtype=torch.int, device=p.device)
-                    )
-
-                # update the full tensor if sharded
-                sharded_p = None
-                if _is_dtensor(p) and prox_kwargs["is_svd_grouper"]:
-                    sharded_p = p
-                    p = p.full_tensor()
-
-                # only rank 0 of the device mesh should run the grouper
-                sv_count = state.get("sv_count")
-                if sharded_p is None or sharded_p.device_mesh.get_rank() == 0:
-                    grouper = grouper_cls(p, **grouper_kwargs)
-                    zero_elts, group_norm, zeros_are_summed = self._apply_prox(
-                        grouper,
-                        prox_map,
-                        p,
-                        tau_reweight=state.get("tau_reweight", 1.0),
-                        sv_count=sv_count,
-                        **prox_kwargs,
-                    )
-
-                    if zeros_are_summed:
-                        state["sparsity_frac"] = zero_elts / grouper.p.numel()
-                    elif dist_is_init:
-                        _maybe_async_aggregate(regularized_zeros_buf, zero_elts)
-
-                    if torch.is_tensor(zero_elts):
-                        zero_elts = zero_elts.item()
-
-                    if self.iterative_reweight is not None:
-                        if init_sigma_reweight:
-                            state["sigma"] = group_norm
-                        if "sigma" in state and update_tau_reweight:
-                            state["tau_reweight"] = self.iterative_reweight(
-                                group_norm, state["sigma"]
-                            )
-
-                    if prox_kwargs["is_svd_grouper"]:
-                        unfactored_size = grouper.U.size(0) * grouper.Vh.size(1)
-                        n_singular_vals = grouper.p.numel() - zero_elts
-                        factored_size = (
-                            grouper.U.size(0) + grouper.Vh.size(1)
-                        ) * n_singular_vals
-                        group["factored_frac"] = factored_size / unfactored_size
-                        # Only aggregate if not already globally summed
-                        if zeros_are_summed:
-                            regularized_factored_size += factored_size
-                        else:
-                            _maybe_async_aggregate(
-                                regularized_factored_size_buf,
-                                torch.tensor(
-                                    factored_size, dtype=torch.int, device=p.device
-                                ),
-                            )
-
-                        regularized_unfactored_size += unfactored_size
-
-                        # Only factor matrices if it reduces params
-                        regularized_zeros += max(unfactored_size - factored_size, 0)
-                        regularized_params += unfactored_size
-                    else:
-                        regularized_zeros += zero_elts
-                        regularized_params += grouper.p.numel()
-
-                # copy the updated full tensor to the sharded tensor
-                if sharded_p is not None:
-                    torch.distributed.barrier()
-                    if isinstance(sv_count, Tensor):
-                        torch.distributed.broadcast(sv_count, src=0)
-                    sharded_p.copy_(
-                        distribute_tensor(
-                            p,
-                            device_mesh=sharded_p.device_mesh,
-                            placements=sharded_p.placements,
-                        )
-                    )
+            self._step_regularized_group(group, ctx, acc)
 
         self.num_steps += 1
-
-        if torch.distributed.is_initialized() and _is_main_process():
-            regularized_zeros += _sum_async_streams(regularized_zeros_buf)
-            regularized_factored_size += _sum_async_streams(
-                regularized_factored_size_buf
-            )
-
-        if _is_main_process():
-            self.relative_sparsity = (
-                regularized_zeros / regularized_params
-                if regularized_params > 0
-                else 0.0
-            )
-            self.relative_factored_frac = (
-                regularized_factored_size / regularized_unfactored_size
-                if regularized_unfactored_size > 0
-                else 0.0
-            )
-
+        self._finalize_step_stats(acc)
         return loss
 
     @torch._disable_dynamo
