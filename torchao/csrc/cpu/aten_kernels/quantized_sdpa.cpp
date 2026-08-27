@@ -1117,9 +1117,9 @@ int8_sdpa_fused_kernel_impl(
               headSize, kvSize, vStrideN, a_zp);
           }
 
-          // transpose and packing
-          for (int64_t n = 0; n < kvSize; n += kvSplitSize) {
-            int64_t kvBlockSize = std::min(kvSplitSize, kvSize - n);
+          // transpose and pack one kv block of keys into key_reorder_ptr
+          auto transpose_and_pack_key_block =
+              [&](int64_t n, int64_t kvBlockSize) {
             for (int64_t b = 0; b < kvBlockSize; b += block_64) {
               bool istail = kvBlockSize - b < block_64;
               int64_t trans_rows = istail ? kvBlockSize - b : block_64;
@@ -1151,6 +1151,12 @@ int8_sdpa_fused_kernel_impl(
                       key_reorder_ptr + n * qk_gemm_K +
                           b * qk_gemm_K);
             }
+          };
+
+          // transpose and packing
+          for (int64_t n = 0; n < kvSize; n += kvSplitSize) {
+            int64_t kvBlockSize = std::min(kvSplitSize, kvSize - n);
+            transpose_and_pack_key_block(n, kvBlockSize);
             // split headSize to block_64, block_64, block_64 ...
             // [av_gemm_K, headSize] -> [av_gemm_K,  block_64 ...]
             for (int64_t b = 0; b < rndHeadSize; b += block_64) {
@@ -1166,6 +1172,80 @@ int8_sdpa_fused_kernel_impl(
                           av_gemm_K * b);
             }
           }
+
+          // Compute one q @ k.T block (index l) and fuse dequant/mask/max reduce.
+          auto compute_qk_block =
+              [&](int64_t l, int64_t m, int64_t qBlockSize) {
+            int64_t n = l * kvSplitSize;
+            int64_t kvBlockSize = std::min(kvSplitSize, kvSize - n);
+            // Calculate q @ k.T
+            for (int64_t b = 0; b < kvBlockSize; b += block_64) {
+              at::native::cpublas::brgemm(
+                    qSplitSize, block_64, qk_gemm_K,
+                    qk_gemm_K, // lda
+                    block_64, //ldb
+                    rndkvSplitSize, //ldc,
+                    false,
+                    query_t_padding_ptr,
+                    key_reorder_ptr + n * qk_gemm_K +
+                        b * qk_gemm_K,
+                    qk_s32_data + b);
+            }
+
+            // do dequant compensation, add mask, max reduce for softmax, and convert qk from s32 to fp32
+            accum_t* qk_block_data = qk_data + l * qSplitSize * rndkvSplitSize;
+            if (has_attn_mask) {
+              mask_t* mask_data_offset = mask_data + i * mStrideB + j * mStrideH + m * mStrideM + (mStrideN == 0 ? 0 : n);
+              _dequant_mask_max_fusion_kernel(
+                qk_s32_data, //in
+                mask_data_offset, //mask_ptr
+                q_sum_ptr, //sum_a_ptr
+                k_sum_ptr + n, //sum_b_ptr
+                qBlockSize, //M
+                kvBlockSize, //N
+                rndkvSplitSize, //ldi
+                mStrideM, //ldm
+                rndkvSplitSize, //ldo
+                q_zp * k_zp * headSize, //zp_a*zp_b*k=beta
+                q_scale * k_scale * scaling_factor, //scale_a*scale_b*scale_sdpa=alpha
+                qk_block_data, //out
+                sfm_max_ptr // sfm_max_ptr
+              );
+            } else {
+              _dequant_max_fusion_kernel(
+                qk_s32_data, //in
+                q_sum_ptr, //sum_a_ptr
+                k_sum_ptr + n, //sum_b_ptr
+                qBlockSize, //M
+                kvBlockSize, //N
+                rndkvSplitSize, //ldi
+                rndkvSplitSize, //ldo
+                q_zp * k_zp * headSize, //zp_a*zp_b*k=beta
+                q_scale * k_scale * scaling_factor, //scale_a*scale_b*scale_sdpa=alpha
+                qk_block_data, //out
+                sfm_max_ptr // sfm_max_ptr
+              );
+            }
+          };
+
+          // Calculate Softmax(q @ k.T) @ v into dst_s32_data.
+          auto compute_av_gemm = [&]() {
+            for (int64_t b = 0; b < headSize; b += block_64) {
+              auto value_reorder_b = value_reorder_ptr + b * av_gemm_K;
+              auto dst_s32_b = dst_s32_data + b;
+              for (int64_t s = 0; s < kvSlice; s++) {
+                at::native::cpublas::brgemm(
+                    qSplitSize, block_64, av_gemm_K,
+                    av_gemm_K, // lda
+                    rndHeadSize, //ldb
+                    rndHeadSize, //ldc
+                    s != 0,
+                    qk_reduced_data + s * qk_reduce_strideL,
+                    value_reorder_b + s * v_reorder_strideL,
+                    dst_s32_b);
+              }
+            }
+          };
 
           // sdpa core
           for (int64_t k = 0; k < qSlice; k++) {
@@ -1198,56 +1278,7 @@ int8_sdpa_fused_kernel_impl(
             }
             const int64_t rkvSlice = (num_keys - 1) / kvSplitSize + 1;
             for (int64_t l = 0; l < rkvSlice; l++) {
-              int64_t n = l * kvSplitSize;
-              int64_t kvBlockSize = std::min(kvSplitSize, kvSize - n);
-              // Calculate q @ k.T
-              for (int64_t b = 0; b < kvBlockSize; b += block_64) {
-                at::native::cpublas::brgemm(
-                      qSplitSize, block_64, qk_gemm_K,
-                      qk_gemm_K, // lda
-                      block_64, //ldb
-                      rndkvSplitSize, //ldc,
-                      false,
-                      query_t_padding_ptr,
-                      key_reorder_ptr + n * qk_gemm_K +
-                          b * qk_gemm_K,
-                      qk_s32_data + b);
-              }
-
-              // do dequant compensation, add mask, max reduce for softmax, and convert qk from s32 to fp32
-              accum_t* qk_block_data = qk_data + l * qSplitSize * rndkvSplitSize;
-              if (has_attn_mask) {
-                mask_t* mask_data_offset = mask_data + i * mStrideB + j * mStrideH + m * mStrideM + (mStrideN == 0 ? 0 : n);
-                _dequant_mask_max_fusion_kernel(
-                  qk_s32_data, //in
-                  mask_data_offset, //mask_ptr
-                  q_sum_ptr, //sum_a_ptr
-                  k_sum_ptr + n, //sum_b_ptr
-                  qBlockSize, //M
-                  kvBlockSize, //N
-                  rndkvSplitSize, //ldi
-                  mStrideM, //ldm
-                  rndkvSplitSize, //ldo
-                  q_zp * k_zp * headSize, //zp_a*zp_b*k=beta
-                  q_scale * k_scale * scaling_factor, //scale_a*scale_b*scale_sdpa=alpha
-                  qk_block_data, //out
-                  sfm_max_ptr // sfm_max_ptr
-                );
-              } else {
-                _dequant_max_fusion_kernel(
-                  qk_s32_data, //in
-                  q_sum_ptr, //sum_a_ptr
-                  k_sum_ptr + n, //sum_b_ptr
-                  qBlockSize, //M
-                  kvBlockSize, //N
-                  rndkvSplitSize, //ldi
-                  rndkvSplitSize, //ldo
-                  q_zp * k_zp * headSize, //zp_a*zp_b*k=beta
-                  q_scale * k_scale * scaling_factor, //scale_a*scale_b*scale_sdpa=alpha
-                  qk_block_data, //out
-                  sfm_max_ptr // sfm_max_ptr
-                );
-              }
+              compute_qk_block(l, m, qBlockSize);
             }
             // sub max, exp, sum reduce, div sum for softmax
             // and quant
@@ -1292,21 +1323,7 @@ int8_sdpa_fused_kernel_impl(
               );
             }
             // Calculate Softmax(q @ k.T) @ v
-            for (int64_t b = 0; b < headSize; b += block_64) {
-              auto value_reorder_b = value_reorder_ptr + b * av_gemm_K;
-              auto dst_s32_b = dst_s32_data + b;
-              for (int64_t s = 0; s < kvSlice; s++) {
-                at::native::cpublas::brgemm(
-                    qSplitSize, block_64, av_gemm_K,
-                    av_gemm_K, // lda
-                    rndHeadSize, //ldb
-                    rndHeadSize, //ldc
-                    s != 0,
-                    qk_reduced_data + s * qk_reduce_strideL,
-                    value_reorder_b + s * v_reorder_strideL,
-                    dst_s32_b);
-              }
-            }
+            compute_av_gemm();
 
             // After the last gemm,
             // do dequant compensation, quant and convert from s32 to int8
