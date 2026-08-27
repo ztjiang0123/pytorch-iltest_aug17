@@ -844,13 +844,28 @@ def _reference_dequantize_per_tensor_int8(
     return ((x_i8.to(torch.float32) - zero_point) * scale).to(dtype=torch.float32)
 
 
+def _qdq_per_channel_int8(
+    qdq_op, x, scales, zero_points, ch_axis, quant_min, quant_max
+):
+    # Shared body for the (de)quantize_per_channel int8 patterns. ``qdq_op`` is
+    # the ``quantized_decomposed`` op to trace; the args become placeholders in
+    # the exported pattern graph. Export inlines this call, so the resulting
+    # graph is identical to calling the op directly.
+    return qdq_op(x, scales, zero_points, ch_axis, quant_min, quant_max, torch.int8)
+
+
 def _quantize_per_channel_int8(
     x_fp32, scales, zero_points, ch_axis, quant_min, quant_max
 ):
-    out_i8 = torch.ops.quantized_decomposed.quantize_per_channel(
-        x_fp32, scales, zero_points, ch_axis, quant_min, quant_max, torch.int8
+    return _qdq_per_channel_int8(
+        torch.ops.quantized_decomposed.quantize_per_channel,
+        x_fp32,
+        scales,
+        zero_points,
+        ch_axis,
+        quant_min,
+        quant_max,
     )
-    return out_i8
 
 
 def _reference_quantize_per_channel_int8(
@@ -868,10 +883,15 @@ def _dequantize_per_channel_int8(
     x_i8, scales, zero_points, ch_axis, quant_min, quant_max
 ):
     # the following will be replaced as placeholders
-    out_fp32 = torch.ops.quantized_decomposed.dequantize_per_channel(
-        x_i8, scales, zero_points, ch_axis, quant_min, quant_max, torch.int8
+    return _qdq_per_channel_int8(
+        torch.ops.quantized_decomposed.dequantize_per_channel,
+        x_i8,
+        scales,
+        zero_points,
+        ch_axis,
+        quant_min,
+        quant_max,
     )
-    return out_fp32
 
 
 def _reference_dequantize_per_channel_int8(
