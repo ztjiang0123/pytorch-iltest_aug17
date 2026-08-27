@@ -255,11 +255,110 @@ class RunConfig:
 _DEFAULT_RUN_CONFIG = RunConfig()
 
 
+def _benchmark_gemm_times(config, float8_recipe_name, M_val, K_val, N_val):
+    """Measure observed bf16 and fp8 gemm times for the 3 gemms of a linear layer."""
+    assert config.mx_recipe_name not in (
+        "mxfp4_cutlass",
+        "mxfp8_32x32_flexible_gemm_layout",
+        "mxfp8_32x32_weight",
+    ), f"do_benchmarks unsupported with mx_recipe_name={config.mx_recipe_name!r}"
+
+    # TODO(future): make the bf16 gemm times exactly match the e2e
+    # benchmarks, there is a slight deviation, probably related to gemm
+    # operand memory formats/transpositions below not exactly matching
+    # what PyTorch core is doing for `torch.mm`
+    # input @ weight_t = output
+    bf16_g1, f8_g1 = get_gemm_times(
+        "output",
+        M_val,
+        K_val,
+        N_val,
+        True,
+        "row_major:col_major",
+        float8_recipe_name,
+        config.mx_recipe_name,
+        config.gemm_cache_filename,
+    )
+    # grad_output @ weight = grad_input
+    bf16_g2, f8_g2 = get_gemm_times(
+        "grad_input",
+        M_val,
+        N_val,
+        K_val,
+        False,
+        "row_major:row_major",
+        float8_recipe_name,
+        config.mx_recipe_name,
+        config.gemm_cache_filename,
+    )
+    # input_t @ grad_output = grad_weight
+    bf16_g3, f8_g3 = get_gemm_times(
+        "grad_weight",
+        K_val,
+        M_val,
+        N_val,
+        False,
+        "col_major:row_major",
+        float8_recipe_name,
+        config.mx_recipe_name,
+        config.gemm_cache_filename,
+    )
+    b_bf16_gemm_time_s = bf16_g1 + bf16_g2 + bf16_g3
+    b_fp8_gemm_time_s = f8_g1 + f8_g2 + f8_g3
+    return b_bf16_gemm_time_s, b_fp8_gemm_time_s
+
+
+def _build_lowp_model(config, float8_recipe_name, m_orig):
+    """Return a compiled float8/mx model derived from ``m_orig``."""
+    if float8_recipe_name is not None:
+        recipe_config = Float8LinearConfig.from_recipe_name(float8_recipe_name)
+        m_fp8_dyn = convert_to_float8_training(
+            copy.deepcopy(m_orig), config=recipe_config
+        )
+        return torch.compile(m_fp8_dyn)
+
+    assert config.mx_recipe_name is not None
+    try:
+        recipe_config = MXFP8TrainingOpConfig.from_recipe(
+            MXFP8TrainingRecipe(config.mx_recipe_name)
+        )
+    except ValueError:
+        raise ValueError(
+            f"Unsupported mx_recipe_name: {config.mx_recipe_name}. "
+            f"Supported values: {[r.value for r in MXFP8TrainingRecipe]}"
+        )
+    m_fp8_dyn = copy.deepcopy(m_orig)
+    quantize_(m_fp8_dyn, config=recipe_config)
+    return torch.compile(m_fp8_dyn)
+
+
+def _benchmark_e2e_times(config, float8_recipe_name, M_val, K_val, N_val):
+    """Measure observed e2e fwd+bwd time for bf16 and low-precision models."""
+    if config.enable_fusion_modeling:
+        m_orig = LNLinearSigmoid(K_val, N_val).cuda().bfloat16()
+    else:
+        m_orig = nn.Sequential(nn.Linear(K_val, N_val, bias=False)).cuda().bfloat16()
+    x = torch.randn(M_val, K_val, dtype=torch.bfloat16, device="cuda").requires_grad_()
+
+    # get the gradient of the right shape
+    grad_output = torch.randn(M_val, N_val, dtype=torch.bfloat16, device="cuda")
+
+    # get the bf16 gpu kernel time
+    torch._dynamo.reset()
+    m_bf16 = torch.compile(copy.deepcopy(m_orig))
+    b_bf16_e2e_time_s = get_gpu_kernel_time(m_bf16, x, grad_output)
+
+    # get the low-precision dynamic scaling gpu kernel time
+    torch._dynamo.reset()
+    m_fp8_dyn = _build_lowp_model(config, float8_recipe_name, m_orig)
+    b_fp8_e2e_time_s = get_gpu_kernel_time(m_fp8_dyn, x, grad_output)
+    return b_bf16_e2e_time_s, b_fp8_e2e_time_s
+
+
 def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
     outfile = config.outfile
     do_benchmarks = config.do_benchmarks
     shape_gen_name = config.shape_gen_name
-    gemm_cache_filename = config.gemm_cache_filename
     n_limit = config.n_limit
     float8_recipe_name = config.float8_recipe_name
     mx_recipe_name = config.mx_recipe_name
@@ -361,60 +460,15 @@ def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
             fp8_gemm_time_sympy.subs(M, M_val).subs(K, K_val).subs(N, N_val)
         )
 
-        # if enabled, also measured observed gemm time
+        # if enabled, also measure observed gemm time
         b_bf16_gemm_time_s, b_fp8_gemm_time_s = 0, 0
         rb_bf16_gemm_ratio = -1
         rb_fp8_gemm_ratio = -1
 
         if do_benchmarks:
-            assert mx_recipe_name not in (
-                "mxfp4_cutlass",
-                "mxfp8_32x32_flexible_gemm_layout",
-                "mxfp8_32x32_weight",
-            ), f"do_benchmarks unsupported with {mx_recipe_name=}"
-
-            # TODO(future): make the bf16 gemm times exactly match the e2e
-            # benchmarks, there is a slight deviation, probably related to gemm
-            # operand memory formats/transpositions below not exactly matching
-            # what PyTorch core is doing for `torch.mm`
-            # input @ weight_t = output
-            bf16_g1, f8_g1 = get_gemm_times(
-                "output",
-                M_val,
-                K_val,
-                N_val,
-                True,
-                "row_major:col_major",
-                float8_recipe_name,
-                mx_recipe_name,
-                gemm_cache_filename,
+            b_bf16_gemm_time_s, b_fp8_gemm_time_s = _benchmark_gemm_times(
+                config, float8_recipe_name, M_val, K_val, N_val
             )
-            # grad_output @ weight = grad_input
-            bf16_g2, f8_g2 = get_gemm_times(
-                "grad_input",
-                M_val,
-                N_val,
-                K_val,
-                False,
-                "row_major:row_major",
-                float8_recipe_name,
-                mx_recipe_name,
-                gemm_cache_filename,
-            )
-            # input_t @ grad_output = grad_weight
-            bf16_g3, f8_g3 = get_gemm_times(
-                "grad_weight",
-                K_val,
-                M_val,
-                N_val,
-                False,
-                "col_major:row_major",
-                float8_recipe_name,
-                mx_recipe_name,
-                gemm_cache_filename,
-            )
-            b_bf16_gemm_time_s = bf16_g1 + bf16_g2 + bf16_g3
-            b_fp8_gemm_time_s = f8_g1 + f8_g2 + f8_g3
             rb_bf16_gemm_ratio = r_bf16_gemm_time_s / b_bf16_gemm_time_s
             rb_fp8_gemm_ratio = r_fp8_gemm_time_s / b_fp8_gemm_time_s
 
@@ -425,48 +479,9 @@ def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
 
         b_bf16_e2e_time_s, b_fp8_e2e_time_s = 0, 0
         if do_benchmarks:
-            # create the model
-            if enable_fusion_modeling:
-                m_orig = LNLinearSigmoid(K_val, N_val).cuda().bfloat16()
-            else:
-                m_orig = (
-                    nn.Sequential(nn.Linear(K_val, N_val, bias=False)).cuda().bfloat16()
-                )
-            x = torch.randn(
-                M_val, K_val, dtype=torch.bfloat16, device="cuda"
-            ).requires_grad_()
-
-            # get the gradient of the right shape
-            grad_output = torch.randn(M_val, N_val, dtype=torch.bfloat16, device="cuda")
-
-            # get the bf16 gpu kernel time
-            torch._dynamo.reset()
-            m_bf16 = torch.compile(copy.deepcopy(m_orig))
-            b_bf16_e2e_time_s = get_gpu_kernel_time(m_bf16, x, grad_output)
-
-            # get the float8 dynamic scaling gpu kernel time
-
-            torch._dynamo.reset()
-            if float8_recipe_name is not None:
-                config = Float8LinearConfig.from_recipe_name(float8_recipe_name)
-                m_fp8_dyn = convert_to_float8_training(
-                    copy.deepcopy(m_orig), config=config
-                )
-            else:
-                assert mx_recipe_name is not None
-                try:
-                    config = MXFP8TrainingOpConfig.from_recipe(
-                        MXFP8TrainingRecipe(mx_recipe_name)
-                    )
-                except ValueError:
-                    raise ValueError(
-                        f"Unsupported mx_recipe_name: {mx_recipe_name}. "
-                        f"Supported values: {[r.value for r in MXFP8TrainingRecipe]}"
-                    )
-                m_fp8_dyn = copy.deepcopy(m_orig)
-                quantize_(m_fp8_dyn, config=config)
-            m_fp8_dyn = torch.compile(m_fp8_dyn)
-            b_fp8_e2e_time_s = get_gpu_kernel_time(m_fp8_dyn, x, grad_output)
+            b_bf16_e2e_time_s, b_fp8_e2e_time_s = _benchmark_e2e_times(
+                config, float8_recipe_name, M_val, K_val, N_val
+            )
 
         # Calculate e2e speedup if benchmarks were run, otherwise -1
         if b_bf16_e2e_time_s > 0 and b_fp8_e2e_time_s > 0:
