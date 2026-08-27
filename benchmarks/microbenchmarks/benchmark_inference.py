@@ -76,6 +76,45 @@ def _make_cache_key(config: BenchmarkConfig) -> Tuple:
     )
 
 
+def _run_memory_profiler(m_copy, input_data, config, result) -> None:
+    """Generate and visualize a memory profile, recording paths on ``result``.
+
+    Failures are handled locally so the caller's control flow stays flat: a
+    known unpacking bug is reported with guidance, and any other error is
+    logged with a traceback.
+    """
+    print("Running memory profiler...")
+    try:
+        # Create memory profiler directory if it doesn't exist
+        memory_profiler_dir = os.path.join(config.output_dir, "memory_profiler/pickle")
+        os.makedirs(memory_profiler_dir, exist_ok=True)
+
+        # Save memory profile with .pickle extension
+        result.memory_profile_path, result.memory_stats = generate_memory_profile(
+            model=m_copy,
+            input_data=input_data,
+            profile_file_path=os.path.join(
+                memory_profiler_dir,
+                f"{config._file_name}_memory_profile.pickle",
+            ),
+        )
+
+        if result.memory_profile_path:
+            result.memory_visualization_path = visualize_memory_profile(
+                result.memory_profile_path
+            )
+    except ValueError as e:
+        if "not enough values to unpack" in str(e):
+            print(
+                "Failed due to existing bugs, re‑run the code to generate memory profile. Please raise an issue if it persists."
+            )
+    except Exception as e:
+        print(f"Error running memory profiler: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+
 def run(config: BenchmarkConfig) -> BenchmarkResult:
     """
     Run inference benchmarks.
@@ -232,40 +271,7 @@ def run(config: BenchmarkConfig) -> BenchmarkResult:
 
         # Run memory profiler if enabled
         if config.enable_memory_profiler:
-            print("Running memory profiler...")
-            try:
-                # Create memory profiler directory if it doesn't exist
-                memory_profiler_dir = os.path.join(
-                    config.output_dir, "memory_profiler/pickle"
-                )
-                os.makedirs(memory_profiler_dir, exist_ok=True)
-
-                # Save memory profile with .pickle extension
-                result.memory_profile_path, result.memory_stats = (
-                    generate_memory_profile(
-                        model=m_copy,
-                        input_data=input_data,
-                        profile_file_path=os.path.join(
-                            memory_profiler_dir,
-                            f"{config._file_name}_memory_profile.pickle",
-                        ),
-                    )
-                )
-
-                if result.memory_profile_path:
-                    result.memory_visualization_path = visualize_memory_profile(
-                        result.memory_profile_path
-                    )
-            except ValueError as e:
-                if "not enough values to unpack" in str(e):
-                    print(
-                        "Failed due to existing bugs, re‑run the code to generate memory profile. Please raise an issue if it persists."
-                    )
-            except Exception as e:
-                print(f"Error running memory profiler: {e}")
-                import traceback
-
-                traceback.print_exc()
+            _run_memory_profiler(m_copy, input_data, config, result)
 
         return result
     except Exception as e:
