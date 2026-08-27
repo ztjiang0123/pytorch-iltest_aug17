@@ -86,7 +86,9 @@ else:
         logger.debug(f"Skipping import of cpp extensions: {e}")
 
 # must import dtypes before quantization
-from . import dtypes  # noqa: I001
+from . import dtypes
+
+# isort: split
 
 from torchao.quantization import (
     quantize_,
