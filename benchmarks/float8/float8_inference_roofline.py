@@ -542,6 +542,128 @@ def _create_model_and_input(
     return m_orig, x
 
 
+def _get_inference_configs(recipe_name):
+    """Build the quantization config(s) for a given recipe.
+
+    Returns a tuple ``(config_calib, config)`` where ``config_calib`` is the
+    optional calibration/prepare config (``None`` for recipes that do not need
+    calibration) and ``config`` is the config used for the benchmarked convert.
+    """
+    if recipe_name == "tensorwise":
+        return None, Float8DynamicActivationFloat8WeightConfig(
+            granularity=PerTensor(),
+        )
+    if recipe_name == "rowwise":
+        return None, Float8DynamicActivationFloat8WeightConfig(
+            granularity=PerRow(),
+            # for now, use TORCH. In the future might be interesting
+            # to benchmark AUTO and MSLK.
+            kernel_preference=KernelPreference.TORCH,
+        )
+    if recipe_name == "mxfp8_cublas":
+        return None, MXDynamicActivationMXWeightConfig(
+            activation_dtype=torch.float8_e4m3fn,
+            weight_dtype=torch.float8_e4m3fn,
+            kernel_preference=KernelPreference.AUTO,
+        )
+    if recipe_name == "mxfp4_cutlass":
+        return None, MXDynamicActivationMXWeightConfig(
+            activation_dtype=torch.float4_e2m1fn_x2,
+            weight_dtype=torch.float4_e2m1fn_x2,
+            kernel_preference=KernelPreference.AUTO,
+        )
+    if recipe_name == "nvfp4":
+        return None, NVFP4DynamicActivationNVFP4WeightConfig(
+            use_dynamic_per_tensor_scale=True,
+        )
+    if recipe_name == "nvfp4_no_global_scale":
+        return None, NVFP4DynamicActivationNVFP4WeightConfig(
+            use_dynamic_per_tensor_scale=False,
+        )
+    if recipe_name == "nvfp4_static":
+        config_calib = NVFP4DynamicActivationNVFP4WeightConfig(
+            step="prepare",
+        )
+        config = NVFP4DynamicActivationNVFP4WeightConfig(
+            step="convert",
+        )
+        return config_calib, config
+    assert False, "unsupported"
+
+
+def _quantize_for_op(m_fp8_dyn, config, op_name):
+    """Apply ``config`` to ``m_fp8_dyn`` for the given op type."""
+    if op_name == "linear":
+        quantize_(m_fp8_dyn, config)
+    elif op_name == "conv2d":
+        _is_conv2d = lambda m, fqn: isinstance(m, torch.nn.Conv2d)
+        quantize_(m_fp8_dyn, config, filter_fn=_is_conv2d)
+    else:
+        _is_conv3d = lambda m, fqn: isinstance(m, torch.nn.Conv3d)
+        quantize_(m_fp8_dyn, config, filter_fn=_is_conv3d)
+
+
+def _run_e2e_benchmark(geometry, recipe_name, bench):
+    """Run the bf16 and fp8 end-to-end kernel-time benchmarks for one shape.
+
+    ``geometry`` (`ConvGeometry`) carries the op type and the per-shape
+    dimensions; ``bench`` (`BenchmarkConfig`) carries the reporting options.
+    Returns ``(b_bf16_e2e_time_s, b_fp8_e2e_time_s)``. Conv benchmarks are
+    skipped (returning zeros) on GPUs older than SM 10.0.
+    """
+    op_name = geometry.op_name
+    M_val, K_val, N_val = geometry.batch, geometry.in_channels, geometry.out_channels
+
+    if op_name in ("conv2d", "conv3d") and not is_sm_at_least_100():
+        print(
+            f"WARNING: Skipping {op_name} benchmarks for shape ({M_val}, {K_val}, {N_val}). "
+            f"Float8 convolution requires SM 10.0+ (Blackwell/B100 GPUs). "
+            f"Current GPU: {torch.cuda.get_device_name(0)} with SM {torch.cuda.get_device_capability()}. "
+            f"Roofline model estimates are still valid."
+        )
+        return 0, 0
+
+    m_orig, x = _create_model_and_input(
+        geometry,
+        bench.enable_fusion_modeling,
+    )
+
+    # get the bf16 gpu kernel time
+    torch._dynamo.reset()
+    m_bf16 = torch.compile(copy.deepcopy(m_orig))
+
+    outfile = bench.outfile
+    bf16_trace_filename = None
+    if bench.save_profile_traces:
+        bf16_trace_filename = f"{outfile}_{M_val}_{K_val}_{N_val}_bf16.json"
+    b_bf16_e2e_time_s = get_gpu_kernel_time(m_bf16, x, bf16_trace_filename)
+
+    # get the float8 dynamic scaling gpu kernel time
+    torch._dynamo.reset()
+
+    config_calib, config = _get_inference_configs(recipe_name)
+
+    m_fp8_dyn = copy.deepcopy(m_orig)
+
+    if config_calib is not None:
+        # calibrate with sample data
+        # this benchmark is performance-only, so a toy datum is fine
+        quantize_(m_fp8_dyn, config_calib)
+        toy_datum = torch.randn(M_val, K_val, dtype=torch.bfloat16, device="cuda")
+        m_fp8_dyn(toy_datum)
+
+    _quantize_for_op(m_fp8_dyn, config, op_name)
+
+    m_fp8_dyn = torch.compile(m_fp8_dyn)
+
+    fp8_trace_filename = None
+    if bench.save_profile_traces:
+        fp8_trace_filename = f"{outfile}_{M_val}_{K_val}_{N_val}_fp8.json"
+    b_fp8_e2e_time_s = get_gpu_kernel_time(m_fp8_dyn, x, fp8_trace_filename)
+
+    return b_bf16_e2e_time_s, b_fp8_e2e_time_s
+
+
 def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
     """
     Args:
@@ -579,7 +701,6 @@ def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
     outfile = bench.outfile
     do_benchmarks = bench.do_benchmarks
     n_limit = bench.n_limit
-    save_profile_traces = bench.save_profile_traces
     enable_fusion_modeling = bench.enable_fusion_modeling
     skip_printing_detailed_metrics = bench.skip_printing_detailed_metrics
 
@@ -806,110 +927,21 @@ def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
         b_bf16_e2e_time_s, b_fp8_e2e_time_s = 0, 0
 
         if do_benchmarks:
-            if op_name in ("conv2d", "conv3d") and not is_sm_at_least_100():
-                print(
-                    f"WARNING: Skipping {op_name} benchmarks for shape ({M_val}, {K_val}, {N_val}). "
-                    f"Float8 convolution requires SM 10.0+ (Blackwell/B100 GPUs). "
-                    f"Current GPU: {torch.cuda.get_device_name(0)} with SM {torch.cuda.get_device_capability()}. "
-                    f"Roofline model estimates are still valid."
-                )
-            else:
-                model_geometry = ConvGeometry(
-                    op_name=op_name,
-                    batch=M_val,
-                    in_channels=K_val,
-                    out_channels=N_val,
-                    kernel_size=kernel_size,
-                    D=D,
-                    H=H,
-                    W=W,
-                    stride=stride,
-                    padding=padding,
-                )
-                m_orig, x = _create_model_and_input(
-                    model_geometry,
-                    enable_fusion_modeling,
-                )
-
-                # get the bf16 gpu kernel time
-                torch._dynamo.reset()
-                m_bf16 = torch.compile(copy.deepcopy(m_orig))
-
-                bf16_trace_filename = None
-                if save_profile_traces:
-                    bf16_trace_filename = f"{outfile}_{M_val}_{K_val}_{N_val}_bf16.json"
-                b_bf16_e2e_time_s = get_gpu_kernel_time(m_bf16, x, bf16_trace_filename)
-
-                # get the float8 dynamic scaling gpu kernel time
-                torch._dynamo.reset()
-
-                if recipe_name == "tensorwise":
-                    config = Float8DynamicActivationFloat8WeightConfig(
-                        granularity=PerTensor(),
-                    )
-                elif recipe_name == "rowwise":
-                    config = Float8DynamicActivationFloat8WeightConfig(
-                        granularity=PerRow(),
-                        # for now, use TORCH. In the future might be interesting
-                        # to benchmark AUTO and MSLK.
-                        kernel_preference=KernelPreference.TORCH,
-                    )
-                elif recipe_name == "mxfp8_cublas":
-                    config = MXDynamicActivationMXWeightConfig(
-                        activation_dtype=torch.float8_e4m3fn,
-                        weight_dtype=torch.float8_e4m3fn,
-                        kernel_preference=KernelPreference.AUTO,
-                    )
-                elif recipe_name == "mxfp4_cutlass":
-                    config = MXDynamicActivationMXWeightConfig(
-                        activation_dtype=torch.float4_e2m1fn_x2,
-                        weight_dtype=torch.float4_e2m1fn_x2,
-                        kernel_preference=KernelPreference.AUTO,
-                    )
-                elif recipe_name == "nvfp4":
-                    config = NVFP4DynamicActivationNVFP4WeightConfig(
-                        use_dynamic_per_tensor_scale=True,
-                    )
-                elif recipe_name == "nvfp4_no_global_scale":
-                    config = NVFP4DynamicActivationNVFP4WeightConfig(
-                        use_dynamic_per_tensor_scale=False,
-                    )
-                elif recipe_name == "nvfp4_static":
-                    config_calib = NVFP4DynamicActivationNVFP4WeightConfig(
-                        step="prepare",
-                    )
-                    config = NVFP4DynamicActivationNVFP4WeightConfig(
-                        step="convert",
-                    )
-                else:
-                    assert False, "unsupported"
-
-                m_fp8_dyn = copy.deepcopy(m_orig)
-
-                if recipe_name == "nvfp4_static":
-                    # calibrate with sample data
-                    # this benchmark is performance-only, so a toy datum is fine
-                    quantize_(m_fp8_dyn, config_calib)
-                    toy_datum = torch.randn(
-                        M_val, K_val, dtype=torch.bfloat16, device="cuda"
-                    )
-                    m_fp8_dyn(toy_datum)
-
-                if op_name == "linear":
-                    quantize_(m_fp8_dyn, config)
-                elif op_name == "conv2d":
-                    _is_conv2d = lambda m, fqn: isinstance(m, torch.nn.Conv2d)
-                    quantize_(m_fp8_dyn, config, filter_fn=_is_conv2d)
-                else:
-                    _is_conv3d = lambda m, fqn: isinstance(m, torch.nn.Conv3d)
-                    quantize_(m_fp8_dyn, config, filter_fn=_is_conv3d)
-
-                m_fp8_dyn = torch.compile(m_fp8_dyn)
-
-                fp8_trace_filename = None
-                if save_profile_traces:
-                    fp8_trace_filename = f"{outfile}_{M_val}_{K_val}_{N_val}_fp8.json"
-                b_fp8_e2e_time_s = get_gpu_kernel_time(m_fp8_dyn, x, fp8_trace_filename)
+            model_geometry = ConvGeometry(
+                op_name=op_name,
+                batch=M_val,
+                in_channels=K_val,
+                out_channels=N_val,
+                kernel_size=kernel_size,
+                D=D,
+                H=H,
+                W=W,
+                stride=stride,
+                padding=padding,
+            )
+            b_bf16_e2e_time_s, b_fp8_e2e_time_s = _run_e2e_benchmark(
+                model_geometry, recipe_name, bench
+            )
 
         # Calculate e2e speedup if benchmarks were run, otherwise -1
         if b_bf16_e2e_time_s > 0 and b_fp8_e2e_time_s > 0:

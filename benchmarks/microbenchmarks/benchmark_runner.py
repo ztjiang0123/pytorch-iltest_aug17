@@ -201,17 +201,22 @@ def get_quantization_sparsity_recipes(
         elif "semi" in sparse_config or "2:4" in sparse_config:
             # For semi-sparse, only pair with compatible quantization methods
             for quant_config in quantization_recipes:
-                if (
-                    "marlin" in quant_config
-                    or "int8dq" in quant_config
-                    or "float8dq" in quant_config
-                    or quant_config == "baseline"
-                ):
+                if _is_semi_sparse_compatible(quant_config):
                     config_recipes.add((quant_config, sparse_config))
         else:
             raise ValueError(f"Invalid sparsity recipe: {sparse_config}")
 
     return config_recipes
+
+
+def _is_semi_sparse_compatible(quant_config: str) -> bool:
+    """Whether a quantization recipe can be paired with semi-structured sparsity."""
+    return (
+        "marlin" in quant_config
+        or "int8dq" in quant_config
+        or "float8dq" in quant_config
+        or quant_config == "baseline"
+    )
 
 
 def load_benchmark_configs(cli_args: argparse.Namespace) -> List[BenchmarkConfig]:
