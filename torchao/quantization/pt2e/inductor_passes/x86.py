@@ -1079,6 +1079,99 @@ def _is_valid_dequant_linear_pattern(dtype, input_dim_exceeds_two, input_contigu
     return _inner
 
 
+def _redirect_uses_to_new_qlinear(
+    new_linear_node,
+    linear_node,
+    output_reshape_node,
+    match,
+    bias,
+    input_dim_exceeds_two,
+    input_contiguous,
+):
+    """Point the consumers of the matched linear at ``new_linear_node``.
+
+    Returns the bias-add output node when it exists (non-contiguous >2D input
+    with a bias), so the caller can erase it later; otherwise returns ``None``.
+    """
+    # 2D input: uses hang off the linear node directly.
+    if not input_dim_exceeds_two:
+        linear_node.replace_all_uses_with(new_linear_node)
+        new_linear_node.meta.update(linear_node.meta)
+        return None
+
+    # >2D contiguous input: uses hang off the trailing output reshape.
+    if input_contiguous:
+        output_reshape_node.replace_all_uses_with(new_linear_node)
+        new_linear_node.meta.update(output_reshape_node.meta)
+        return None
+
+    # >2D non-contiguous input without bias: uses hang off the linear node.
+    if not bias:
+        linear_node.replace_all_uses_with(new_linear_node)
+        new_linear_node.meta.update(linear_node.meta)
+        return None
+
+    # >2D non-contiguous input with bias: uses hang off the bias add.
+    output_add_node_for_bias = match.output_node()
+    assert output_add_node_for_bias.target is aten.add.Tensor
+    output_add_node_for_bias.replace_all_uses_with(new_linear_node)
+    new_linear_node.meta.update(output_add_node_for_bias.meta)
+    return output_add_node_for_bias
+
+
+def _erase_dequant_linear_pattern(
+    graph,
+    dtype,
+    bias,
+    input_dim_exceeds_two,
+    input_contiguous,
+    linear_node,
+    output_reshape_node,
+    output_add_node_for_bias,
+    act_reshape_node,
+    act_expand_node,
+    wgt_expand_node,
+    activation_to_bf16_node,
+    dequant_node,
+    t_node,
+    weight_to_bf16_node,
+    dequant,
+):
+    """Erase the original nodes replaced by the fused qlinear node.
+
+    ``wgt_expand_node`` / ``weight_to_bf16_node`` / ``output_add_node_for_bias``
+    are ``None`` when the corresponding node does not exist for this pattern
+    variant, which keeps the erase order flat and branch-light.
+    """
+    # Erase the trailing output node (reshape, or bias-add) for >2D inputs.
+    if input_dim_exceeds_two:
+        if input_contiguous:
+            graph.erase_node(output_reshape_node)
+        elif bias:
+            graph.erase_node(output_add_node_for_bias)
+
+    graph.erase_node(linear_node)
+
+    # Erase the activation reshape/expand (and weight expand) for >2D inputs.
+    if input_dim_exceeds_two:
+        if input_contiguous:
+            graph.erase_node(act_reshape_node)
+        else:
+            graph.erase_node(act_expand_node)
+            graph.erase_node(wgt_expand_node)
+
+    if weight_to_bf16_node is not None:
+        graph.erase_node(activation_to_bf16_node)
+
+    # Erase the dequant pattern.
+    graph.erase_node(dequant_node)
+    # Erase the dequant per channel pattern.
+    graph.erase_node(t_node)
+    if weight_to_bf16_node is not None:
+        graph.erase_node(weight_to_bf16_node)
+    graph.erase_node(dequant)
+
+
 def _register_qlinear_weight_prepack_pass(
     pattern,
     pass_number,
@@ -1200,45 +1293,36 @@ def _register_qlinear_weight_prepack_pass(
                 new_linear_node = graph.call_function(
                     torch.ops.onednn.qlinear_pointwise.default, args=new_args
                 )
-            if input_dim_exceeds_two:
-                if input_contiguous:
-                    output_reshape_node.replace_all_uses_with(new_linear_node)
-                    new_linear_node.meta.update(output_reshape_node.meta)
-                else:
-                    if bias:
-                        output_add_node_for_bias = match.output_node()
-                        assert output_add_node_for_bias.target is aten.add.Tensor
-                        output_add_node_for_bias.replace_all_uses_with(new_linear_node)
-                        new_linear_node.meta.update(output_add_node_for_bias.meta)
-                    else:
-                        linear_node.replace_all_uses_with(new_linear_node)
-                        new_linear_node.meta.update(linear_node.meta)
-            else:
-                linear_node.replace_all_uses_with(new_linear_node)
-                new_linear_node.meta.update(linear_node.meta)
+            output_add_node_for_bias = _redirect_uses_to_new_qlinear(
+                new_linear_node,
+                linear_node,
+                output_reshape_node,
+                match,
+                bias,
+                input_dim_exceeds_two,
+                input_contiguous,
+            )
 
-            # Erase the original linear node
-            if input_dim_exceeds_two:
-                if input_contiguous:
-                    graph.erase_node(output_reshape_node)
-                elif not input_contiguous and bias:
-                    graph.erase_node(output_add_node_for_bias)  # type: ignore[possibly-undefined]
-            graph.erase_node(linear_node)
-            if input_dim_exceeds_two:
-                if input_contiguous:
-                    graph.erase_node(act_reshape_node)
-                else:
-                    graph.erase_node(act_expand_node)
-                    graph.erase_node(wgt_expand_node)  # type: ignore[possibly-undefined]
-            if dtype == torch.bfloat16:
-                graph.erase_node(activation_to_bf16_node)
-            # Erase the dequant pattern
-            graph.erase_node(dequant_node)
-            # Erase the dequant per channel pattern
-            graph.erase_node(t_node)
-            if dtype == torch.bfloat16:
-                graph.erase_node(weight_to_bf16_node)  # type: ignore[possibly-undefined]
-            graph.erase_node(dequant)
+            _erase_dequant_linear_pattern(
+                graph,
+                dtype,
+                bias,
+                input_dim_exceeds_two,
+                input_contiguous,
+                linear_node,
+                output_reshape_node,
+                output_add_node_for_bias,
+                act_reshape_node,
+                act_expand_node,
+                wgt_expand_node
+                if input_dim_exceeds_two and not input_contiguous
+                else None,
+                activation_to_bf16_node,
+                dequant_node,
+                t_node,
+                weight_to_bf16_node if dtype == torch.bfloat16 else None,
+                dequant,
+            )
 
             counters["inductor"]["qlinear_weight_prepack_matcher_count"] += 1
             counters["inductor"]["qlinear_weight_prepack_matcher_nodes"] += len(
@@ -2672,46 +2756,71 @@ def _register_qconv_binary_fusion():
             )
 
 
+def _scalar_from_value(value: Any) -> float | None:
+    """Return ``value`` as a float if it is a scalar int/float or 1-element tensor."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, torch.Tensor) and value.numel() == 1:
+        return float(value.item())
+    return None
+
+
+def _const_float_from_aten_full(node: torch.fx.Node) -> float | None:
+    """case 1: ``aten.full([1], c)`` -> ``c``."""
+    if node.target is not torch.ops.aten.full.default:
+        return None
+    if len(node.args) >= 2 and isinstance(node.args[1], (int, float)):
+        return float(node.args[1])
+    return None
+
+
+def _const_float_from_aten_tensor(node: torch.fx.Node) -> float | None:
+    """case 2: ``aten.tensor([c])`` -> ``c``."""
+    if node.target is not torch.tensor or len(node.args) < 1:
+        return None
+    data = node.args[0]
+    if (
+        isinstance(data, (list, tuple))
+        and len(data) == 1
+        and isinstance(data[0], (int, float))
+    ):
+        return float(data[0])
+    return None
+
+
+def _const_float_from_get_attr(node: torch.fx.Node) -> float | None:
+    """case 3: ``get_attr(lifted_tensor)`` -> the resolved scalar."""
+    if node.op != "get_attr":
+        return None
+    obj = node.graph.owning_module
+    for atom in str(node.target).split("."):
+        if not hasattr(obj, atom):
+            return None
+        obj = getattr(obj, atom)
+    return _scalar_from_value(obj)
+
+
+def _const_float_from_meta_val(node: torch.fx.Node) -> float | None:
+    """case 4: fall back to the scalar recorded in ``node.meta['val']``."""
+    return _scalar_from_value(node.meta.get("val", None))
+
+
 def _extract_const_float_from_node(v: Any) -> float | None:
     if isinstance(v, (int, float)):
         return float(v)
 
-    if isinstance(v, torch.fx.Node):
-        # case 1: aten.full([1], c)
-        if v.target is torch.ops.aten.full.default:
-            if len(v.args) >= 2 and isinstance(v.args[1], (int, float)):
-                return float(v.args[1])
+    if not isinstance(v, torch.fx.Node):
+        return None
 
-        # case 2: aten.tensor
-        if v.target is torch.tensor and len(v.args) >= 1:
-            data = v.args[0]
-            if (
-                isinstance(data, (list, tuple))
-                and len(data) == 1
-                and isinstance(data[0], (int, float))
-            ):
-                return float(data[0])
-
-        # case 3: get_attr(lifted_tensor)
-        if v.op == "get_attr":
-            obj = v.graph.owning_module
-            for atom in str(v.target).split("."):
-                if not hasattr(obj, atom):
-                    obj = None
-                    break
-                obj = getattr(obj, atom)
-
-            if isinstance(obj, (int, float)):
-                return float(obj)
-            if isinstance(obj, torch.Tensor) and obj.numel() == 1:
-                return float(obj.item())
-
-        # case 4: meta val fallback
-        mv = v.meta.get("val", None)
-        if isinstance(mv, (int, float)):
-            return float(mv)
-        if isinstance(mv, torch.Tensor) and mv.numel() == 1:
-            return float(mv.item())
+    for extractor in (
+        _const_float_from_aten_full,
+        _const_float_from_aten_tensor,
+        _const_float_from_get_attr,
+        _const_float_from_meta_val,
+    ):
+        result = extractor(v)
+        if result is not None:
+            return result
 
     return None
 

@@ -13,11 +13,11 @@ import torch
 from torchao.utils import ceil_div
 
 from .cute_utils import (
-    F8_MAX,
     compute_amax,
     compute_scale_from_amax,
     load_vals_chunk_full,
     load_vals_chunk_tail,
+    quantize_chunk_to_fp8_reg,
 )
 
 
@@ -332,13 +332,7 @@ def _compile_mxfp8_quantize_3d_cutedsl(
             k_rel: cutlass.Int32,
             USE_RCEIL: cutlass.Constexpr[bool],
         ):
-            q_vals4_vec = vals_chunk.load() * inv_scale
-            if not cutlass.const_expr(USE_RCEIL):
-                q_vals4_vec = cute.where(q_vals4_vec > F8_MAX, F8_MAX, q_vals4_vec)
-                q_vals4_vec = cute.where(q_vals4_vec < -F8_MAX, -F8_MAX, q_vals4_vec)
-            q_fp8_vec4 = q_vals4_vec.to(cutlass.Float8E4M3FN)
-            q_fp8_vals4 = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
-            q_fp8_vals4.store(q_fp8_vec4)
+            q_fp8_vals4 = quantize_chunk_to_fp8_reg(vals_chunk, inv_scale, USE_RCEIL)
             self._store_q_fp8_chunk(q_fp8_vals4, sOUT_tile, sout_base, k_rel)
 
         @cute.jit
