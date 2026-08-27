@@ -125,9 +125,11 @@ class _KernelTimers:
 
     measurements: List[KernelMeasurement]
 
-    def time_mem(self, name, fn, in_bytes, out_data, out_scale):
+    def time_mem(self, name, fn, in_bytes, out):
+        # ``out`` is the (data, scale) pair the quant kernel writes; its bytes
+        # are added to the input read to get total memory traffic.
         us = benchmark_cuda_function_in_microseconds(fn)
-        moved = in_bytes + _io_bytes(out_data, out_scale)
+        moved = in_bytes + _io_bytes(*out)
         self.measurements.append(KernelMeasurement(name, Kind.MEM, us, moved, 0.0))
 
     def time_gemm(self, name, fn, flops, bytes_moved):
@@ -137,52 +139,64 @@ class _KernelTimers:
         )
 
 
-def _bench_forward(timers, inputs, block_size):
-    """Time the forward path: activation quant, weight quant, grouped GEMM."""
+@dataclass
+class _ActGemmSpec:
+    """Describes one activation-quant + weight-quant + grouped-GEMM path.
+
+    Forward and dgrad share this exact kernel sequence; they differ only in the
+    activation tensor, the weight-quant entry point, the GEMM output free dim,
+    and the measurement labels captured here.
+    """
+
+    act: torch.Tensor
+    weight_quant_fn: object
+    out_free_dim: int
+    act_quant_label: str
+    weight_quant_label: str
+    gemm_label: str
+
+
+def _bench_act_gemm_path(timers, inputs, block_size, spec: _ActGemmSpec):
+    """Time an activation-quant / weight-quant / grouped-GEMM path.
+
+    Shared by the forward and dgrad benchmarks (see ``_ActGemmSpec``).
+    """
     M, N, K = inputs.M, inputs.N, inputs.K
-    A, B_t = inputs.A, inputs.B_t
+    B_t = inputs.B_t
     fp8, out_dtype = inputs.fp8, inputs.out_dtype
 
-    A_fp8, A_scale = triton_fp8_blockwise_act_quant_lhs(
-        A.contiguous(), block_size=block_size, dtype=fp8
+    act_fp8, act_scale = triton_fp8_blockwise_act_quant_lhs(
+        spec.act.contiguous(), block_size=block_size, dtype=fp8
     )
     timers.time_mem(
-        "fwd: act_quant_lhs",
+        spec.act_quant_label,
         lambda: triton_fp8_blockwise_act_quant_lhs(
-            A.contiguous(), block_size=block_size, dtype=fp8
+            spec.act.contiguous(), block_size=block_size, dtype=fp8
         ),
-        _io_bytes(A),
-        A_fp8,
-        A_scale,
+        _io_bytes(spec.act),
+        (act_fp8, act_scale),
     )
 
-    B_fwd_fp8, B_fwd_scale = (
-        triton_fp8_blockwise_weight_quant_grouped_transposed_rhs_deepgemm(
-            B_t, block_size=block_size, dtype=fp8
-        )
-    )
+    w_fp8, w_scale = spec.weight_quant_fn(B_t, block_size=block_size, dtype=fp8)
     timers.time_mem(
-        "fwd: weight_quant_forward_rhs",
-        lambda: triton_fp8_blockwise_weight_quant_grouped_transposed_rhs_deepgemm(
-            B_t, block_size=block_size, dtype=fp8
-        ),
+        spec.weight_quant_label,
+        lambda: spec.weight_quant_fn(B_t, block_size=block_size, dtype=fp8),
         _io_bytes(B_t),
-        B_fwd_fp8,
-        B_fwd_scale,
+        (w_fp8, w_scale),
     )
 
-    # GEMM mem traffic: read A_fp8 + scales + B_fp8 + scales, write bf16 out.
-    fwd_gemm_bytes = (
-        _io_bytes(A_fp8, A_scale, B_fwd_fp8, B_fwd_scale) + M * N * 2  # bf16 out
+    # GEMM mem traffic: read act_fp8 + scales + w_fp8 + scales, write bf16 out.
+    gemm_bytes = (
+        _io_bytes(act_fp8, act_scale, w_fp8, w_scale) + M * spec.out_free_dim * 2
     )
     timers.time_gemm(
-        "fwd: deepgemm_grouped_mm",
+        spec.gemm_label,
         lambda: deepgemm_blockwise_scaled_grouped_mm(
-            A_fp8,
-            B_fwd_fp8,
-            A_scale,
+            act_fp8,
+            w_fp8,
+            act_scale,
             inputs.recipe_a,
-            B_fwd_scale,
+            w_scale,
             inputs.recipe_b,
             inputs.offs,
             out_dtype,
@@ -190,61 +204,43 @@ def _bench_forward(timers, inputs, block_size):
             offset_plan=inputs.offset_plan,
         ),
         2.0 * M * N * K,
-        fwd_gemm_bytes,
+        gemm_bytes,
+    )
+
+
+def _bench_forward(timers, inputs, block_size):
+    """Time the forward path: activation quant, weight quant, grouped GEMM."""
+    _bench_act_gemm_path(
+        timers,
+        inputs,
+        block_size,
+        _ActGemmSpec(
+            act=inputs.A,
+            weight_quant_fn=(
+                triton_fp8_blockwise_weight_quant_grouped_transposed_rhs_deepgemm
+            ),
+            out_free_dim=inputs.N,
+            act_quant_label="fwd: act_quant_lhs",
+            weight_quant_label="fwd: weight_quant_forward_rhs",
+            gemm_label="fwd: deepgemm_grouped_mm",
+        ),
     )
 
 
 def _bench_dgrad(timers, inputs, block_size):
     """Time the dgrad path: grad_out quant, weight quant, grouped GEMM."""
-    M, N, K = inputs.M, inputs.N, inputs.K
-    grad_out, B_t = inputs.grad_out, inputs.B_t
-    fp8, out_dtype = inputs.fp8, inputs.out_dtype
-
-    gout_fp8, gout_scale = triton_fp8_blockwise_act_quant_lhs(
-        grad_out.contiguous(), block_size=block_size, dtype=fp8
-    )
-    timers.time_mem(
-        "bwd: act_quant_lhs(grad_out)",
-        lambda: triton_fp8_blockwise_act_quant_lhs(
-            grad_out.contiguous(), block_size=block_size, dtype=fp8
+    _bench_act_gemm_path(
+        timers,
+        inputs,
+        block_size,
+        _ActGemmSpec(
+            act=inputs.grad_out,
+            weight_quant_fn=triton_fp8_blockwise_weight_quant_grouped_rhs_deepgemm,
+            out_free_dim=inputs.K,
+            act_quant_label="bwd: act_quant_lhs(grad_out)",
+            weight_quant_label="bwd: weight_quant_dgrad_rhs",
+            gemm_label="bwd: deepgemm_grouped_mm_dgrad",
         ),
-        _io_bytes(grad_out),
-        gout_fp8,
-        gout_scale,
-    )
-
-    B_dgrad_fp8, B_dgrad_scale = triton_fp8_blockwise_weight_quant_grouped_rhs_deepgemm(
-        B_t, block_size=block_size, dtype=fp8
-    )
-    timers.time_mem(
-        "bwd: weight_quant_dgrad_rhs",
-        lambda: triton_fp8_blockwise_weight_quant_grouped_rhs_deepgemm(
-            B_t, block_size=block_size, dtype=fp8
-        ),
-        _io_bytes(B_t),
-        B_dgrad_fp8,
-        B_dgrad_scale,
-    )
-
-    dgrad_gemm_bytes = (
-        _io_bytes(gout_fp8, gout_scale, B_dgrad_fp8, B_dgrad_scale) + M * K * 2
-    )
-    timers.time_gemm(
-        "bwd: deepgemm_grouped_mm_dgrad",
-        lambda: deepgemm_blockwise_scaled_grouped_mm(
-            gout_fp8,
-            B_dgrad_fp8,
-            gout_scale,
-            inputs.recipe_a,
-            B_dgrad_scale,
-            inputs.recipe_b,
-            inputs.offs,
-            out_dtype,
-            block_size,
-            offset_plan=inputs.offset_plan,
-        ),
-        2.0 * M * N * K,
-        dgrad_gemm_bytes,
     )
 
 
@@ -288,8 +284,7 @@ def _bench_wgrad(timers, inputs, block_size):
             lhs_md,
         ),
         _io_bytes(grad_out),
-        lhs_op.data,
-        lhs_op.scale,
+        (lhs_op.data, lhs_op.scale),
     )
     timers.time_mem(
         f"bwd: wgrad_quant_rhs(A) [{rhs_path}]",
@@ -297,8 +292,7 @@ def _bench_wgrad(timers, inputs, block_size):
             A, offset_plan.group_end_offsets, group_sizes, block_size, fp8, rhs_md
         ),
         _io_bytes(A),
-        rhs_op.data,
-        rhs_op.scale,
+        (rhs_op.data, rhs_op.scale),
     )
 
     wgrad_plan = prepare_deepgemm_wgrad_plan(grad_out, A, offset_plan, block_size, fp8)
