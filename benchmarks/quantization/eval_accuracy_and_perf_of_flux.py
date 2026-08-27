@@ -101,6 +101,28 @@ def generate_image(
     return image
 
 
+def _wrap_text(draw, text: str, font, max_width: int) -> list:
+    """Break ``text`` into lines that each fit within ``max_width`` pixels."""
+    lines = []
+    current_line = []
+    for word in text.split():
+        test_line = " ".join(current_line + [word])
+        bbox = draw.textbbox((0, 0), test_line, font=font)
+        line_width = bbox[2] - bbox[0]
+
+        if line_width <= max_width:
+            current_line.append(word)
+            continue
+
+        if current_line:
+            lines.append(" ".join(current_line))
+        current_line = [word]
+
+    if current_line:
+        lines.append(" ".join(current_line))
+    return lines
+
+
 def create_comparison_image(
     baseline_img: Image.Image,
     modified_img: Image.Image,
@@ -150,24 +172,7 @@ def create_comparison_image(
     if prompt:
         # Wrap prompt text if it's too long
         max_width = total_width - 20  # 10px padding on each side
-        prompt_lines = []
-        words = prompt.split()
-        current_line = []
-
-        for word in words:
-            test_line = " ".join(current_line + [word])
-            bbox = draw.textbbox((0, 0), test_line, font=prompt_font)
-            line_width = bbox[2] - bbox[0]
-
-            if line_width <= max_width:
-                current_line.append(word)
-            else:
-                if current_line:
-                    prompt_lines.append(" ".join(current_line))
-                current_line = [word]
-
-        if current_line:
-            prompt_lines.append(" ".join(current_line))
+        prompt_lines = _wrap_text(draw, prompt, prompt_font, max_width)
 
         # Draw each line of the prompt
         for line in prompt_lines:
@@ -759,9 +764,7 @@ def _run_performance_mode(ctx, quantized):
     if quantized:
         # performance_quant records the layer count right after the header,
         # matching the accuracy layout; performance_hp omits it.
-        perf_rows.insert(
-            0, ("scalar", "total_linear_layers_quantized", num_quantized)
-        )
+        perf_rows.insert(0, ("scalar", "total_linear_layers_quantized", num_quantized))
     _save_summary_csv(ctx, mode, perf_rows)
 
 

@@ -232,32 +232,39 @@ def print_results(experiments: List[Experiment]):
     print(tabulate(rows, headers=headers))
 
 
+def _should_skip_config(config) -> bool:
+    """Return True if the current device can't run the config's recipe."""
+    if config.recipe == Float8TrainingRecipe.FP8_ROWWISE:
+        if is_ROCM() and not (is_MI300() or is_MI350()):
+            logging.warning(
+                "Skipping FP8 rowwise benchmarks, requires MI300 or MI350 on ROCm"
+            )
+            return True
+        if not is_ROCM() and torch.cuda.get_device_capability() != (9, 0):
+            logging.warning(
+                f"Skipping FP8 rowwise benchmarks, only supported on compute capability 9.0 and found {torch.cuda.get_device_capability()}"
+            )
+            return True
+        return False
+
+    if config.recipe in (
+        MXFP8TrainingRecipe.MXFP8_RCEIL,
+        MXFP8TrainingRecipe.MXFP8_RCEIL_WGRAD_WITH_HP,
+    ) and torch.cuda.get_device_capability() != (10, 0):
+        logging.warning(
+            f"Skipping MXFP8 benchmarks, only supported on compute capability 10.0 and found {torch.cuda.get_device_capability()}"
+        )
+        return True
+
+    return False
+
+
 def main(args: argparse.Namespace):
     torch.random.manual_seed(123)
     configs = get_configs()
     results = []
     for config in tqdm(configs):
-        if config.recipe == Float8TrainingRecipe.FP8_ROWWISE:
-            if is_ROCM():
-                if not (is_MI300() or is_MI350()):
-                    logging.warning(
-                        "Skipping FP8 rowwise benchmarks, requires MI300 or MI350 on ROCm"
-                    )
-                    continue
-            else:
-                if torch.cuda.get_device_capability() != (9, 0):
-                    logging.warning(
-                        f"Skipping FP8 rowwise benchmarks, only supported on compute capability 9.0 and found {torch.cuda.get_device_capability()}"
-                    )
-                    continue
-
-        elif config.recipe in (
-            MXFP8TrainingRecipe.MXFP8_RCEIL,
-            MXFP8TrainingRecipe.MXFP8_RCEIL_WGRAD_WITH_HP,
-        ) and torch.cuda.get_device_capability() != (10, 0):
-            logging.warning(
-                f"Skipping MXFP8 benchmarks, only supported on compute capability 10.0 and found {torch.cuda.get_device_capability()}"
-            )
+        if _should_skip_config(config):
             continue
 
         result = run_experiment(config, args)

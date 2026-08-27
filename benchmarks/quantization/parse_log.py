@@ -39,34 +39,58 @@ def parse_accuracy_metrics(section_lines: List[str]) -> Dict[str, Optional[float
         "winogrande_acc_stderr": None,
     }
 
-    for line in section_lines:
-        # Parse wikitext word_perplexity
-        # Format: |          |       |none  |     0|word_perplexity|↓  |7.5435|±  |   N/A|
-        # Note: The task name "wikitext" is on a previous line, this is a continuation row
-        if "|word_perplexity" in line:
-            parts = [p.strip() for p in line.split("|")]
-            # Find the value (should be after word_perplexity)
-            try:
-                idx = parts.index("word_perplexity")
-                if idx + 2 < len(parts):
-                    metrics["wikitext_word_perplexity"] = float(parts[idx + 2])
-            except (ValueError, IndexError):
-                pass
+    # Each entry maps a metric key to the ``(label, offset)`` column in the
+    # lm_eval table row identified by ``row_marker``.
+    # Format of a matched row, e.g.:
+    #   |          |    |none|0|word_perplexity|↓|7.5435|±|   N/A|
+    #   |winogrande|1   |none|0|acc            |↑|0.7419|±|0.0123|
+    row_specs = [
+        ("|word_perplexity", [("wikitext_word_perplexity", "word_perplexity", 2)]),
+        (
+            "|winogrande",
+            [
+                ("winogrande_acc", "acc", 2),
+                ("winogrande_acc_stderr", "acc", 4),
+            ],
+        ),
+    ]
 
-        # Parse winogrande accuracy
-        # Format: |winogrande|      1|none  |     0|acc            |↑  |0.7419|±  |0.0123|
-        if "|winogrande" in line and "|acc" in line:
-            parts = [p.strip() for p in line.split("|")]
-            try:
-                idx = parts.index("acc")
-                if idx + 2 < len(parts):
-                    metrics["winogrande_acc"] = float(parts[idx + 2])
-                if idx + 4 < len(parts) and parts[idx + 4] != "N/A":
-                    metrics["winogrande_acc_stderr"] = float(parts[idx + 4])
-            except (ValueError, IndexError):
-                pass
+    for line in section_lines:
+        for row_marker, columns in row_specs:
+            if row_marker in line:
+                _extract_row_metrics(line, columns, metrics)
 
     return metrics
+
+
+def _column_value(parts: List[str], label: str, offset: int) -> Optional[float]:
+    """Return the float ``offset`` columns after ``label`` in ``parts`` if valid."""
+    try:
+        idx = parts.index(label)
+    except ValueError:
+        return None
+    if idx + offset >= len(parts):
+        return None
+    value = parts[idx + offset]
+    if value == "N/A":
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _extract_row_metrics(
+    line: str,
+    columns: List[tuple],
+    metrics: Dict[str, Optional[float]],
+) -> None:
+    """Extract each ``(metric_key, label, offset)`` column from a table ``line``."""
+    parts = [p.strip() for p in line.split("|")]
+    for metric_key, label, offset in columns:
+        value = _column_value(parts, label, offset)
+        if value is not None:
+            metrics[metric_key] = value
 
 
 def parse_throughput_metrics(

@@ -94,14 +94,16 @@ def cleanup_gpu():
 def _make_strip_causal_mask_pass(strip_causal_mask: bool):
     """Create a pre-grad pass that strips HF's materialized causal masks from SDPA nodes."""
 
+    def _maybe_strip_node(node):
+        if not _is_sdpa_node(node):
+            return
+        _, needs_strip = _sdpa_is_fusible(node, strip_causal_mask=strip_causal_mask)
+        if needs_strip:
+            _strip_causal_mask(node)
+
     def _strip_causal_mask_pass(graph):
         for node in graph.nodes:
-            if _is_sdpa_node(node):
-                _, needs_strip = _sdpa_is_fusible(
-                    node, strip_causal_mask=strip_causal_mask
-                )
-                if needs_strip:
-                    _strip_causal_mask(node)
+            _maybe_strip_node(node)
         graph.eliminate_dead_code()
 
     return _strip_causal_mask_pass
