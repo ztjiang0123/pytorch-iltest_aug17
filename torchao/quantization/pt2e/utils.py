@@ -62,7 +62,23 @@ __all__ = [
     "_is_conv_transpose_node",
     "_is_sym_size_node",
     "_filter_sym_size_users",
+    "save_scalar_buffers_to_state_dict",
 ]
+
+
+def save_scalar_buffers_to_state_dict(module, destination, prefix, names):
+    """
+    Serialize scalar-valued attributes that cannot be registered as buffers.
+
+    ``torch.nn.Module._save_to_state_dict`` does not persist attributes that are
+    not registered buffers/parameters, so observers and fake quantizers that hold
+    scalar tensors (e.g. ``scale``/``zero_point`` or ``min_val``/``max_val``)
+    must serialize them manually. Callers are expected to invoke the default
+    ``super()._save_to_state_dict(...)`` themselves; this helper writes each
+    attribute in ``names`` into ``destination`` under ``prefix``.
+    """
+    for name in names:
+        destination[prefix + name] = getattr(module, name)
 
 
 # TODO: remove unused
@@ -1322,5 +1338,5 @@ def _is_sym_size_node(node: Node):
 
 
 def _filter_sym_size_users(node: torch.fx.Node) -> list[torch.fx.Node]:
-    node_users = list(filter((lambda x: (_is_sym_size_node(x) is False)), node.users))
+    node_users = list(filter((lambda x: _is_sym_size_node(x) is False), node.users))
     return node_users

@@ -41,6 +41,7 @@ from torchao.quantization.pt2e.utils import (
     check_min_max_valid,
     is_per_channel,
     is_per_tensor,
+    save_scalar_buffers_to_state_dict,
     validate_qmin_qmax,
 )
 from torchao.quantization.utils import get_block_size
@@ -1375,8 +1376,9 @@ class HistogramObserver(UniformQuantizationObserverBase):
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         super()._save_to_state_dict(destination, prefix, keep_vars)
-        destination[prefix + "min_val"] = self.min_val
-        destination[prefix + "max_val"] = self.max_val
+        save_scalar_buffers_to_state_dict(
+            self, destination, prefix, ["min_val", "max_val"]
+        )
 
     def _load_from_state_dict(
         self,

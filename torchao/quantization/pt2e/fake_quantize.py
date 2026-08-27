@@ -32,6 +32,9 @@ from torchao.quantization.pt2e.observer import (
     default_fixed_qparams_range_0to1_observer,
     default_fixed_qparams_range_neg1to1_observer,
 )
+from torchao.quantization.pt2e.utils import (
+    save_scalar_buffers_to_state_dict,
+)
 from torchao.quantization.quant_primitives import (
     _fake_quantize_affine,
 )
@@ -289,8 +292,9 @@ class FakeQuantize(FakeQuantizeBase):
         # We cannot currently register scalar values as buffers, so need to manually
         # specify serialization here.
         super()._save_to_state_dict(destination, prefix, keep_vars)
-        destination[prefix + "scale"] = self.scale
-        destination[prefix + "zero_point"] = self.zero_point
+        save_scalar_buffers_to_state_dict(
+            self, destination, prefix, ["scale", "zero_point"]
+        )
 
     def _load_from_state_dict(
         self,

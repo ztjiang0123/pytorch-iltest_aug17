@@ -202,81 +202,67 @@ def parse_recipe_section(section_lines: List[str], recipe_name: str) -> Dict:
     return result
 
 
-def parse_log_file(log_file_path: str) -> Dict:
-    """Parse the entire log file."""
-    with open(log_file_path, "r") as f:
-        lines = [line.rstrip("\n") for line in f]
-
-    # Parse header
-    header = parse_header(lines)
-
-    # Find recipe sections
+def _split_recipe_sections(lines: List[str]) -> List[tuple]:
+    """Split log lines into ``(recipe_name, section_lines)`` pairs."""
     recipe_sections = []
     current_section = None
     current_recipe = None
 
-    for i, line in enumerate(lines):
-        # Look for recipe markers
+    for line in lines:
         match = re.match(r"processing quant_recipe (.+)", line)
         if match:
-            # Save previous section if exists
+            # A new recipe marker closes the previous section (if any).
             if current_section is not None:
                 recipe_sections.append((current_recipe, current_section))
-
-            # Start new section
             current_recipe = match.group(1).strip()
             current_section = []
         elif current_section is not None:
             current_section.append(line)
 
-    # Don't forget the last section
+    # Don't forget the last open section.
     if current_section is not None:
         recipe_sections.append((current_recipe, current_section))
 
-    # Parse each recipe section
-    results = []
-    for recipe_name, section_lines in recipe_sections:
-        result = parse_recipe_section(section_lines, recipe_name)
-        results.append(result)
+    return recipe_sections
 
-    # Calculate speedups relative to baseline ("None")
-    baseline = None
+
+def _safe_ratio(value: Optional[float], baseline: Optional[float]) -> Optional[float]:
+    """Return ``value / baseline`` when both are present, else ``None``."""
+    if value is None or baseline is None:
+        return None
+    return value / baseline
+
+
+def _annotate_speedups(results: List[Dict]) -> None:
+    """Fill in ``speedup_prefill``/``speedup_decode`` relative to the "None" baseline."""
+    baseline = next((r for r in results if r["recipe"] == "None"), None)
+    baseline_prefill = baseline["prefill_total_tokens_per_sec"] if baseline else None
+    baseline_decode = baseline["decode_total_tokens_per_sec"] if baseline else None
+
     for result in results:
-        if result["recipe"] == "None":
-            baseline = result
-            break
+        result["speedup_prefill"] = _safe_ratio(
+            result["prefill_total_tokens_per_sec"], baseline_prefill
+        )
+        result["speedup_decode"] = _safe_ratio(
+            result["decode_total_tokens_per_sec"], baseline_decode
+        )
 
-    if baseline:
-        baseline_prefill = baseline["prefill_total_tokens_per_sec"]
-        baseline_decode = baseline["decode_total_tokens_per_sec"]
 
-        for result in results:
-            # Calculate prefill speedup
-            if (
-                result["prefill_total_tokens_per_sec"] is not None
-                and baseline_prefill is not None
-            ):
-                result["speedup_prefill"] = (
-                    result["prefill_total_tokens_per_sec"] / baseline_prefill
-                )
-            else:
-                result["speedup_prefill"] = None
+def parse_log_file(log_file_path: str) -> Dict:
+    """Parse the entire log file."""
+    with open(log_file_path, "r") as f:
+        lines = [line.rstrip("\n") for line in f]
 
-            # Calculate decode speedup
-            if (
-                result["decode_total_tokens_per_sec"] is not None
-                and baseline_decode is not None
-            ):
-                result["speedup_decode"] = (
-                    result["decode_total_tokens_per_sec"] / baseline_decode
-                )
-            else:
-                result["speedup_decode"] = None
-    else:
-        # No baseline found, set all speedups to None
-        for result in results:
-            result["speedup_prefill"] = None
-            result["speedup_decode"] = None
+    header = parse_header(lines)
+
+    recipe_sections = _split_recipe_sections(lines)
+    results = [
+        parse_recipe_section(section_lines, recipe_name)
+        for recipe_name, section_lines in recipe_sections
+    ]
+
+    # Calculate speedups relative to baseline ("None").
+    _annotate_speedups(results)
 
     return {
         "header": header,
