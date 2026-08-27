@@ -7,6 +7,7 @@
 """Shared benchmarking helpers for the nvfp4_training benchmark scripts."""
 
 import argparse
+from dataclasses import dataclass
 from typing import Callable, List
 
 import torch
@@ -17,7 +18,9 @@ LLAMA_BATCH_SIZE = 1
 LLAMA_SEQ_LEN = 2048
 
 
-def build_representative_model_configs(make_config: Callable[[int, int, str, str], object]):
+def build_representative_model_configs(
+    make_config: Callable[[int, int, str, str], object],
+):
     """Build the shared set of Llama-derived shapes.
 
     Args:
@@ -37,18 +40,29 @@ def build_representative_model_configs(make_config: Callable[[int, int, str, str
     ]
 
 
+@dataclass
+class BenchmarkHarness:
+    """The callables a benchmark script provides to :func:`run_benchmark_main`.
+
+    Grouping these hooks keeps ``run_benchmark_main``'s signature small and
+    documents that they are the single unit of behavior a script plugs in.
+    """
+
+    get_configs: Callable[[], List[object]]
+    get_representative_model_configs: Callable[[], List[object]]
+    run_experiment: Callable[[object], object]
+    make_experiment: Callable[[object, object], object]
+    print_results: Callable[[List[object]], None]
+
+
 def run_benchmark_main(
-    get_configs: Callable[[], List[object]],
-    get_representative_model_configs: Callable[[], List[object]],
-    run_experiment: Callable[[object], object],
-    make_experiment: Callable[[object, object], object],
-    print_results: Callable[[List[object]], None],
+    harness: BenchmarkHarness,
     seed: int = 123,
 ):
     """Parse args, run the selected shape set, and print the results table.
 
-    ``run_experiment`` may return ``None`` for configs that are skipped (e.g.
-    unsupported hardware); such configs are omitted from the results.
+    ``harness.run_experiment`` may return ``None`` for configs that are skipped
+    (e.g. unsupported hardware); such configs are omitted from the results.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -61,16 +75,16 @@ def run_benchmark_main(
 
     torch.random.manual_seed(seed)
     configs = (
-        get_representative_model_configs()
+        harness.get_representative_model_configs()
         if args.shape_set == "representative-models"
-        else get_configs()
+        else harness.get_configs()
     )
     results = []
     for config in tqdm(configs):
-        result = run_experiment(config)
+        result = harness.run_experiment(config)
         if result is not None:
-            results.append(make_experiment(config, result))
-    print_results(results)
+            results.append(harness.make_experiment(config, result))
+    harness.print_results(results)
 
 
 def print_results(experiments: List[object]):
