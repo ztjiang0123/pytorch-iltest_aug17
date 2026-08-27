@@ -1016,7 +1016,7 @@ def _annotate_cat(
 
         if cat_node.target != torch.ops.aten.cat.default:
             # TODO: change this to AnnotationException
-            raise Exception(  # noqa: TRY002
+            raise Exception(
                 f"Expected cat node: torch.ops.aten.cat.default, but found {cat_node.target}"
                 " please check if you are calling the correct capture API"
             )
