@@ -185,80 +185,117 @@ static inline void store_elem(at::Float8_e4m3fn &out, float input) {
   out = static_cast<at::Float8_e4m3fn>(input);
 }
 
+// Return the exclusive end offset for batch entry `b`. The last batch entry may
+// use `last_offset` (when set) instead of `offsets[b + 1]`.
+template <typename index_t>
+static inline index_t _batch_end_offset(const int64_t b, const index_t *offsets,
+                                        const index_t last_offset,
+                                        const int64_t num_batch) {
+  const bool is_last_batch = (b + 1) == num_batch && last_offset != -1;
+  return is_last_batch ? last_offset : offsets[b + 1];
+}
+
+#if defined(CPU_CAPABILITY_AVX512)
+// How many batch entries ahead to prefetch. Each entry has ~3 rows to fetch
+// from a 40M-row table; DRAM latency ~100 ns means we must keep enough
+// in-flight requests to hide latency.
+constexpr int64_t PREFETCH_DIST = 8;
+
+// Software prefetch for batch entry b+PREFETCH_DIST to overlap DRAM latency
+// (~100 ns per random access to large table) with AVX512 compute.
+template <typename index_t, typename data_t>
+static inline void _prefetch_batch_ahead(const int64_t b, const int64_t bs_end,
+                                         const int64_t emb_dim,
+                                         const index_t *indices,
+                                         const index_t *offsets,
+                                         const index_t last_offset,
+                                         const data_t *weight,
+                                         const int64_t num_batch) {
+  const int64_t pref_b = b + PREFETCH_DIST;
+  if (pref_b >= bs_end) {
+    return;
+  }
+  const int64_t pref_start = offsets[pref_b];
+  const int64_t pref_end =
+      _batch_end_offset(pref_b, offsets, last_offset, num_batch);
+  for (int64_t pj = pref_start; pj < pref_end; ++pj) {
+    _prefetch_emb_row(weight + indices[pj] * emb_dim, emb_dim);
+  }
+}
+
+// Sum one 128-wide block across a batch entry's rows, scale, and store.
 template <typename index_t, typename data_t, typename output_t>
-inline void _scaled_embedding_bag_krnl(
+static inline void _scaled_embedding_bag_block_avx512(
+    const int64_t block_id, const int64_t start_idx, const int64_t end_idx,
+    const int64_t emb_dim, const index_t *indices, const data_t *weight,
+    const __m512 scale_v, output_t *result) {
+  constexpr int64_t block_dim = 128;
+  __m512 x0, x1, x2, x3, x4, x5, x6, x7;
+  __m512 y0, y1, y2, y3, y4, y5, y6, y7;
+  // load first indices
+  int64_t idx = indices[start_idx] * emb_dim + block_dim * block_id;
+  output_t *block_result = result + block_dim * block_id;
+  std::tie(x0, x1, x2, x3, x4, x5, x6, x7) = load_chunk(weight + idx);
+  for (int64_t j = start_idx + 1; j < end_idx; ++j) {
+    // add following idx
+    idx = indices[j] * emb_dim + block_dim * block_id;
+    std::tie(y0, y1, y2, y3, y4, y5, y6, y7) = load_chunk(weight + idx);
+    x0 = _mm512_add_ps(x0, y0);
+    x1 = _mm512_add_ps(x1, y1);
+    x2 = _mm512_add_ps(x2, y2);
+    x3 = _mm512_add_ps(x3, y3);
+    x4 = _mm512_add_ps(x4, y4);
+    x5 = _mm512_add_ps(x5, y5);
+    x6 = _mm512_add_ps(x6, y6);
+    x7 = _mm512_add_ps(x7, y7);
+  }
+  x0 = _mm512_mul_ps(x0, scale_v);
+  x1 = _mm512_mul_ps(x1, scale_v);
+  x2 = _mm512_mul_ps(x2, scale_v);
+  x3 = _mm512_mul_ps(x3, scale_v);
+  x4 = _mm512_mul_ps(x4, scale_v);
+  x5 = _mm512_mul_ps(x5, scale_v);
+  x6 = _mm512_mul_ps(x6, scale_v);
+  x7 = _mm512_mul_ps(x7, scale_v);
+  // store
+  store_chunk(block_result, {x0, x1, x2, x3, x4, x5, x6, x7});
+}
+
+template <typename index_t, typename data_t, typename output_t>
+static inline void _scaled_embedding_bag_avx512(
     const int64_t bs_begin, const int64_t bs_end, const int64_t num_emb,
     const int64_t emb_dim, const index_t last_offset, const index_t *indices,
     const index_t *offsets, const data_t *weight, const double scale,
     output_t *result, const int64_t num_batch) {
-#if defined(CPU_CAPABILITY_AVX512)
-  // How many batch entries ahead to prefetch. Each entry has ~3 rows to fetch
-  // from a 40M-row table; DRAM latency ~100 ns means we must keep enough
-  // in-flight requests to hide latency.
-  constexpr int64_t PREFETCH_DIST = 8;
-  if (kHasAVX512 && emb_dim % 128 == 0) {
-    constexpr int64_t block_dim = 128;
-    const int64_t num_blocks = emb_dim / block_dim;
-    __m512 scale_v = _mm512_set1_ps(scale);
-    for (int64_t b = bs_begin; b < bs_end; ++b) {
-      // Software prefetch for batch entry b+PREFETCH_DIST to overlap DRAM
-      // latency (~100 ns per random access to large table) with AVX512 compute.
-      const int64_t pref_b = b + PREFETCH_DIST;
-      if (pref_b < bs_end) {
-        const int64_t pref_start = offsets[pref_b];
-        const int64_t pref_end = (pref_b + 1 == num_batch && last_offset != -1)
-                                     ? last_offset
-                                     : offsets[pref_b + 1];
-        for (int64_t pj = pref_start; pj < pref_end; ++pj) {
-          _prefetch_emb_row(weight + indices[pj] * emb_dim, emb_dim);
-        }
-      }
-
-      __m512 x0, x1, x2, x3, x4, x5, x6, x7;
-      __m512 y0, y1, y2, y3, y4, y5, y6, y7;
-      int64_t start_idx = offsets[b];
-      int64_t end_idx = ((b + 1) == num_batch && last_offset != -1)
-                            ? last_offset
-                            : offsets[b + 1];
-      for (int64_t block_id = 0; block_id < num_blocks; block_id++) {
-        // load first indices
-        int64_t idx = indices[start_idx] * emb_dim + block_dim * block_id;
-        output_t *block_result = result + block_dim * block_id;
-        std::tie(x0, x1, x2, x3, x4, x5, x6, x7) = load_chunk(weight + idx);
-        for (int64_t j = start_idx + 1; j < end_idx; ++j) {
-          // add following idx
-          idx = indices[j] * emb_dim + block_dim * block_id;
-          std::tie(y0, y1, y2, y3, y4, y5, y6, y7) = load_chunk(weight + idx);
-          x0 = _mm512_add_ps(x0, y0);
-          x1 = _mm512_add_ps(x1, y1);
-          x2 = _mm512_add_ps(x2, y2);
-          x3 = _mm512_add_ps(x3, y3);
-          x4 = _mm512_add_ps(x4, y4);
-          x5 = _mm512_add_ps(x5, y5);
-          x6 = _mm512_add_ps(x6, y6);
-          x7 = _mm512_add_ps(x7, y7);
-        }
-        x0 = _mm512_mul_ps(x0, scale_v);
-        x1 = _mm512_mul_ps(x1, scale_v);
-        x2 = _mm512_mul_ps(x2, scale_v);
-        x3 = _mm512_mul_ps(x3, scale_v);
-        x4 = _mm512_mul_ps(x4, scale_v);
-        x5 = _mm512_mul_ps(x5, scale_v);
-        x6 = _mm512_mul_ps(x6, scale_v);
-        x7 = _mm512_mul_ps(x7, scale_v);
-        // store
-        store_chunk(block_result, {x0, x1, x2, x3, x4, x5, x6, x7});
-      }
-      result += num_emb * emb_dim;
-    }
-    return;
-  }
-#endif
+  constexpr int64_t block_dim = 128;
+  const int64_t num_blocks = emb_dim / block_dim;
+  __m512 scale_v = _mm512_set1_ps(scale);
   for (int64_t b = bs_begin; b < bs_end; ++b) {
-    int64_t start_idx = offsets[b];
-    int64_t end_idx = ((b + 1) == num_batch && last_offset != -1)
-                          ? last_offset
-                          : offsets[b + 1];
+    _prefetch_batch_ahead(b, bs_end, emb_dim, indices, offsets, last_offset,
+                          weight, num_batch);
+    const int64_t start_idx = offsets[b];
+    const int64_t end_idx =
+        _batch_end_offset(b, offsets, last_offset, num_batch);
+    for (int64_t block_id = 0; block_id < num_blocks; block_id++) {
+      _scaled_embedding_bag_block_avx512(block_id, start_idx, end_idx, emb_dim,
+                                         indices, weight, scale_v, result);
+    }
+    result += num_emb * emb_dim;
+  }
+}
+#endif
+
+// Scalar fallback: sum a batch entry's rows element-wise, scale, and store.
+template <typename index_t, typename data_t, typename output_t>
+static inline void _scaled_embedding_bag_scalar(
+    const int64_t bs_begin, const int64_t bs_end, const int64_t num_emb,
+    const int64_t emb_dim, const index_t last_offset, const index_t *indices,
+    const index_t *offsets, const data_t *weight, const double scale,
+    output_t *result, const int64_t num_batch) {
+  for (int64_t b = bs_begin; b < bs_end; ++b) {
+    const int64_t start_idx = offsets[b];
+    const int64_t end_idx =
+        _batch_end_offset(b, offsets, last_offset, num_batch);
     for (int64_t d = 0; d < emb_dim; d++) {
       int64_t idx = indices[start_idx] * emb_dim;
       float value = float(weight[idx + d]);
@@ -271,6 +308,25 @@ inline void _scaled_embedding_bag_krnl(
     }
     result += num_emb * emb_dim;
   }
+}
+
+template <typename index_t, typename data_t, typename output_t>
+inline void _scaled_embedding_bag_krnl(
+    const int64_t bs_begin, const int64_t bs_end, const int64_t num_emb,
+    const int64_t emb_dim, const index_t last_offset, const index_t *indices,
+    const index_t *offsets, const data_t *weight, const double scale,
+    output_t *result, const int64_t num_batch) {
+#if defined(CPU_CAPABILITY_AVX512)
+  if (kHasAVX512 && emb_dim % 128 == 0) {
+    _scaled_embedding_bag_avx512(bs_begin, bs_end, num_emb, emb_dim, last_offset,
+                                 indices, offsets, weight, scale, result,
+                                 num_batch);
+    return;
+  }
+#endif
+  _scaled_embedding_bag_scalar(bs_begin, bs_end, num_emb, emb_dim, last_offset,
+                               indices, offsets, weight, scale, result,
+                               num_batch);
 }
 
 template <typename index_t, typename data_t, typename output_t>

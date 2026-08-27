@@ -49,30 +49,38 @@ class OperatorConfig(NamedTuple):
     operators: list[OperatorPatternType]
 
 
-def get_input_act_qspec(quantization_config: Optional[QuantizationConfig]):
+def _get_act_qspec(
+    quantization_config: Optional[QuantizationConfig],
+    activation: Optional[QuantizationSpec],
+):
     if quantization_config is None:
         return None
-    if quantization_config.input_activation is None:
+    if activation is None:
         return None
-    quantization_spec: QuantizationSpec = quantization_config.input_activation
+    quantization_spec: QuantizationSpec = activation
     assert quantization_spec.qscheme in [
         torch.per_tensor_affine,
         torch.per_tensor_symmetric,
     ]
     return quantization_spec
+
+
+def get_input_act_qspec(quantization_config: Optional[QuantizationConfig]):
+    activation = (
+        quantization_config.input_activation
+        if quantization_config is not None
+        else None
+    )
+    return _get_act_qspec(quantization_config, activation)
 
 
 def get_output_act_qspec(quantization_config: Optional[QuantizationConfig]):
-    if quantization_config is None:
-        return None
-    if quantization_config.output_activation is None:
-        return None
-    quantization_spec: QuantizationSpec = quantization_config.output_activation
-    assert quantization_spec.qscheme in [
-        torch.per_tensor_affine,
-        torch.per_tensor_symmetric,
-    ]
-    return quantization_spec
+    activation = (
+        quantization_config.output_activation
+        if quantization_config is not None
+        else None
+    )
+    return _get_act_qspec(quantization_config, activation)
 
 
 def get_weight_qspec(quantization_config: Optional[QuantizationConfig]):

@@ -20,6 +20,7 @@ from torchao.quantization.utils import pack_tinygemm_scales_and_zeros
 from torchao.utils import TorchAOBaseTensor, fill_defaults, find_multiple
 
 from .int4_choose_qparams_algorithm import Int4ChooseQParamsAlgorithm
+from .int4_common import _int4_quantization_type
 
 __all__ = [
     "Int4TilePackedTo4dTensor",
@@ -88,10 +89,7 @@ class Int4TilePackedTo4dTensor(TorchAOBaseTensor):
         self.act_pre_scale = act_pre_scale
 
     def _quantization_type(self):
-        s = f"shape={self.shape}, block_size={self.block_size}, device={self.device}"
-        if self.act_pre_scale is not None:
-            s += f", act_pre_scale.shape={self.act_pre_scale.shape}"
-        return s
+        return _int4_quantization_type(self)
 
     @classmethod
     def from_hp(
