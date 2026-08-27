@@ -12,6 +12,7 @@ import torch
 from torchao.utils import ceil_div
 
 from .cute_utils import (
+    make_2d_tile_smem_layouts,
     make_axis_spec,
     make_kernel_io,
     make_quant_opts,
@@ -33,17 +34,7 @@ def _make_tile_smem_layouts(tile_m: int, tile_k: int):
     Returns:
         Tuple of (smem_layout_in, smem_layout_out), both for shared memory
     """
-    import cutlass.cute as cute
-
-    smem_layout_in = cute.make_layout(
-        (tile_m, tile_k),
-        stride=(tile_k, 1),
-    )
-    smem_layout_out = cute.make_layout(
-        (tile_m, tile_k),
-        stride=(tile_k, 1),
-    )
-    return smem_layout_in, smem_layout_out
+    return make_2d_tile_smem_layouts(tile_m, tile_k, output_column_major=False)
 
 
 # Config format:

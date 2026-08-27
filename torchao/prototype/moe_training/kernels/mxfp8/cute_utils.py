@@ -423,6 +423,35 @@ if _cutedsl_runtime_available():
                 "Group sizes must be multiples of 128",
             )
 
+    def make_2d_tile_smem_layouts(tile_m, tile_k, *, output_column_major):
+        """Create the input/output SMEM tile layouts shared by the 2D kernels.
+
+        The 1x32 and 32x1 MXFP8 kernels build identical row-major input tiles
+        and differ only in the output tile's memory format: the 1x32 kernel
+        stores row-major (K fastest) while the 32x1 kernel stores column-major
+        (M fastest). ``output_column_major`` selects between them so the layout
+        construction lives in one place.
+
+        Args:
+            tile_m: Tile size in the M dimension.
+            tile_k: Tile size in the K dimension.
+            output_column_major: When True, the output tile is column-major
+                (stride ``(1, tile_m)``); otherwise it is row-major.
+
+        Returns:
+            Tuple of ``(smem_layout_in, smem_layout_out)`` for shared memory.
+        """
+        smem_layout_in = cute.make_layout(
+            (tile_m, tile_k),
+            stride=(tile_k, 1),
+        )
+        out_stride = (1, tile_m) if output_column_major else (tile_k, 1)
+        smem_layout_out = cute.make_layout(
+            (tile_m, tile_k),
+            stride=out_stride,
+        )
+        return smem_layout_in, smem_layout_out
+
     def make_tile_shape(*, tile_m, tile_k, stage_count):
         """Bundle compile-time tile geometry for the MXFP8 kernels."""
         return SimpleNamespace(tile_m=tile_m, tile_k=tile_k, stage_count=stage_count)

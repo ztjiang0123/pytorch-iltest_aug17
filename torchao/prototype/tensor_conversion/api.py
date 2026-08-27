@@ -126,6 +126,33 @@ def _find_tied_params(model):
     return module_name_to_tied_param
 
 
+def _convert_linear_weight(module, name, tensor_type, intx_packing_format):
+    """Convert a single linear module's IntxUnpackedToInt8Tensor weight in place.
+
+    Returns without touching ``module`` when its weight is not an
+    ``IntxUnpackedToInt8Tensor``.
+    """
+    weight = module.weight
+    if not isinstance(weight, IntxUnpackedToInt8Tensor):
+        print(
+            f"Skipping converting {name} to IntxOpaqueTensor because its weight is not an IntxUnpackedToInt8Tensor"
+        )
+        return
+
+    if tensor_type == "int8_lut_tensor":
+        _convert_linear_weight_to_int8_lut_tensor(module)
+    elif tensor_type == "intx_opaque_tensor":
+        _convert_module_weight_to_intx_opaque_tensor(module, intx_packing_format)
+    elif tensor_type == "auto":
+        use_int8_lut = weight._has_float_zero_point() and isinstance(module, nn.Linear)
+        if use_int8_lut:
+            _convert_linear_weight_to_int8_lut_tensor(module)
+        else:
+            _convert_module_weight_to_intx_opaque_tensor(module, intx_packing_format)
+    else:
+        raise ValueError(f"Unexpected tensor_type={tensor_type}")
+
+
 def _convert_model_for_aarch64(
     model,
     *,
@@ -145,32 +172,14 @@ def _convert_model_for_aarch64(
             continue
 
         if isinstance(module, nn.Embedding):
-            print("Skipping converting nn.Embedding {name} because it is not tied")
+            print(f"Skipping converting nn.Embedding {name} because it is not tied")
             continue
 
-        if not (convert_linear and isinstance(module, nn.Linear)):
+        is_convertible_linear = convert_linear and isinstance(module, nn.Linear)
+        if not is_convertible_linear:
             continue
 
-        weight = module.weight
-        if not isinstance(weight, IntxUnpackedToInt8Tensor):
-            print(
-                f"Skipping converting {name} to IntxOpaqueTensor because its weight is not an IntxUnpackedToInt8Tensor"
-            )
-            continue
-
-        if tensor_type == "int8_lut_tensor":
-            _convert_linear_weight_to_int8_lut_tensor(module)
-        elif tensor_type == "intx_opaque_tensor":
-            _convert_module_weight_to_intx_opaque_tensor(module, intx_packing_format)
-        elif tensor_type == "auto":
-            if weight._has_float_zero_point() and isinstance(module, nn.Linear):
-                _convert_linear_weight_to_int8_lut_tensor(module)
-            else:
-                _convert_module_weight_to_intx_opaque_tensor(
-                    module, intx_packing_format
-                )
-        else:
-            raise ValueError(f"Unexpected tensor_type={tensor_type}")
+        _convert_linear_weight(module, name, tensor_type, intx_packing_format)
 
     return model
 

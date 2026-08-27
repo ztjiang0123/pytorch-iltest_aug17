@@ -700,13 +700,21 @@ def _(func, types, args, kwargs):
         )
 
 
-@implements(aten.conv3d.default)
-def _(func, types, args, kwargs):
-    """The semantics of memory_format will match high precision counterparts
+def _conv3d_dispatch(func, types, args, kwargs, quantize_and_scaled_conv3d=None):
+    """Shared ``aten.conv3d.default`` implementation for float8 tensors.
+
+    The two float8 tensor subclasses (stable ``Float8Tensor`` and the static-
+    quant ``PrototypeFloat8Tensor``) share identical arg parsing but each has
+    its own ``_quantize_and_scaled_conv3d`` kernel; ``quantize_and_scaled_conv3d``
+    lets the caller pick which one runs (defaulting to the stable kernel).
+
+    The semantics of memory_format will match high precision counterparts
     i.e. if any of input or weight are in channels_last_3d format
     the output will be in channels_last_3d format, otherwise the output
     will be contiguous
     """
+    if quantize_and_scaled_conv3d is None:
+        quantize_and_scaled_conv3d = _quantize_and_scaled_conv3d
     (
         input_tensor,
         weight_tensor,
@@ -716,7 +724,7 @@ def _(func, types, args, kwargs):
         dilation,
         groups,
     ) = fill_defaults(args, 7, [None, [1, 1, 1], [0, 0, 0], [1, 1, 1], 1])
-    conv3d_output = _quantize_and_scaled_conv3d(
+    conv3d_output = quantize_and_scaled_conv3d(
         input_tensor,
         weight_tensor,
         bias,
@@ -725,6 +733,9 @@ def _(func, types, args, kwargs):
         dilation,
     )
     return conv3d_output
+
+
+implements(aten.conv3d.default)(_conv3d_dispatch)
 
 
 @implements(aten.conv2d.default)
