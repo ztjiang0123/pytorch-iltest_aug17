@@ -12,11 +12,8 @@ import torch
 from torchao.utils import ceil_div
 
 from .cute_utils import (
-    make_axis_spec,
-    make_kernel_io,
-    make_quant_opts,
-    make_tile_shape,
-    make_tma_handles,
+    make_kernel_namespace,
+    make_tile_2d_smem_layouts,
     run_quantize_2d_kernel,
 )
 
@@ -25,25 +22,8 @@ def _make_tile_smem_layouts(tile_m: int, tile_k: int):
     """Create shared memory layouts for input and output tiles.
 
     Both layouts use row-major format (K is fastest-changing dimension).
-
-    Args:
-        tile_m: Tile size in M dimension
-        tile_k: Tile size in K dimension
-
-    Returns:
-        Tuple of (smem_layout_in, smem_layout_out), both for shared memory
     """
-    import cutlass.cute as cute
-
-    smem_layout_in = cute.make_layout(
-        (tile_m, tile_k),
-        stride=(tile_k, 1),
-    )
-    smem_layout_out = cute.make_layout(
-        (tile_m, tile_k),
-        stride=(tile_k, 1),
-    )
-    return smem_layout_in, smem_layout_out
+    return make_tile_2d_smem_layouts(tile_m, tile_k, out_column_major=False)
 
 
 # Config format:
@@ -269,54 +249,6 @@ def _compile_mxfp8_quantize_2d_cutedsl(
             sOUT_tile_u32[lane_rel, chunk_base // cutlass.Int32(4)] = q_fp8_vals4_u32[0]
 
         @cute.jit
-        def _issue_tma_load(
-            self,
-            tma_atom_in: cute.CopyAtom,
-            gIN_tile: cute.Tensor,
-            sIN_tile: cute.Tensor,
-            tma_mbar_ptr: cutlass.Int64,
-            warp_idx: cutlass.Int32,
-        ):
-            """Issue TMA load from global memory to shared memory (producer warp only).
-
-            Only warp 0 executes the TMA load and updates the barrier.
-
-            Args:
-                tma_atom_in: TMA copy atom for G2S
-                gIN_tile: Input tile in global memory (TILE_M, TILE_K)
-                sIN_tile: Input tile in shared memory (TILE_M, TILE_K)
-                tma_mbar_ptr: TMA barrier pointer
-                warp_idx: Warp index
-
-            Storage locations:
-                Source: gIN_tile (global memory)
-                Destination: sIN_tile (shared memory)
-            """
-            if warp_idx == 0:
-                cta_layout = cute.make_layout((1,))
-                sIN_for_tma_partition = cute.group_modes(sIN_tile, 0, 1)
-                gIN_for_tma_partition = cute.group_modes(gIN_tile, 0, 1)
-                tINs, tINg = cpasync.tma_partition(
-                    tma_atom_in,
-                    0,
-                    cta_layout,
-                    sIN_for_tma_partition,
-                    gIN_for_tma_partition,
-                )
-                tINg_stage0 = tINg[(None, 0)]
-                tINs_stage0 = tINs[(None, 0)]
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        tma_mbar_ptr, TILE_COPY_BYTES
-                    )
-                cute.copy(
-                    tma_atom_in,
-                    tINg_stage0,
-                    tINs_stage0,
-                    tma_bar_ptr=tma_mbar_ptr,
-                )
-
-        @cute.jit
         def _issue_tma_store(
             self,
             tma_atom_out: cute.CopyAtom,
@@ -394,13 +326,16 @@ def _compile_mxfp8_quantize_2d_cutedsl(
             """
             smem_allocator = utils.SmemAllocator()
             storage = smem_allocator.allocate(SharedStorage)
-            shape = make_tile_shape(
-                tile_m=TILE_M, tile_k=TILE_K, stage_count=STAGE_COUNT_VALUE
+            shape = make_kernel_namespace(
+                tile_m=TILE_M,
+                tile_k=TILE_K,
+                stage_count=STAGE_COUNT_VALUE,
+                tile_copy_bytes=TILE_COPY_BYTES,
             )
 
             def _axis_1x32(bidx, bidy):
                 # 1x32: M is the fixed CTA tile (bidy), K is grouped (bidx).
-                return make_axis_spec(
+                return make_kernel_namespace(
                     shape=shape,
                     tiles_per_cta=K_TILES_PER_CTA,
                     group_tile_idx=cutlass.Int64(bidx),
@@ -418,10 +353,10 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                     is_full_tiles=IS_FULL_K_TILES,
                 )
 
-            io = make_kernel_io(
+            io = make_kernel_namespace(
                 storage=storage,
                 smem_layouts=_make_tile_smem_layouts(TILE_M, TILE_K),
-                tma=make_tma_handles(
+                tma=make_kernel_namespace(
                     atom_in=tma_atom_in,
                     tensor_in=tma_tensor_in,
                     atom_out=tma_atom_out,
@@ -432,7 +367,7 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                 scales_out_u8=scales_out_u8,
                 blocked_scale_output=BLOCKED_SCALE_OUTPUT_VALUE,
                 blocked_scale_layout=blocked_scale_layout,
-                opts=make_quant_opts(
+                opts=make_kernel_namespace(
                     use_rceil=USE_RCEIL,
                     blocked_scale_output=BLOCKED_SCALE_OUTPUT_VALUE,
                 ),

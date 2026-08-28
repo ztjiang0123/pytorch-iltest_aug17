@@ -47,6 +47,80 @@ def _cutedsl_runtime_available() -> bool:
     return len(_missing_cutedsl_runtime_packages()) == 0
 
 
+def make_tile_2d_smem_layouts(tile_m: int, tile_k: int, out_column_major: bool):
+    """Create shared memory layouts for the input and output tiles of a 2D MXFP8 kernel.
+
+    The input tile is always row-major (K is the fastest-changing dimension). The
+    output tile is row-major for 1x32 scaling and column-major for 32x1 scaling; the
+    caller selects via ``out_column_major``.
+
+    Args:
+        tile_m: Tile size in the M dimension.
+        tile_k: Tile size in the K dimension.
+        out_column_major: When True the output tile is column-major (M fastest),
+            otherwise it is row-major (K fastest).
+
+    Returns:
+        Tuple of (smem_layout_in, smem_layout_out) for shared memory.
+    """
+    import cutlass.cute as cute
+
+    smem_layout_in = cute.make_layout(
+        (tile_m, tile_k),
+        stride=(tile_k, 1),
+    )
+    out_stride = (1, tile_m) if out_column_major else (tile_k, 1)
+    smem_layout_out = cute.make_layout(
+        (tile_m, tile_k),
+        stride=out_stride,
+    )
+    return smem_layout_in, smem_layout_out
+
+
+def issue_tma_load_g2s(tma_atom_in, tiles, tma_mbar_ptr, warp_idx, spec):
+    """Issue a bulk-tensor TMA load from global to shared memory (producer warp).
+
+    Shared by the 1x32 / 32x1 (2D) and 3D MXFP8 kernels: only warp 0 partitions
+    the tiles, arrives on the mbarrier with the expected transaction bytes, and
+    issues the copy. Plain (non-``@cute.jit``) helper: its cute ops inline into
+    the caller's trace, so the only per-kernel differences arrive via arguments.
+
+    Args:
+        tma_atom_in: TMA copy atom for the global-to-shared load.
+        tiles: ``(gIN_tile, sIN_tile)`` global/shared input tiles.
+        tma_mbar_ptr: TMA mbarrier pointer.
+        warp_idx: Warp index (only warp 0 issues the load).
+        spec: ``(tile_copy_bytes, group_modes_end)`` where ``group_modes_end`` is
+            1 for 2D tiles and 2 for 3D tiles.
+    """
+    import cutlass.cute as cute
+    from cutlass.cute.nvgpu import cpasync
+
+    gIN_tile, sIN_tile = tiles
+    tile_copy_bytes, group_modes_end = spec
+    if warp_idx == 0:
+        cta_layout = cute.make_layout((1,))
+        sIN_for_tma_partition = cute.group_modes(sIN_tile, 0, group_modes_end)
+        gIN_for_tma_partition = cute.group_modes(gIN_tile, 0, group_modes_end)
+        tINs, tINg = cpasync.tma_partition(
+            tma_atom_in,
+            0,
+            cta_layout,
+            sIN_for_tma_partition,
+            gIN_for_tma_partition,
+        )
+        tINg_stage0 = tINg[(None, 0)]
+        tINs_stage0 = tINs[(None, 0)]
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(tma_mbar_ptr, tile_copy_bytes)
+        cute.copy(
+            tma_atom_in,
+            tINg_stage0,
+            tINs_stage0,
+            tma_bar_ptr=tma_mbar_ptr,
+        )
+
+
 if _cutedsl_runtime_available():
     import cutlass
     import cutlass.cute as cute
@@ -423,37 +497,27 @@ if _cutedsl_runtime_available():
                 "Group sizes must be multiples of 128",
             )
 
-    def make_tile_shape(*, tile_m, tile_k, stage_count):
-        """Bundle compile-time tile geometry for the MXFP8 kernels."""
-        return SimpleNamespace(tile_m=tile_m, tile_k=tile_k, stage_count=stage_count)
+    def make_kernel_namespace(**fields):
+        """Bundle keyword fields into a namespace for the MXFP8 kernel helpers.
 
-    def make_tma_handles(*, atom_in, tensor_in, atom_out, tensor_out):
-        """Bundle the input/output TMA atoms and tensor views for a kernel."""
-        return SimpleNamespace(
-            atom_in=atom_in,
-            tensor_in=tensor_in,
-            atom_out=atom_out,
-            tensor_out=tensor_out,
-        )
+        A single parameterised constructor for every per-launch record the 2D
+        kernels pass around (tile geometry, TMA handles, quant options, axis
+        role spec, kernel I/O). Callers name the fields; downstream helpers read
+        them as attributes. The specific field sets are:
 
-    def make_axis_spec(**fields):
-        """Bundle the axis-role parameters distinguishing 1x32 from 32x1.
-
-        The two kernels are structurally identical up to a transposed axis
-        (1x32 quantizes along K, 32x1 along M). ``fields`` captures which axis
-        is the grouped CTA-tile axis (``tiles_per_cta``, ``group_tile_idx``,
-        ``group_is_first_coord``), which axis each lane strides over (``lane_*``)
-        and which axis is quantized into 32-element blocks (``block_*``,
-        ``scale_dim``), plus the ``*_axis_size`` / ``num_blocks`` bounds for the
-        tail (partial-tile) path and the ``is_full_tiles`` flag.
+        - tile geometry: ``tile_m``, ``tile_k``, ``stage_count``,
+          ``tile_copy_bytes``.
+        - TMA handles: ``atom_in``, ``tensor_in``, ``atom_out``, ``tensor_out``.
+        - quant options: ``use_rceil``, ``blocked_scale_output``.
+        - axis role (1x32 vs 32x1, transposed axis): ``tiles_per_cta``,
+          ``group_tile_idx``, ``group_is_first_coord``, the ``lane_*`` /
+          ``block_*`` / ``scale_dim`` axis fields, the ``*_axis_size`` /
+          ``num_blocks`` tail bounds and ``is_full_tiles``.
+        - kernel I/O: ``storage``, ``smem_layouts``, ``tma``, ``shape``,
+          ``offs``, ``scales_out_u8``, ``blocked_scale_output``,
+          ``blocked_scale_layout``, ``opts``, ``compute_warps``.
         """
         return SimpleNamespace(**fields)
-
-    def make_quant_opts(*, use_rceil, blocked_scale_output):
-        """Bundle per-launch quantization options for the tile-loop helpers."""
-        return SimpleNamespace(
-            use_rceil=use_rceil, blocked_scale_output=blocked_scale_output
-        )
 
     def _axis_tile_coord(axis, group_coord, fixed_coord):
         """Order a (group, fixed) tile index pair into (M, K) coordinates."""
@@ -477,8 +541,8 @@ if _cutedsl_runtime_available():
             storage: Allocated ``SharedStorage`` instance.
             smem_layouts: ``(smem_layout_in, smem_layout_out)`` per-tile layouts.
             tidx: Thread index (only lane 0 initializes the barriers).
-            tma: TMA handles (see ``make_tma_handles``).
-            shape: Tile geometry (see ``make_tile_shape``).
+            tma: TMA handles (see ``make_kernel_namespace``).
+            shape: Tile geometry (see ``make_kernel_namespace``).
 
         Returns:
             A staging namespace with ``in0/out0/in1/out1`` SMEM tiles and
@@ -546,7 +610,7 @@ if _cutedsl_runtime_available():
 
     def _issue_tile_loads(state, tile_step, tile_eff, sIN_tile, tma_mbar_ptr):
         """Issue the current-tile TMA load and prefetch the next tile's load."""
-        kernel, tma, shape, axis = state.kernel, state.tma, state.shape, state.axis
+        tma, shape, axis = state.tma, state.shape, state.axis
         stage_count = shape.stage_count
         tiles_per_cta = axis.tiles_per_cta
         tile_shape = (shape.tile_m, shape.tile_k)
@@ -560,8 +624,12 @@ if _cutedsl_runtime_available():
                 tile_shape,
                 _axis_tile_coord(axis, tile_eff, axis.fixed_tile),
             )
-            kernel._issue_tma_load(
-                tma.atom_in, gIN_tile, sIN_tile, tma_mbar_ptr, warp_idx
+            issue_tma_load_g2s(
+                tma.atom_in,
+                (gIN_tile, sIN_tile),
+                tma_mbar_ptr,
+                warp_idx,
+                (shape.tile_copy_bytes, 1),
             )
 
         if cutlass.const_expr(stage_count > 1 and tiles_per_cta > 1):
@@ -577,8 +645,12 @@ if _cutedsl_runtime_available():
                     tile_shape,
                     _axis_tile_coord(axis, tile_next, axis.fixed_tile),
                 )
-                kernel._issue_tma_load(
-                    tma.atom_in, gIN_tile_next, sIN_tile_next, mbar_next, warp_idx
+                issue_tma_load_g2s(
+                    tma.atom_in,
+                    (gIN_tile_next, sIN_tile_next),
+                    mbar_next,
+                    warp_idx,
+                    (shape.tile_copy_bytes, 1),
                 )
 
     def _quantize_lane_full(state, tiles, lane, tile_eff):
@@ -695,9 +767,9 @@ if _cutedsl_runtime_available():
 
         Args:
             kernel: Kernel instance providing the block-level primitives.
-            tma: TMA handles (see ``make_tma_handles``).
+            tma: TMA handles (see ``make_kernel_namespace``).
             staging: Staging namespace from ``setup_kernel_smem_and_barriers``.
-            axis: Axis-role spec (see ``make_axis_spec``); also carries
+            axis: Axis-role spec (see ``make_kernel_namespace``); also carries
                 ``shape`` (tile geometry).
             opts_ctx: ``(opts, warp_idx, tidx, compute_warps, scales_tensor)``:
                 quantization options plus the per-thread runtime context.
@@ -743,15 +815,6 @@ if _cutedsl_runtime_available():
             )
             kernel._issue_tma_store(tma.atom_out, gOUT_tile, sOUT_tile, warp_idx)
 
-    def make_kernel_io(**fields):
-        """Bundle the per-launch I/O + geometry a 2D quantize kernel needs.
-
-        Expected fields: ``storage``, ``smem_layouts``, ``tma``, ``shape``,
-        ``offs``, ``scales_out_u8``, ``blocked_scale_output``,
-        ``blocked_scale_layout``, ``opts``, ``compute_warps``.
-        """
-        return SimpleNamespace(**fields)
-
     def run_quantize_2d_kernel(kernel, io, build_axis):
         """Full body of the warp-specialized 2D MXFP8 quantization kernel.
 
@@ -760,11 +823,11 @@ if _cutedsl_runtime_available():
         and the TMA-pipelined tile loop — so the 1x32 and 32x1 ``@cute.kernel``
         entry points reduce to a single call. The only per-kernel difference is
         the axis role assignment, provided by ``build_axis(bidx, bidy)`` which
-        returns an ``make_axis_spec`` namespace.
+        returns a ``make_kernel_namespace`` axis-role namespace.
 
         Args:
             kernel: Kernel instance providing the block-level primitives.
-            io: I/O + geometry bundle (see ``make_kernel_io``).
+            io: I/O + geometry bundle (see ``make_kernel_namespace``).
             build_axis: ``(bidx, bidy) -> axis`` factory for the axis spec.
 
         Plain (non-``@cute.jit``) helper; its cute ops inline into the trace.
