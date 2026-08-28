@@ -16,6 +16,23 @@ from torchao._models.sam2.config_utils import resolve_config
 from torchao._models.sam2.modeling.sam2_utils import DropPath, LayerNorm2d, get_clones
 
 
+@dataclass
+class MaskDownSamplerConfig:
+    """Grouped hyperparameters for :class:`MaskDownSampler`.
+
+    The output channels, per-step conv shape, and total downsample factor all
+    travel together and can be passed as a single config object or as
+    individual keyword arguments (as the Hydra configs do). ``activation`` is
+    kept as a separate constructor argument because it is an ``nn.Module`` type.
+    """
+
+    embed_dim: int = 256
+    kernel_size: int = 4
+    stride: int = 4
+    padding: int = 0
+    total_stride: int = 16
+
+
 class MaskDownSampler(nn.Module):
     """
     Progressively downsample a mask by total_stride, each time by stride.
@@ -27,14 +44,17 @@ class MaskDownSampler(nn.Module):
 
     def __init__(
         self,
-        embed_dim=256,
-        kernel_size=4,
-        stride=4,
-        padding=0,
-        total_stride=16,
+        config: Optional[MaskDownSamplerConfig] = None,
         activation=nn.GELU,
+        **kwargs,
     ):
         super().__init__()
+        config = resolve_config(config, MaskDownSamplerConfig, kwargs)
+        embed_dim = config.embed_dim
+        kernel_size = config.kernel_size
+        stride = config.stride
+        padding = config.padding
+        total_stride = config.total_stride
         num_layers = int(math.log2(total_stride) // math.log2(stride))
         assert stride**num_layers == total_stride
         self.encoder = nn.Sequential()
@@ -60,6 +80,29 @@ class MaskDownSampler(nn.Module):
         return self.encoder(x)
 
 
+@dataclass
+class CXBlockConfig:
+    """Grouped hyperparameters for :class:`CXBlock`.
+
+    The convolution shape, stochastic-depth rate, layer-scale init, and the
+    depthwise-conv switch all travel together and can be passed as a single
+    config object or as individual keyword arguments (as the Hydra configs do).
+
+    Attributes:
+        kernel_size (int): Depthwise conv kernel size. Default: 7
+        padding (int): Depthwise conv padding. Default: 3
+        drop_path (float): Stochastic depth rate. Default: 0.0
+        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
+        use_dwconv (bool): Whether the conv is depthwise. Default: True
+    """
+
+    kernel_size: int = 7
+    padding: int = 3
+    drop_path: float = 0.0
+    layer_scale_init_value: float = 1e-6
+    use_dwconv: bool = True
+
+
 # Lightly adapted from ConvNext (https://github.com/facebookresearch/ConvNeXt)
 class CXBlock(nn.Module):
     r"""ConvNeXt Block. There are two equivalent implementations:
@@ -69,20 +112,23 @@ class CXBlock(nn.Module):
 
     Args:
         dim (int): Number of input channels.
-        drop_path (float): Stochastic depth rate. Default: 0.0
-        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
+        config (CXBlockConfig): Grouped block hyperparameters. Individual
+            fields may also be passed as keyword arguments.
     """
 
     def __init__(
         self,
         dim,
-        kernel_size=7,
-        padding=3,
-        drop_path=0.0,
-        layer_scale_init_value=1e-6,
-        use_dwconv=True,
+        config: Optional[CXBlockConfig] = None,
+        **kwargs,
     ):
         super().__init__()
+        config = resolve_config(config, CXBlockConfig, kwargs)
+        kernel_size = config.kernel_size
+        padding = config.padding
+        drop_path = config.drop_path
+        layer_scale_init_value = config.layer_scale_init_value
+        use_dwconv = config.use_dwconv
         self.dwconv = nn.Conv2d(
             dim,
             dim,
