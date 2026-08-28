@@ -9,11 +9,13 @@ from .quantized_modules import (
 from .quantizers import (
     CodeBookQuantizer,
     IntQuantizer,
+    QuantRange,
 )
 
 __all__ = [
     "CodeBookQuantizer",
     "IntQuantizer",
+    "QuantRange",
     "QuantizedEmbedding",
     "QuantizedLinear",
     "QuantizationRecipe",

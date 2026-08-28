@@ -1,10 +1,17 @@
-from typing import Optional, Tuple, Union
+from typing import NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 from torch.autograd import Function
 
 __supported_group_size_strings__ = ["per_token", "per_channel", "per_tensor"]
+
+
+class QuantRange(NamedTuple):
+    """Inclusive integer range of representable quantized values."""
+
+    q_min: int
+    q_max: int
 
 
 class RoundStraightThrough(Function):
@@ -53,8 +60,7 @@ class IntQuantizer(nn.Module):
                 x,
                 self.group_size,
                 self.quantization_mode,
-                q_min,
-                q_max,
+                QuantRange(q_min, q_max),
             )
         else:
             scale = self.scale
@@ -133,10 +139,10 @@ class IntQuantizer(nn.Module):
         x: torch.Tensor,
         group_size: Union[int, str],
         quantization_mode: str,
-        q_min: int,
-        q_max: int,
+        quant_range: QuantRange,
         scale_eps: float = 1e-9,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        q_min, q_max = quant_range
         if not isinstance(group_size, int) and group_size == "per_tensor":
             x_min = torch.min(x)
             x_max = torch.max(x)
@@ -261,7 +267,7 @@ class IntQuantizer(nn.Module):
 
         q_min, q_max = self.get_qmin_qmax(self.num_bits, signed=signed)
         scale, offset = self.get_scale_offset(
-            x, self.group_size, self.quantization_mode, q_min, q_max
+            x, self.group_size, self.quantization_mode, QuantRange(q_min, q_max)
         )
 
         # with per-tensor we get empty tensors sometimes
