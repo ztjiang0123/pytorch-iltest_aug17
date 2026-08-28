@@ -1,6 +1,7 @@
 # mypy: allow-untyped-defs
 
 import sys
+from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
 import torch
@@ -125,6 +126,7 @@ __all__ = [
     "UniformQuantizationObserverBase",
     "ObserverOrFakeQuantizeConstructor",
     "DerivedObserverOrFakeQuantize",
+    "DerivedQParamsSpec",
     # utils
     "enable_fake_quant",
     "enable_observer",
@@ -168,6 +170,22 @@ __all__ = [
 ]
 
 
+@dataclass
+class DerivedQParamsSpec:
+    """Quantization-range and scheme metadata for a derived observer.
+
+    These values travel together and are all optional refinements of how the
+    derived qparams are interpreted, so grouping them keeps
+    :class:`DerivedObserverOrFakeQuantize`'s constructor down to the observers it
+    derives from and the function that combines them.
+    """
+
+    quant_min: Optional[int] = None
+    quant_max: Optional[int] = None
+    qscheme: Optional[torch.qscheme] = None
+    ch_axis: Optional[int] = None
+
+
 class DerivedObserverOrFakeQuantize(ObserverBase):
     r"""This observer is used to describe an observer whose quantization parameters
     are derived from other observers
@@ -180,18 +198,17 @@ class DerivedObserverOrFakeQuantize(ObserverBase):
         derive_qparams_fn: Callable[
             [list[ObserverOrFakeQuantize]], tuple[Tensor, Tensor]
         ],
-        quant_min: Optional[int] = None,
-        quant_max: Optional[int] = None,
-        qscheme: Optional[torch.qscheme] = None,
-        ch_axis: Optional[int] = None,
+        qparams_spec: Optional[DerivedQParamsSpec] = None,
     ):
         super().__init__(dtype)
+        if qparams_spec is None:
+            qparams_spec = DerivedQParamsSpec()
         self.obs_or_fqs = obs_or_fqs
         self.derive_qparams_fn = derive_qparams_fn
-        self.quant_min = quant_min
-        self.quant_max = quant_max
-        self.qscheme = qscheme
-        self.ch_axis = ch_axis
+        self.quant_min = qparams_spec.quant_min
+        self.quant_max = qparams_spec.quant_max
+        self.qscheme = qparams_spec.qscheme
+        self.ch_axis = qparams_spec.ch_axis
 
         from .utils import is_per_channel
 

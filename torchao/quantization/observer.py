@@ -6,6 +6,7 @@
 import logging
 import warnings
 from abc import ABCMeta, abstractmethod
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Optional, Tuple
 
@@ -63,6 +64,29 @@ def _with_args(cls_or_self, *args, **kwargs):
 ABC: Any = ABCMeta("ABC", (object,), {})  # compatible with Python 2 *and* 3:
 
 
+@dataclass
+class AffineQuantizedObserverConfig:
+    """Optional settings shared by every affine quantized observer.
+
+    These values all describe *how* qparams are computed (range, dtypes, and
+    zero-point handling) and are passed around together, so grouping them keeps
+    :class:`AffineQuantizedObserverBase` and its subclasses down to the required
+    ``mapping_type``/``target_dtype``/``granularity`` plus this config.
+
+    See :mod:`torchao.quantization.quant_primitives` for the meaning of each
+    field.
+    """
+
+    quant_min: Optional[int] = None
+    quant_max: Optional[int] = None
+    eps: Optional[float] = None
+    scale_dtype: Optional[torch.dtype] = None
+    zero_point_dtype: Optional[torch.dtype] = None
+    preserve_zero: bool = True
+    zero_point_domain: ZeroPointDomain = ZeroPointDomain.INT
+    keepdim: bool = False
+
+
 class AffineQuantizedObserverBase(ABC, torch.nn.Module):
     """Observer module for affine quantization (https://github.com/pytorch/ao/tree/main/torchao/quantization#affine-quantization)
 
@@ -80,32 +104,27 @@ class AffineQuantizedObserverBase(ABC, torch.nn.Module):
         mapping_type: MappingType,
         target_dtype: torch.dtype,
         granularity: Granularity,
-        quant_min: Optional[int] = None,
-        quant_max: Optional[int] = None,
-        eps: Optional[float] = None,
-        scale_dtype: Optional[torch.dtype] = None,
-        zero_point_dtype: Optional[torch.dtype] = None,
-        preserve_zero: bool = True,
-        zero_point_domain: ZeroPointDomain = ZeroPointDomain.INT,
-        keepdim: bool = False,
+        config: Optional[AffineQuantizedObserverConfig] = None,
     ):
         super().__init__()
+        if config is None:
+            config = AffineQuantizedObserverConfig()
         assert granularity is not None, "granularity is None"
-        if zero_point_domain is None:
+        if config.zero_point_domain is None:
             raise ValueError("Please use ZeroPointDomain.NONE instead of None")
 
         # Deprecation warnings for preserve_zero and zero_point_domain
         # Only preserve_zero=True and zero_point_domain=INT are supported
-        if not preserve_zero:
+        if not config.preserve_zero:
             warnings.warn(
                 "preserve_zero=False is deprecated and will be removed in a future release. "
                 "Only preserve_zero=True is supported.",
                 DeprecationWarning,
                 stacklevel=2,
             )
-        if zero_point_domain != ZeroPointDomain.INT:
+        if config.zero_point_domain != ZeroPointDomain.INT:
             warnings.warn(
-                f"zero_point_domain={zero_point_domain} is deprecated and will be removed in a future release. "
+                f"zero_point_domain={config.zero_point_domain} is deprecated and will be removed in a future release. "
                 "Only ZeroPointDomain.INT is supported.",
                 DeprecationWarning,
                 stacklevel=2,
@@ -114,14 +133,14 @@ class AffineQuantizedObserverBase(ABC, torch.nn.Module):
         self.mapping_type = mapping_type
         self.target_dtype = target_dtype
         self.granularity = granularity
-        self.quant_min = quant_min
-        self.quant_max = quant_max
-        self.eps = eps
-        self.scale_dtype = scale_dtype
-        self.zero_point_dtype = zero_point_dtype
-        self.preserve_zero = preserve_zero
-        self.zero_point_domain = zero_point_domain
-        self.keepdim = keepdim
+        self.quant_min = config.quant_min
+        self.quant_max = config.quant_max
+        self.eps = config.eps
+        self.scale_dtype = config.scale_dtype
+        self.zero_point_dtype = config.zero_point_dtype
+        self.preserve_zero = config.preserve_zero
+        self.zero_point_domain = config.zero_point_domain
+        self.keepdim = config.keepdim
 
     @abstractmethod
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -202,34 +221,24 @@ class AffineQuantizedFixedQParamObserver(AffineQuantizedObserverBase):
         mapping_type: MappingType,
         target_dtype: torch.dtype,
         granularity: Granularity,
-        quant_min: Optional[int] = None,
-        quant_max: Optional[int] = None,
-        eps: Optional[float] = None,
-        scale_dtype: Optional[torch.dtype] = None,
-        zero_point_dtype: Optional[torch.dtype] = None,
-        preserve_zero: bool = True,
-        zero_point_domain: ZeroPointDomain = ZeroPointDomain.INT,
+        config: Optional[AffineQuantizedObserverConfig] = None,
         scale: Optional[torch.Tensor] = None,
         zero_point: Optional[torch.Tensor] = None,
     ):
+        if config is None:
+            config = AffineQuantizedObserverConfig()
         super().__init__(
             mapping_type,
             target_dtype,
             granularity,
-            quant_min,
-            quant_max,
-            eps,
-            scale_dtype,
-            zero_point_dtype,
-            preserve_zero,
-            zero_point_domain,
+            config,
         )
         if not scale:
             scale = torch.Tensor([1])
         if not zero_point:
             zero_point = torch.zeros_like(scale)
-        self.register_buffer("scale", scale.to(dtype=scale_dtype))
-        self.register_buffer("zero_point", zero_point.to(dtype=zero_point_dtype))
+        self.register_buffer("scale", scale.to(dtype=config.scale_dtype))
+        self.register_buffer("zero_point", zero_point.to(dtype=config.zero_point_dtype))
 
     def set_qparams(self, scale, zero_point=None):
         if not zero_point:
@@ -254,13 +263,7 @@ class AffineQuantizedMSEObserver(AffineQuantizedObserverBase):
         mapping_type: MappingType,
         target_dtype: torch.dtype,
         granularity: Granularity,
-        quant_min: Optional[int] = None,
-        quant_max: Optional[int] = None,
-        eps: Optional[float] = None,
-        scale_dtype: Optional[torch.dtype] = None,
-        zero_point_dtype: Optional[torch.dtype] = None,
-        preserve_zero: bool = True,
-        zero_point_domain: ZeroPointDomain = ZeroPointDomain.INT,
+        config: Optional[AffineQuantizedObserverConfig] = None,
         steps: int = 100,
         run_once: bool = False,
     ):
@@ -268,13 +271,7 @@ class AffineQuantizedMSEObserver(AffineQuantizedObserverBase):
             mapping_type,
             target_dtype,
             granularity,
-            quant_min,
-            quant_max,
-            eps,
-            scale_dtype,
-            zero_point_dtype,
-            preserve_zero,
-            zero_point_domain,
+            config,
         )
         self.steps = steps
         self.calibrated = False

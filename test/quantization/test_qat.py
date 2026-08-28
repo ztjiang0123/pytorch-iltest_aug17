@@ -34,6 +34,7 @@ from torchao.quantization.granularity import (
     PerToken,
 )
 from torchao.quantization.linear_quant_modules import (
+    _Linear4ReplaceSettings,
     _Linear8da4wReplaceSettings,
     _replace_linear_8da4w,
     _replace_linear_int4,
@@ -1131,13 +1132,15 @@ class TestQAT(TestCase):
         )
         _replace_linear_int4(
             module,
-            256,
-            8,
-            padding_allowed=True,
-            precision=torch.bfloat16,
-            scales_precision=torch.bfloat16,
-            linear_class=Int4WeightOnlyQATLinear,
-            copy_weights=True,
+            _Linear4ReplaceSettings(
+                groupsize=256,
+                inner_k_tiles=8,
+                padding_allowed=True,
+                precision=torch.bfloat16,
+                scales_precision=torch.bfloat16,
+                linear_class=Int4WeightOnlyQATLinear,
+                copy_weights=True,
+            ),
         )
         assert not isinstance(module[0], Int4WeightOnlyQATLinear) and isinstance(
             module[0], torch.nn.Linear
@@ -1147,13 +1150,15 @@ class TestQAT(TestCase):
         )
         _replace_linear_int4(
             module,
-            256,
-            8,
-            padding_allowed=True,
-            precision=torch.bfloat16,
-            scales_precision=torch.bfloat16,
-            linear_class=Int4WeightOnlyQATLinear,
-            copy_weights=True,
+            _Linear4ReplaceSettings(
+                groupsize=256,
+                inner_k_tiles=8,
+                padding_allowed=True,
+                precision=torch.bfloat16,
+                scales_precision=torch.bfloat16,
+                linear_class=Int4WeightOnlyQATLinear,
+                copy_weights=True,
+            ),
         )
         assert isinstance(module[0], Int4WeightOnlyQATLinear)
 

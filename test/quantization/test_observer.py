@@ -18,6 +18,7 @@ from torchao.quantization.observer import (
     AffineQuantizedFixedQParamObserver,
     AffineQuantizedMinMaxObserver,
     AffineQuantizedMSEObserver,
+    AffineQuantizedObserverConfig,
 )
 from torchao.quantization.quant_primitives import MappingType
 
@@ -43,9 +44,11 @@ class TestQuantFlow(TestCase):
             MappingType.ASYMMETRIC,
             torch.uint8,
             granularity=PerTensor(),
-            eps=torch.finfo(torch.float32).eps,
-            scale_dtype=torch.float,
-            zero_point_dtype=torch.int,
+            config=AffineQuantizedObserverConfig(
+                eps=torch.finfo(torch.float32).eps,
+                scale_dtype=torch.float,
+                zero_point_dtype=torch.int,
+            ),
         )
         ref_obs = MinMaxObserver(dtype=torch.uint8, qscheme=torch.per_tensor_affine)
         self._test_obs_helper(obs, ref_obs)
@@ -55,9 +58,11 @@ class TestQuantFlow(TestCase):
             MappingType.ASYMMETRIC,
             torch.uint8,
             granularity=PerAxis(axis=0),
-            eps=torch.finfo(torch.float32).eps,
-            scale_dtype=torch.float,
-            zero_point_dtype=torch.int,
+            config=AffineQuantizedObserverConfig(
+                eps=torch.finfo(torch.float32).eps,
+                scale_dtype=torch.float,
+                zero_point_dtype=torch.int,
+            ),
         )
         ref_obs = PerChannelMinMaxObserver(
             dtype=torch.uint8, qscheme=torch.per_channel_affine
@@ -69,9 +74,11 @@ class TestQuantFlow(TestCase):
             MappingType.SYMMETRIC,
             torch.float8_e4m3fn,
             granularity=PerTensor(),
-            eps=torch.finfo(torch.float32).eps,
-            scale_dtype=torch.float,
-            zero_point_dtype=torch.int,
+            config=AffineQuantizedObserverConfig(
+                eps=torch.finfo(torch.float32).eps,
+                scale_dtype=torch.float,
+                zero_point_dtype=torch.int,
+            ),
         )
         example_inputs = [
             torch.randn(10, 2048),
@@ -87,9 +94,11 @@ class TestQuantFlow(TestCase):
             MappingType.SYMMETRIC,
             torch.float8_e4m3fn,
             granularity=PerAxis(1),
-            eps=torch.finfo(torch.float32).eps,
-            scale_dtype=torch.float,
-            zero_point_dtype=torch.int,
+            config=AffineQuantizedObserverConfig(
+                eps=torch.finfo(torch.float32).eps,
+                scale_dtype=torch.float,
+                zero_point_dtype=torch.int,
+            ),
         )
         for example_input in example_inputs:
             obs(example_input)
@@ -101,9 +110,11 @@ class TestQuantFlow(TestCase):
             MappingType.SYMMETRIC,
             torch.float8_e4m3fn,
             granularity=PerAxis(0),
-            eps=torch.finfo(torch.float32).eps,
-            scale_dtype=torch.float,
-            zero_point_dtype=torch.int,
+            config=AffineQuantizedObserverConfig(
+                eps=torch.finfo(torch.float32).eps,
+                scale_dtype=torch.float,
+                zero_point_dtype=torch.int,
+            ),
         )
         example_inputs = [
             torch.randn(10, 2048),
@@ -119,9 +130,11 @@ class TestQuantFlow(TestCase):
             MappingType.SYMMETRIC,
             torch.float8_e4m3fn,
             granularity=PerAxis(1),
-            eps=torch.finfo(torch.float32).eps,
-            scale_dtype=torch.float,
-            zero_point_dtype=torch.int,
+            config=AffineQuantizedObserverConfig(
+                eps=torch.finfo(torch.float32).eps,
+                scale_dtype=torch.float,
+                zero_point_dtype=torch.int,
+            ),
         )
         example_inputs = [
             torch.randn(10, 2048),
@@ -138,9 +151,11 @@ class TestQuantFlow(TestCase):
             MappingType.SYMMETRIC,
             torch.int8,
             granularity=PerAxis(0),
-            eps=torch.finfo(torch.float32).eps,
-            scale_dtype=torch.float,
-            zero_point_dtype=torch.int,
+            config=AffineQuantizedObserverConfig(
+                eps=torch.finfo(torch.float32).eps,
+                scale_dtype=torch.float,
+                zero_point_dtype=torch.int,
+            ),
             steps=100,
             run_once=True,
         )
@@ -153,9 +168,11 @@ class TestQuantFlow(TestCase):
             MappingType.SYMMETRIC,
             torch.int8,
             granularity=PerAxis(0),
-            eps=torch.finfo(torch.float32).eps,
-            scale_dtype=torch.float,
-            zero_point_dtype=torch.int,
+            config=AffineQuantizedObserverConfig(
+                eps=torch.finfo(torch.float32).eps,
+                scale_dtype=torch.float,
+                zero_point_dtype=torch.int,
+            ),
         )
         minmax_obs(example_input)
         min_val, max_val = minmax_obs.min_val, minmax_obs.max_val
@@ -169,9 +186,11 @@ class TestQuantFlow(TestCase):
             MappingType.SYMMETRIC,
             torch.float8_e4m3fn,
             granularity=PerAxis(0),
-            eps=torch.finfo(torch.float32).eps,
-            scale_dtype=torch.float,
-            zero_point_dtype=torch.int,
+            config=AffineQuantizedObserverConfig(
+                eps=torch.finfo(torch.float32).eps,
+                scale_dtype=torch.float,
+                zero_point_dtype=torch.int,
+            ),
         )
         example_input = torch.randn(10, 2048)
         obs(example_input)
@@ -186,20 +205,24 @@ class TestQuantFlow(TestCase):
             MappingType.ASYMMETRIC,
             torch.uint8,
             granularity=PerAxis(axis=0),
-            eps=torch.finfo(torch.float32).eps,
-            scale_dtype=torch.float,
-            zero_point_dtype=torch.int,
-            keepdim=False,
+            config=AffineQuantizedObserverConfig(
+                eps=torch.finfo(torch.float32).eps,
+                scale_dtype=torch.float,
+                zero_point_dtype=torch.int,
+                keepdim=False,
+            ),
         )
         # Test with keepdim=True
         obs_keepdim = AffineQuantizedMinMaxObserver(
             MappingType.ASYMMETRIC,
             torch.uint8,
             granularity=PerAxis(axis=0),
-            eps=torch.finfo(torch.float32).eps,
-            scale_dtype=torch.float,
-            zero_point_dtype=torch.int,
-            keepdim=True,
+            config=AffineQuantizedObserverConfig(
+                eps=torch.finfo(torch.float32).eps,
+                scale_dtype=torch.float,
+                zero_point_dtype=torch.int,
+                keepdim=True,
+            ),
         )
 
         example_input = torch.randn(10, 2048)
@@ -240,20 +263,24 @@ class TestQuantFlow(TestCase):
             MappingType.ASYMMETRIC,
             torch.uint8,
             granularity=PerTensor(),
-            eps=torch.finfo(torch.float32).eps,
-            scale_dtype=torch.float,
-            zero_point_dtype=torch.int,
-            keepdim=False,
+            config=AffineQuantizedObserverConfig(
+                eps=torch.finfo(torch.float32).eps,
+                scale_dtype=torch.float,
+                zero_point_dtype=torch.int,
+                keepdim=False,
+            ),
         )
         # Test with keepdim=True
         obs_keepdim = AffineQuantizedMinMaxObserver(
             MappingType.ASYMMETRIC,
             torch.uint8,
             granularity=PerTensor(),
-            eps=torch.finfo(torch.float32).eps,
-            scale_dtype=torch.float,
-            zero_point_dtype=torch.int,
-            keepdim=True,
+            config=AffineQuantizedObserverConfig(
+                eps=torch.finfo(torch.float32).eps,
+                scale_dtype=torch.float,
+                zero_point_dtype=torch.int,
+                keepdim=True,
+            ),
         )
 
         example_input = torch.randn(*input_shape)

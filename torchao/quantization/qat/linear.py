@@ -16,6 +16,7 @@ from torchao.quantization.linear_quant_modules import (
     Int8DynActInt4WeightLinear,
     WeightOnlyInt4Linear,
     _check_linear_int4_k,
+    _Linear4ReplaceSettings,
     _Linear8da4wReplaceSettings,
     _replace_linear_8da4w,
     _replace_linear_int4,
@@ -425,13 +426,15 @@ class Int4WeightOnlyQATQuantizer(_LegacyQATQuantizer):
     ) -> torch.nn.Module:
         _replace_linear_int4(
             model,
-            self.groupsize,
-            self.inner_k_tiles,
-            padding_allowed=True,
-            precision=self.precision,
-            scales_precision=self.scales_precision,
-            linear_class=Int4WeightOnlyQATLinear,
-            copy_weights=True,
+            _Linear4ReplaceSettings(
+                groupsize=self.groupsize,
+                inner_k_tiles=self.inner_k_tiles,
+                padding_allowed=True,
+                precision=self.precision,
+                scales_precision=self.scales_precision,
+                linear_class=Int4WeightOnlyQATLinear,
+                copy_weights=True,
+            ),
         )
         return model
 
