@@ -4,11 +4,32 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+@dataclass
+class FpnConv:
+    """Configuration for the lateral 1x1 convolutions in :class:`FpnNeck`."""
+
+    kernel_size: int = 1
+    stride: int = 1
+    padding: int = 0
+
+
+@dataclass
+class FpnFusion:
+    """Configuration for the top-down feature fusion in :class:`FpnNeck`."""
+
+    interp_model: str = "bilinear"
+    fuse_type: str = "sum"
+    # Levels to have top-down features in their outputs. ``None`` means all
+    # levels receive top-down propagation.
+    top_down_levels: Optional[List[int]] = field(default=None)
 
 
 class ImageEncoder(nn.Module):
@@ -62,20 +83,21 @@ class FpnNeck(nn.Module):
         position_encoding: nn.Module,
         d_model: int,
         backbone_channel_list: List[int],
-        kernel_size: int = 1,
-        stride: int = 1,
-        padding: int = 0,
-        fpn_interp_model: str = "bilinear",
-        fuse_type: str = "sum",
-        fpn_top_down_levels: Optional[List[int]] = None,
+        conv: Optional[FpnConv] = None,
+        fusion: Optional[FpnFusion] = None,
     ):
         """Initialize the neck
-        :param trunk: the backbone
         :param position_encoding: the positional encoding to use
         :param d_model: the dimension of the model
-        :param neck_norm: the normalization to use
+        :param backbone_channel_list: input channels of each backbone level
+        :param conv: kernel size, stride, and padding of the lateral convs
+        :param fusion: interpolation mode, fuse type, and top-down levels
         """
         super().__init__()
+        if conv is None:
+            conv = FpnConv()
+        if fusion is None:
+            fusion = FpnFusion()
         self.position_encoding = position_encoding
         self.convs = nn.ModuleList()
         self.backbone_channel_list = backbone_channel_list
@@ -87,21 +109,22 @@ class FpnNeck(nn.Module):
                 nn.Conv2d(
                     in_channels=dim,
                     out_channels=d_model,
-                    kernel_size=kernel_size,
-                    stride=stride,
-                    padding=padding,
+                    kernel_size=conv.kernel_size,
+                    stride=conv.stride,
+                    padding=conv.padding,
                 ),
             )
 
             self.convs.append(current)
-        self.fpn_interp_model = fpn_interp_model
-        assert fuse_type in ["sum", "avg"]
-        self.fuse_type = fuse_type
+        self.fpn_interp_model = fusion.interp_model
+        assert fusion.fuse_type in ["sum", "avg"]
+        self.fuse_type = fusion.fuse_type
 
         # levels to have top-down features in its outputs
-        # e.g. if fpn_top_down_levels is [2, 3], then only outputs of level 2 and 3
+        # e.g. if top_down_levels is [2, 3], then only outputs of level 2 and 3
         # have top-down propagation, while outputs of level 0 and level 1 have only
         # lateral features from the same backbone level.
+        fpn_top_down_levels = fusion.top_down_levels
         if fpn_top_down_levels is None:
             # default is to have top-down features on all levels
             fpn_top_down_levels = range(len(self.convs))

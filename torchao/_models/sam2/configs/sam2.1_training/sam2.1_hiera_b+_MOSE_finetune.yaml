@@ -81,8 +81,10 @@ trainer:
           temperature: 10000
         d_model: 256
         backbone_channel_list: [896, 448, 224, 112]
-        fpn_top_down_levels: [2, 3]  # output level 0 and 1 directly use the backbone features
-        fpn_interp_model: nearest
+        fusion:
+          _target_: sam2.modeling.backbones.image_encoder.FpnFusion
+          top_down_levels: [2, 3]  # output level 0 and 1 directly use the backbone features
+          interp_model: nearest
 
     memory_attention:
       _target_: sam2.modeling.memory_attention.MemoryAttention

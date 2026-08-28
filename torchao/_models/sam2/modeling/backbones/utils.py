@@ -6,11 +6,21 @@
 
 """Some utilities for backbones, in particular for windowing"""
 
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+@dataclass
+class PatchEmbedConv:
+    """Configuration for the projection convolution used by :class:`PatchEmbed`."""
+
+    kernel_size: Tuple[int, ...] = (7, 7)
+    stride: Tuple[int, ...] = (4, 4)
+    padding: Tuple[int, ...] = (3, 3)
 
 
 def window_partition(x, window_size):
@@ -69,23 +79,26 @@ class PatchEmbed(nn.Module):
 
     def __init__(
         self,
-        kernel_size: Tuple[int, ...] = (7, 7),
-        stride: Tuple[int, ...] = (4, 4),
-        padding: Tuple[int, ...] = (3, 3),
+        conv: Optional[PatchEmbedConv] = None,
         in_chans: int = 3,
         embed_dim: int = 768,
     ):
         """
         Args:
-            kernel_size (Tuple): kernel size of the projection layer.
-            stride (Tuple): stride of the projection layer.
-            padding (Tuple): padding size of the projection layer.
+            conv (PatchEmbedConv): kernel size, stride, and padding of the
+                projection layer (defaults to the standard SAM2 values).
             in_chans (int): Number of input image channels.
-            embed_dim (int):  embed_dim (int): Patch embedding dimension.
+            embed_dim (int): Patch embedding dimension.
         """
         super().__init__()
+        if conv is None:
+            conv = PatchEmbedConv()
         self.proj = nn.Conv2d(
-            in_chans, embed_dim, kernel_size=kernel_size, stride=stride, padding=padding
+            in_chans,
+            embed_dim,
+            kernel_size=conv.kernel_size,
+            stride=conv.stride,
+            padding=conv.padding,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
