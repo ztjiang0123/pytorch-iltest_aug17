@@ -156,6 +156,83 @@ def issue_tma_store_s2g(tma_atom_out, gOUT_tile, sOUT_tile, warp_idx, group_mode
         cute.copy(tma_atom_out, tOUTs[(None, 0)], tOUTg[(None, 0)])
 
 
+def resolve_input_cutlass_dtype(input_dtype_name: str, kernel_name: str):
+    """Map a ``str(torch.dtype)`` to the matching cutlass dtype.
+
+    Shared by the 1x32 / 32x1 (2D) and 3D MXFP8 compile paths. ``kernel_name``
+    only customizes the error message (e.g. ``"quantize_3d"``).
+
+    Args:
+        input_dtype_name: ``str(x.dtype)``, e.g. ``"torch.bfloat16"``.
+        kernel_name: Kernel identifier used in the unsupported-dtype message.
+
+    Returns:
+        The cutlass dtype (``cutlass.Float32`` or ``cutlass.BFloat16``).
+    """
+    import cutlass
+
+    if input_dtype_name == "torch.float32":
+        return cutlass.Float32
+    if input_dtype_name == "torch.bfloat16":
+        return cutlass.BFloat16
+    raise ValueError(
+        f"Unsupported input dtype for CuTeDSL {kernel_name}: {input_dtype_name}"
+    )
+
+
+def bind_kernel_config(kernel, config):
+    """Expose a frozen kernel-config dataclass as uppercase kernel attributes.
+
+    Shared by the 1x32 / 32x1 (2D) and 3D MXFP8 kernels. Each config field is
+    copied onto ``kernel`` as an uppercased attribute (e.g. ``tile_k`` ->
+    ``kernel.TILE_K``, ``shared_storage`` -> ``kernel.SHARED_STORAGE``) so the
+    traced ``@cute.jit`` / ``@cute.kernel`` methods can read them as compile-time
+    constexpr. Kernels that need a differently-named attribute (e.g.
+    ``self.SharedStorage``) can alias it after calling this.
+
+    Args:
+        kernel: The kernel instance to populate.
+        config: A frozen dataclass of compile-time constants.
+    """
+    import dataclasses
+
+    for field in dataclasses.fields(config):
+        setattr(kernel, field.name.upper(), getattr(config, field.name))
+
+
+def make_staged_smem_struct(input_cutlass_dtype, stage_count, stage_elems):
+    """Build the per-compile ``@cute.struct`` for staged input/output SMEM.
+
+    Shared by the 1x32 / 32x1 (2D) and 3D MXFP8 compile paths. Depends on the
+    tuned tile geometry, so it is created once per compiled specialization rather
+    than shared at module scope.
+
+    Args:
+        input_cutlass_dtype: Cutlass dtype of the staged input SMEM.
+        stage_count: Number of pipeline stages.
+        stage_elems: Number of elements per stage (``tile_m * tile_k``).
+
+    Returns:
+        The ``SharedStorage`` ``@cute.struct`` class.
+    """
+    import cutlass
+    import cutlass.cute as cute
+
+    @cute.struct
+    class SharedStorage:
+        tma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, stage_count]
+        in_smem: cute.struct.Align[
+            cute.struct.MemRange[input_cutlass_dtype, stage_count * stage_elems],
+            128,
+        ]
+        out_smem: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float8E4M3FN, stage_count * stage_elems],
+            128,
+        ]
+
+    return SharedStorage
+
+
 if _cutedsl_runtime_available():
     import cutlass
     import cutlass.cute as cute

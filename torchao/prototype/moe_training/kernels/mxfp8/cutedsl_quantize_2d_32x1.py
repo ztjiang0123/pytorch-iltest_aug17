@@ -23,9 +23,12 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from torchao.utils import ceil_div
 
 from .cute_utils import (
+    bind_kernel_config,
     issue_tma_store_s2g,
     make_kernel_namespace,
+    make_staged_smem_struct,
     make_tile_2d_smem_layouts,
+    resolve_input_cutlass_dtype,
     run_quantize_2d_kernel,
 )
 
@@ -65,38 +68,6 @@ def _select_cutedsl_config(
     else:
         config_name = "fallback"
     return config_name, _CUTEDSL_CONFIGS[config_name]
-
-
-def _resolve_input_cutlass_dtype_32x1(input_dtype_name: str):
-    if input_dtype_name == "torch.float32":
-        return cutlass.Float32
-    if input_dtype_name == "torch.bfloat16":
-        return cutlass.BFloat16
-    raise ValueError(
-        f"Unsupported input dtype for CuTeDSL quantize_2d_32x1: {input_dtype_name}"
-    )
-
-
-def _make_shared_storage_struct_32x1(input_cutlass_dtype, stage_count, stage_elems):
-    """Build the per-compile ``@cute.struct`` for staged input/output SMEM.
-
-    Depends on the tuned tile geometry, so it is created once per compiled
-    specialization rather than shared at module scope.
-    """
-
-    @cute.struct
-    class SharedStorage:
-        tma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, stage_count]
-        in_smem: cute.struct.Align[
-            cute.struct.MemRange[input_cutlass_dtype, stage_count * stage_elems],
-            128,
-        ]
-        out_smem: cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float8E4M3FN, stage_count * stage_elems],
-            128,
-        ]
-
-    return SharedStorage
 
 
 @dataclass(frozen=True)
@@ -142,25 +113,12 @@ class _Mxfp8Quantize2d32x1Kernel:
     """
 
     def __init__(self, config: "_Mxfp8Quantize2d32x1Config"):
-        # Expose the tuned/config constants as attributes so the traced
-        # ``@cute.jit`` / ``@cute.kernel`` methods keep reading ``self.TILE_M``
-        # etc. as compile-time constexpr.
+        # Expose every config field as an uppercased attribute (e.g.
+        # ``config.tile_m`` -> ``self.TILE_M``) so the traced ``@cute.jit`` /
+        # ``@cute.kernel`` methods read them as compile-time constexpr.
+        bind_kernel_config(self, config)
+        # Method bodies reference the mixed-case ``self.SharedStorage``.
         self.SharedStorage = config.shared_storage
-        self.INPUT_CUTLASS_DTYPE = config.input_cutlass_dtype
-        self.SCALING_MODE = config.scaling_mode
-        self.COMPUTE_WARPS = config.compute_warps
-        self.TILE_M = config.tile_m
-        self.TILE_K = config.tile_k
-        self.M_TILES_PER_CTA = config.m_tiles_per_cta
-        self.IS_FULL_M_TILES = config.is_full_m_tiles
-        self.BLOCKED_SCALE_OUTPUT = config.blocked_scale_output
-        self.SCALE_DIM_M = config.scale_dim_m
-        self.M_BLOCKS_PER_TILE = config.m_blocks_per_tile
-        self.STAGE_COUNT = config.stage_count
-        self.THREADS_PER_BLOCK = config.threads_per_block
-        self.TILE_COPY_BYTES = config.tile_copy_bytes
-        self.K_THREADS = config.k_threads
-        self.K_ITERS_PER_LANE = config.k_iters_per_lane
 
     @cute.jit
     def _load_block_full_smem_to_reg(
@@ -491,7 +449,9 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
     """
     from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
-    input_cutlass_dtype = _resolve_input_cutlass_dtype_32x1(input_dtype_name)
+    input_cutlass_dtype = resolve_input_cutlass_dtype(
+        input_dtype_name, "quantize_2d_32x1"
+    )
 
     # Warp-specialized TMA kernel:
     # - warp 0: producer (issues TMA G2S and S2G)
@@ -515,7 +475,7 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
     k_iters_per_lane = ceil_div(tile_k, k_threads)
     stage_elems = tile_m * tile_k
 
-    shared_storage = _make_shared_storage_struct_32x1(
+    shared_storage = make_staged_smem_struct(
         input_cutlass_dtype, stage_count, stage_elems
     )
 

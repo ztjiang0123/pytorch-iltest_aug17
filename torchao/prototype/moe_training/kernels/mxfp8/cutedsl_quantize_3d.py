@@ -25,13 +25,16 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from torchao.utils import ceil_div
 
 from .cute_utils import (
+    bind_kernel_config,
     compute_amax,
     compute_scale_from_amax,
     issue_tma_load_g2s,
     issue_tma_store_s2g,
     load_vals_chunk_full,
     load_vals_chunk_tail,
+    make_staged_smem_struct,
     quantize_chunk_to_fp8_reg,
+    resolve_input_cutlass_dtype,
 )
 
 
@@ -85,38 +88,6 @@ def _select_cutedsl_config(
     return config_name, _CUTEDSL_CONFIGS[config_name]
 
 
-def _resolve_input_cutlass_dtype(input_dtype_name: str):
-    if input_dtype_name == "torch.float32":
-        return cutlass.Float32
-    if input_dtype_name == "torch.bfloat16":
-        return cutlass.BFloat16
-    raise ValueError(
-        f"Unsupported input dtype for CuTeDSL quantize_3d: {input_dtype_name}"
-    )
-
-
-def _make_shared_storage_struct(input_cutlass_dtype, stage_count, stage_elems):
-    """Build the per-compile ``@cute.struct`` for staged input/output SMEM.
-
-    Depends on the tuned tile geometry, so it is created once per compiled
-    specialization rather than shared at module scope.
-    """
-
-    @cute.struct
-    class SharedStorage:
-        tma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, stage_count]
-        in_smem: cute.struct.Align[
-            cute.struct.MemRange[input_cutlass_dtype, stage_count * stage_elems],
-            128,
-        ]
-        out_smem: cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float8E4M3FN, stage_count * stage_elems],
-            128,
-        ]
-
-    return SharedStorage
-
-
 @dataclass(frozen=True)
 class _Mxfp8Quantize3dConfig:
     """Tuned compile-time configuration for the MXFP8 3D quantize kernel.
@@ -156,28 +127,12 @@ class _Mxfp8Quantize3dKernel:
     """
 
     def __init__(self, config: "_Mxfp8Quantize3dConfig"):
-        # Expose the tuned/config constants as attributes so the traced
-        # ``@cute.jit`` / ``@cute.kernel`` methods keep reading ``self.TILE_N``
-        # etc. as compile-time constexpr.
+        # Expose every config field as an uppercased attribute (e.g.
+        # ``config.tile_n`` -> ``self.TILE_N``) so the traced ``@cute.jit`` /
+        # ``@cute.kernel`` methods read them as compile-time constexpr.
+        bind_kernel_config(self, config)
+        # Method bodies reference the mixed-case ``self.SharedStorage``.
         self.SharedStorage = config.shared_storage
-        self.INPUT_CUTLASS_DTYPE = config.input_cutlass_dtype
-        self.SCALING_MODE = config.scaling_mode
-        self.COMPUTE_WARPS = config.compute_warps
-        self.TILE_N = config.tile_n
-        self.TILE_K = config.tile_k
-        self.K_TILES_PER_CTA = config.k_tiles_per_cta
-        self.IS_FULL_K_TILES = config.is_full_k_tiles
-        self.SCALE_DIM_N = config.scale_dim_n
-        self.SCALE_DIM_K = config.scale_dim_k
-        self.BLOCKED_SCALE_OUTPUT = config.blocked_scale_output
-        self.INPUT_TRANSPOSED = config.input_transposed
-        self.STAGE_COUNT = config.stage_count
-        self.THREADS_PER_BLOCK = config.threads_per_block
-        self.TILE_COPY_BYTES = config.tile_copy_bytes
-        self.K_THREADS = config.k_threads
-        self.K_ITERS_PER_LANE = config.k_iters_per_lane
-        self.STAGE_ELEMS = config.stage_elems
-        self.N_BLOCKS_PER_TILE = config.n_blocks_per_tile
 
     @cute.jit
     def _load_vals_block_full(
@@ -812,7 +767,7 @@ def _compile_mxfp8_quantize_3d_cutedsl(
     #   `cvt.rp.satfinite.ue8m0x2.f32` on its own.
     # - FLOOR still uses a different lowered sequence than C++
     #   helper routines.
-    input_cutlass_dtype = _resolve_input_cutlass_dtype(input_dtype_name)
+    input_cutlass_dtype = resolve_input_cutlass_dtype(input_dtype_name, "quantize_3d")
 
     # Warp-specialized TMA kernel:
     # - warp 0: producer (issues TMA G2S and S2G)
@@ -843,7 +798,7 @@ def _compile_mxfp8_quantize_3d_cutedsl(
     k_iters_per_lane = ceil_div(tile_k, k_threads)
     stage_elems = tile_n * tile_k
 
-    shared_storage = _make_shared_storage_struct(
+    shared_storage = make_staged_smem_struct(
         input_cutlass_dtype, stage_count, stage_elems
     )
 
