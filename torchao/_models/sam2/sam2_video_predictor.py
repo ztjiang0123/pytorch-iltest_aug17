@@ -188,6 +188,74 @@ class SAM2VideoPredictor(SAM2Base):
         """Get the total number of unique object ids received so far in this session."""
         return len(inference_state["obj_idx_to_id"])
 
+    @staticmethod
+    def _normalize_points_and_labels(points, labels):
+        """Coerce user point/label inputs into batched float/int tensors."""
+        if points is None:
+            points = torch.zeros(0, 2, dtype=torch.float32)
+        elif not isinstance(points, torch.Tensor):
+            points = torch.tensor(points, dtype=torch.float32)
+        if labels is None:
+            labels = torch.zeros(0, dtype=torch.int32)
+        elif not isinstance(labels, torch.Tensor):
+            labels = torch.tensor(labels, dtype=torch.int32)
+        if points.dim() == 2:
+            points = points.unsqueeze(0)  # add batch dimension
+        if labels.dim() == 1:
+            labels = labels.unsqueeze(0)  # add batch dimension
+        return points, labels
+
+    def _prepend_box_prompt(
+        self, inference_state, box, points, labels, clear_old_points
+    ):
+        """Add `box` as the first two points with labels 2 and 3.
+
+        This is consistent with how SAM 2 is trained, and the box must be
+        provided before any point prompt.
+        """
+        if not clear_old_points:
+            raise ValueError(
+                "cannot add box without clearing old points, since "
+                "box prompt must be provided before any point prompt "
+                "(please use clear_old_points=True instead)"
+            )
+        if inference_state["tracking_has_started"]:
+            warnings.warn(
+                "You are adding a box after tracking starts. SAM 2 may not always be "
+                "able to incorporate a box prompt for *refinement*. If you intend to "
+                "use box prompt as an *initial* input before tracking, please call "
+                "'reset_state' on the inference state to restart from scratch.",
+                category=UserWarning,
+                stacklevel=2,
+            )
+        if not isinstance(box, torch.Tensor):
+            box = torch.tensor(box, dtype=torch.float32, device=points.device)
+        box_coords = box.reshape(1, 2, 2)
+        box_labels = torch.tensor([2, 3], dtype=torch.int32, device=labels.device)
+        box_labels = box_labels.reshape(1, 2)
+        points = torch.cat([box_coords, points], dim=1)
+        labels = torch.cat([box_labels, labels], dim=1)
+        return points, labels
+
+    def _lookup_prev_sam_mask_logits(
+        self, inference_state, frame_idx, obj_output_dict, obj_temp_output_dict, storage_key
+    ):
+        """Fetch any previously predicted mask logits for this frame/object."""
+        # lookup temporary output dict first, which contains the most recent output
+        # (if not found, then lookup conditioning and non-conditioning frame output)
+        prev_out = obj_temp_output_dict[storage_key].get(frame_idx)
+        if prev_out is None:
+            prev_out = obj_output_dict["cond_frame_outputs"].get(frame_idx)
+        if prev_out is None:
+            prev_out = obj_output_dict["non_cond_frame_outputs"].get(frame_idx)
+
+        if prev_out is None or prev_out["pred_masks"] is None:
+            return None
+        device = inference_state["device"]
+        prev_sam_mask_logits = prev_out["pred_masks"].to(device, non_blocking=True)
+        # Clamp the scale of prev_sam_mask_logits to avoid rare numerical issues.
+        return torch.clamp(prev_sam_mask_logits, -32.0, 32.0)
+
     @torch.no_grad()
     def add_new_points_or_box(
         self,
@@ -210,44 +278,14 @@ class SAM2VideoPredictor(SAM2Base):
         if points is None and box is None:
             raise ValueError("at least one of points or box must be provided as input")
 
-        if points is None:
-            points = torch.zeros(0, 2, dtype=torch.float32)
-        elif not isinstance(points, torch.Tensor):
-            points = torch.tensor(points, dtype=torch.float32)
-        if labels is None:
-            labels = torch.zeros(0, dtype=torch.int32)
-        elif not isinstance(labels, torch.Tensor):
-            labels = torch.tensor(labels, dtype=torch.int32)
-        if points.dim() == 2:
-            points = points.unsqueeze(0)  # add batch dimension
-        if labels.dim() == 1:
-            labels = labels.unsqueeze(0)  # add batch dimension
+        points, labels = self._normalize_points_and_labels(points, labels)
 
         # If `box` is provided, we add it as the first two points with labels 2 and 3
         # along with the user-provided points (consistent with how SAM 2 is trained).
         if box is not None:
-            if not clear_old_points:
-                raise ValueError(
-                    "cannot add box without clearing old points, since "
-                    "box prompt must be provided before any point prompt "
-                    "(please use clear_old_points=True instead)"
-                )
-            if inference_state["tracking_has_started"]:
-                warnings.warn(
-                    "You are adding a box after tracking starts. SAM 2 may not always be "
-                    "able to incorporate a box prompt for *refinement*. If you intend to "
-                    "use box prompt as an *initial* input before tracking, please call "
-                    "'reset_state' on the inference state to restart from scratch.",
-                    category=UserWarning,
-                    stacklevel=2,
-                )
-            if not isinstance(box, torch.Tensor):
-                box = torch.tensor(box, dtype=torch.float32, device=points.device)
-            box_coords = box.reshape(1, 2, 2)
-            box_labels = torch.tensor([2, 3], dtype=torch.int32, device=labels.device)
-            box_labels = box_labels.reshape(1, 2)
-            points = torch.cat([box_coords, points], dim=1)
-            labels = torch.cat([box_labels, labels], dim=1)
+            points, labels = self._prepend_box_prompt(
+                inference_state, box, points, labels, clear_old_points
+            )
 
         if normalize_coords:
             video_H = inference_state["video_height"]
@@ -285,20 +323,13 @@ class SAM2VideoPredictor(SAM2Base):
 
         # Get any previously predicted mask logits on this object and feed it along with
         # the new clicks into the SAM mask decoder.
-        prev_sam_mask_logits = None
-        # lookup temporary output dict first, which contains the most recent output
-        # (if not found, then lookup conditioning and non-conditioning frame output)
-        prev_out = obj_temp_output_dict[storage_key].get(frame_idx)
-        if prev_out is None:
-            prev_out = obj_output_dict["cond_frame_outputs"].get(frame_idx)
-            if prev_out is None:
-                prev_out = obj_output_dict["non_cond_frame_outputs"].get(frame_idx)
-
-        if prev_out is not None and prev_out["pred_masks"] is not None:
-            device = inference_state["device"]
-            prev_sam_mask_logits = prev_out["pred_masks"].to(device, non_blocking=True)
-            # Clamp the scale of prev_sam_mask_logits to avoid rare numerical issues.
-            prev_sam_mask_logits = torch.clamp(prev_sam_mask_logits, -32.0, 32.0)
+        prev_sam_mask_logits = self._lookup_prev_sam_mask_logits(
+            inference_state,
+            frame_idx,
+            obj_output_dict,
+            obj_temp_output_dict,
+            storage_key,
+        )
         current_out, _ = self._run_single_frame_inference(
             inference_state=inference_state,
             output_dict=obj_output_dict,  # run on the slice of a single object

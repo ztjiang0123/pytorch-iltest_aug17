@@ -37,6 +37,7 @@ from torchao.quantization.pt2e.quantizer.utils import _create_global_config_filt
 
 from .x86_inductor_quantizer import (
     X86InductorQuantizer,
+    _config_checker,
     _create_module_name_filter,
     _create_operator_type_filter,
 )
@@ -155,23 +156,6 @@ def get_default_arm_inductor_quantization_config(
         is_qat,
     )
     return quantization_config
-
-
-def _config_checker(method: Callable) -> Callable:
-    @functools.wraps(method)
-    def wrapper(
-        quantizer: "ArmInductorQuantizer",
-        name: Any,
-        quantization_config: Optional["QuantizationConfig"],
-    ) -> "ArmInductorQuantizer":
-        if quantizer._need_skip_config(quantization_config):
-            warnings.warn(
-                f"Skip the quantization config for {name}.",
-            )
-            return quantizer
-        return method(quantizer, name, quantization_config)
-
-    return wrapper
 
 
 class ArmInductorQuantizer(X86InductorQuantizer):

@@ -533,12 +533,23 @@ class Int8DynActInt4WeightLinear(torch.nn.Module):
         )
 
 
+@dataclass
+class _Linear8da4wReplaceSettings:
+    """Quantization settings that travel together when replacing linear layers.
+
+    Grouping these related values keeps :func:`_replace_linear_8da4w`'s
+    signature small and avoids positional-argument mistakes at call sites.
+    """
+
+    groupsize: int
+    padding_allowed: bool
+    precision: torch.dtype
+    scales_precision: torch.dtype
+
+
 def _replace_linear_8da4w(
     module: torch.nn.Module,
-    groupsize: int,
-    padding_allowed: bool,
-    precision: torch.dtype,
-    scales_precision: torch.dtype,
+    settings: _Linear8da4wReplaceSettings,
     linear_class: Type[torch.nn.Module],
     copy_weights: bool = False,
 ):
@@ -547,7 +558,8 @@ def _replace_linear_8da4w(
 
     def filter_fn(child: torch.nn.Module, cur_fqn: str) -> bool:
         return isinstance(child, nn.Linear) and (
-            _check_linear_int4_k(child.in_features, groupsize) or padding_allowed
+            _check_linear_int4_k(child.in_features, settings.groupsize)
+            or settings.padding_allowed
         )
 
     def replacement_fn(child: torch.nn.Module) -> torch.nn.Module:
@@ -557,9 +569,9 @@ def _replace_linear_8da4w(
             config=Int8DynActInt4WeightConfig(
                 bias=child.bias is not None,
                 device=child.weight.device,
-                groupsize=groupsize,
-                precision=precision,
-                scales_precision=scales_precision,
+                groupsize=settings.groupsize,
+                precision=settings.precision,
+                scales_precision=settings.scales_precision,
             ),
         )
         # In distributed training, the model may be instantiated
@@ -582,10 +594,12 @@ def replace_linear_8da4w(
 ):
     _replace_linear_8da4w(
         module,
-        groupsize,
-        padding_allowed,
-        precision,
-        scales_precision,
+        _Linear8da4wReplaceSettings(
+            groupsize=groupsize,
+            padding_allowed=padding_allowed,
+            precision=precision,
+            scales_precision=scales_precision,
+        ),
         Int8DynActInt4WeightLinear,
     )
 
