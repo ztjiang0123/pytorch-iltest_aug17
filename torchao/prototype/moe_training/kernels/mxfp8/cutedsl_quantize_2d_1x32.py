@@ -15,6 +15,7 @@ from .cute_utils import (
     make_axis_spec,
     make_kernel_io,
     make_quant_opts,
+    make_tile_2d_smem_layouts,
     make_tile_shape,
     make_tma_handles,
     run_quantize_2d_kernel,
@@ -25,25 +26,8 @@ def _make_tile_smem_layouts(tile_m: int, tile_k: int):
     """Create shared memory layouts for input and output tiles.
 
     Both layouts use row-major format (K is fastest-changing dimension).
-
-    Args:
-        tile_m: Tile size in M dimension
-        tile_k: Tile size in K dimension
-
-    Returns:
-        Tuple of (smem_layout_in, smem_layout_out), both for shared memory
     """
-    import cutlass.cute as cute
-
-    smem_layout_in = cute.make_layout(
-        (tile_m, tile_k),
-        stride=(tile_k, 1),
-    )
-    smem_layout_out = cute.make_layout(
-        (tile_m, tile_k),
-        stride=(tile_k, 1),
-    )
-    return smem_layout_in, smem_layout_out
+    return make_tile_2d_smem_layouts(tile_m, tile_k, out_column_major=False)
 
 
 # Config format:

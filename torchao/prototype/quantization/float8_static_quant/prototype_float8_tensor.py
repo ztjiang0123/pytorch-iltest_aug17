@@ -39,6 +39,7 @@ from torchao.quantization.quantize_.workflows import (
 )
 from torchao.quantization.quantize_.workflows.float8.float8_tensor import (
     _FLOAT8_ADDMM_IMPLS,
+    _dispatch_conv3d,
     _float8_dequantize,
     _float8_mm_dispatch,
     _float8_quantization_type,
@@ -707,24 +708,7 @@ def _(func, types, args, kwargs):
     the output will be in channels_last_3d format, otherwise the output
     will be contiguous
     """
-    (
-        input_tensor,
-        weight_tensor,
-        bias,
-        stride,
-        padding,
-        dilation,
-        groups,
-    ) = fill_defaults(args, 7, [None, [1, 1, 1], [0, 0, 0], [1, 1, 1], 1])
-    conv3d_output = _quantize_and_scaled_conv3d(
-        input_tensor,
-        weight_tensor,
-        bias,
-        stride,
-        padding,
-        dilation,
-    )
-    return conv3d_output
+    return _dispatch_conv3d(args, _quantize_and_scaled_conv3d)
 
 
 @implements(aten.conv2d.default)

@@ -540,27 +540,118 @@ def _compile_mxfp8_quantize_3d_cutedsl(
                 )
             else:
                 scales_expert = scales_colwise_u8
+
+            # Whether the kernel double-buffers input/output tiles across k-tiles.
+            multi_stage = cutlass.const_expr(STAGE_COUNT > 1)
+            prefetch_enabled = cutlass.const_expr(multi_stage and K_TILES_PER_CTA > 1)
+
+            def select_stage_tiles(stage_idx):
+                """Pick the (input, output, mbar) triple for a pipeline stage."""
+                if cutlass.const_expr(multi_stage) and stage_idx == 1:
+                    return sIN_tile1, sOUT_tile1, tma_mbar_ptr0 + stage_idx
+                mbar = (
+                    tma_mbar_ptr0 + stage_idx
+                    if cutlass.const_expr(multi_stage)
+                    else tma_mbar_ptr0
+                )
+                return sIN_tile0, sOUT_tile0, mbar
+
+            def prefetch_next_input_tile(tile_step):
+                """Issue the TMA load for the next k-tile into its staging buffer."""
+                if cutlass.const_expr(tile_step + 1 < K_TILES_PER_CTA):
+                    bidx_next = k_tile_group_idx * K_TILES_PER_CTA + tile_step + 1
+                    next_stage_idx = (tile_step + 1) % STAGE_COUNT
+                    sIN_tile_next, _, tma_mbar_ptr_next = select_stage_tiles(
+                        next_stage_idx
+                    )
+                    gIN_tile_next = cute.local_tile(
+                        tma_tensor_in, (1, TILE_N, TILE_K), (e, n_tile, bidx_next)
+                    )
+                    self._issue_tma_load(
+                        tma_atom_in,
+                        gIN_tile_next,
+                        sIN_tile_next,
+                        tma_mbar_ptr_next,
+                        warp_idx,
+                    )
+
+            def compute_and_store_tile(k0, sIN_tile, sOUT_tile):
+                """Quantize this lane's rows of the loaded tile and stage the result."""
+                lane = tidx % 32
+                k_lane = (warp_idx - 1) * 32 + lane
+                for kk in cutlass.range_constexpr(K_ITERS_PER_LANE):
+                    k_rel = k_lane + kk * K_THREADS
+                    k = k0 + k_rel
+                    k_in_bounds = cutlass.const_expr(IS_FULL_K_TILES) or k < K
+                    if not (k_rel < TILE_K and k_in_bounds):
+                        continue
+                    if cutlass.const_expr(SCALE_DIM_K_VALUE == 32):
+                        k_block = k // cutlass.Int64(32)
+                    else:
+                        k_block = cutlass.Int64(0)
+                    for nb in cutlass.range_constexpr(N_BLOCKS_PER_TILE):
+                        n_block = n_tile * N_BLOCKS_PER_TILE + nb
+                        n_block_in_bounds = (
+                            cutlass.const_expr(IS_FULL_K_TILES) or n_block < n_blocks
+                        )
+                        if not n_block_in_bounds:
+                            continue
+                        n_base = nb * SCALE_DIM_N_VALUE
+                        if cutlass.const_expr(IS_FULL_K_TILES):
+                            vals_block = self._load_vals_block_full(
+                                sIN_tile,
+                                n_base,
+                                k_rel,
+                            )
+                        else:
+                            vals_block = self._load_vals_block_tail(
+                                sIN_tile,
+                                n0,
+                                n_base,
+                                k_rel,
+                                N,
+                            )
+                        inv_scale = self._compute_inv_scale_and_store(
+                            vals_block,
+                            scales_expert,
+                            e,
+                            n_block,
+                            k,
+                            k_block,
+                            lane,
+                            USE_RCEIL,
+                            BLOCKED_SCALE_OUTPUT_VALUE,
+                        )
+                        if cutlass.const_expr(IS_FULL_K_TILES):
+                            self._quantize_store_full(
+                                vals_block,
+                                inv_scale,
+                                sOUT_tile,
+                                n_base,
+                                k_rel,
+                                USE_RCEIL,
+                            )
+                        else:
+                            self._quantize_store_tail(
+                                vals_block,
+                                inv_scale,
+                                sOUT_tile,
+                                n0,
+                                n_base,
+                                k_rel,
+                                N,
+                                USE_RCEIL,
+                            )
+
             for tile_step in cutlass.range_constexpr(K_TILES_PER_CTA):
                 bidx_eff = k_tile_group_idx * K_TILES_PER_CTA + tile_step
                 k0 = bidx_eff * TILE_K
 
                 stage_idx = tile_step % STAGE_COUNT
-
-                sIN_tile = sIN_tile0
-                sOUT_tile = sOUT_tile0
-                tma_mbar_ptr = tma_mbar_ptr0
-                if cutlass.const_expr(STAGE_COUNT > 1):
-                    tma_mbar_ptr = tma_mbar_ptr0 + stage_idx
-                if cutlass.const_expr(STAGE_COUNT > 1):
-                    if stage_idx == 1:
-                        sIN_tile = sIN_tile1
-                        sOUT_tile = sOUT_tile1
-
+                sIN_tile, sOUT_tile, tma_mbar_ptr = select_stage_tiles(stage_idx)
                 tma_phase = (tile_step // STAGE_COUNT) % 2
 
-                if cutlass.const_expr(
-                    tile_step == 0 or not (STAGE_COUNT > 1 and K_TILES_PER_CTA > 1)
-                ):
+                if cutlass.const_expr(tile_step == 0 or not prefetch_enabled):
                     gIN_tile = cute.local_tile(
                         tma_tensor_in, (1, TILE_N, TILE_K), (e, n_tile, bidx_eff)
                     )
@@ -572,95 +663,12 @@ def _compile_mxfp8_quantize_3d_cutedsl(
                         warp_idx,
                     )
 
-                if cutlass.const_expr(STAGE_COUNT > 1 and K_TILES_PER_CTA > 1):
-                    if cutlass.const_expr(tile_step + 1 < K_TILES_PER_CTA):
-                        bidx_next = k_tile_group_idx * K_TILES_PER_CTA + tile_step + 1
-                        next_stage_idx = (tile_step + 1) % STAGE_COUNT
-                        sIN_tile_next = sIN_tile0
-                        tma_mbar_ptr_next = tma_mbar_ptr0
-                        if cutlass.const_expr(STAGE_COUNT > 1):
-                            tma_mbar_ptr_next = tma_mbar_ptr0 + next_stage_idx
-                        if cutlass.const_expr(STAGE_COUNT > 1):
-                            if next_stage_idx == 1:
-                                sIN_tile_next = sIN_tile1
-
-                        gIN_tile_next = cute.local_tile(
-                            tma_tensor_in, (1, TILE_N, TILE_K), (e, n_tile, bidx_next)
-                        )
-                        self._issue_tma_load(
-                            tma_atom_in,
-                            gIN_tile_next,
-                            sIN_tile_next,
-                            tma_mbar_ptr_next,
-                            warp_idx,
-                        )
+                if cutlass.const_expr(prefetch_enabled):
+                    prefetch_next_input_tile(tile_step)
 
                 if warp_idx >= 1 and warp_idx <= compute_warps:
                     cute.arch.mbarrier_wait(tma_mbar_ptr, tma_phase)
-                    lane = tidx % 32
-                    k_lane = (warp_idx - 1) * 32 + lane
-
-                    for kk in cutlass.range_constexpr(K_ITERS_PER_LANE):
-                        k_rel = k_lane + kk * K_THREADS
-                        k = k0 + k_rel
-                        k_in_bounds = cutlass.const_expr(IS_FULL_K_TILES) or k < K
-                        if k_rel < TILE_K and k_in_bounds:
-                            if cutlass.const_expr(SCALE_DIM_K_VALUE == 32):
-                                k_block = k // cutlass.Int64(32)
-                            for nb in cutlass.range_constexpr(N_BLOCKS_PER_TILE):
-                                n_block = n_tile * N_BLOCKS_PER_TILE + nb
-                                if (
-                                    cutlass.const_expr(IS_FULL_K_TILES)
-                                    or n_block < n_blocks
-                                ):
-                                    n_base = nb * SCALE_DIM_N_VALUE
-                                    if cutlass.const_expr(IS_FULL_K_TILES):
-                                        vals_block = self._load_vals_block_full(
-                                            sIN_tile,
-                                            n_base,
-                                            k_rel,
-                                        )
-                                    else:
-                                        vals_block = self._load_vals_block_tail(
-                                            sIN_tile,
-                                            n0,
-                                            n_base,
-                                            k_rel,
-                                            N,
-                                        )
-                                    inv_scale = self._compute_inv_scale_and_store(
-                                        vals_block,
-                                        scales_expert,
-                                        e,
-                                        n_block,
-                                        k,
-                                        k_block
-                                        if cutlass.const_expr(SCALE_DIM_K_VALUE == 32)
-                                        else cutlass.Int64(0),
-                                        lane,
-                                        USE_RCEIL,
-                                        BLOCKED_SCALE_OUTPUT_VALUE,
-                                    )
-                                    if cutlass.const_expr(IS_FULL_K_TILES):
-                                        self._quantize_store_full(
-                                            vals_block,
-                                            inv_scale,
-                                            sOUT_tile,
-                                            n_base,
-                                            k_rel,
-                                            USE_RCEIL,
-                                        )
-                                    else:
-                                        self._quantize_store_tail(
-                                            vals_block,
-                                            inv_scale,
-                                            sOUT_tile,
-                                            n0,
-                                            n_base,
-                                            k_rel,
-                                            N,
-                                            USE_RCEIL,
-                                        )
+                    compute_and_store_tile(k0, sIN_tile, sOUT_tile)
 
                 gOUT_tile = cute.local_tile(
                     tma_tensor_out, (1, TILE_N, TILE_K), (e, n_tile, bidx_eff)

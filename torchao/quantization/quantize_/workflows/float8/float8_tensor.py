@@ -642,6 +642,32 @@ def _quantize_and_scaled_conv3d(
     return output
 
 
+def _dispatch_conv3d(args, quantize_and_scaled_conv3d):
+    """Unpack ``aten.conv3d.default`` args and delegate to the given conv3d impl.
+
+    Shared between the stable and prototype float8 tensors so the argument
+    defaulting stays in one place. ``quantize_and_scaled_conv3d`` is the
+    per-tensor implementation (each subclass asserts on its own weight type).
+    """
+    (
+        input_tensor,
+        weight_tensor,
+        bias,
+        stride,
+        padding,
+        dilation,
+        groups,
+    ) = fill_defaults(args, 7, [None, [1, 1, 1], [0, 0, 0], [1, 1, 1], 1])
+    return quantize_and_scaled_conv3d(
+        input_tensor,
+        weight_tensor,
+        bias,
+        stride,
+        padding,
+        dilation,
+    )
+
+
 @implements(aten.convolution.default)
 def _(func, types, args, kwargs):
     """The semantics of memory_format will match high precision counterparts
@@ -707,24 +733,7 @@ def _(func, types, args, kwargs):
     the output will be in channels_last_3d format, otherwise the output
     will be contiguous
     """
-    (
-        input_tensor,
-        weight_tensor,
-        bias,
-        stride,
-        padding,
-        dilation,
-        groups,
-    ) = fill_defaults(args, 7, [None, [1, 1, 1], [0, 0, 0], [1, 1, 1], 1])
-    conv3d_output = _quantize_and_scaled_conv3d(
-        input_tensor,
-        weight_tensor,
-        bias,
-        stride,
-        padding,
-        dilation,
-    )
-    return conv3d_output
+    return _dispatch_conv3d(args, _quantize_and_scaled_conv3d)
 
 
 @implements(aten.conv2d.default)

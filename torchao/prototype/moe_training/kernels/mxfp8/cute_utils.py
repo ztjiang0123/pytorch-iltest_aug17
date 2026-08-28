@@ -47,6 +47,36 @@ def _cutedsl_runtime_available() -> bool:
     return len(_missing_cutedsl_runtime_packages()) == 0
 
 
+def make_tile_2d_smem_layouts(tile_m: int, tile_k: int, out_column_major: bool):
+    """Create shared memory layouts for the input and output tiles of a 2D MXFP8 kernel.
+
+    The input tile is always row-major (K is the fastest-changing dimension). The
+    output tile is row-major for 1x32 scaling and column-major for 32x1 scaling; the
+    caller selects via ``out_column_major``.
+
+    Args:
+        tile_m: Tile size in the M dimension.
+        tile_k: Tile size in the K dimension.
+        out_column_major: When True the output tile is column-major (M fastest),
+            otherwise it is row-major (K fastest).
+
+    Returns:
+        Tuple of (smem_layout_in, smem_layout_out) for shared memory.
+    """
+    import cutlass.cute as cute
+
+    smem_layout_in = cute.make_layout(
+        (tile_m, tile_k),
+        stride=(tile_k, 1),
+    )
+    out_stride = (1, tile_m) if out_column_major else (tile_k, 1)
+    smem_layout_out = cute.make_layout(
+        (tile_m, tile_k),
+        stride=out_stride,
+    )
+    return smem_layout_in, smem_layout_out
+
+
 if _cutedsl_runtime_available():
     import cutlass
     import cutlass.cute as cute

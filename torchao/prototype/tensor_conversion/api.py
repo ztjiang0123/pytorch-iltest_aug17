@@ -126,6 +126,25 @@ def _find_tied_params(model):
     return module_name_to_tied_param
 
 
+def _convert_linear_weight_by_tensor_type(module, tensor_type, intx_packing_format):
+    """Convert one linear module's IntxUnpackedToInt8Tensor weight to the
+    packed tensor selected by ``tensor_type``."""
+    if tensor_type == "int8_lut_tensor":
+        _convert_linear_weight_to_int8_lut_tensor(module)
+    elif tensor_type == "intx_opaque_tensor":
+        _convert_module_weight_to_intx_opaque_tensor(module, intx_packing_format)
+    elif tensor_type == "auto":
+        prefer_lut = module.weight._has_float_zero_point() and isinstance(
+            module, nn.Linear
+        )
+        if prefer_lut:
+            _convert_linear_weight_to_int8_lut_tensor(module)
+        else:
+            _convert_module_weight_to_intx_opaque_tensor(module, intx_packing_format)
+    else:
+        raise ValueError(f"Unexpected tensor_type={tensor_type}")
+
+
 def _convert_model_for_aarch64(
     model,
     *,
@@ -151,26 +170,13 @@ def _convert_model_for_aarch64(
         if not (convert_linear and isinstance(module, nn.Linear)):
             continue
 
-        weight = module.weight
-        if not isinstance(weight, IntxUnpackedToInt8Tensor):
+        if not isinstance(module.weight, IntxUnpackedToInt8Tensor):
             print(
                 f"Skipping converting {name} to IntxOpaqueTensor because its weight is not an IntxUnpackedToInt8Tensor"
             )
             continue
 
-        if tensor_type == "int8_lut_tensor":
-            _convert_linear_weight_to_int8_lut_tensor(module)
-        elif tensor_type == "intx_opaque_tensor":
-            _convert_module_weight_to_intx_opaque_tensor(module, intx_packing_format)
-        elif tensor_type == "auto":
-            if weight._has_float_zero_point() and isinstance(module, nn.Linear):
-                _convert_linear_weight_to_int8_lut_tensor(module)
-            else:
-                _convert_module_weight_to_intx_opaque_tensor(
-                    module, intx_packing_format
-                )
-        else:
-            raise ValueError(f"Unexpected tensor_type={tensor_type}")
+        _convert_linear_weight_by_tensor_type(module, tensor_type, intx_packing_format)
 
     return model
 
