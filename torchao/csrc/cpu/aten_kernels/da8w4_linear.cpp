@@ -457,6 +457,52 @@ void _dequant_gemm_accum_small_M(
       ldc);
 #endif
 
+// Buffers and strides for the scalar reference GEMM, grouped so the helper
+// functions take one argument object instead of a long pointer/stride list.
+template <typename Tin>
+struct RefGemmArgs {
+  float* C;
+  const Tin* A_ptr;
+  const float* scales_a;
+  const int32_t* qzeros_a;
+  const int8_t* dqB;
+  const float* scales_b;
+  int64_t M;
+  int64_t K;
+  int64_t lda;
+  int64_t ldc;
+};
+
+// Dequantized int8 * int8 dot product for one output element (row i, col j).
+// Split out from _ref_gemm_accum so the k loop and dequant branch do not
+// deepen the nesting of the enclosing i/j loops.
+template <int64_t N, bool sym_quant_a, typename Tin>
+float _ref_gemm_dot(const RefGemmArgs<Tin>& a, int64_t i, int64_t j) {
+  float sum = 0;
+  for (int64_t k = 0; k < a.K; ++k) {
+    if constexpr (sym_quant_a) {
+      sum += ((int32_t)a.A_ptr[i * a.lda + k] * a.dqB[k * N + j]);
+    } else {
+      sum += ((int32_t)a.A_ptr[i * a.lda + k] - a.qzeros_a[i]) *
+          (int32_t)a.dqB[k * N + j];
+    }
+  }
+  return sum;
+}
+
+// Scalar reference for the dequantized GEMM accumulation, used when the
+// packed AVX-512 path is unavailable. Kept as a standalone helper so the
+// loop nest does not deepen _dequant_gemm_accum.
+template <int64_t N, bool sym_quant_a, typename Tin>
+void _ref_gemm_accum(const RefGemmArgs<Tin>& a) {
+  for (int64_t i = 0; i < a.M; ++i) {
+    for (int64_t j = 0; j < N; ++j) {
+      float sum = _ref_gemm_dot<N, sym_quant_a>(a, i, j);
+      a.C[i * a.ldc + j] += sum * a.scales_a[i] * a.scales_b[j];
+    }
+  }
+}
+
 template <bool cpublas_can_pack, int64_t N, int64_t ldb, bool sym_quant_a>
 void _dequant_gemm_accum(
     float* C,
@@ -527,19 +573,9 @@ void _dequant_gemm_accum(
   } else
 #endif
   {
-    for (int64_t i = 0; i < M; ++i) {
-      for (int64_t j = 0; j < N; ++j) {
-        float sum = 0;
-        for (int64_t k = 0; k < K; ++k) {
-          if constexpr (sym_quant_a) {
-            sum += ((int32_t)A_ptr[i * lda + k] * dqB[k * N + j]);
-          } else {
-            sum += ((int32_t)A_ptr[i * lda + k] - qzeros_a[i]) * (int32_t)dqB[k * N + j];
-          }
-        }
-        C[i * ldc + j] += sum * scales_a[i] * scales_b[j];
-      }
-    }
+    RefGemmArgs<Tin> args{
+        C, A_ptr, scales_a, qzeros_a, dqB, scales_b, M, K, lda, ldc};
+    _ref_gemm_accum<N, sym_quant_a>(args);
   }
 }
 
