@@ -16,6 +16,7 @@ from .cute_utils import (
     issue_tma_store_s2g,
     make_kernel_namespace,
     make_tile_2d_smem_layouts,
+    resolve_input_cutlass_dtype,
     run_quantize_2d_kernel,
 )
 
@@ -103,19 +104,6 @@ class _CuteDSLKernelConfig:
     m_iters_per_lane: int
 
 
-def _resolve_input_cutlass_dtype(input_dtype_name: str):
-    """Map a torch dtype name to the matching CUTLASS dtype."""
-    import cutlass
-
-    if input_dtype_name == "torch.float32":
-        return cutlass.Float32
-    if input_dtype_name == "torch.bfloat16":
-        return cutlass.BFloat16
-    raise ValueError(
-        f"Unsupported input dtype for CuTeDSL quantize_2d: {input_dtype_name}"
-    )
-
-
 def _compute_kernel_config(raw: _RawKernelArgs) -> _CuteDSLKernelConfig:
     """Validate the raw kernel arguments and derive compile-time constants."""
     # Warp-specialized TMA kernel:
@@ -166,7 +154,7 @@ def _build_fake_compile_inputs(cfg: _CuteDSLKernelConfig, has_offs: bool):
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
-    input_cutlass_dtype = _resolve_input_cutlass_dtype(cfg.input_dtype_name)
+    input_cutlass_dtype = resolve_input_cutlass_dtype(cfg.input_dtype_name, "quantize_2d")
 
     m = cute.sym_int(divisibility=32)
     k = cute.sym_int(divisibility=32)
@@ -379,7 +367,7 @@ def _build_quantize_2d_kernel_class(cfg: _CuteDSLKernelConfig) -> Any:
     import cutlass.cute as cute
     import cutlass.utils as utils
 
-    input_cutlass_dtype = _resolve_input_cutlass_dtype(cfg.input_dtype_name)
+    input_cutlass_dtype = resolve_input_cutlass_dtype(cfg.input_dtype_name, "quantize_2d")
 
     # Aliases used by the config-bound ``SharedStorage`` struct and the thin
     # device-helper methods below. Runtime methods read the rest from ``cfg``.
