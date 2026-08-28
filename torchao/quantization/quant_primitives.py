@@ -386,78 +386,61 @@ def quantize_affine(
     )
 
 
-def _quantize_affine_with_dtype_cast(
-    no_dtype_cast_fn: Callable[..., torch.Tensor],
+def _reshape_input_for_quantize(
     input: torch.Tensor,
-    block_size: List[int],
+    block_size,
     scale: torch.Tensor,
     zero_point: Optional[torch.Tensor],
-    output_dtype: torch.dtype,
-    quant_min: Optional[Union[int, float, bool]],
-    quant_max: Optional[Union[int, float, bool]],
-) -> torch.Tensor:
-    """Shared driver for the affine-quantize wrappers.
+):
+    """Validate and reshape ``input``/``scale``/``zero_point`` for block-wise quantization.
 
-    Resolves ``quant_min``/``quant_max`` from ``output_dtype`` when unset, applies the
-    uintx dtype workaround, delegates the actual quantization math to ``no_dtype_cast_fn``,
-    and casts the result to ``output_dtype``. The zero-point domain (INT, FLOAT, or NONE)
-    is determined entirely by which ``no_dtype_cast_fn`` is passed in.
+    Shared preamble for the ``_quantize_affine*_no_dtype_cast`` implementations. Reshapes
+    ``input`` to align with the per-block reduction, views ``scale`` (and ``zero_point``
+    when present) to the reduced shape, and returns the original input shape so callers can
+    restore it. ``zero_point`` is normalized to ``None`` when it is absent or empty.
+
+    Returns:
+        Tuple of ``(input, scale, zero_point, original_shape)``.
     """
-    quant_min, quant_max = _get_and_check_qmin_qmax(output_dtype, quant_min, quant_max)
+    # TODO: validations
+    # TODO: validate scale/zero_point dimensions are compatible with block_size
+    assert input.dtype in [
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+    ], f"Unsupported input dtype: {input.dtype}"
+    assert len(block_size) == input.dim(), (
+        f"Got input dim:{input.dim()}, block_size: {block_size}"
+    )
+    shape_for_reduction, reduction_dims = _get_reduction_params(
+        block_size, input.size()
+    )
+    original_shape = input.shape
+    input = input.view(shape_for_reduction)
+    shape_after_reduction = shape_for_reduction
+    for i in reduction_dims:
+        shape_after_reduction[i] = 1
+    scale = scale.view(shape_after_reduction)
+
+    if zero_point is not None and zero_point.numel() > 0:
+        zero_point = zero_point.view(shape_after_reduction)
+    else:
+        # in some cases zero_point being a non-value shows as a tensor
+        # with numel=0 which we handle by unifying the two
+        zero_point = None
+
+    return input, scale, zero_point, original_shape
+
+
+def _quantize_affine_cast(
+    no_dtype_cast_quant: torch.Tensor, output_dtype: torch.dtype
+) -> torch.Tensor:
+    """Apply the uintx workaround and cast a no-dtype-cast quant result to ``output_dtype``."""
     # workaround for uintx dtypes, since we don't have native Uintx dtype connected with
     # torch.uintx dtypes yet
     if output_dtype in _SUB_BYTE_UINT_BOUNDS:
         output_dtype = torch.uint8
-    return no_dtype_cast_fn(
-        input,
-        block_size,
-        scale,
-        zero_point,
-        quant_min,
-        quant_max,
-    ).to(output_dtype)
-
-
-@register_custom_op
-def _quantize_affine(
-    input: torch.Tensor,
-    block_size: List[int],
-    scale: torch.Tensor,
-    zero_point: Optional[torch.Tensor],
-    output_dtype: torch.dtype,
-    quant_min: Optional[Union[int, float, bool]] = None,
-    quant_max: Optional[Union[int, float, bool]] = None,
-) -> torch.Tensor:
-    """Quantize tensor using affine quantization with integer zero point domain.
-
-    Op definition that has compatible signatures with custom op library.
-
-    Args:
-        input: Input tensor to quantize (float32, float16, or bfloat16)
-        block_size: Granularity of quantization - size of tensor elements sharing same qparam
-        scale: Quantization scale parameter
-        zero_point: Quantization zero point parameter (optional)
-        output_dtype: Target quantized dtype (e.g., torch.uint8, torch.int8)
-        quant_min: Minimum quantized value, derived from dtype if None
-        quant_max: Maximum quantized value, derived from dtype if None
-
-    Returns:
-        Quantized tensor with requested dtype
-
-    Note:
-        zero_point_domain is pre-defined as INT, meaning:
-        quantized_val = (float_val / scale) (integer) + zero_point (integer)
-    """
-    return _quantize_affine_with_dtype_cast(
-        _quantize_affine_no_dtype_cast,
-        input,
-        block_size,
-        scale,
-        zero_point,
-        output_dtype,
-        quant_min,
-        quant_max,
-    )
+    return no_dtype_cast_quant.to(output_dtype)
 
 
 def _quantize_affine_no_dtype_cast(
@@ -489,32 +472,9 @@ def _quantize_affine_no_dtype_cast(
     2. Quantize the input based on the quantization parameters scale and zero_point with zero_point_domain = INT
     3. Reshape the quantized result to original shape
     """
-    # TODO: validations
-    # TODO: validate scale/zero_point dimensions are compatible with block_size
-    assert input.dtype in [
-        torch.float32,
-        torch.float16,
-        torch.bfloat16,
-    ], f"Unsupported input dtype: {input.dtype}"
-    assert len(block_size) == input.dim(), (
-        f"Got input dim:{input.dim()}, block_size: {block_size}"
+    input, scale, zero_point, original_shape = _reshape_input_for_quantize(
+        input, block_size, scale, zero_point
     )
-    shape_for_reduction, reduction_dims = _get_reduction_params(
-        block_size, input.size()
-    )
-    original_shape = input.shape
-    input = input.view(shape_for_reduction)
-    shape_after_reduction = shape_for_reduction
-    for i in reduction_dims:
-        shape_after_reduction[i] = 1
-    scale = scale.view(shape_after_reduction)
-
-    if zero_point is not None and zero_point.numel() > 0:
-        zero_point = zero_point.view(shape_after_reduction)
-    else:
-        # in some cases zero_point being a non-value shows as a tensor
-        # with numel=0 which we handle by unifying the two
-        zero_point = None
 
     quant = torch.clamp(
         _Round.apply(input * (1.0 / scale)) + zero_point, quant_min, quant_max
@@ -522,53 +482,6 @@ def _quantize_affine_no_dtype_cast(
     quant = quant.view(original_shape)
 
     return quant
-
-
-def _quantize_affine_tinygemm(
-    input: torch.Tensor,
-    block_size: List[int],
-    scale: torch.Tensor,
-    zero_point: Optional[torch.Tensor],
-    output_dtype: torch.dtype,
-    quant_min: Optional[Union[int, float, bool]] = None,
-    quant_max: Optional[Union[int, float, bool]] = None,
-) -> torch.Tensor:
-    """Quantize tensor using affine quantization with float zero point domain for tinygemm.
-
-    Specialized quantization for tinygemm int4mm kernel where zero point is in floating point domain.
-
-    Args:
-        input: Input tensor to quantize (float32, float16, or bfloat16)
-        block_size: Granularity of quantization - size of tensor elements sharing same qparam
-        scale: Quantization scale parameter
-        zero_point: Quantization zero point parameter (optional)
-        output_dtype: Target quantized dtype (e.g., torch.uint8, torch.int8)
-        quant_min: Minimum quantized value, derived from dtype if None
-        quant_max: Maximum quantized value, derived from dtype if None
-
-    Returns:
-        Quantized tensor with requested dtype
-
-    The op does the following:
-    1. Figure out the dimension for reduction based on block_size, also reshape the input to align with
-       the shape after reduction
-    2. Quantize the input based on the quantization parameters scale and zero_point with zero_point_domain = FLOAT
-    3. Reshape the quantized result to original shape
-
-    Note:
-        zero_point_domain is pre-defined as FLOAT, meaning:
-        quantized_val = (float_val - (zero_point (float) - scale * mid_point)) / scale
-    """
-    return _quantize_affine_with_dtype_cast(
-        _quantize_affine_tinygemm_no_dtype_cast,
-        input,
-        block_size,
-        scale,
-        zero_point,
-        output_dtype,
-        quant_min,
-        quant_max,
-    )
 
 
 def _quantize_affine_tinygemm_no_dtype_cast(
@@ -600,32 +513,9 @@ def _quantize_affine_tinygemm_no_dtype_cast(
     2. Quantize the input based on the quantization parameters scale and zero_point with zero_point_domain = FLOAT
     3. Reshape the quantized result to original shape
     """
-    # TODO: validations
-    # TODO: validate scale/zero_point dimensions are compatible with block_size
-    assert input.dtype in [
-        torch.float32,
-        torch.float16,
-        torch.bfloat16,
-    ], f"Unsupported input dtype: {input.dtype}"
-    assert len(block_size) == input.dim(), (
-        f"Got input dim:{input.dim()}, block_size: {block_size}"
+    input, scale, zero_point, original_shape = _reshape_input_for_quantize(
+        input, block_size, scale, zero_point
     )
-    shape_for_reduction, reduction_dims = _get_reduction_params(
-        block_size, input.size()
-    )
-    original_shape = input.shape
-    input = input.view(shape_for_reduction)
-    shape_after_reduction = shape_for_reduction
-    for i in reduction_dims:
-        shape_after_reduction[i] = 1
-    scale = scale.view(shape_after_reduction)
-
-    if zero_point is not None and zero_point.numel() > 0:
-        zero_point = zero_point.view(shape_after_reduction)
-    else:
-        # in some cases zero_point being a non-value shows as a tensor
-        # with numel=0 which we handle by unifying the two
-        zero_point = None
 
     mid_point = (quant_max + quant_min + 1) / 2
     min_val = zero_point - scale * mid_point
@@ -633,54 +523,6 @@ def _quantize_affine_tinygemm_no_dtype_cast(
     quant = quant.view(original_shape)
 
     return quant
-
-
-def _quantize_affine_no_zero_point(
-    input: torch.Tensor,
-    block_size: List[int],
-    scale: torch.Tensor,
-    zero_point: Optional[torch.Tensor],
-    output_dtype: torch.dtype,
-    quant_min: Optional[Union[int, float, bool]] = None,
-    quant_max: Optional[Union[int, float, bool]] = None,
-) -> torch.Tensor:
-    """Quantize tensor using affine quantization without zero point.
-
-    Specialized quantization for cases where zero point is not needed (e.g., floatx quantization).
-
-    Args:
-        input: Input tensor to quantize (float32, float16, or bfloat16)
-        block_size: Granularity of quantization - size of tensor elements sharing same qparam
-        scale: Quantization scale parameter
-        zero_point: Quantization zero point parameter (ignored, should be None)
-        output_dtype: Target quantized dtype (e.g., torch.uint8, torch.int8)
-        quant_min: Minimum quantized value, derived from dtype if None
-        quant_max: Maximum quantized value, derived from dtype if None
-
-    Returns:
-        Quantized tensor with requested dtype
-
-    The op does the following:
-    1. Figure out the dimension for reduction based on block_size, also reshape the input to align with
-       the shape after reduction
-    2. Quantize the input based on the quantization parameters scale with zero_point_domain = NONE
-    3. Reshape the quantized result to original shape
-
-    Note:
-        zero_point_domain is pre-defined as NONE, meaning:
-        quantized_val = (float_val / scale) | This is primarily used for floatx quantization
-        where we do not want to round values to nearest integer and instead scale and cast.
-    """
-    return _quantize_affine_with_dtype_cast(
-        _quantize_affine_no_zero_point_no_dtype_cast,
-        input,
-        block_size,
-        scale,
-        zero_point,
-        output_dtype,
-        quant_min,
-        quant_max,
-    )
 
 
 def _quantize_affine_no_zero_point_no_dtype_cast(
@@ -712,37 +554,94 @@ def _quantize_affine_no_zero_point_no_dtype_cast(
     2. Quantize the input based on the quantization parameters scale with zero_point_domain = NONE
     3. Reshape the quantized result to original shape
     """
-    # TODO: validations
-    # TODO: validate scale/zero_point dimensions are compatible with block_size
-    assert input.dtype in [
-        torch.float32,
-        torch.float16,
-        torch.bfloat16,
-    ], f"Unsupported input dtype: {input.dtype}"
-    assert len(block_size) == input.dim(), (
-        f"Got input dim:{input.dim()}, block_size: {block_size}"
+    input, scale, _, original_shape = _reshape_input_for_quantize(
+        input, block_size, scale, zero_point
     )
-    shape_for_reduction, reduction_dims = _get_reduction_params(
-        block_size, input.size()
-    )
-    original_shape = input.shape
-    input = input.view(shape_for_reduction)
-    shape_after_reduction = shape_for_reduction
-    for i in reduction_dims:
-        shape_after_reduction[i] = 1
-    scale = scale.view(shape_after_reduction)
-
-    if zero_point is not None and zero_point.numel() > 0:
-        zero_point = zero_point.view(shape_after_reduction)
-    else:
-        # in some cases zero_point being a non-value shows as a tensor
-        # with numel=0 which we handle by unifying the two
-        zero_point = None
 
     quant = torch.clamp(_Round.apply(input * (1.0 / scale)), quant_min, quant_max)
     quant = quant.view(original_shape)
 
     return quant
+
+
+@register_custom_op
+def _quantize_affine(
+    input: torch.Tensor,
+    block_size: List[int],
+    scale: torch.Tensor,
+    zero_point: Optional[torch.Tensor],
+    output_dtype: torch.dtype,
+    quant_min: Optional[Union[int, float, bool]] = None,
+    quant_max: Optional[Union[int, float, bool]] = None,
+) -> torch.Tensor:
+    """Quantize tensor using affine quantization with integer zero point domain.
+
+    Op definition that has compatible signatures with custom op library.
+
+    Note:
+        zero_point_domain is pre-defined as INT, meaning:
+        quantized_val = (float_val / scale) (integer) + zero_point (integer)
+    """
+    quant_min, quant_max = _get_and_check_qmin_qmax(output_dtype, quant_min, quant_max)
+    input, scale, zero_point, original_shape = _reshape_input_for_quantize(
+        input, block_size, scale, zero_point
+    )
+    quant = torch.clamp(
+        _Round.apply(input * (1.0 / scale)) + zero_point, quant_min, quant_max
+    )
+    return _quantize_affine_cast(quant.view(original_shape), output_dtype)
+
+
+def _quantize_affine_tinygemm(
+    input: torch.Tensor,
+    block_size: List[int],
+    scale: torch.Tensor,
+    zero_point: Optional[torch.Tensor],
+    output_dtype: torch.dtype,
+    quant_min: Optional[Union[int, float, bool]] = None,
+    quant_max: Optional[Union[int, float, bool]] = None,
+) -> torch.Tensor:
+    """Quantize tensor using affine quantization with float zero point domain for tinygemm.
+
+    Specialized quantization for tinygemm int4mm kernel where zero point is in floating
+    point domain, meaning:
+        quantized_val = (float_val - (zero_point (float) - scale * mid_point)) / scale
+    """
+    quant_min, quant_max = _get_and_check_qmin_qmax(output_dtype, quant_min, quant_max)
+    input, scale, zero_point, original_shape = _reshape_input_for_quantize(
+        input, block_size, scale, zero_point
+    )
+    mid_point = (quant_max + quant_min + 1) / 2
+    min_val = zero_point - scale * mid_point
+    quant = torch.clamp(_Round.apply((input - min_val) / scale), quant_min, quant_max)
+    return _quantize_affine_cast(quant.view(original_shape), output_dtype)
+
+
+def _quantize_affine_no_zero_point(
+    input: torch.Tensor,
+    block_size: List[int],
+    scale: torch.Tensor,
+    zero_point: Optional[torch.Tensor],
+    output_dtype: torch.dtype,
+    quant_min: Optional[Union[int, float, bool]] = None,
+    quant_max: Optional[Union[int, float, bool]] = None,
+) -> torch.Tensor:
+    """Quantize tensor using affine quantization without zero point.
+
+    Specialized quantization for cases where zero point is not needed (e.g., floatx
+    quantization), meaning:
+        quantized_val = (float_val / scale)
+    This is primarily used for floatx quantization where we do not want to round values to
+    nearest integer and instead scale and cast.
+    """
+    # zero_point is intentionally ignored in this domain; it is accepted only so the three
+    # public quantize ops remain signature-compatible for callers that dispatch dynamically.
+    quant_min, quant_max = _get_and_check_qmin_qmax(output_dtype, quant_min, quant_max)
+    input, scale, _, original_shape = _reshape_input_for_quantize(
+        input, block_size, scale, zero_point
+    )
+    quant = torch.clamp(_Round.apply(input * (1.0 / scale)), quant_min, quant_max)
+    return _quantize_affine_cast(quant.view(original_shape), output_dtype)
 
 
 def dequantize_affine(

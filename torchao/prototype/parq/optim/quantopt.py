@@ -6,6 +6,7 @@
 
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Generator, Optional
 
@@ -30,6 +31,16 @@ if HAS_DTENSOR:
     from torch.distributed.tensor import distribute_tensor
     from torch.distributed.tensor.experimental import local_map
     from torch.distributed.tensor.placement_types import Shard
+
+
+@dataclass
+class _GroupQuantContext:
+    """Per-group quantization constants shared across all params in one ``step`` group."""
+
+    quantizer: Quantizer
+    quant_bits: int
+    gamma: float
+    quant_update: bool
 
 
 class QuantOptimizer(BaseWrappedOptimizer):
@@ -234,9 +245,15 @@ class QuantOptimizer(BaseWrappedOptimizer):
 
         return loss
 
-    def _maybe_init_quants(self, state, p, quantizer, b, per_channel) -> None:
-        """(Re)allocate the per-parameter quantization target buffer."""
-        quant_size = quantizer.get_quant_size(b)
+    def _maybe_init_quants(self, state, p, ctx) -> None:
+        """(Re)allocate the per-parameter quantization target buffer into ``state``.
+
+        ``p`` is the (possibly reshaped) tensor whose shape/device the buffer must match,
+        while ``state`` is the original parameter's state dict so the buffer is stored where
+        the rest of ``step`` looks for it.
+        """
+        per_channel = self.quant_per_channel and p.dim() > 1
+        quant_size = ctx.quantizer.get_quant_size(ctx.quant_bits)
         if per_channel:
             quant_size = (p.size(0), quant_size)
         state["quants"] = torch.empty(quant_size, device=p.device)
@@ -260,31 +277,33 @@ class QuantOptimizer(BaseWrappedOptimizer):
         # row-major ordering ensures this is correct
         return p.view(-1, block_size)
 
-    def _quantize_param(self, p, state, group, quantizer, gamma, quant_update):
+    def _quantize_param(self, p, group, ctx):
         """Quantize a single parameter in place and return its PARQ inverse slope."""
+        state = self.state[p]
         # save latent parameters, need detach()? or copy p)
         state["latent"].copy_(p)
 
         # in-place scaling of parameters by 1/gamma if specified
         if self.quant_shrink:
-            p.div_(gamma)
+            p.div_(ctx.gamma)
 
         # reshape p according to block size if specified
         p = self._reshape_for_blocks(p, group.get("quant_block_size"))
 
         # quantization by channel or by layer; update quantization targets periodically
-        b = group["quant_bits"]
         per_channel = self.quant_per_channel and p.dim() > 1
-        if quant_update:
-            self._maybe_init_quants(state, p, quantizer, b, per_channel)
+        if ctx.quant_update:
+            self._maybe_init_quants(state, p, ctx)
 
         dim = -1 if per_channel else None
         if per_channel and p.dim() > 2:
             p = p.flatten(start_dim=1)
 
         q = None
-        if quant_update:
-            qfunc = partial(self.quantize_, quantizer=quantizer, b=b, dim=dim)
+        if ctx.quant_update:
+            qfunc = partial(
+                self.quantize_, quantizer=ctx.quantizer, b=ctx.quant_bits, dim=dim
+            )
             if is_dtensor(p):
                 qfunc = local_map(
                     qfunc,
@@ -320,20 +339,21 @@ class QuantOptimizer(BaseWrappedOptimizer):
 
     def _quantize_group(self, i, group, quant_update) -> None:
         """Quantize every trainable parameter in a group and anneal its weight decay."""
-        # Override quantizer if specified in the group
-        quantizer = self._get_quantizer(i)
-
         # AProx in practice: ensure shrinkage coefficient >= 1
         group["cumu_lr"] += group["lr"]
-        gamma = max(1.0, group["cumu_lr"])
+        ctx = _GroupQuantContext(
+            # Override quantizer if specified in the group
+            quantizer=self._get_quantizer(i),
+            quant_bits=group["quant_bits"],
+            gamma=max(1.0, group["cumu_lr"]),
+            quant_update=quant_update,
+        )
 
         inv_slope = 0.0
         for p in group["params"]:
             if not p.requires_grad:
                 continue
-            inv_slope = self._quantize_param(
-                p, self.state[p], group, quantizer, gamma, quant_update
-            )
+            inv_slope = self._quantize_param(p, group, ctx)
 
         # quantized parameters share the same PARQ inverse slope
         self._anneal_weight_decay(group, inv_slope)
