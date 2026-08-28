@@ -733,6 +733,19 @@ def _is_valid_dequant_conv_pattern(dtype):
 
 
 @dataclass
+class QConvWeightPrepackConfig:
+    """Options shared by the qconv weight-prepack pattern generators.
+
+    Grouping these flags keeps the weight-prepack registration and pattern
+    generation helpers to a small, readable parameter list instead of threading
+    each flag separately.
+    """
+
+    dtype: Any = torch.float32
+    is_fp8: bool = False
+
+
+@dataclass
 class _QConvDequantPattern:
     """Nodes of a matched dequant->conv pattern that weight prepack rewrites.
 
@@ -793,8 +806,11 @@ def _erase_qconv_dequant_pattern(graph, pattern):
 
 
 def _register_qconv_weight_prepack_pass(
-    pattern, pass_number, dtype=torch.float32, is_fp8=False
+    pattern, pass_number, config: QConvWeightPrepackConfig
 ):
+    dtype = config.dtype
+    is_fp8 = config.is_fp8
+
     @register_freezing_graph_pattern(
         pattern,
         extra_check=_is_valid_dequant_conv_pattern(dtype),
@@ -1631,7 +1647,9 @@ def _register_qconv_weight_prepack():
         for weight_prepack_pattern in weight_prepack_patterns:
             # Register to pass_number 1, so we can do dequant promotion in pass_number 0.
             _register_qconv_weight_prepack_pass(
-                weight_prepack_pattern, pass_number=1, dtype=dtype, is_fp8=is_fp8
+                weight_prepack_pattern,
+                pass_number=1,
+                config=QConvWeightPrepackConfig(dtype=dtype, is_fp8=is_fp8),
             )
 
 
