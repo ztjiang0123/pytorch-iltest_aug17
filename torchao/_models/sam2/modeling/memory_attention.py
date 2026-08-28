@@ -4,12 +4,13 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass, fields, replace
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
 from torch import Tensor, nn
 
+from torchao._models.sam2.config_utils import resolve_config
 from torchao._models.sam2.modeling.sam.transformer import RoPEAttention
 from torchao._models.sam2.modeling.sam2_utils import get_activation_fn, get_clones
 
@@ -31,31 +32,6 @@ class MemoryAttentionLayerConfig:
     pos_enc_at_cross_attn_keys: bool = True
     pos_enc_at_cross_attn_queries: bool = False
 
-    @classmethod
-    def field_names(cls):
-        return tuple(f.name for f in fields(cls))
-
-
-def _resolve_layer_config(
-    config: Optional[MemoryAttentionLayerConfig],
-    overrides: Dict[str, Any],
-) -> MemoryAttentionLayerConfig:
-    """Merge an optional config with keyword overrides.
-
-    Keyword arguments matching a config field take precedence over ``config``
-    (or the defaults when ``config`` is ``None``), preserving the historical
-    keyword-based call sites while collapsing the long parameter list.
-    """
-    base = config if config is not None else MemoryAttentionLayerConfig()
-    field_overrides = {
-        k: overrides[k]
-        for k in MemoryAttentionLayerConfig.field_names()
-        if k in overrides
-    }
-    if not field_overrides:
-        return base
-    return replace(base, **field_overrides)
-
 
 class MemoryAttentionLayer(nn.Module):
     def __init__(
@@ -66,7 +42,7 @@ class MemoryAttentionLayer(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        config = _resolve_layer_config(config, kwargs)
+        config = resolve_config(config, MemoryAttentionLayerConfig, kwargs)
         d_model = config.d_model
         dim_feedforward = config.dim_feedforward
         dropout = config.dropout

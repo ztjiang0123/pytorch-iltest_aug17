@@ -5,13 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
-from dataclasses import dataclass, fields, replace
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torchao._models.sam2.config_utils import resolve_config
 from torchao._models.sam2.modeling.sam2_utils import DropPath, LayerNorm2d, get_clones
 
 
@@ -148,29 +149,6 @@ class MemoryEncoderConfig:
     out_dim: int = 64
     in_dim: int = 256  # in_dim of pix_feats
 
-    @classmethod
-    def field_names(cls):
-        return tuple(f.name for f in fields(cls))
-
-
-def _resolve_encoder_config(
-    config: Optional[MemoryEncoderConfig],
-    overrides: Dict[str, Any],
-) -> MemoryEncoderConfig:
-    """Merge an optional config with keyword overrides.
-
-    Keyword arguments matching a config field take precedence over ``config``
-    (or the defaults when ``config`` is ``None``), preserving the historical
-    keyword-based call sites while collapsing the long parameter list.
-    """
-    base = config if config is not None else MemoryEncoderConfig()
-    field_overrides = {
-        k: overrides[k] for k in MemoryEncoderConfig.field_names() if k in overrides
-    }
-    if not field_overrides:
-        return base
-    return replace(base, **field_overrides)
-
 
 class MemoryEncoder(nn.Module):
     def __init__(
@@ -182,7 +160,7 @@ class MemoryEncoder(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        config = _resolve_encoder_config(config, kwargs)
+        config = resolve_config(config, MemoryEncoderConfig, kwargs)
         in_dim = config.in_dim
         out_dim = config.out_dim
 

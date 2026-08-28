@@ -6,8 +6,8 @@
 
 import logging
 import os
-from dataclasses import dataclass, field, fields, replace
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 import torch
 from hydra import compose
@@ -15,6 +15,7 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
 from torchao._models import sam2
+from torchao._models.sam2.config_utils import resolve_config
 
 # Check if the user is running Python from the parent directory of the sam2 repo
 # (i.e. the directory where this repo is cloned into) -- this is not supported since
@@ -83,29 +84,6 @@ class SAM2BuildConfig:
     hydra_overrides_extra: List[str] = field(default_factory=list)
     apply_postprocessing: bool = True
 
-    @classmethod
-    def field_names(cls):
-        return tuple(f.name for f in fields(cls))
-
-
-def _resolve_build_config(
-    config: Optional[SAM2BuildConfig],
-    overrides: Dict[str, Any],
-) -> SAM2BuildConfig:
-    """Merge an optional :class:`SAM2BuildConfig` with keyword overrides.
-
-    Keyword arguments matching a config field take precedence over ``config``
-    (or the defaults when ``config`` is ``None``), preserving the historical
-    keyword-based call sites while collapsing the long parameter list.
-    """
-    base = config if config is not None else SAM2BuildConfig()
-    field_overrides = {
-        k: overrides[k] for k in SAM2BuildConfig.field_names() if k in overrides
-    }
-    if not field_overrides:
-        return base
-    return replace(base, **field_overrides)
-
 
 def build_sam2(
     config_file,
@@ -114,7 +92,7 @@ def build_sam2(
     config: Optional[SAM2BuildConfig] = None,
     **kwargs,
 ):
-    build_config = _resolve_build_config(config, kwargs)
+    build_config = resolve_config(config, SAM2BuildConfig, kwargs)
     hydra_overrides_extra = build_config.hydra_overrides_extra
     if build_config.apply_postprocessing:
         hydra_overrides_extra = hydra_overrides_extra.copy()
