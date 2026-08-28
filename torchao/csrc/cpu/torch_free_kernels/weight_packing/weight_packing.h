@@ -156,6 +156,122 @@ inline size_t packed_weights_offset(
 
 // ===== Shared pack/unpack implementations =====
 
+namespace detail {
+
+// Append a single little-endian scalar to the packed buffer and advance the
+// cursor. Keeps the store loops free of pointer arithmetic.
+template <typename T>
+inline void append_scalar(char*& cursor, T value) {
+  *reinterpret_cast<T*>(cursor) = value;
+  cursor += sizeof(T);
+}
+
+// All inputs and output state for one pack_weights call. Grouping them lets each
+// step below be a small named method, so the top-level pack_weights loop reads
+// as a flat sequence of decisions instead of deeply nested control flow.
+template <int weight_nbit, int nr, int kr, int sr>
+struct WeightPacker {
+  int n;
+  int k;
+  int group_size;
+  const int8_t* weight_qvals;
+  const float* weight_scales;
+  const int8_t* weight_zeros; // nullptr if not packed
+  const float* bias; // nullptr if not packed
+  int groups_per_k;
+  char* cursor;
+  std::array<int32_t, nr> qvals_sum;
+
+  // True when column (n_idx + j) is inside the real matrix (not zero padding).
+  bool column_in_range(int n_idx, int j) const {
+    return n_idx + j < n;
+  }
+
+  // Pack one group's qvals for the next nr columns starting at (n_idx, k_idx),
+  // accumulating per-column sums. Columns past the end of n are zero-filled.
+  void pack_group_qvals(int n_idx, int k_idx) {
+    constexpr int packed_buffer_bytes = weight_nbit * nr * kr / 8;
+    std::array<int8_t, nr * kr> buffer;
+    int8_t packed_values[nr * kr];
+
+    for (int idx_in_group = 0; idx_in_group < group_size; idx_in_group += kr) {
+      buffer.fill(0);
+      for (int j = 0; j < nr; j++) {
+        if (column_in_range(n_idx, j)) {
+          std::memcpy(
+              buffer.data() + kr * j,
+              weight_qvals + (n_idx + j) * k + (k_idx + idx_in_group),
+              kr);
+          qvals_sum[j] += impl::compute_sum(buffer.data() + kr * j, kr);
+        }
+      }
+      torchao::weight_packing::pack_values(
+          packed_values, buffer.data(), nr, kr, sr);
+      impl::pack_buffer<weight_nbit, kr, nr>(cursor, packed_values);
+      cursor += packed_buffer_bytes;
+    }
+  }
+
+  // Store this group's scale for each of the next nr columns (0 past end of n).
+  void store_group_scales(int n_idx, int group_idx) {
+    for (int j = 0; j < nr; j++) {
+      float scale = column_in_range(n_idx, j)
+          ? weight_scales[(n_idx + j) * groups_per_k + group_idx]
+          : 0.0f;
+      append_scalar(cursor, scale);
+    }
+  }
+
+  // Store this group's accumulated qval sum for each of the next nr columns.
+  void store_group_qval_sums() {
+    for (int j = 0; j < nr; j++) {
+      append_scalar(cursor, qvals_sum[j]);
+    }
+  }
+
+  // Store this group's zero point for each of the next nr columns (0 past end).
+  void store_group_zeros(int n_idx, int group_idx) {
+    for (int j = 0; j < nr; j++) {
+      int32_t zero = column_in_range(n_idx, j)
+          ? static_cast<int32_t>(
+                weight_zeros[(n_idx + j) * groups_per_k + group_idx])
+          : 0;
+      append_scalar(cursor, zero);
+    }
+  }
+
+  // Store bias for each of the next nr columns (0 past the end of n).
+  void store_bias(int n_idx) {
+    for (int j = 0; j < nr; j++) {
+      float bias_ = column_in_range(n_idx, j) ? bias[n_idx + j] : 0.0f;
+      append_scalar(cursor, bias_);
+    }
+  }
+
+  // Pack one group: qvals, then its per-column scale/sum/zero attributes.
+  void pack_group(int n_idx, int group_idx) {
+    qvals_sum.fill(0);
+    pack_group_qvals(n_idx, group_idx * group_size);
+    store_group_scales(n_idx, group_idx);
+    store_group_qval_sums();
+    if (weight_zeros != nullptr) {
+      store_group_zeros(n_idx, group_idx);
+    }
+  }
+
+  // Pack every group and the optional bias for the next nr columns.
+  void pack_column_block(int n_idx) {
+    for (int group_idx = 0; group_idx < groups_per_k; group_idx++) {
+      pack_group(n_idx, group_idx);
+    }
+    if (bias != nullptr) {
+      store_bias(n_idx);
+    }
+  }
+};
+
+} // namespace detail
+
 // Pack weights into architecture-portable format
 template <int weight_nbit, int nr, int kr, int sr>
 inline void pack_weights(
@@ -176,104 +292,25 @@ inline void pack_weights(
     int /*sr_rt*/) {
   assert(k % group_size == 0);
   assert(group_size % kr == 0);
-  bool has_weight_zeros = (weight_zeros != nullptr);
-  bool has_bias = (bias != nullptr);
-  int groups_per_k = k / group_size;
-
-  // Buffer to hold (kr * nr) values
-  std::array<int8_t, nr * kr> buffer;
-
-  // Buffer to hold (kr * nr) values after those values
-  // are packed by params (nr, kr, sr)
-  int8_t packed_values[nr * kr];
-
-  // Bytes of packed buffer of (nr * kr) values
   assert(nr * kr % 8 == 0);
-  constexpr int packed_buffer_bytes = weight_nbit * nr * kr / 8;
 
-  // Buffer to hold sum of weight_qvals in each column group
-  std::array<int32_t, nr> qvals_sum;
+  // All per-group/per-column work lives in WeightPacker's small named methods,
+  // so this function is just a flat loop over the nr-column blocks.
+  detail::WeightPacker<weight_nbit, nr, kr, sr> packer{
+      n,
+      k,
+      group_size,
+      weight_qvals,
+      weight_scales,
+      weight_zeros,
+      bias,
+      k / group_size,
+      reinterpret_cast<char*>(packed_weights),
+      {}};
 
-  // Data pointer for packed weights
-  auto packed_weights_byte_ptr = reinterpret_cast<char*>(packed_weights);
-
-  // Loop over n by nr
   for (int n_idx = 0; n_idx < n; n_idx += nr) {
-    // Loop over groups along k
-    for (int group_idx = 0; group_idx < groups_per_k; group_idx++) {
-      // Initialize qvals_sum for each group to 0
-      qvals_sum.fill(0);
-
-      // Loop over group by kr and pack the weights for the next nr columns
-      int k_idx = group_idx * group_size;
-      for (int idx_in_group = 0; idx_in_group < group_size;
-           idx_in_group += kr) {
-        // Fill buffer with next kr values from the next nr columns
-        // If there are fewer than nr columns, 0s are stored
-        buffer.fill(0);
-        for (int j = 0; j < nr; j++) {
-          if (n_idx + j < n) {
-            std::memcpy(
-                buffer.data() + kr * j,
-                weight_qvals + (n_idx + j) * k + (k_idx + idx_in_group),
-                kr);
-            qvals_sum[j] +=
-                impl::compute_sum(buffer.data() + kr * j, kr);
-          }
-        }
-
-        // Pack buffer
-        torchao::weight_packing::pack_values(
-            packed_values, buffer.data(), nr, kr, sr);
-        impl::pack_buffer<weight_nbit, kr, nr>(
-            packed_weights_byte_ptr, packed_values);
-        packed_weights_byte_ptr += packed_buffer_bytes;
-      } // loop over group (idx_in_group)
-
-      // Store group attributes scale, qval_sums, and zeros for next nr columns
-      // If there are fewer than nr columns, 0s are stored
-
-      // Store weight scales
-      for (int j = 0; j < nr; j++) {
-        float scale = 0.0f;
-        if (n_idx + j < n) {
-          scale = weight_scales[(n_idx + j) * groups_per_k + group_idx];
-        }
-        *reinterpret_cast<float*>(packed_weights_byte_ptr) = scale;
-        packed_weights_byte_ptr += sizeof(float);
-      }
-
-      // Store weight qval sums
-      for (int j = 0; j < nr; j++) {
-        *reinterpret_cast<int32_t*>(packed_weights_byte_ptr) = qvals_sum[j];
-        packed_weights_byte_ptr += sizeof(int32_t);
-      }
-
-      // Store weight zeros
-      if (has_weight_zeros) {
-        for (int j = 0; j < nr; j++) {
-          int32_t zero = 0;
-          if (n_idx + j < n) {
-            zero = weight_zeros[(n_idx + j) * groups_per_k + group_idx];
-          }
-          *reinterpret_cast<int32_t*>(packed_weights_byte_ptr) = zero;
-          packed_weights_byte_ptr += sizeof(int32_t);
-        }
-      }
-    } // loop over k (group_idx)
-
-    // Store bias for next nr columns
-    if (has_bias) {
-      for (int j = 0; j < nr; j++) {
-        float bias_ = 0.0f;
-        if (n_idx + j < n) {
-          bias_ = bias[n_idx + j];
-        }
-        *reinterpret_cast<float*>(packed_weights_byte_ptr) = bias_;
-        packed_weights_byte_ptr += sizeof(float);
-      }
-    }
-  } // n_idx
+    packer.pack_column_block(n_idx);
+  }
 }
 
 // Unpack weights at n_idx to support shared embedding/unembedding

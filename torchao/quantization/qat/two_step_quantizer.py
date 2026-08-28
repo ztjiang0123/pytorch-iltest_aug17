@@ -17,12 +17,17 @@ class TwoStepQuantizer:
     - ``convert``: convert the fake-quantized model to a quantized model
     """
 
+    def _unimplemented_step(self, step: str) -> "torch.nn.Module":
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement the '{step}' step"
+        )
+
     def prepare(
         self, model: torch.nn.Module, *args: Any, **kwargs: Any
     ) -> torch.nn.Module:
-        raise NotImplementedError
+        return self._unimplemented_step("prepare")
 
     def convert(
         self, model: torch.nn.Module, *args: Any, **kwargs: Any
     ) -> torch.nn.Module:
-        raise NotImplementedError
+        return self._unimplemented_step("convert")

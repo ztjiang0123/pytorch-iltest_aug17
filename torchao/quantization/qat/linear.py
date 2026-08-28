@@ -626,11 +626,9 @@ class Float8ActInt4WeightQATQuantizer(_LegacyQATQuantizer):
                 self.prepare(child)
         return model
 
-    # TODO: add convert path
-    def convert(
-        self, model: torch.nn.Module, *args: Any, **kwargs: Any
-    ) -> torch.nn.Module:
-        raise NotImplementedError
+    # TODO: add convert path. The base ``_LegacyQATQuantizer.convert`` delegates
+    # to ``_convert_qat_linear``, which raises ``NotImplementedError`` until a
+    # float8-specific conversion is implemented, so no override is needed here.
 
     def get_activation_fake_quantize_config(self) -> Optional[FakeQuantizeConfigBase]:
         raise NotImplementedError("Float8 FakeQuantizeConfig does not exist yet")
