@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import argparse
 import csv
 import os
 import random
@@ -13,7 +14,6 @@ from functools import wraps
 from typing import Callable, TypeVar
 
 import diffusers
-import fire
 import lpips
 import numpy as np
 import torch
@@ -781,38 +781,15 @@ def _run_performance_mode(ctx, quantized):
     _save_summary_csv(ctx, mode, perf_rows)
 
 
-@torch.inference_mode()
-def run(
-    mode: str = "accuracy",
-    num_prompts: int = None,
-    num_inference_steps: int = 4,
-    quant_config_str: str = "float8_rowwise",
-    use_compile: bool = False,
-    torch_compile_mode: str = "default",
-    debug_prompt: str | None = None,
-    print_model: bool = False,
-    cache_baseline_images: bool = False,
-    perf_n_iter: int = 10,
-    batch_size: int = 1,
-    use_deterministic_algorithms: bool = False,
-    num_gpus_used: int = None,
-):
-    """
-    A performance and accuracy eval script for quantizing flux-1.schnell:
+@dataclass
+class RunConfig:
+    """User-facing options for :func:`run`, populated from the CLI.
 
-      1. load flux-1.schnell model
-      2a. for mode == 'accuracy':
-        2. run it on a prompts dataset and save the images
-        3. quantize the model, run it on the same dataset and save the images
-        4. report accuracy difference (using LPIPS) between 2 and 3
-      2b. for mode == 'performance_hp':
-        2. run it on a debug prompt and measure performance (high precision / baseline)
-      2c. for mode == 'performance_quant':
-        2. quantize the model, run it on a debug prompt and measure performance
-      2d. for mode == 'aggregate_accuracy':
-        2. load CSV files from multiple GPU runs and aggregate LPIPS results
+    Bundling the command-line flags into a single value object keeps
+    ``run``'s signature small and lets the argument parser and the run
+    logic share one source of truth for defaults.
 
-    Args:
+    Attributes:
         mode: 'accuracy', 'performance_hp', 'performance_quant', or 'aggregate_accuracy'
         num_prompts: Optional limit on number of prompts to use (for debugging)
         num_inference_steps: Number of passes through the transformer,
@@ -831,6 +808,44 @@ def run(
         num_gpus_used: For 'aggregate_accuracy' mode, the number of GPUs that were used
           to generate the data. Required for aggregate_accuracy mode.
     """
+
+    mode: str = "accuracy"
+    num_prompts: int = None
+    num_inference_steps: int = 4
+    quant_config_str: str = "float8_rowwise"
+    use_compile: bool = False
+    torch_compile_mode: str = "default"
+    debug_prompt: str | None = None
+    print_model: bool = False
+    cache_baseline_images: bool = False
+    perf_n_iter: int = 10
+    batch_size: int = 1
+    use_deterministic_algorithms: bool = False
+    num_gpus_used: int = None
+
+
+@torch.inference_mode()
+def run(config: RunConfig):
+    """
+    A performance and accuracy eval script for quantizing flux-1.schnell:
+
+      1. load flux-1.schnell model
+      2a. for mode == 'accuracy':
+        2. run it on a prompts dataset and save the images
+        3. quantize the model, run it on the same dataset and save the images
+        4. report accuracy difference (using LPIPS) between 2 and 3
+      2b. for mode == 'performance_hp':
+        2. run it on a debug prompt and measure performance (high precision / baseline)
+      2c. for mode == 'performance_quant':
+        2. quantize the model, run it on a debug prompt and measure performance
+      2d. for mode == 'aggregate_accuracy':
+        2. load CSV files from multiple GPU runs and aggregate LPIPS results
+
+    See :class:`RunConfig` for a description of each option.
+    """
+    mode = config.mode
+    batch_size = config.batch_size
+
     # Distributed setup for torchrun
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -839,29 +854,29 @@ def run(
     # model = "black-forest-labs/FLUX.1-dev"
     model = "black-forest-labs/FLUX.1-schnell"
     prompts_dataset = "sayakpaul/drawbench"
-    if debug_prompt is not None:
+    if config.debug_prompt is not None:
         prompts_dataset = "debug"
 
-    if use_deterministic_algorithms:
+    if config.use_deterministic_algorithms:
         # this is needed to make torch.compile be deterministic with flux-1.schnell
         torch.use_deterministic_algorithms(True)
 
     ctx = RunContext(
         mode=mode,
         model=model,
-        quant_config_str=quant_config_str,
-        num_inference_steps=num_inference_steps,
+        quant_config_str=config.quant_config_str,
+        num_inference_steps=config.num_inference_steps,
         prompts_dataset=prompts_dataset,
-        use_compile=use_compile,
-        torch_compile_mode=torch_compile_mode,
-        use_deterministic_algorithms=use_deterministic_algorithms,
+        use_compile=config.use_compile,
+        torch_compile_mode=config.torch_compile_mode,
+        use_deterministic_algorithms=config.use_deterministic_algorithms,
         batch_size=batch_size,
-        cache_baseline_images=cache_baseline_images,
-        print_model=print_model,
-        perf_n_iter=perf_n_iter,
-        num_prompts=num_prompts,
-        debug_prompt=debug_prompt,
-        num_gpus_used=num_gpus_used,
+        cache_baseline_images=config.cache_baseline_images,
+        print_model=config.print_model,
+        perf_n_iter=config.perf_n_iter,
+        num_prompts=config.num_prompts,
+        debug_prompt=config.debug_prompt,
+        num_gpus_used=config.num_gpus_used,
         local_rank=local_rank,
         world_size=world_size,
     )
@@ -925,5 +940,42 @@ def run(
         _run_performance_mode(ctx, quantized=True)
 
 
+def _parse_args(argv=None) -> RunConfig:
+    """Parse CLI flags into a :class:`RunConfig`, preserving flag names."""
+    defaults = RunConfig()
+    parser = argparse.ArgumentParser(
+        description="Performance and accuracy eval for quantizing flux-1.schnell."
+    )
+    parser.add_argument("--mode", default=defaults.mode)
+    parser.add_argument("--num_prompts", type=int, default=defaults.num_prompts)
+    parser.add_argument(
+        "--num_inference_steps", type=int, default=defaults.num_inference_steps
+    )
+    parser.add_argument("--quant_config_str", default=defaults.quant_config_str)
+    parser.add_argument(
+        "--use_compile", action="store_true", default=defaults.use_compile
+    )
+    parser.add_argument("--torch_compile_mode", default=defaults.torch_compile_mode)
+    parser.add_argument("--debug_prompt", default=defaults.debug_prompt)
+    parser.add_argument(
+        "--print_model", action="store_true", default=defaults.print_model
+    )
+    parser.add_argument(
+        "--cache_baseline_images",
+        action="store_true",
+        default=defaults.cache_baseline_images,
+    )
+    parser.add_argument("--perf_n_iter", type=int, default=defaults.perf_n_iter)
+    parser.add_argument("--batch_size", type=int, default=defaults.batch_size)
+    parser.add_argument(
+        "--use_deterministic_algorithms",
+        action="store_true",
+        default=defaults.use_deterministic_algorithms,
+    )
+    parser.add_argument("--num_gpus_used", type=int, default=defaults.num_gpus_used)
+    args = parser.parse_args(argv)
+    return RunConfig(**vars(args))
+
+
 if __name__ == "__main__":
-    fire.Fire(run)
+    run(_parse_args())

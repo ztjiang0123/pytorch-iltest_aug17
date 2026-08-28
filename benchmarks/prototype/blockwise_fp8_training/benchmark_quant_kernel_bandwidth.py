@@ -80,6 +80,23 @@ class Tolerance:
     atol: float
 
 
+@dataclass(frozen=True)
+class SweepConfig:
+    """Shapes to benchmark: every ``(m, k)`` for ``m in m_values``."""
+
+    m_values: Iterable[int]
+    k: int
+    block_size: int
+
+
+@dataclass(frozen=True)
+class CorrectnessCheck:
+    """Whether to validate kernel output and, if so, at what tolerance."""
+
+    enabled: bool
+    tolerance: Tolerance
+
+
 def _validate_k_divisible(shape: Tuple[int, int], block_size: int) -> Optional[str]:
     _, k = shape
     if k % block_size != 0:
@@ -266,19 +283,16 @@ def _calculate_logical_io_gbps(
 
 
 def _run_suite(
-    m_values: Iterable[int],
-    k: int,
-    block_size: int,
+    sweep: SweepConfig,
     bandwidth_spec: GpuBandwidthSpec,
-    check_correctness: bool,
-    correctness_rtol: float,
-    correctness_atol: float,
+    correctness: CorrectnessCheck,
 ) -> Tuple[List[KernelMeasurement], List[SkippedKernelCase]]:
     measurements = []
     skipped = []
 
-    for m in m_values:
-        shape = (m, k)
+    block_size = sweep.block_size
+    for m in sweep.m_values:
+        shape = (m, sweep.k)
         for kernel in KERNEL_SPECS:
             reason = kernel.validate(shape, block_size)
             if reason is not None:
@@ -293,13 +307,13 @@ def _run_suite(
 
             input_tensor = torch.randn(*shape, dtype=torch.bfloat16, device="cuda")
             kernel_us, output = _benchmark_kernel(kernel, input_tensor, block_size)
-            if check_correctness:
+            if correctness.enabled:
                 _check_correctness(
                     kernel=kernel,
                     input_tensor=input_tensor,
                     block_size=block_size,
                     output=output,
-                    tolerance=Tolerance(rtol=correctness_rtol, atol=correctness_atol),
+                    tolerance=correctness.tolerance,
                 )
             effective_logical_io_gbps = _calculate_logical_io_gbps(
                 input_tensor=input_tensor,
@@ -565,13 +579,19 @@ def main():
     bandwidth_spec = _resolve_gpu_specs(use_roofline_utils=args.use_roofline_utils)
 
     measurements, skipped = _run_suite(
-        m_values=args.m_values,
-        k=args.k,
-        block_size=args.block_size,
+        sweep=SweepConfig(
+            m_values=args.m_values,
+            k=args.k,
+            block_size=args.block_size,
+        ),
         bandwidth_spec=bandwidth_spec,
-        check_correctness=args.check_correctness,
-        correctness_rtol=args.correctness_rtol,
-        correctness_atol=args.correctness_atol,
+        correctness=CorrectnessCheck(
+            enabled=args.check_correctness,
+            tolerance=Tolerance(
+                rtol=args.correctness_rtol,
+                atol=args.correctness_atol,
+            ),
+        ),
     )
     _print_results(
         measurements=measurements,
