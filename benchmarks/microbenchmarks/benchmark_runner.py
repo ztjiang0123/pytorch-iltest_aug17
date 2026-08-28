@@ -176,6 +176,27 @@ def get_param_combinations(model_param):
     return shapes, base_params
 
 
+def _is_semi_sparse_compatible(quant_config: str) -> bool:
+    """Return True if a quantization recipe can be paired with semi-sparsity."""
+    return (
+        "marlin" in quant_config
+        or "int8dq" in quant_config
+        or "float8dq" in quant_config
+        or quant_config == "baseline"
+    )
+
+
+def _semi_sparse_recipes(
+    quantization_recipes: List[str], sparse_config: str
+) -> Set[Tuple[str, Optional[str]]]:
+    """Pair a semi-sparse recipe with each compatible quantization recipe."""
+    return {
+        (quant_config, sparse_config)
+        for quant_config in quantization_recipes
+        if _is_semi_sparse_compatible(quant_config)
+    }
+
+
 def get_quantization_sparsity_recipes(
     quantization_recipes: List[str], sparsity_recipes: List[str]
 ) -> Set[Tuple[str, Optional[str]]]:
@@ -206,14 +227,9 @@ def get_quantization_sparsity_recipes(
             config_recipes.add(("baseline", sparse_config))
         elif "semi" in sparse_config or "2:4" in sparse_config:
             # For semi-sparse, only pair with compatible quantization methods
-            for quant_config in quantization_recipes:
-                if (
-                    "marlin" in quant_config
-                    or "int8dq" in quant_config
-                    or "float8dq" in quant_config
-                    or quant_config == "baseline"
-                ):
-                    config_recipes.add((quant_config, sparse_config))
+            config_recipes.update(
+                _semi_sparse_recipes(quantization_recipes, sparse_config)
+            )
         else:
             raise ValueError(f"Invalid sparsity recipe: {sparse_config}")
 

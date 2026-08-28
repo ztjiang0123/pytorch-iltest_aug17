@@ -6,6 +6,7 @@
 import math
 import resource
 import time
+from dataclasses import dataclass
 
 import fire
 import torch
@@ -278,6 +279,212 @@ def memory_runner(path, fn, *args, **kwargs):
     return result
 
 
+def _configure_inductor():
+    """Enable the inductor/sparse settings shared by every eval run."""
+    from torch._inductor import config as inductorconfig
+
+    inductorconfig.triton.unique_kernel_names = True
+    inductorconfig.epilogue_fusion = True
+    inductorconfig.coordinate_descent_tuning = True
+    inductorconfig.coordinate_descent_check_all_directions = True
+    inductorconfig.force_fuse_int_mm_with_mul = True
+    inductorconfig.use_mixed_mm = True
+    from torch.sparse import SparseSemiStructuredTensor
+
+    SparseSemiStructuredTensor._FORCE_CUTLASS = False
+
+
+def _resolve_use_half(use_half):
+    """Map the ``use_half`` CLI string to a torch dtype (or None)."""
+    if use_half is None:
+        return None
+    if use_half == "float16":
+        return torch.float16
+    if use_half == "bfloat16":
+        return torch.bfloat16
+    raise ValueError("Expected one of float16 or bfloat for specified {use_half}")
+
+
+def _build_predictor(
+    sam_checkpoint_base_path, sam_model_type, device, use_half, use_rel_pos
+):
+    """Load the SAM checkpoint and wrap it in an eval-ready predictor."""
+    # https://github.com/facebookresearch/segment-anything/tree/main#model-checkpoints
+    # largest to smallest: vit_h, vit_l, vit_b
+    model_type_to_checkpoint = {
+        "vit_h": f"{sam_checkpoint_base_path}/sam_vit_h_4b8939.pth",
+        "vit_l": f"{sam_checkpoint_base_path}/sam_vit_l_0b3195.pth",
+        "vit_b": f"{sam_checkpoint_base_path}/sam_vit_b_01ec64.pth",
+    }
+
+    from segment_anything_fast import SamPredictor, sam_model_registry
+
+    checkpoint_path = model_type_to_checkpoint[sam_model_type]
+    sam = sam_model_registry[sam_model_type](checkpoint=checkpoint_path).to(
+        torch.device(device)
+    )
+    predictor = SamPredictor(sam)
+
+    from segment_anything_fast import tools
+
+    tools.apply_eval_dtype_predictor(predictor, use_half)
+
+    for block in predictor.model.image_encoder.blocks:
+        block.attn.use_rel_pos = use_rel_pos
+
+    return predictor
+
+
+def _apply_compression(predictor, compress):
+    """Apply the requested quantization/sparsity scheme to the image encoder."""
+    if compress == "int8_dynamic_quant":
+        quantize_(
+            predictor.model.image_encoder, Int8DynamicActivationInt8WeightConfig()
+        )
+    elif compress == "sparse_mlp_only":
+
+        def mlp_only(mod, name):
+            return isinstance(mod, torch.nn.Linear) and "mlp" in name
+
+        apply_fake_sparsity(predictor.model.image_encoder, filter_fn=mlp_only)
+        sparsify_(
+            predictor.model.image_encoder, semi_sparse_weight(), filter_fn=mlp_only
+        )
+    elif compress == "sparse":
+        apply_fake_sparsity(predictor.model.image_encoder)
+        sparsify_(predictor.model.image_encoder, semi_sparse_weight())
+    else:
+        assert compress is None, f"Unsupported compress mode {compress}"
+
+
+def _filter_annotated_img_ids(coco_img_ids_, coco, catIds):
+    """Keep only image ids that have at least one matching annotation."""
+    coco_img_ids = []
+    for imgId in coco_img_ids_:
+        img = coco.loadImgs(imgId)[0]
+        annIds = coco.getAnnIds(imgIds=img["id"], catIds=catIds, iscrowd=None)
+        anns = coco.loadAnns(annIds)
+        if len(anns) != 0:
+            coco_img_ids.append(imgId)
+    return coco_img_ids
+
+
+def _select_runner(profile_path, profile_top, memory_path, use_compile):
+    """Choose the runner wrapper implied by the profiling/memory flags."""
+    if profile_path is not None:
+        import functools
+
+        return functools.partial(profiler_runner, profile_path)
+
+    if profile_top:
+        return profile_top_runner
+
+    if memory_path is not None:
+        assert use_compile != "max-autotune", (
+            f"Memory path does not support {use_compile}"
+        )
+        import functools
+
+        return functools.partial(memory_runner, memory_path)
+
+    return identity_runner
+
+
+def _measure_memory():
+    """Return (max_bytes_scaled, percentage) of peak allocated memory."""
+    if torch.cuda.is_available():
+        max_memory_allocated_bytes = torch.cuda.max_memory_allocated()
+        _, total_memory = torch.cuda.mem_get_info()
+        max_memory_allocated_percentage = int(
+            100 * (max_memory_allocated_bytes / total_memory)
+        )
+        max_memory_allocated_bytes = max_memory_allocated_bytes >> 20
+    else:
+        import psutil
+
+        total_memory = psutil.virtual_memory().total
+        max_memory_allocated_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        max_memory_allocated_percentage = int(
+            100 * (max_memory_allocated_bytes / (total_memory >> 10))
+        )
+        max_memory_allocated_bytes = max_memory_allocated_bytes >> 10
+    return max_memory_allocated_bytes, max_memory_allocated_percentage
+
+
+def _write_csv_result(row, print_header):
+    """Append one benchmark row (and optionally the header) to results.csv."""
+    with open("results.csv", "a") as f:
+        if print_header:
+            header = ",".join(
+                [
+                    "device",
+                    "sam_model_type",
+                    "batch_size",
+                    "memory(MiB)",
+                    "memory(%)",
+                    "img_s(avg)",
+                    "batch_ms(avg)/batch_size",
+                    "mIoU",
+                    "use_compile",
+                    "use_half",
+                    "compress",
+                    "use_compile_decoder",
+                    "use_rel_pos",
+                    "pad_input_image_batch",
+                    "num_workers",
+                    "num_batches",
+                    "num_images",
+                    "profile_path",
+                    "memory_path",
+                ]
+            )
+            f.write(header + "\n")
+        f.write(",".join(map(str, row)) + "\n")
+
+
+@dataclass
+class _JsonResultContext:
+    """Fields shared by every JSON result row for a single eval run."""
+
+    output_json_path: str
+    output_json_local: bool
+    sam_model_type: str
+    compress: object
+    min_sqnr: object
+    use_compile: str
+    device: str
+    max_memory_allocated_bytes: int
+    img_s: object
+
+
+def _write_json_results(ctx: "_JsonResultContext"):
+    """Write memory and performance rows to the OSSCI/local JSON sink."""
+    headers = [
+        "name",
+        "dtype",
+        "min_sqnr",
+        "compile",
+        "device",
+        "arch",
+        "metric",
+        "actual",
+        "target",
+    ]
+    name = ctx.sam_model_type
+    arch = get_arch_name()
+    dtype = ctx.compress or "noquant"
+    # boolean flag to indicate whether compile is used
+    compile = ctx.use_compile != "False"
+    common = [name, dtype, ctx.min_sqnr, compile, ctx.device, arch]
+    memory_result = common + ["memory(MiB)", ctx.max_memory_allocated_bytes, None]
+    performance_result = common + ["img_s(avg)", ctx.img_s, None]
+    write_json_result = (
+        write_json_result_local if ctx.output_json_local else write_json_result_ossci
+    )
+    write_json_result(ctx.output_json_path, headers, memory_result)
+    write_json_result(ctx.output_json_path, headers, performance_result)
+
+
 def run(
     coco_root_dir,
     coco_slice_name,
@@ -305,85 +512,22 @@ def run(
     output_json_path=None,
     output_json_local=False,
 ):
-    from torch._inductor import config as inductorconfig
-
-    inductorconfig.triton.unique_kernel_names = True
-    inductorconfig.epilogue_fusion = True
-    inductorconfig.coordinate_descent_tuning = True
-    inductorconfig.coordinate_descent_check_all_directions = True
-    inductorconfig.force_fuse_int_mm_with_mul = True
-    inductorconfig.use_mixed_mm = True
-    from torch.sparse import SparseSemiStructuredTensor
-
-    SparseSemiStructuredTensor._FORCE_CUTLASS = False
-
-    if use_half is not None:
-        if use_half == "float16":
-            use_half = torch.float16
-        elif use_half == "bfloat16":
-            use_half = torch.bfloat16
-        else:
-            raise ValueError(
-                "Expected one of float16 or bfloat for specified {use_half}"
-            )
+    _configure_inductor()
+    use_half = _resolve_use_half(use_half)
 
     # Batch size needs to be a multiple of two and at most 512.
     assert math.log2(batch_size).is_integer()
     assert batch_size <= 512
 
-    # https://github.com/facebookresearch/segment-anything/tree/main#model-checkpoints
-    # largest to smallest: vit_h, vit_l, vit_b
-    model_type_to_checkpoint = {
-        "vit_h": f"{sam_checkpoint_base_path}/sam_vit_h_4b8939.pth",
-        "vit_l": f"{sam_checkpoint_base_path}/sam_vit_l_0b3195.pth",
-        "vit_b": f"{sam_checkpoint_base_path}/sam_vit_b_01ec64.pth",
-    }
-
-    from segment_anything_fast import SamPredictor, sam_model_registry
-
-    checkpoint_path = model_type_to_checkpoint[sam_model_type]
-    sam = sam_model_registry[sam_model_type](checkpoint=checkpoint_path).to(
-        torch.device(device)
+    predictor = _build_predictor(
+        sam_checkpoint_base_path, sam_model_type, device, use_half, use_rel_pos
     )
-    predictor = SamPredictor(sam)
-
-    from segment_anything_fast import tools
-
-    tools.apply_eval_dtype_predictor(predictor, use_half)
-
-    for block in predictor.model.image_encoder.blocks:
-        block.attn.use_rel_pos = use_rel_pos
-
-    if compress == "int8_dynamic_quant":
-        quantize_(
-            predictor.model.image_encoder, Int8DynamicActivationInt8WeightConfig()
-        )
-    elif compress == "sparse_mlp_only":
-
-        def mlp_only(mod, name):
-            return isinstance(mod, torch.nn.Linear) and "mlp" in name
-
-        apply_fake_sparsity(predictor.model.image_encoder, filter_fn=mlp_only)
-        sparsify_(
-            predictor.model.image_encoder, semi_sparse_weight(), filter_fn=mlp_only
-        )
-    elif compress == "sparse":
-        apply_fake_sparsity(predictor.model.image_encoder)
-        sparsify_(predictor.model.image_encoder, semi_sparse_weight())
-    else:
-        assert compress is None, f"Unsupported compress mode {compress}"
+    _apply_compression(predictor, compress)
 
     coco_img_ids_, cat_id_to_cat, catIds, coco = setup_coco_img_ids(
         coco_root_dir, coco_slice_name, coco_category_names, img_id
     )
-
-    coco_img_ids = []
-    for imgId in coco_img_ids_:
-        img = coco.loadImgs(imgId)[0]
-        annIds = coco.getAnnIds(imgIds=img["id"], catIds=catIds, iscrowd=None)
-        anns = coco.loadAnns(annIds)
-        if len(anns) != 0:
-            coco_img_ids.append(imgId)
+    coco_img_ids = _filter_annotated_img_ids(coco_img_ids_, coco, catIds)
 
     build_batch = build_data(
         coco_img_ids,
@@ -405,23 +549,7 @@ def run(
         num_workers=num_workers,
         pin_memory=False,
     )
-    runner = identity_runner
-
-    if profile_path is not None:
-        import functools
-
-        runner = functools.partial(profiler_runner, profile_path)
-
-    if profile_top:
-        runner = profile_top_runner
-
-    if memory_path is not None:
-        assert use_compile != "max-autotune", (
-            f"Memory path does not support {use_compile}"
-        )
-        import functools
-
-        runner = functools.partial(memory_runner, memory_path)
+    runner = _select_runner(profile_path, profile_top, memory_path, use_compile)
 
     results, avg_ms_per_img, num_batches, num_images = runner(
         build_results,
@@ -443,121 +571,47 @@ def run(
         batch_ms_batch_size = (avg_ms_per_img * num_images) / num_batches / batch_size
 
     mIoU = calculate_miou(results, mask_debug_out_dir, True, cat_id_to_cat)
-    if torch.cuda.is_available():
-        max_memory_allocated_bytes = torch.cuda.max_memory_allocated()
-        _, total_memory = torch.cuda.mem_get_info()
-        max_memory_allocated_percentage = int(
-            100 * (max_memory_allocated_bytes / total_memory)
-        )
-        max_memory_allocated_bytes = max_memory_allocated_bytes >> 20
-    else:
-        import psutil
+    max_memory_allocated_bytes, max_memory_allocated_percentage = _measure_memory()
 
-        total_memory = psutil.virtual_memory().total
-        max_memory_allocated_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        max_memory_allocated_percentage = int(
-            100 * (max_memory_allocated_bytes / (total_memory >> 10))
-        )
-        max_memory_allocated_bytes = max_memory_allocated_bytes >> 10
-
-    with open("results.csv", "a") as f:
-        if print_header:
-            header = ",".join(
-                [
-                    "device",
-                    "sam_model_type",
-                    "batch_size",
-                    "memory(MiB)",
-                    "memory(%)",
-                    "img_s(avg)",
-                    "batch_ms(avg)/batch_size",
-                    "mIoU",
-                    "use_compile",
-                    "use_half",
-                    "compress",
-                    "use_compile_decoder",
-                    "use_rel_pos",
-                    "pad_input_image_batch",
-                    "num_workers",
-                    "num_batches",
-                    "num_images",
-                    "profile_path",
-                    "memory_path",
-                ]
-            )
-            f.write(header + "\n")
-        vals = ",".join(
-            map(
-                str,
-                [
-                    device,
-                    sam_model_type,
-                    batch_size,
-                    max_memory_allocated_bytes,
-                    max_memory_allocated_percentage,
-                    img_s,
-                    batch_ms_batch_size,
-                    mIoU,
-                    use_compile,
-                    use_half,
-                    compress,
-                    use_compile_decoder,
-                    use_rel_pos,
-                    pad_input_image_batch,
-                    num_workers,
-                    num_batches,
-                    num_images,
-                    profile_path,
-                    memory_path,
-                ],
-            )
-        )
-        f.write(vals + "\n")
+    _write_csv_result(
+        [
+            device,
+            sam_model_type,
+            batch_size,
+            max_memory_allocated_bytes,
+            max_memory_allocated_percentage,
+            img_s,
+            batch_ms_batch_size,
+            mIoU,
+            use_compile,
+            use_half,
+            compress,
+            use_compile_decoder,
+            use_rel_pos,
+            pad_input_image_batch,
+            num_workers,
+            num_batches,
+            num_images,
+            profile_path,
+            memory_path,
+        ],
+        print_header,
+    )
 
     if output_json_path:
-        headers = [
-            "name",
-            "dtype",
-            "min_sqnr",
-            "compile",
-            "device",
-            "arch",
-            "metric",
-            "actual",
-            "target",
-        ]
-        name = sam_model_type
-        arch = get_arch_name()
-        dtype = compress or "noquant"
-        # boolean flag to indicate whether compile is used
-        compile = use_compile != "False"
-        memory_result = [
-            name,
-            dtype,
-            min_sqnr,
-            compile,
-            device,
-            arch,
-            "memory(MiB)",
-            max_memory_allocated_bytes,
-            None,
-        ]
-        performance_result = [
-            name,
-            dtype,
-            min_sqnr,
-            compile,
-            device,
-            arch,
-            "img_s(avg)",
-            img_s,
-            None,
-        ]
-        write_json_result = (
-            write_json_result_local if output_json_local else write_json_result_ossci
+        _write_json_results(
+            _JsonResultContext(
+                output_json_path=output_json_path,
+                output_json_local=output_json_local,
+                sam_model_type=sam_model_type,
+                compress=compress,
+                min_sqnr=min_sqnr,
+                use_compile=use_compile,
+                device=device,
+                max_memory_allocated_bytes=max_memory_allocated_bytes,
+                img_s=img_s,
+            )
         )
-        write_json_result(output_json_path, headers, memory_result)
-        write_json_result(output_json_path, headers, performance_result)
 
 
 if __name__ == "__main__":

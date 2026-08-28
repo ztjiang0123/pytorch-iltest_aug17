@@ -44,7 +44,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
                 continue
             cpu_state_dict[key] = state_dict[key]
         del state_dict
-        trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
+        trainer._save(output_dir, state_dict=cpu_state_dict)
 
 
 def get_local_rank():

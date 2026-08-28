@@ -21,6 +21,52 @@ static inline bool cpublas_could_pack() {
   return cpublas_can_pack;
 }
 
+#if defined(CPU_CAPABILITY_AVX512)
+constexpr int kVnniNGroupSize = 8;
+constexpr int kVnniSize = 4;
+
+// Pack one [vnni_size, n_group_size] sub-tile (at lane pair `nb` / row `k`) of a
+// weight block into its VNNI4 destination location.
+static inline void pack_weight_subtile_vnni4(
+    const uint8_t* __restrict__ in_ptr,
+    uint8_t* __restrict__ out_ptr,
+    int block_n,
+    int nb,
+    int k) {
+  for (int ni = 0; ni < kVnniNGroupSize; ++ni) {
+    for (int ki = 0; ki < kVnniSize; ++ki) {
+      int src_idx_1 = nb * kVnniNGroupSize + ni + (k + ki) * block_n;
+      int src_idx_2 = (nb + 1) * kVnniNGroupSize + ni + (k + ki) * block_n;
+      int dst_idx =
+          (nb / 2 * kVnniNGroupSize + ni) * kVnniSize + k * block_n / 2 + ki;
+      uint8_t src_1 = *(in_ptr + src_idx_1);
+      uint8_t src_2 = *(in_ptr + src_idx_2);
+      uint8_t dst = (src_1 & 0x0f) | ((src_2 & 0x0f) << 4);
+      *(out_ptr + dst_idx) = dst;
+    }
+  }
+}
+
+// Reorder a single [block_k, block_n] weight block to VNNI4 and pack two lanes
+// along N.
+// N=16 viewed as two lanes: a0, ...a7, b0, ...b7
+// pack two lanes: [a0, b0], ..., [a7, b7]
+// plain shape = [block_k, block_n]
+// packed shape = [block_k / 4, block_n / 2, 4] viewed as [block_k, block_n / 2]
+static inline void pack_weight_block_vnni4(
+    const uint8_t* __restrict__ in_ptr,
+    uint8_t* __restrict__ out_ptr,
+    int block_k,
+    int block_n) {
+  const int n_group = block_n / kVnniNGroupSize; // 4
+  for (int nb = 0; nb < n_group; nb += 2) {
+    for (int k = 0; k < block_k; k += kVnniSize) {
+      pack_weight_subtile_vnni4(in_ptr, out_ptr, block_n, nb, k);
+    }
+  }
+}
+#endif
+
 /*
 return: packed_weight, packed_scales, packed_qzeros, compensation
 */
@@ -80,30 +126,7 @@ da8w4_linear_prepack_impl(
       for (const auto i : c10::irange(begin, end)) {
         auto in_ptr = weight_ptr + i * block_k * block_n;
         auto out_ptr = blocked_weight_ptr + i * block_k * block_n / 2;
-
-        // Reorder weight block to VNNI4 and pack two lanes along N
-        // N=16 viewed as two lanes: a0, ...a7, b0, ...b7
-        // pack two lanes: [a0, b0], ..., [a7, b7]
-        // plain shape = [block_k, block_n]
-        // packed shape = [block_k / 4, block_n / 2, 4] viewed as [block_k, block_n / 2]
-        constexpr int n_group_size = 8;
-        constexpr int vnni_size = 4;
-        constexpr int n_group = block_n / n_group_size; // 4
-        for (int nb = 0; nb < n_group; nb += 2) {
-          for (int k = 0; k < block_k; k += vnni_size) {
-            for (int ni = 0; ni < n_group_size; ++ni) {
-              for (int ki = 0; ki < vnni_size; ++ki) {
-                int src_idx_1 = nb * n_group_size + ni + (k + ki) * block_n;
-                int src_idx_2 = (nb + 1) * n_group_size + ni + (k + ki) * block_n;
-                int dst_idx = (nb / 2 * n_group_size + ni) * vnni_size + k * block_n / 2 + ki;
-                uint8_t src_1 = *(in_ptr + src_idx_1);
-                uint8_t src_2 = *(in_ptr + src_idx_2);
-                uint8_t dst = (src_1 & 0x0f) | ((src_2 & 0x0f) << 4);
-                *(out_ptr + dst_idx) = dst;
-              }
-            }
-          }
-        }
+        pack_weight_block_vnni4(in_ptr, out_ptr, block_k, block_n);
       }
     });
   } else
