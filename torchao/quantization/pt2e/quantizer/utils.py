@@ -30,6 +30,33 @@ class QuantizationConfig:
     is_qat: bool = False
 
 
+def _create_global_config_filter(
+    default_quantizable_ops: set,
+) -> Callable[[list[Node]], bool]:
+    """Create a filter function for global configuration.
+
+    The returned filter takes a list of nodes and returns True if there is
+    exactly one node in the list whose target is in ``default_quantizable_ops``,
+    and False otherwise. It raises ``NotImplementedError`` if more than one such
+    node is present in a single pattern.
+
+    The set of default quantizable operations differs per quantizer backend,
+    so it is passed in explicitly rather than closed over a module global.
+    """
+
+    def _global_config_filter(nodes: list[Node]) -> bool:
+        num_nodes_in_default_quantizable_ops = sum(
+            node.target in default_quantizable_ops for node in nodes
+        )
+        if num_nodes_in_default_quantizable_ops > 1:
+            raise NotImplementedError(
+                "Several nodes within a single pattern are default quantizable operations."
+            )
+        return num_nodes_in_default_quantizable_ops == 1
+
+    return _global_config_filter
+
+
 # Use Annotated because list[Callable].__module__ is read-only.
 OperatorPatternType = typing.Annotated[list[Callable], None]
 if sys.version_info < (3, 14):

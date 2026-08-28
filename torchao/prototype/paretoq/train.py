@@ -8,7 +8,6 @@ from models.configuration_llama import LlamaConfig
 from models.modeling_llama_quant import (
     LlamaForCausalLM as LlamaForCausalLMQuant,
 )
-import copy
 import torch
 import transformers
 from utils import utils

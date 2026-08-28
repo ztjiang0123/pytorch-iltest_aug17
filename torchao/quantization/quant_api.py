@@ -352,6 +352,38 @@ def quantize_(
         )
 
 
+def _validate_intx_weight_config(
+    weight_dtype: torch.dtype,
+    granularity: Granularity,
+    mapping_type: MappingType,
+    *,
+    granularity_field_name: str,
+    mapping_type_field_name: str,
+):
+    """Validate the weight quantization parameters shared by the intx configs.
+
+    ``granularity_field_name`` / ``mapping_type_field_name`` are only used to
+    produce error messages that name the field of the calling config.
+    """
+    assert weight_dtype in [getattr(torch, f"int{b}") for b in range(1, 9)], (
+        f"weight_dtype must be torch.intx, where 1 <= x <= 8, but got {weight_dtype}"
+    )
+    assert isinstance(granularity, (PerAxis, PerGroup)), (
+        f"{granularity_field_name} must be PerAxis or PerGroup, but got {granularity}"
+    )
+    if isinstance(granularity, PerAxis):
+        assert granularity.axis == 0, (
+            f"axis must be 0, but got {granularity.axis}"
+        )
+    assert mapping_type in [
+        MappingType.ASYMMETRIC,
+        MappingType.SYMMETRIC,
+        MappingType.SYMMETRIC_NO_CLIPPING_ERR,
+    ], (
+        f"{mapping_type_field_name} must be MappingType.ASYMMETRIC, MappingType.SYMMETRIC, or MappingType.SYMMETRIC_NO_CLIPPING_ERR, but got {mapping_type}"
+    )
+
+
 @dataclass
 class Int8DynamicActivationIntxWeightConfig(AOBaseConfig):
     """
@@ -397,22 +429,12 @@ class Int8DynamicActivationIntxWeightConfig(AOBaseConfig):
         torch._C._log_api_usage_once(
             "torchao.quantization.Int8DynamicActivationIntxWeightConfig"
         )
-        assert self.weight_dtype in [getattr(torch, f"int{b}") for b in range(1, 9)], (
-            f"weight_dtype must be torch.intx, where 1 <= x <= 8, but got {self.weight_dtype}"
-        )
-        assert isinstance(self.weight_granularity, (PerAxis, PerGroup)), (
-            f"weight_granularity must be PerAxis or PerGroup, but got {self.weight_granularity}"
-        )
-        if isinstance(self.weight_granularity, PerAxis):
-            assert self.weight_granularity.axis == 0, (
-                f"axis must be 0, but got {self.weight_granularity.axis}"
-            )
-        assert self.weight_mapping_type in [
-            MappingType.ASYMMETRIC,
-            MappingType.SYMMETRIC,
-            MappingType.SYMMETRIC_NO_CLIPPING_ERR,
-        ], (
-            f"weight_mapping_type must be MappingType.ASYMMETRIC or MappingType.SYMMETRIC or MappingType.SYMMETRIC_NO_CLIPPING_ERR, but got {self.weight_mapping_type}"
+        _validate_intx_weight_config(
+            self.weight_dtype,
+            self.weight_granularity,
+            self.weight_mapping_type,
+            granularity_field_name="weight_granularity",
+            mapping_type_field_name="weight_mapping_type",
         )
         assert self.act_mapping_type in [
             MappingType.ASYMMETRIC,
@@ -1368,22 +1390,12 @@ class IntxWeightOnlyConfig(AOBaseConfig):
 
     def __post_init__(self):
         torch._C._log_api_usage_once("torchao.quantization.IntxWeightOnlyConfig")
-        assert self.weight_dtype in [getattr(torch, f"int{b}") for b in range(1, 9)], (
-            f"weight_dtype must be torch.intx, where 1 <= x <= 8, but got {self.weight_dtype}"
-        )
-        assert isinstance(self.granularity, (PerAxis, PerGroup)), (
-            f"granularity must be PerAxis or PerGroup, but got {self.granularity}"
-        )
-        if isinstance(self.granularity, PerAxis):
-            assert self.granularity.axis == 0, (
-                f"axis must be 0 with PerAxis, but got {self.granularity.axis}"
-            )
-        assert self.mapping_type in [
-            MappingType.ASYMMETRIC,
-            MappingType.SYMMETRIC,
-            MappingType.SYMMETRIC_NO_CLIPPING_ERR,
-        ], (
-            f"mapping_type must be MappingType.ASYMMETRIC, MappingType.SYMMETRIC, or MappingType.SYMMETRIC_NO_CLIPPING_ERR, but got {self.mapping_type}"
+        _validate_intx_weight_config(
+            self.weight_dtype,
+            self.granularity,
+            self.mapping_type,
+            granularity_field_name="granularity",
+            mapping_type_field_name="mapping_type",
         )
 
 

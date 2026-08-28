@@ -420,30 +420,41 @@ ScalingType get_scaling_type(
 
 } // namespace
 
+// Bundles the hipBLASLt data/compute types selected for a given element type.
+struct HipBlasLtGemmTypes {
+  hipDataType abcType;
+  hipblasComputeType_t computeType;
+  hipDataType scaleType;
+};
+
+// Resolve the hipBLASLt data/compute/scale types for the element type `Dtype`.
+// Kept separate from bgemm_hipblaslt so the matmul flow reads as a sequence of
+// steps rather than a long compile-time type dispatch.
 template <typename Dtype>
-inline void bgemm_hipblaslt(CUDABLAS_BGEMM_ARGTYPES(Dtype), bool mat1_is_swizzled, bool mat2_is_swizzled) {
-  hipDataType abcType = HIP_R_32F;
-  hipblasComputeType_t computeType = HIPBLAS_COMPUTE_32F;
-  hipDataType scaleType = HIP_R_32F;
+inline constexpr HipBlasLtGemmTypes hipblaslt_gemm_types_for() {
   if constexpr (std::is_same_v<Dtype, double>) {
-    abcType = HIP_R_64F;
-    computeType = HIPBLAS_COMPUTE_64F;
-    scaleType = HIP_R_64F;
+    return {HIP_R_64F, HIPBLAS_COMPUTE_64F, HIP_R_64F};
   } else if constexpr (std::is_same_v<Dtype, float>) {
+    return {HIP_R_32F, HIPBLAS_COMPUTE_32F, HIP_R_32F};
   } else if constexpr (std::is_same_v<Dtype, c10::complex<double>>) {
-    abcType = HIP_C_64F;
-    computeType = HIPBLAS_COMPUTE_64F;
-    scaleType = HIP_C_64F;
+    return {HIP_C_64F, HIPBLAS_COMPUTE_64F, HIP_C_64F};
   } else if constexpr (std::is_same_v<Dtype, c10::complex<float>>) {
-    abcType = HIP_C_32F;
-    scaleType = HIP_C_32F;
+    return {HIP_C_32F, HIPBLAS_COMPUTE_32F, HIP_C_32F};
   } else if constexpr (std::is_same_v<Dtype, at::Half>) {
-    abcType = HIP_R_16F;
+    return {HIP_R_16F, HIPBLAS_COMPUTE_32F, HIP_R_32F};
   } else if constexpr (std::is_same_v<Dtype, at::BFloat16>) {
-    abcType = HIP_R_16BF;
+    return {HIP_R_16BF, HIPBLAS_COMPUTE_32F, HIP_R_32F};
   } else {
     static_assert(false && sizeof(Dtype), "at::cuda::blas::bgemm_internal_cublaslt: not implemented");
   }
+}
+
+template <typename Dtype>
+inline void bgemm_hipblaslt(CUDABLAS_BGEMM_ARGTYPES(Dtype), bool mat1_is_swizzled, bool mat2_is_swizzled) {
+  constexpr HipBlasLtGemmTypes gemmTypes = hipblaslt_gemm_types_for<Dtype>();
+  const hipDataType abcType = gemmTypes.abcType;
+  const hipblasComputeType_t computeType = gemmTypes.computeType;
+  const hipDataType scaleType = gemmTypes.scaleType;
 
   hipblasLtHandle_t ltHandle = at::cuda::getCurrentCUDABlasLtHandle();
   hipblasOperation_t opa = _cublasOpFromChar(transa);
