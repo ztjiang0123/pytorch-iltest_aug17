@@ -114,16 +114,127 @@ def get_configs_compute_bound():
 
 MIXED_MM_HEURISTICS = {
     "EVEN_K": lambda args: args["K"] % (args["BLOCK_K"] * args["SPLIT_K"]) == 0,
-    "BLOCK_K": lambda args: min(args["BLOCK_K"], args["QGROUP_SIZE"])
-    if not args["TRANSPOSED"]
-    else args["BLOCK_K"],
-    "BLOCK_N": lambda args: min(args["BLOCK_N"], args["QGROUP_SIZE"])
-    if args["TRANSPOSED"]
-    else args["BLOCK_N"],
-    "SPLIT_K": lambda args: 1
-    if args["IS_BFLOAT16"]
-    else args["SPLIT_K"],  # atomic add not supported for bfloat16
+    "BLOCK_K": lambda args: (
+        min(args["BLOCK_K"], args["QGROUP_SIZE"])
+        if not args["TRANSPOSED"]
+        else args["BLOCK_K"]
+    ),
+    "BLOCK_N": lambda args: (
+        min(args["BLOCK_N"], args["QGROUP_SIZE"])
+        if args["TRANSPOSED"]
+        else args["BLOCK_N"]
+    ),
+    "SPLIT_K": lambda args: (
+        1 if args["IS_BFLOAT16"] else args["SPLIT_K"]
+    ),  # atomic add not supported for bfloat16
 }
+
+
+@triton.jit
+def _mixed_mm_swizzle(
+    M,
+    N,
+    K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    TRANSPOSED: tl.constexpr,
+    DEBUG: tl.constexpr,
+):
+    """Compute the threadblock swizzle and per-block row/col offsets.
+
+    Returns ``(pid_m, pid_n, pid_z, ram, rak, rbn, rbk)``: the swizzled program
+    ids and the A/B index vectors used to build the block pointers.
+    """
+    # Threadblock swizzling
+    pid = tl.program_id(0)
+    pid_z = tl.program_id(1)
+
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + (pid % group_size)
+    pid_n = (pid % width) // group_size
+
+    rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    if not DEBUG:
+        ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+    else:
+        ram = rm
+    rak = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
+
+    # BLOCK_K for b is effectively BLOCK_K // 2
+    if not TRANSPOSED:
+        rn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+        if not DEBUG:
+            rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+        else:
+            rbn = rn
+        rbk = pid_z * BLOCK_K // 2 + tl.arange(0, BLOCK_K // 2)
+    else:
+        rn = (pid_n * BLOCK_N // 2 + tl.arange(0, BLOCK_N // 2)) % N
+        if not DEBUG:
+            rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N // 2), BLOCK_N // 2)
+        else:
+            rbn = rn
+        rbk = rak
+
+    return pid_m, pid_n, pid_z, ram, rak, rbn, rbk
+
+
+@triton.jit
+def _unpack_and_dequant_b(
+    qb,
+    scales,
+    zeros,
+    out_dtype: tl.constexpr,
+    IS_BFLOAT16: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    TRANSPOSED: tl.constexpr,
+):
+    """Unpack packed 2x-int4 weights and dequantize them to ``out_dtype``.
+
+    ``qb`` holds two int4 values per byte; the low and high nibbles are unpacked,
+    upcast, reshaped to the block layout, then dequantized as ``(b - zeros) * scales``.
+    Returns the dequantized block ready for ``tl.dot``.
+    """
+    # Unpack qweights -- h/t jlebar!
+    _4_i8 = tl.full((1,), 4, dtype=tl.int8)
+    qb_lo = (qb << _4_i8) >> _4_i8
+    qb_hi = qb >> _4_i8
+
+    # Upcast to fp16
+    # TODO: better bfloat16 conversion? compilation error if direct conversion from int8 to bfloat16
+    if IS_BFLOAT16:
+        dq_b = tl.join(
+            qb_lo.to(tl.float16).to(out_dtype),
+            qb_hi.to(tl.float16).to(out_dtype),
+        ).permute(0, 2, 1)
+    else:
+        dq_b = tl.join(
+            qb_lo.to(out_dtype),
+            qb_hi.to(out_dtype),
+        ).permute(0, 2, 1)
+    if not TRANSPOSED:
+        dq_b = dq_b.reshape(BLOCK_K, BLOCK_N)
+    else:
+        dq_b = dq_b.reshape(BLOCK_N, BLOCK_K)
+
+    # Scale upcasted weights
+    # Note that we broadcast the scales --> the assumption is that all scales fall within a single QGROUP
+    # This condition is statically check (see assertions above)
+    zeros = zeros[None, :]
+    scales = scales[None, :]
+    dq_b = (dq_b - zeros) * scales
+
+    if TRANSPOSED:
+        dq_b = tl.trans(dq_b)
+    return dq_b
 
 
 @triton.jit
@@ -196,46 +307,9 @@ def _mixed_mm_kernel(
     else:
         tl.static_assert(QGROUP_SIZE % BLOCK_N == 0)
 
-    # TODO: refactor swizzling to separate function
-    # Threadblock swizzling
-    pid = tl.program_id(0)
-    pid_z = tl.program_id(1)
-
-    grid_m = tl.cdiv(M, BLOCK_M)
-    grid_n = tl.cdiv(N, BLOCK_N)
-
-    width = GROUP_M * grid_n
-    group_id = pid // width
-    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
-    pid_m = group_id * GROUP_M + (pid % group_size)
-    pid_n = (pid % width) // group_size
-
-    rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-    if not DEBUG:
-        ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
-    else:
-        ram = rm
-    # rn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
-    # rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
-    rak = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
-
-    # BLOCK_K for b is effectively BLOCK_K // 2
-    if not TRANSPOSED:
-        rn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
-        if not DEBUG:
-            rbn = tl.max_contiguous(
-                tl.multiple_of(rn % N, BLOCK_N), BLOCK_N
-            )  # rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
-        else:
-            rbn = rn
-        rbk = pid_z * BLOCK_K // 2 + tl.arange(0, BLOCK_K // 2)
-    else:
-        rn = (pid_n * BLOCK_N // 2 + tl.arange(0, BLOCK_N // 2)) % N
-        if not DEBUG:
-            rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N // 2), BLOCK_N // 2)
-        else:
-            rbn = rn
-        rbk = rak
+    pid_m, pid_n, pid_z, ram, rak, rbn, rbk = _mixed_mm_swizzle(
+        M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, TRANSPOSED, DEBUG
+    )
 
     A = A + (ram[:, None] * stride_am + rak[None, :] * stride_ak)
 
@@ -287,45 +361,16 @@ def _mixed_mm_kernel(
         scales = tl.load(scales_ptr + offsets_scale_n + scale_offset_k)
         zeros = tl.load(zeros_ptr + offsets_scale_n + scale_offset_k)
 
-        # Unpack qweights -- h/t jlebar!
-        _4_i8 = tl.full((1,), 4, dtype=tl.int8)
-        qb_lo = (qb << _4_i8) >> _4_i8
-        qb_hi = qb >> _4_i8
-
-        # Upcast to fp16
-        # TODO: better bfloat16 conversion? compilation error if direct conversion from int8 to bfloat16
-        if IS_BFLOAT16:
-            dq_b = (
-                tl.join(
-                    qb_lo.to(tl.float16).to(A.dtype.element_ty),
-                    qb_hi.to(tl.float16).to(A.dtype.element_ty),
-                ).permute(0, 2, 1)
-                # .reshape(BLOCK_K, BLOCK_N)
-            )
-        else:
-            dq_b = (
-                tl.join(
-                    qb_lo.to(A.dtype.element_ty),
-                    qb_hi.to(A.dtype.element_ty),
-                ).permute(0, 2, 1)
-                # .reshape(BLOCK_K, BLOCK_N)
-            )
-        if not TRANSPOSED:
-            dq_b = dq_b.reshape(BLOCK_K, BLOCK_N)
-        else:
-            dq_b = dq_b.reshape(BLOCK_N, BLOCK_K)
-
-        # Scale upcasted weights
-        # Note that we broadcast the scales --> the assumption is that all scales fall within a single QGROUP
-        # This condition is statically check (see assertions above)
-
-        zeros = zeros[None, :]
-        scales = scales[None, :]
-
-        dq_b = (dq_b - zeros) * scales
-
-        if TRANSPOSED:
-            dq_b = tl.trans(dq_b)
+        dq_b = _unpack_and_dequant_b(
+            qb,
+            scales,
+            zeros,
+            A.dtype.element_ty,
+            IS_BFLOAT16,
+            BLOCK_N,
+            BLOCK_K,
+            TRANSPOSED,
+        )
 
         if fp8_fast_accum:
             acc = tl.dot(

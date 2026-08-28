@@ -500,19 +500,21 @@ class SAM2VideoPredictor(SAM2Base):
                 device=inference_state["device"],
             ),
         }
-        empty_mask_ptr = None
+        # Lazily created dummy pointer shared by every object that is missing on
+        # this frame; computed at most once per call via ``_empty_mask_ptr``.
+        empty_mask_ptr_cache = {}
+
+        def _empty_mask_ptr():
+            if "value" not in empty_mask_ptr_cache:
+                empty_mask_ptr_cache["value"] = self._get_empty_mask_ptr(
+                    inference_state, frame_idx
+                )
+            return empty_mask_ptr_cache["value"]
+
         for obj_idx in range(batch_size):
-            obj_temp_output_dict = inference_state["temp_output_dict_per_obj"][obj_idx]
-            obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
-            out = obj_temp_output_dict[storage_key].get(frame_idx, None)
-            # If the object doesn't appear in "temp_output_dict_per_obj" on this frame,
-            # we fall back and look up its previous output in "output_dict_per_obj".
-            # We look up both "cond_frame_outputs" and "non_cond_frame_outputs" in
-            # "output_dict_per_obj" to find a previous output for this object.
-            if out is None:
-                out = obj_output_dict["cond_frame_outputs"].get(frame_idx, None)
-            if out is None:
-                out = obj_output_dict["non_cond_frame_outputs"].get(frame_idx, None)
+            out = self._lookup_obj_output(
+                inference_state, obj_idx, storage_key, frame_idx
+            )
             # If the object doesn't appear in "output_dict_per_obj" either, we skip it
             # and leave its mask scores to the default scores (i.e. the NO_OBJ_SCORE
             # placeholder above) and set its object pointer to be a dummy pointer.
@@ -521,31 +523,14 @@ class SAM2VideoPredictor(SAM2Base):
                 # tracking outcomes on this frame (only do it under `run_mem_encoder=True`,
                 # i.e. when we need to build the memory for tracking).
                 if run_mem_encoder:
-                    if empty_mask_ptr is None:
-                        empty_mask_ptr = self._get_empty_mask_ptr(
-                            inference_state, frame_idx
-                        )
                     # fill object pointer with a dummy pointer (based on an empty mask)
-                    consolidated_out["obj_ptr"][obj_idx : obj_idx + 1] = empty_mask_ptr
+                    consolidated_out["obj_ptr"][obj_idx : obj_idx + 1] = (
+                        _empty_mask_ptr()
+                    )
                 continue
-            # Add the temporary object output mask to consolidated output mask
-            obj_mask = out["pred_masks"]
-            consolidated_pred_masks = consolidated_out[consolidated_mask_key]
-            if obj_mask.shape[-2:] == consolidated_pred_masks.shape[-2:]:
-                consolidated_pred_masks[obj_idx : obj_idx + 1] = obj_mask
-            else:
-                # Resize first if temporary object mask has a different resolution
-                resized_obj_mask = torch.nn.functional.interpolate(
-                    obj_mask,
-                    size=consolidated_pred_masks.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                consolidated_pred_masks[obj_idx : obj_idx + 1] = resized_obj_mask
-            consolidated_out["obj_ptr"][obj_idx : obj_idx + 1] = out["obj_ptr"]
-            consolidated_out["object_score_logits"][obj_idx : obj_idx + 1] = out[
-                "object_score_logits"
-            ]
+            self._fill_consolidated_obj_output(
+                consolidated_out, consolidated_mask_key, obj_idx, out
+            )
 
         # Optionally, apply non-overlapping constraints on the consolidated scores
         # and rerun the memory encoder
@@ -571,6 +556,45 @@ class SAM2VideoPredictor(SAM2Base):
             consolidated_out["maskmem_pos_enc"] = maskmem_pos_enc
 
         return consolidated_out
+
+    def _lookup_obj_output(self, inference_state, obj_idx, storage_key, frame_idx):
+        """Find an object's output for ``frame_idx``, falling back across dicts.
+
+        First checks "temp_output_dict_per_obj" for this frame, then falls back to
+        "output_dict_per_obj" (both "cond_frame_outputs" and
+        "non_cond_frame_outputs"). Returns ``None`` if the object has no output.
+        """
+        obj_temp_output_dict = inference_state["temp_output_dict_per_obj"][obj_idx]
+        obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
+        out = obj_temp_output_dict[storage_key].get(frame_idx, None)
+        if out is None:
+            out = obj_output_dict["cond_frame_outputs"].get(frame_idx, None)
+        if out is None:
+            out = obj_output_dict["non_cond_frame_outputs"].get(frame_idx, None)
+        return out
+
+    def _fill_consolidated_obj_output(
+        self, consolidated_out, consolidated_mask_key, obj_idx, out
+    ):
+        """Copy a single object's temporary output into the consolidated output."""
+        # Add the temporary object output mask to consolidated output mask
+        obj_mask = out["pred_masks"]
+        consolidated_pred_masks = consolidated_out[consolidated_mask_key]
+        if obj_mask.shape[-2:] == consolidated_pred_masks.shape[-2:]:
+            consolidated_pred_masks[obj_idx : obj_idx + 1] = obj_mask
+        else:
+            # Resize first if temporary object mask has a different resolution
+            resized_obj_mask = torch.nn.functional.interpolate(
+                obj_mask,
+                size=consolidated_pred_masks.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            consolidated_pred_masks[obj_idx : obj_idx + 1] = resized_obj_mask
+        consolidated_out["obj_ptr"][obj_idx : obj_idx + 1] = out["obj_ptr"]
+        consolidated_out["object_score_logits"][obj_idx : obj_idx + 1] = out[
+            "object_score_logits"
+        ]
 
     def _get_empty_mask_ptr(self, inference_state, frame_idx):
         """Get a dummy object pointer based on an empty mask on the current frame."""

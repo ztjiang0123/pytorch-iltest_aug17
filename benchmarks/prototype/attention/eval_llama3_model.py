@@ -111,6 +111,22 @@ class RuntimeBenchConfig:
     num_iters: int
 
 
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    """User-facing options that describe a single benchmark run.
+
+    Everything except the model id is bundled here so callers configure the run
+    as one value instead of a long positional/keyword parameter list.
+    """
+
+    baseline_backend: str = "fa3"
+    test_backend: str = "fa3_fp8"
+    num_runtime_iters: int = 10
+    num_warmup: int = 3
+    seq_lengths: list[int] | None = None
+    compile: bool = False
+
+
 def cleanup_gpu():
     """Free GPU memory between benchmark phases."""
     gc.collect()
@@ -263,13 +279,17 @@ def benchmark_runtime(
 @torch.inference_mode()
 def run_benchmark(
     model_id: str,
-    baseline_backend: str = "fa3",
-    test_backend: str = "fa3_fp8",
-    num_runtime_iters: int = 10,
-    num_warmup: int = 3,
-    seq_lengths: list[int] | None = None,
-    compile: bool = False,
+    config: BenchmarkConfig | None = None,
 ):
+    if config is None:
+        config = BenchmarkConfig()
+
+    baseline_backend = config.baseline_backend
+    test_backend = config.test_backend
+    num_runtime_iters = config.num_runtime_iters
+    num_warmup = config.num_warmup
+    compile = config.compile
+    seq_lengths = config.seq_lengths
     if seq_lengths is None:
         seq_lengths = DEFAULT_SEQ_LENGTHS
 
@@ -507,12 +527,14 @@ def main():
 
     run_benchmark(
         model_id=args.model_id,
-        baseline_backend=args.baseline,
-        test_backend=args.test,
-        num_runtime_iters=args.num_runtime_iters,
-        num_warmup=args.num_warmup,
-        seq_lengths=args.seq_lengths,
-        compile=args.compile,
+        config=BenchmarkConfig(
+            baseline_backend=args.baseline,
+            test_backend=args.test,
+            num_runtime_iters=args.num_runtime_iters,
+            num_warmup=args.num_warmup,
+            seq_lengths=args.seq_lengths,
+            compile=args.compile,
+        ),
     )
 
 

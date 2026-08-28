@@ -105,6 +105,50 @@ TORCHAO_ALWAYS_INLINE static inline void compute_tile_1x4x32(
  * @param clamp_min_vec The minimum value for clamping.
  * @param clamp_max_vec The maximum value for clamping.
  */
+// Store a 4-wide vector into ``out`` starting at ``offset``, writing only the
+// ``remaining_cols`` valid lanes when the tile runs past the output width.
+TORCHAO_ALWAYS_INLINE static inline void store_partial_f32(
+    float* __restrict__ out,
+    int offset,
+    int remaining_cols,
+    const float32x4_t& res) {
+  if (remaining_cols >= 4) {
+    vst1q_f32(out + offset, res);
+    return;
+  }
+  float temp_res[4];
+  vst1q_f32(temp_res, res);
+  for (int i = 0; i < remaining_cols; ++i) {
+    *(out + offset + i) = temp_res[i];
+  }
+}
+
+// Apply the optional bias and clamp to a single accumulator vector and store it
+// into ``out_row`` at the column tile identified by ``nb``.
+TORCHAO_ALWAYS_INLINE static inline void post_process_and_store_vec(
+    float* __restrict__ out_row,
+    int nb,
+    int n_cols,
+    int n_tile_start,
+    float32x4_t res,
+    const float* __restrict__ bias_ptr,
+    bool has_clamp,
+    const float32x4_t& clamp_min_vec,
+    const float32x4_t& clamp_max_vec) {
+  if (bias_ptr != nullptr) {
+    float32x4_t bias_vec = vld1q_f32(bias_ptr + nb * 4);
+    res = vaddq_f32(res, bias_vec);
+  }
+  if (has_clamp) {
+    res = vmaxq_f32(res, clamp_min_vec);
+    res = vminq_f32(res, clamp_max_vec);
+  }
+
+  const int current_n_offset = n_tile_start + nb * 4;
+  const int remaining_cols = n_cols - current_n_offset;
+  store_partial_f32(out_row, current_n_offset, remaining_cols, res);
+}
+
 template <int mr_, int nr_>
 TORCHAO_ALWAYS_INLINE static inline void post_process_and_store(
     float* __restrict__ output,
@@ -120,27 +164,16 @@ TORCHAO_ALWAYS_INLINE static inline void post_process_and_store(
   for (int m = 0; m < mr_; ++m) {
     float* out_row = output + m * ldc;
     for (int nb = 0; nb < NR_VEC; ++nb) {
-      float32x4_t res = accum[m][nb];
-      if (bias_ptr != nullptr) {
-        float32x4_t bias_vec = vld1q_f32(bias_ptr + nb * 4);
-        res = vaddq_f32(res, bias_vec);
-      }
-      if (has_clamp) {
-        res = vmaxq_f32(res, clamp_min_vec);
-        res = vminq_f32(res, clamp_max_vec);
-      }
-
-      const int current_n_offset = n_tile_start + nb * 4;
-      const int remaining_cols = n_cols - current_n_offset;
-      if (remaining_cols < 4) {
-        float temp_res[4];
-        vst1q_f32(temp_res, res);
-        for (int i = 0; i < remaining_cols; ++i) {
-          *(out_row + current_n_offset + i) = temp_res[i];
-        }
-      } else {
-        vst1q_f32(out_row + current_n_offset, res);
-      }
+      post_process_and_store_vec(
+          out_row,
+          nb,
+          n_cols,
+          n_tile_start,
+          accum[m][nb],
+          bias_ptr,
+          has_clamp,
+          clamp_min_vec,
+          clamp_max_vec);
     }
   }
 }
