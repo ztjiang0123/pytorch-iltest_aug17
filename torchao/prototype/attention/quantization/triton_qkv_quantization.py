@@ -30,25 +30,20 @@ from torchao.prototype.attention.quantization.triton_hadamard_utils import (
         triton.Config({"BLOCK_SIZE": 2048}, num_warps=8),
         triton.Config({"BLOCK_SIZE": 4096}, num_warps=8),
     ],
-    key=["chunk_size", "D"],
+    key=["D"],
 )
 @triton.jit
 def single_phase1_kernel(
-    # Input tensor [B, H, S, D]
-    x_ptr,
-    # Output: partial max values [B * H * num_chunks]
-    partial_max_ptr,
-    # Input strides (for [B, H, S, D] layout)
-    stride_b,
-    stride_h,
-    stride_s,
-    stride_d,
-    # Dimensions
-    S,
-    D,
-    H,
-    chunk_size,
-    num_chunks,
+    # Buffer pointers, in order:
+    #   x_ptr           input tensor       [B, H, S, D]
+    #   partial_max_ptr partial max values [B * H * num_chunks]
+    ptrs,
+    # Input strides for [B, H, S, D]: (stride_b, stride_h, stride_s, stride_d)
+    strides,
+    # Dimensions: (S, H, chunk_size, num_chunks)
+    dims,
+    # Head dimension (kept separate so it can key the autotuner)
+    D: tl.constexpr,
     # Block size
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -58,7 +53,15 @@ def single_phase1_kernel(
     Grid: (B, H, num_chunks)
 
     Uses linearized iteration over chunk_size * D elements.
+
+    ``ptrs``, ``strides`` and ``dims`` bundle what would otherwise be long,
+    same-typed parameter runs, matching the convention used by the RoPE +
+    Hadamard phase1 kernels in this package.
     """
+    x_ptr, partial_max_ptr = ptrs
+    stride_b, stride_h, stride_s, stride_d = strides
+    S, H, chunk_size, num_chunks = dims
+
     pid_b = tl.program_id(axis=0)
     pid_h = tl.program_id(axis=1)
     pid_chunk = tl.program_id(axis=2)
@@ -225,17 +228,10 @@ def _quantize_one_tensor(x, spec):
     descale = torch.empty(B, H_kv, dtype=torch.float32, device=x.device)
 
     single_phase1_kernel[grid](
-        x,
-        partial_max,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        x.stride(3),
-        S,
-        D,
-        H,
-        chunk_size,
-        num_chunks,
+        (x, partial_max),
+        (x.stride(0), x.stride(1), x.stride(2), x.stride(3)),
+        (S, H, chunk_size, num_chunks),
+        D=D,
     )
     # A group reduce over the [B, H, num_chunks] buffer is a single reduce over
     # `groups * num_chunks` contiguous entries per (batch, kv_head), since the

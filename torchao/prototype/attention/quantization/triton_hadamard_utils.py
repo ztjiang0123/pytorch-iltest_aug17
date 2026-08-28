@@ -173,42 +173,40 @@ def _apply_hadamard(
 
 @triton.jit
 def _inverse_hadamard_kernel(
-    # Input tensor [B, H, S, D]
-    input_ptr,
-    # Output tensor [B, H, S, D]
-    output_ptr,
-    # Temp buffer for Hadamard [B, H, num_chunks, D]
-    temp_ptr,
-    # Input strides [B, H, S, D] (may be non-contiguous)
-    stride_in_b,
-    stride_in_h,
-    stride_in_s,
-    stride_in_d,
-    # Output strides [B, H, S, D] (contiguous)
-    stride_out_b,
-    stride_out_h,
-    stride_out_s,
-    stride_out_d,
-    # Temp buffer strides [B, H, num_chunks, D]
-    stride_temp_b,
-    stride_temp_h,
-    stride_temp_c,
-    stride_temp_d,
-    # Dimensions
-    S,
-    H,
-    chunk_size,
-    num_chunks,
-    # Compile-time constants
+    # Buffer pointers, in order:
+    #   input_ptr   input tensor            [B, H, S, D] (may be non-contiguous)
+    #   output_ptr  output tensor           [B, H, S, D] (contiguous)
+    #   temp_ptr    butterfly scratch       [B, H, num_chunks, D]
+    ptrs,
+    # Strides as (in_strides, out_strides, temp_strides), each a 4-tuple:
+    #   in_strides   for input  [B, H, S, D]: (stride_b, stride_h, stride_s, stride_d)
+    #   out_strides  for output [B, H, S, D]: (stride_b, stride_h, stride_s, stride_d)
+    #   temp_strides for temp   [B, H, num_chunks, D]: (stride_b, stride_h, stride_c, stride_d)
+    strides,
+    # Dimensions: (S, H, chunk_size, num_chunks)
+    dims,
+    # Head dimension (kept separate so it can key the launch)
     D: tl.constexpr,
-    LOG2_D: tl.constexpr,
-    USE_BFLOAT16: tl.constexpr,
+    # Remaining compile-time constants: (LOG2_D, USE_BFLOAT16)
+    META: tl.constexpr,
 ):
     """Apply inverse Hadamard transform along D dimension.
 
     Grid: (B, H, num_chunks)
     Block: D threads, each handles one d index across S positions in chunk.
+
+    ``ptrs``, ``strides`` and ``dims`` bundle what would otherwise be long,
+    same-typed parameter runs, matching the convention used by the phase1
+    kernels in this package.
     """
+    input_ptr, output_ptr, temp_ptr = ptrs
+    in_strides, out_strides, temp_strides = strides
+    stride_in_b, stride_in_h, stride_in_s, stride_in_d = in_strides
+    stride_out_b, stride_out_h, stride_out_s, stride_out_d = out_strides
+    stride_temp_b, stride_temp_h, stride_temp_c, stride_temp_d = temp_strides
+    S, H, chunk_size, num_chunks = dims
+    LOG2_D, USE_BFLOAT16 = META
+
     pid_b = tl.program_id(axis=0)
     pid_h = tl.program_id(axis=1)
     pid_chunk = tl.program_id(axis=2)
@@ -270,28 +268,20 @@ def inverse_hadamard_transform(
     use_bfloat16 = x.dtype == torch.bfloat16
 
     _inverse_hadamard_kernel[grid](
-        x,
-        output,
-        temp_buffer,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        x.stride(3),
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        output.stride(3),
-        temp_buffer.stride(0),
-        temp_buffer.stride(1),
-        temp_buffer.stride(2),
-        temp_buffer.stride(3),
-        S,
-        H,
-        chunk_size,
-        num_chunks,
+        (x, output, temp_buffer),
+        (
+            (x.stride(0), x.stride(1), x.stride(2), x.stride(3)),
+            (output.stride(0), output.stride(1), output.stride(2), output.stride(3)),
+            (
+                temp_buffer.stride(0),
+                temp_buffer.stride(1),
+                temp_buffer.stride(2),
+                temp_buffer.stride(3),
+            ),
+        ),
+        (S, H, chunk_size, num_chunks),
         D=D,
-        LOG2_D=LOG2_D,
-        USE_BFLOAT16=use_bfloat16,
+        META=(LOG2_D, use_bfloat16),
         num_warps=4,
     )
 
