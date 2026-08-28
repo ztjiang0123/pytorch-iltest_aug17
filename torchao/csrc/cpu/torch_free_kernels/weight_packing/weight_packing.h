@@ -166,6 +166,15 @@ inline void append_scalar(char*& cursor, T value) {
   cursor += sizeof(T);
 }
 
+// Loop-invariant description of the weight matrix being packed. Bundling these
+// fields keeps the per-group/per-column helpers to a small argument count.
+struct PackLayout {
+  int n;
+  int k;
+  int group_size;
+  const int8_t* weight_qvals;
+};
+
 // Pack one group (group_size values) of the next nr columns starting at
 // (n_idx, k_idx) into the packed buffer, accumulating per-column value sums.
 // Columns past the end of n are zero-filled. Advances the cursor past the
@@ -173,26 +182,24 @@ inline void append_scalar(char*& cursor, T value) {
 template <int weight_nbit, int nr, int kr, int sr>
 inline void pack_group_qvals(
     char*& cursor,
+    const PackLayout& layout,
     int n_idx,
-    int n,
-    int k,
     int k_idx,
-    int group_size,
-    const int8_t* weight_qvals,
     std::array<int32_t, nr>& qvals_sum) {
   constexpr int packed_buffer_bytes = weight_nbit * nr * kr / 8;
   std::array<int8_t, nr * kr> buffer;
   int8_t packed_values[nr * kr];
 
-  for (int idx_in_group = 0; idx_in_group < group_size; idx_in_group += kr) {
+  for (int idx_in_group = 0; idx_in_group < layout.group_size;
+       idx_in_group += kr) {
     // Fill buffer with the next kr values from the next nr columns.
     // If there are fewer than nr columns, 0s are stored.
     buffer.fill(0);
     for (int j = 0; j < nr; j++) {
-      if (n_idx + j < n) {
+      if (n_idx + j < layout.n) {
         std::memcpy(
             buffer.data() + kr * j,
-            weight_qvals + (n_idx + j) * k + (k_idx + idx_in_group),
+            layout.weight_qvals + (n_idx + j) * layout.k + (k_idx + idx_in_group),
             kr);
         qvals_sum[j] += impl::compute_sum(buffer.data() + kr * j, kr);
       }
@@ -264,6 +271,8 @@ inline void pack_weights(
   // Cursor into the packed weights, advanced by each store below.
   char* cursor = reinterpret_cast<char*>(packed_weights);
 
+  const detail::PackLayout layout{n, k, group_size, weight_qvals};
+
   // Loop over n by nr.
   for (int n_idx = 0; n_idx < n; n_idx += nr) {
     // Loop over groups along k.
@@ -272,14 +281,7 @@ inline void pack_weights(
 
       // Pack the group's qvals for the next nr columns and accumulate sums.
       detail::pack_group_qvals<weight_nbit, nr, kr, sr>(
-          cursor,
-          n_idx,
-          n,
-          k,
-          group_idx * group_size,
-          group_size,
-          weight_qvals,
-          qvals_sum);
+          cursor, layout, n_idx, group_idx * group_size, qvals_sum);
 
       // Store the group's per-column attributes (scale, qval sums, zeros).
       // Columns past the end of n are zero-filled.
