@@ -31,6 +31,7 @@ from torchao.prototype.attention.quantization import (
     _fp8_rope_sdpa_quantize,
     _fp8_sdpa_quantize,
     _inverse_hadamard_transform,
+    _RopeQkvInputs,
 )
 
 
@@ -136,11 +137,7 @@ def _fp8_rope_sdpa(
     if use_hadamard:
         q_fp8, k_fp8, v_fp8, descale_q, descale_k, descale_v = (
             _fp8_hadamard_rope_sdpa_quantize(
-                query,
-                key,
-                value,
-                cos,
-                sin,
+                _RopeQkvInputs(query, key, value, cos, sin),
                 rope_interleaved=rope_interleaved,
                 v_only=(hadamard == "V_ONLY"),
             )

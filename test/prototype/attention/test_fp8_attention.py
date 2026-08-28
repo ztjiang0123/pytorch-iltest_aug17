@@ -41,6 +41,7 @@ if torch_version_at_least("2.11.0"):
             _fp8_rope_sdpa_quantize,
             _fp8_sdpa_quantize,
             _inverse_hadamard_transform,
+            _RopeQkvInputs,
         )
 
 
@@ -420,7 +421,7 @@ class TestHadamardAccuracy(TestCase):
 
         # Quantize V with Hadamard (RoPE path, v_only=True)
         _, _, v_fp8_had, _, _, v_descale_had = _fp8_hadamard_rope_sdpa_quantize(
-            q, k, v, cos, sin, v_only=True
+            _RopeQkvInputs(q, k, v, cos, sin), v_only=True
         )
         v_recon_had = _inverse_hadamard_transform(
             (v_fp8_had.float() * v_descale_had[:, :, None, None]).to(dtype)

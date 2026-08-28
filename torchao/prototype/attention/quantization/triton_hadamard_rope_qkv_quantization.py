@@ -22,6 +22,7 @@ import triton.language as tl
 
 from torchao.prototype.attention.quantization.triton_hadamard_utils import (
     QuantizeSpec,
+    RopeQkvInputs,
     _apply_hadamard,
     _compute_num_chunks,
     _get_log2_d,
@@ -45,43 +46,23 @@ from torchao.prototype.attention.quantization.triton_rope_qkv_quantization impor
 )
 @triton.jit
 def hadamard_rope_single_phase1_kernel(
-    # Input tensor [B, S, H, D]
-    x_ptr,
-    # RoPE frequency tensors [S, D]
-    cos_ptr,
-    sin_ptr,
-    # Intermediate output tensor [B, H, S, D]
-    x_out_ptr,
-    # Temp buffer for Hadamard [B, H, num_chunks, D]
-    temp_ptr,
-    # Output: partial max values [B * H * num_chunks]
-    partial_max_ptr,
-    # Input strides (for [B, S, H, D] layout)
-    stride_in_b,
-    stride_in_s,
-    stride_in_h,
-    stride_in_d,
-    # Output strides (for [B, H, S, D] layout)
-    stride_out_b,
-    stride_out_h,
-    stride_out_s,
-    stride_out_d,
-    # Temp buffer strides [B, H, num_chunks, D]
-    stride_temp_b,
-    stride_temp_h,
-    stride_temp_c,
-    stride_temp_d,
-    # Dimensions
-    S,
-    H,
-    D_HALF,
-    chunk_size,
-    num_chunks,
-    # Compile-time constants
+    # Buffer pointers, in order:
+    #   x_ptr           input tensor            [B, S, H, D]
+    #   cos_ptr, sin_ptr RoPE frequency tensors [S, D]
+    #   x_out_ptr       RoPE+Hadamard'd interm. [B, H, S, D]
+    #   temp_ptr        butterfly scratch       [B, H, num_chunks, D] (contiguous)
+    #   partial_max_ptr partial max values      [B * H * num_chunks]
+    ptrs,
+    # Strides as (in_strides, out_strides), each a 4-tuple:
+    #   in_strides  for input  [B, S, H, D]: (stride_b, stride_s, stride_h, stride_d)
+    #   out_strides for output [B, H, S, D]: (stride_b, stride_h, stride_s, stride_d)
+    strides,
+    # Dimensions: (S, H, D_HALF, chunk_size, num_chunks)
+    dims,
+    # Head dimension (kept separate so it can key the autotuner)
     D: tl.constexpr,
-    LOG2_D: tl.constexpr,
-    USE_BFLOAT16: tl.constexpr,
-    ROPE_INTERLEAVED: tl.constexpr,
+    # Remaining compile-time constants: (LOG2_D, USE_BFLOAT16, ROPE_INTERLEAVED)
+    META: tl.constexpr,
 ):
     """
     Phase 1 for Q or K: Apply RoPE + Hadamard, store to intermediate,
@@ -91,15 +72,27 @@ def hadamard_rope_single_phase1_kernel(
     Block: D threads, each handles one d index across all S positions in chunk.
 
     Supports NeoX half-split (pair j, j+D/2) and interleaved (pair 2i, 2i+1).
+
+    ``ptrs``, ``strides`` and ``dims`` bundle what would otherwise be long,
+    same-typed parameter runs; the temp buffer is contiguous so its per-block
+    region is derived from the dimensions instead of passed-in strides.
     """
+    x_ptr, cos_ptr, sin_ptr, x_out_ptr, temp_ptr, partial_max_ptr = ptrs
+    in_strides, out_strides = strides
+    stride_in_b, stride_in_s, stride_in_h, stride_in_d = in_strides
+    stride_out_b, stride_out_h, stride_out_s, stride_out_d = out_strides
+    S, H, D_HALF, chunk_size, num_chunks = dims
+    LOG2_D, USE_BFLOAT16, ROPE_INTERLEAVED = META
+
     pid_b = tl.program_id(axis=0)
     pid_h = tl.program_id(axis=1)
     pid_chunk = tl.program_id(axis=2)
 
     d_idx = tl.arange(0, D)
-    temp_base = (
-        pid_b * stride_temp_b + pid_h * stride_temp_h + pid_chunk * stride_temp_c
-    )
+    # temp is contiguous [B, H, num_chunks, D], so each block owns the D-wide
+    # slice starting at (linear block index) * D.
+    block_idx = pid_b * (H * num_chunks) + pid_h * num_chunks + pid_chunk
+    temp_base = block_idx * D
     s_start = pid_chunk * chunk_size
 
     in_base_b = pid_b * stride_in_b
@@ -146,7 +139,7 @@ def hadamard_rope_single_phase1_kernel(
         x_rope = tl.math.fma(x_val, cos_val, sign * x_partner * sin_val)
 
         # Apply Hadamard transform with 1/sqrt(D) normalization
-        x_rope = _apply_hadamard(x_rope, temp_ptr, temp_base, d_idx, D, LOG2_D)
+        x_rope = _apply_hadamard(x_rope, (temp_ptr, temp_base, d_idx), D, LOG2_D)
 
         # Store to intermediate buffer [B, H, S, D]
         out_offset = out_base + s_idx * stride_out_s + d_idx * stride_out_d
@@ -158,8 +151,7 @@ def hadamard_rope_single_phase1_kernel(
         x_max = tl.maximum(x_max, tl.abs(x_rope))
 
     x_max_scalar = tl.max(x_max)
-    chunk_idx = pid_b * (H * num_chunks) + pid_h * num_chunks + pid_chunk
-    tl.store(partial_max_ptr + chunk_idx, x_max_scalar)
+    tl.store(partial_max_ptr + block_idx, x_max_scalar)
 
 
 @triton.autotune(
@@ -172,38 +164,22 @@ def hadamard_rope_single_phase1_kernel(
 )
 @triton.jit
 def hadamard_v_phase1_kernel(
-    # Input tensor [B, S, H, D]
-    v_ptr,
-    # Intermediate output tensor [B, H, S, D] - Hadamard'd and transposed
-    v_out_ptr,
-    # Temp buffer for Hadamard [B, H, num_chunks, D]
-    temp_ptr,
-    # Output: partial max values [B * H * num_chunks]
-    partial_max_ptr,
-    # Input strides (for [B, S, H, D] layout)
-    stride_in_b,
-    stride_in_s,
-    stride_in_h,
-    stride_in_d,
-    # Output strides (for [B, H, S, D] layout)
-    stride_out_b,
-    stride_out_h,
-    stride_out_s,
-    stride_out_d,
-    # Temp buffer strides [B, H, num_chunks, D]
-    stride_temp_b,
-    stride_temp_h,
-    stride_temp_c,
-    stride_temp_d,
-    # Dimensions
-    S,
-    H,
-    chunk_size,
-    num_chunks,
-    # Compile-time constants
+    # Buffer pointers, in order:
+    #   v_ptr           input tensor            [B, S, H, D]
+    #   v_out_ptr       Hadamard'd + transposed [B, H, S, D]
+    #   temp_ptr        butterfly scratch       [B, H, num_chunks, D] (contiguous)
+    #   partial_max_ptr partial max values      [B * H * num_chunks]
+    ptrs,
+    # Strides as (in_strides, out_strides), each a 4-tuple:
+    #   in_strides  for input  [B, S, H, D]: (stride_b, stride_s, stride_h, stride_d)
+    #   out_strides for output [B, H, S, D]: (stride_b, stride_h, stride_s, stride_d)
+    strides,
+    # Dimensions: (S, H, chunk_size, num_chunks)
+    dims,
+    # Head dimension (kept separate so it can key the autotuner)
     D: tl.constexpr,
-    LOG2_D: tl.constexpr,
-    USE_BFLOAT16: tl.constexpr,
+    # Remaining compile-time constants: (LOG2_D, USE_BFLOAT16)
+    META: tl.constexpr,
 ):
     """
     Phase 1 for V: Apply Hadamard (no RoPE), transpose [B,S,H,D] -> [B,H,S,D],
@@ -211,15 +187,27 @@ def hadamard_v_phase1_kernel(
 
     Grid: (B, H, num_chunks)
     Block: D threads, each handles one d index across all S positions in chunk.
+
+    ``ptrs``, ``strides`` and ``dims`` bundle what would otherwise be long,
+    same-typed parameter runs; the temp buffer is contiguous so its per-block
+    region is derived from the dimensions instead of passed-in strides.
     """
+    v_ptr, v_out_ptr, temp_ptr, partial_max_ptr = ptrs
+    in_strides, out_strides = strides
+    stride_in_b, stride_in_s, stride_in_h, stride_in_d = in_strides
+    stride_out_b, stride_out_h, stride_out_s, stride_out_d = out_strides
+    S, H, chunk_size, num_chunks = dims
+    LOG2_D, USE_BFLOAT16 = META
+
     pid_b = tl.program_id(axis=0)
     pid_h = tl.program_id(axis=1)
     pid_chunk = tl.program_id(axis=2)
 
     d_idx = tl.arange(0, D)
-    temp_base = (
-        pid_b * stride_temp_b + pid_h * stride_temp_h + pid_chunk * stride_temp_c
-    )
+    # temp is contiguous [B, H, num_chunks, D], so each block owns the D-wide
+    # slice starting at (linear block index) * D.
+    block_idx = pid_b * (H * num_chunks) + pid_h * num_chunks + pid_chunk
+    temp_base = block_idx * D
     s_start = pid_chunk * chunk_size
 
     in_base_b = pid_b * stride_in_b
@@ -237,7 +225,7 @@ def hadamard_v_phase1_kernel(
         v_val = tl.load(v_ptr + in_offset, mask=s_mask, other=0.0).to(tl.float32)
 
         # Apply Hadamard transform with 1/sqrt(D) normalization
-        v_val = _apply_hadamard(v_val, temp_ptr, temp_base, d_idx, D, LOG2_D)
+        v_val = _apply_hadamard(v_val, (temp_ptr, temp_base, d_idx), D, LOG2_D)
 
         # Store to intermediate buffer [B, H, S, D] (transposed)
         out_offset = out_base + s_idx * stride_out_s + d_idx * stride_out_d
@@ -249,8 +237,7 @@ def hadamard_v_phase1_kernel(
         v_max = tl.maximum(v_max, tl.abs(v_val))
 
     v_max_scalar = tl.max(v_max)
-    chunk_idx = pid_b * (H * num_chunks) + pid_h * num_chunks + pid_chunk
-    tl.store(partial_max_ptr + chunk_idx, v_max_scalar)
+    tl.store(partial_max_ptr + block_idx, v_max_scalar)
 
 
 def _rope_hadamard_quantize_one(x, cos, sin, spec):
@@ -274,33 +261,19 @@ def _rope_hadamard_quantize_one(x, cos, sin, spec):
     if apply_hadamard:
         temp = torch.empty(B, H, num_chunks, D, dtype=torch.float32, device=x.device)
         hadamard_rope_single_phase1_kernel[grid](
-            x,
-            cos,
-            sin,
-            intermediate,
-            temp,
-            partial_max,
-            x.stride(0),
-            x.stride(1),
-            x.stride(2),
-            x.stride(3),
-            intermediate.stride(0),
-            intermediate.stride(1),
-            intermediate.stride(2),
-            intermediate.stride(3),
-            temp.stride(0),
-            temp.stride(1),
-            temp.stride(2),
-            temp.stride(3),
-            S,
-            H,
-            D_HALF,
-            chunk_size,
-            num_chunks,
+            (x, cos, sin, intermediate, temp, partial_max),
+            (
+                (x.stride(0), x.stride(1), x.stride(2), x.stride(3)),
+                (
+                    intermediate.stride(0),
+                    intermediate.stride(1),
+                    intermediate.stride(2),
+                    intermediate.stride(3),
+                ),
+            ),
+            (S, H, D_HALF, chunk_size, num_chunks),
             D=D,
-            LOG2_D=LOG2_D,
-            USE_BFLOAT16=use_bfloat16,
-            ROPE_INTERLEAVED=rope_interleaved,
+            META=(LOG2_D, use_bfloat16, rope_interleaved),
         )
     else:
         rope_single_phase1_kernel[grid](
@@ -366,29 +339,19 @@ def _hadamard_v_quantize(v, spec):
     descale = torch.empty(B, H_kv, dtype=torch.float32, device=v.device)
 
     hadamard_v_phase1_kernel[grid](
-        v,
-        intermediate,
-        temp,
-        partial_max,
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        intermediate.stride(0),
-        intermediate.stride(1),
-        intermediate.stride(2),
-        intermediate.stride(3),
-        temp.stride(0),
-        temp.stride(1),
-        temp.stride(2),
-        temp.stride(3),
-        S,
-        H_kv,
-        chunk_size,
-        num_chunks,
+        (v, intermediate, temp, partial_max),
+        (
+            (v.stride(0), v.stride(1), v.stride(2), v.stride(3)),
+            (
+                intermediate.stride(0),
+                intermediate.stride(1),
+                intermediate.stride(2),
+                intermediate.stride(3),
+            ),
+        ),
+        (S, H_kv, chunk_size, num_chunks),
         D=D,
-        LOG2_D=LOG2_D,
-        USE_BFLOAT16=use_bfloat16,
+        META=(LOG2_D, use_bfloat16),
     )
     single_reduce_kernel[(B, H_kv)](partial_max, scale, descale, H_kv, num_chunks)
     single_phase2_kernel[grid](
@@ -410,11 +373,7 @@ def _hadamard_v_quantize(v, spec):
 
 
 def triton_fp8_hadamard_rope_sdpa_quantize(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+    inputs: RopeQkvInputs,
     num_chunks: Optional[int] = None,
     rope_interleaved: bool = False,
     v_only: bool = False,
@@ -442,11 +401,13 @@ def triton_fp8_hadamard_rope_sdpa_quantize(
         output = inverse_hadamard_transform(attention_output)
 
     Args:
-        q: Query tensor of shape [B, S, H_q, D] in bf16/fp16
-        k: Key tensor of shape [B, S, H_kv, D] in bf16/fp16
-        v: Value tensor of shape [B, S, H_kv, D] in bf16/fp16
-        cos: Cosine frequencies for RoPE, shape [S, D]
-        sin: Sine frequencies for RoPE, shape [S, D]
+        inputs: A :class:`RopeQkvInputs` bundling the Q/K/V tensors and their
+            shared RoPE cos/sin frequency tables:
+              - ``q``: Query tensor of shape [B, S, H_q, D] in bf16/fp16
+              - ``k``: Key tensor of shape [B, S, H_kv, D] in bf16/fp16
+              - ``v``: Value tensor of shape [B, S, H_kv, D] in bf16/fp16
+              - ``cos``: Cosine frequencies for RoPE, shape [S, D]
+              - ``sin``: Sine frequencies for RoPE, shape [S, D]
         num_chunks: Number of chunks to split S dimension into.
                     If None, automatically selects based on GPU SM count.
         rope_interleaved: If True, use FLUX/GPT-J interleaved RoPE pairing
@@ -465,6 +426,9 @@ def triton_fp8_hadamard_rope_sdpa_quantize(
         D must be a power of 2 and <= 256 for the Hadamard transform.
         Q, K, V must have the same sequence length (RoPE requires matching positions).
     """
+    q, k, v = inputs.q, inputs.k, inputs.v
+    cos, sin = inputs.cos, inputs.sin
+
     assert q.dim() == 4, f"Expected 4D tensor [B, S, H, D], got {q.dim()}D"
     assert k.dim() == 4, f"Expected 4D tensor [B, S, H, D], got {k.dim()}D"
     assert v.dim() == 4, f"Expected 4D tensor [B, S, H, D], got {v.dim()}D"

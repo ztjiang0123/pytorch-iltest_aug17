@@ -11,6 +11,9 @@ from torchao.prototype.attention.quantization.triton_hadamard_rope_qkv_quantizat
     triton_fp8_hadamard_rope_sdpa_quantize as _fp8_hadamard_rope_sdpa_quantize,
 )
 from torchao.prototype.attention.quantization.triton_hadamard_utils import (
+    RopeQkvInputs as _RopeQkvInputs,
+)
+from torchao.prototype.attention.quantization.triton_hadamard_utils import (
     inverse_hadamard_transform as _inverse_hadamard_transform,
 )
 from torchao.prototype.attention.quantization.triton_qkv_quantization import (
@@ -26,4 +29,5 @@ __all__ = [
     "_fp8_hadamard_sdpa_quantize",
     "_fp8_hadamard_rope_sdpa_quantize",
     "_inverse_hadamard_transform",
+    "_RopeQkvInputs",
 ]

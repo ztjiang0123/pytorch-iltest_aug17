@@ -101,7 +101,7 @@ def hadamard_single_phase1_kernel(
         x = tl.load(x_ptr + offset, mask=s_mask, other=0.0).to(tl.float32)
 
         # Apply Hadamard transform with 1/sqrt(D) normalization
-        x = _apply_hadamard(x, temp_ptr, temp_base, d_idx, D, LOG2_D)
+        x = _apply_hadamard(x, (temp_ptr, temp_base, d_idx), D, LOG2_D)
 
         # Store to intermediate buffer in input dtype
         if USE_BFLOAT16:

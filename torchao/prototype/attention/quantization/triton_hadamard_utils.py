@@ -25,6 +25,23 @@ import triton.language as tl
 
 
 @dataclass
+class RopeQkvInputs:
+    """The Q/K/V tensors plus their shared RoPE cos/sin frequency tables.
+
+    These five tensors always travel together into the fused RoPE + Hadamard +
+    FP8 quantize entry point, so bundling them into one value type keeps that
+    entry point's signature short and prevents positional call-site mistakes
+    (e.g. swapping ``cos``/``sin`` or ``k``/``v``, which share dtype and shape).
+    """
+
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    cos: torch.Tensor
+    sin: torch.Tensor
+
+
+@dataclass
 class QuantizeSpec:
     """Per-tensor launch parameters for the FP8 quantize kernel pipeline.
 
@@ -91,9 +108,7 @@ def _compute_num_chunks(device: torch.device, B: int, H: int, S: int) -> int:
 @triton.jit
 def _hadamard_butterfly_stage(
     x,
-    temp_ptr,
-    temp_base,
-    d_idx,
+    scratch,
     stage: tl.constexpr,
     D: tl.constexpr,
 ):
@@ -105,12 +120,14 @@ def _hadamard_butterfly_stage(
 
     Args:
         x: Current D-element vector (vectorized across threads)
-        temp_ptr: Pointer to temp buffer base
-        temp_base: Offset to this block's region in temp buffer
-        d_idx: Vectorized index tensor (tl.arange(0, D))
+        scratch: Butterfly shuffle context ``(temp_ptr, temp_base, d_idx)`` where
+            ``temp_ptr`` points to the temp buffer base, ``temp_base`` is the
+            offset to this block's region and ``d_idx`` is the vectorized index
+            tensor (``tl.arange(0, D)``). These three always travel together.
         stage: Butterfly stage (0 to log2(D)-1), must be constexpr
         D: Head dimension (compile-time constant)
     """
+    temp_ptr, temp_base, d_idx = scratch
     stride = 1 << stage
     partner_d = d_idx ^ stride
     is_left = (d_idx & stride) == 0
@@ -126,9 +143,7 @@ def _hadamard_butterfly_stage(
 @triton.jit
 def _apply_hadamard(
     x,
-    temp_ptr,
-    temp_base,
-    d_idx,
+    scratch,
     D: tl.constexpr,
     LOG2_D: tl.constexpr,
 ):
@@ -136,9 +151,16 @@ def _apply_hadamard(
 
     Uses tl.static_range so each stage index is a compile-time constant.
     Supports D up to 256 (LOG2_D up to 8).
+
+    Args:
+        x: Current D-element vector (vectorized across threads)
+        scratch: Butterfly shuffle context ``(temp_ptr, temp_base, d_idx)`` passed
+            through to each :func:`_hadamard_butterfly_stage` call.
+        D: Head dimension (compile-time constant)
+        LOG2_D: log2(D) (compile-time constant)
     """
     for stage in tl.static_range(LOG2_D):
-        x = _hadamard_butterfly_stage(x, temp_ptr, temp_base, d_idx, stage, D)
+        x = _hadamard_butterfly_stage(x, scratch, stage, D)
     inv_sqrt_d = 1.0 / tl.sqrt(float(D))
     return x * inv_sqrt_d
 
@@ -208,7 +230,7 @@ def _inverse_hadamard_kernel(
         out_offset = out_base + s_idx * stride_out_s + d_idx * stride_out_d
 
         x = tl.load(input_ptr + in_offset, mask=s_mask, other=0.0).to(tl.float32)
-        x = _apply_hadamard(x, temp_ptr, temp_base, d_idx, D, LOG2_D)
+        x = _apply_hadamard(x, (temp_ptr, temp_base, d_idx), D, LOG2_D)
 
         if USE_BFLOAT16:
             tl.store(output_ptr + out_offset, x.to(tl.bfloat16), mask=s_mask)
