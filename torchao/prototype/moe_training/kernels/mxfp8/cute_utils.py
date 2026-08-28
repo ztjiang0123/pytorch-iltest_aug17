@@ -121,6 +121,41 @@ def issue_tma_load_g2s(tma_atom_in, tiles, tma_mbar_ptr, warp_idx, spec):
         )
 
 
+def issue_tma_store_s2g(tma_atom_out, gOUT_tile, sOUT_tile, warp_idx, group_modes_end):
+    """Issue a bulk-tensor TMA store from shared to global memory (producer warp).
+
+    Shared by the 1x32 / 32x1 (2D) and 3D MXFP8 kernels: synchronizes threads,
+    then only warp 0 partitions the tiles and issues the store. Plain
+    (non-``@cute.jit``) helper: its cute ops inline into the caller's trace, so
+    the only per-kernel difference is ``group_modes_end`` (1 for 2D tiles, 2 for
+    3D tiles).
+
+    Args:
+        tma_atom_out: TMA copy atom for the shared-to-global store.
+        gOUT_tile: Output tile in global memory.
+        sOUT_tile: Output tile in shared memory.
+        warp_idx: Warp index (only warp 0 issues the store).
+        group_modes_end: End mode for ``cute.group_modes`` (1 for 2D, 2 for 3D).
+    """
+    import cutlass.cute as cute
+    from cutlass.cute.nvgpu import cpasync
+
+    cute.arch.fence_proxy("async.shared", space="cta")
+    cute.arch.sync_threads()
+    if warp_idx == 0:
+        cta_layout = cute.make_layout((1,))
+        sOUT_for_tma_partition = cute.group_modes(sOUT_tile, 0, group_modes_end)
+        gOUT_for_tma_partition = cute.group_modes(gOUT_tile, 0, group_modes_end)
+        tOUTs, tOUTg = cpasync.tma_partition(
+            tma_atom_out,
+            0,
+            cta_layout,
+            sOUT_for_tma_partition,
+            gOUT_for_tma_partition,
+        )
+        cute.copy(tma_atom_out, tOUTs[(None, 0)], tOUTg[(None, 0)])
+
+
 if _cutedsl_runtime_available():
     import cutlass
     import cutlass.cute as cute

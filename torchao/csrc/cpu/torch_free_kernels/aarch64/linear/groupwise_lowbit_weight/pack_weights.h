@@ -109,6 +109,151 @@ row-major).
  * @param has_bias If true, the packed buffer will contain bias terms.
  * @param bias Pointer to the bias vector (float32, row-major).
  */
+namespace detail {
+
+// The column range of the current n-strip: `n_idx` is the strip's first
+// column and `n` is the total column count, used to zero-pad columns that
+// fall past the end of the weight matrix.
+struct StripColumns {
+  int n_idx;
+  int n;
+};
+
+// Writes the 16-element float LUT for one n-strip and advances `out_ptr`.
+template <int nr_>
+TORCHAO_ALWAYS_INLINE inline void write_strip_lut(
+    uint8_t*& out_ptr,
+    std::vector<float>& lut_buffer,
+    const float* weight_luts,
+    int current_lut_idx,
+    int lut_size) {
+  std::memset(lut_buffer.data(), 0, 16 * sizeof(float));
+  std::memcpy(out_ptr, lut_buffer.data(), 16 * sizeof(float));
+
+  std::memcpy(
+      lut_buffer.data(),
+      weight_luts + current_lut_idx * lut_size,
+      lut_size * sizeof(float));
+  std::memcpy(out_ptr, lut_buffer.data(), 16 * sizeof(float));
+  out_ptr += 16 * sizeof(float);
+}
+
+// Writes `nr_` interleaved scales (one per column in the strip) for a k-block.
+template <int nr_>
+TORCHAO_ALWAYS_INLINE inline void write_block_scales(
+    uint8_t*& out_ptr,
+    const float* weight_scales,
+    int scale_idx,
+    int scales_per_col,
+    StripColumns cols) {
+  for (int j = 0; j < nr_; j++) {
+    float scale = (cols.n_idx + j < cols.n)
+        ? weight_scales[scale_idx + j * scales_per_col]
+        : 0.0f;
+    std::memcpy(out_ptr, &scale, sizeof(float));
+    out_ptr += sizeof(float);
+  }
+}
+
+// Gathers the (nr_ x kr_) tile for a k-block into `padded_tile`, zero-padding
+// any columns that fall outside the matrix.
+template <int nr_, int kr_>
+TORCHAO_ALWAYS_INLINE inline void gather_weight_tile(
+    std::vector<uint8_t>& padded_tile,
+    const uint8_t* weight_qval_indices,
+    int w_idx,
+    int k,
+    StripColumns cols) {
+  std::memset(padded_tile.data(), 0, 128);
+  for (int j = 0; j < nr_; j++) {
+    if (cols.n_idx + j < cols.n) {
+      std::memcpy(
+          padded_tile.data() + j * kr_,
+          weight_qval_indices + w_idx + j * k,
+          kr_);
+    }
+  }
+}
+
+// Writes `nr_` bias values (zero-padded past column `n`) and advances `out_ptr`.
+template <int nr_>
+TORCHAO_ALWAYS_INLINE inline void write_strip_bias(
+    uint8_t*& out_ptr,
+    const float* bias,
+    StripColumns cols) {
+  for (int i = 0; i < nr_; i++) {
+    float current_bias = (cols.n_idx + i < cols.n) ? bias[cols.n_idx + i] : 0.0f;
+    std::memcpy(out_ptr, &current_bias, sizeof(float));
+    out_ptr += sizeof(float);
+  }
+}
+
+// Read-only inputs and scratch buffers shared by every k-block of a strip.
+// Grouped so the per-block/per-strip helpers keep a short parameter list.
+struct PackStripInputs {
+  const uint8_t* weight_qval_indices;
+  const float* weight_scales;
+  std::vector<uint8_t>& padded_tile;
+  std::vector<uint8_t>& tmp_buffer;
+  int k;
+  int scale_group_size;
+  int scales_per_col;
+  bool has_scales;
+};
+
+// Packs one (nr_ x kr_) k-block: optional interleaved scales, then the
+// bit-packed VNNI tile. Advances `out_ptr` past everything it writes.
+template <int weight_nbit_, int nr_, int kr_, int sr_>
+TORCHAO_ALWAYS_INLINE inline void pack_k_block(
+    uint8_t*& out_ptr,
+    const PackStripInputs& in,
+    StripColumns cols,
+    int k_idx) {
+  constexpr int bytes_per_128_packed_values =
+      ((nr_ * kr_ * weight_nbit_) + 7) / 8;
+  int w_idx = cols.n_idx * in.k + k_idx;
+  // Write scales if k_idx is a multiple of scale_group_size.
+  if (in.has_scales && (k_idx % in.scale_group_size == 0)) {
+    write_block_scales<nr_>(
+        out_ptr,
+        in.weight_scales,
+        w_idx / in.scale_group_size,
+        in.scales_per_col,
+        cols);
+  }
+  // Write 128 packed tile (kr x nr).
+  gather_weight_tile<nr_, kr_>(
+      in.padded_tile, in.weight_qval_indices, w_idx, in.k, cols);
+  torchao::weight_packing::pack_values(
+      in.tmp_buffer.data(), in.padded_tile.data(), nr_, kr_, sr_);
+  const uint8_t* buffer = in.tmp_buffer.data();
+  torchao::bitpacking::vec_pack_128_uintx_values<weight_nbit_>(
+      reinterpret_cast<uint8_t*>(out_ptr),
+      vld1q_u8(buffer),
+      vld1q_u8(buffer + 16),
+      vld1q_u8(buffer + 32),
+      vld1q_u8(buffer + 48),
+      vld1q_u8(buffer + 64),
+      vld1q_u8(buffer + 80),
+      vld1q_u8(buffer + 96),
+      vld1q_u8(buffer + 112));
+  out_ptr += bytes_per_128_packed_values;
+}
+
+// Packs every k-block of one n-strip. Keeps the ``k_idx`` loop (and its inner
+// scale branch) out of ``pack_weights`` so that function stays shallow.
+template <int weight_nbit_, int nr_, int kr_, int sr_>
+TORCHAO_ALWAYS_INLINE inline void pack_strip_blocks(
+    uint8_t*& out_ptr,
+    const PackStripInputs& in,
+    StripColumns cols) {
+  for (int k_idx = 0; k_idx < in.k; k_idx += kr_) {
+    pack_k_block<weight_nbit_, nr_, kr_, sr_>(out_ptr, in, cols, k_idx);
+  }
+}
+
+} // namespace detail
+
 template <int weight_nbit_, int nr_, int kr_, int sr_>
 TORCHAO_ALWAYS_INLINE inline void pack_weights(
     // Output
@@ -146,79 +291,29 @@ TORCHAO_ALWAYS_INLINE inline void pack_weights(
   auto* out_ptr = reinterpret_cast<uint8_t*>(packed_weights_ptr);
   constexpr int kLutBufferSize = 16;
   std::vector<float> lut_buffer(kLutBufferSize);
-
   std::vector<uint8_t> padded_tile(nr_ * kr_);
-
   std::vector<uint8_t> tmp_buffer(128);
-  constexpr int bytes_per_128_packed_values =
-      ((nr_ * kr_ * weight_nbit_) + 7) / 8;
 
   const int lut_size = 1 << weight_nbit_;
-  const int scales_per_col = k / scale_group_size;
+  const detail::PackStripInputs strip_inputs{
+      weight_qval_indices,
+      weight_scales,
+      padded_tile,
+      tmp_buffer,
+      k,
+      scale_group_size,
+      /* scales_per_col */ k / scale_group_size,
+      has_scales};
 
   for (int n_idx = 0; n_idx < n; n_idx += nr_) {
+    const detail::StripColumns cols{n_idx, n};
     int current_lut_idx = (n_idx * k) / lut_group_size;
-
-    std::memset(lut_buffer.data(), 0, 16 * sizeof(float));
-    std::memcpy(out_ptr, lut_buffer.data(), 16 * sizeof(float));
-
-    std::memcpy(
-        lut_buffer.data(),
-        weight_luts + current_lut_idx * lut_size,
-        lut_size * sizeof(float));
-    std::memcpy(out_ptr, lut_buffer.data(), 16 * sizeof(float));
-    out_ptr += 16 * sizeof(float);
-
-    for (int k_idx = 0; k_idx < k; k_idx += kr_) {
-      int w_idx = n_idx * k + k_idx;
-      // Write scales if k_idx is a multiple of scale_group_size
-      if (has_scales && (k_idx % scale_group_size == 0)) {
-        int scale_idx = w_idx / scale_group_size;
-        // Write scales for next nr columns
-        for (int j = 0; j < nr_; j++) {
-          float scale = 0.0;
-          if (n_idx + j < n) {
-            scale = weight_scales[scale_idx + j * scales_per_col];
-          }
-          std::memcpy(out_ptr, &scale, sizeof(float));
-          out_ptr += sizeof(float);
-        }
-      }
-      // Write 128 packed tile (kr x nr)
-      std::memset(padded_tile.data(), 0, 128);
-      for (int j = 0; j < nr_; j++) {
-        if (n_idx + j < n) {
-          std::memcpy(
-              padded_tile.data() + j * kr_,
-              weight_qval_indices + w_idx + j * k,
-              kr_);
-        }
-      }
-      torchao::weight_packing::pack_values(
-          tmp_buffer.data(), padded_tile.data(), nr_, kr_, sr_);
-      const uint8_t* buffer = tmp_buffer.data();
-      torchao::bitpacking::vec_pack_128_uintx_values<weight_nbit_>(
-          reinterpret_cast<uint8_t*>(out_ptr),
-          vld1q_u8(buffer),
-          vld1q_u8(buffer + 16),
-          vld1q_u8(buffer + 32),
-          vld1q_u8(buffer + 48),
-          vld1q_u8(buffer + 64),
-          vld1q_u8(buffer + 80),
-          vld1q_u8(buffer + 96),
-          vld1q_u8(buffer + 112));
-      out_ptr += bytes_per_128_packed_values;
-    } // k_idx
-
+    detail::write_strip_lut<nr_>(
+        out_ptr, lut_buffer, weight_luts, current_lut_idx, lut_size);
+    detail::pack_strip_blocks<weight_nbit_, nr_, kr_, sr_>(
+        out_ptr, strip_inputs, cols);
     if (has_bias) {
-      for (int i = 0; i < nr_; i++) {
-        float current_bias = 0.0;
-        if (n_idx + i < n) {
-          current_bias = bias[n_idx + i];
-        }
-        std::memcpy(out_ptr, &current_bias, sizeof(float));
-        out_ptr += sizeof(float);
-      }
+      detail::write_strip_bias<nr_>(out_ptr, bias, cols);
     }
   }
 }

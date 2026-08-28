@@ -12,6 +12,7 @@ import torch
 from torchao.utils import ceil_div
 
 from .cute_utils import (
+    issue_tma_store_s2g,
     make_kernel_namespace,
     make_tile_2d_smem_layouts,
     run_quantize_2d_kernel,
@@ -246,41 +247,10 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
         ):
             """Issue TMA store from shared memory to global memory (producer warp only).
 
-            Synchronizes threads before store. Only warp 0 executes the TMA store.
-
-            Args:
-                tma_atom_out: TMA copy atom for S2G
-                gOUT_tile: Output tile in global memory (TILE_M, TILE_K)
-                sOUT_tile: Output tile in shared memory (TILE_M, TILE_K)
-                warp_idx: Warp index
-
-            Storage locations:
-                Source: sOUT_tile (shared memory)
-                Destination: gOUT_tile (global memory)
+            Synchronizes threads before store; only warp 0 executes the store.
+            2D tiles group a single leading mode for the TMA partition.
             """
-            cute.arch.fence_proxy(
-                "async.shared",
-                space="cta",
-            )
-            cute.arch.sync_threads()
-            if warp_idx == 0:
-                cta_layout = cute.make_layout((1,))
-                sOUT_for_tma_partition = cute.group_modes(sOUT_tile, 0, 1)
-                gOUT_for_tma_partition = cute.group_modes(gOUT_tile, 0, 1)
-                tOUTs, tOUTg = cpasync.tma_partition(
-                    tma_atom_out,
-                    0,
-                    cta_layout,
-                    sOUT_for_tma_partition,
-                    gOUT_for_tma_partition,
-                )
-                tOUTs_stage0 = tOUTs[(None, 0)]
-                tOUTg_stage0 = tOUTg[(None, 0)]
-                cute.copy(
-                    tma_atom_out,
-                    tOUTs_stage0,
-                    tOUTg_stage0,
-                )
+            issue_tma_store_s2g(tma_atom_out, gOUT_tile, sOUT_tile, warp_idx, 1)
 
         @cute.kernel
         def kernel(
