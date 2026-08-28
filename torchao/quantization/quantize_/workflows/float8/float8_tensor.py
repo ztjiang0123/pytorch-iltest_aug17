@@ -1048,12 +1048,11 @@ def _(func, types, args, kwargs):
     return return_and_correct_aliasing(func, args, kwargs, new)
 
 
-@implements(aten.t.default)
-def _(func, types, args, kwargs):
+def _transpose_float8_tensor(args):
     assert len(args) == 1
     self = args[0]
     assert len(self.block_size) == 2
-    new_tensor = self.__class__(
+    return self.__class__(
         self.qdata.t(),
         self.scale.t(),
         (self.block_size[1], self.block_size[0]),
@@ -1062,24 +1061,17 @@ def _(func, types, args, kwargs):
         self.kernel_preference,
         self.dtype,
     )
+
+
+@implements(aten.t.default)
+def _(func, types, args, kwargs):
+    new_tensor = _transpose_float8_tensor(args)
     return return_and_correct_aliasing(func, args, kwargs, new_tensor)
 
 
 @implements_torch_function(torch.Tensor.t)
 def _(func, types, args, kwargs):
-    assert len(args) == 1
-    self = args[0]
-    assert len(self.block_size) == 2
-    new_tensor = self.__class__(
-        self.qdata.t(),
-        self.scale.t(),
-        (self.block_size[1], self.block_size[0]),
-        self.mm_config,
-        self.act_quant_kwargs,
-        self.kernel_preference,
-        self.dtype,
-    )
-    return new_tensor
+    return _transpose_float8_tensor(args)
 
 
 @implements(aten.split.Tensor)

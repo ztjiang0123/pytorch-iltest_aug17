@@ -599,13 +599,25 @@ _DEQUANTIZE_OPS = [
 ]
 
 
-def _is_connected(source: torch.fx.Node, dest: torch.fx.Node) -> bool:
+def _is_connected(
+    source: torch.fx.Node,
+    dest: torch.fx.Node,
+    quantize_ops: Optional[list] = None,
+    dequantize_ops: Optional[list] = None,
+) -> bool:
     """
     Assuming dest is one of the ops inserted by quant workflow, this function
     finds if source and dest are connected. Assumption is that only quant workflow
-    inserted ops exist between source and dest
+    inserted ops exist between source and dest.
+
+    ``quantize_ops`` and ``dequantize_ops`` default to this module's op lists but
+    may be overridden by callers that recognize additional quant workflow ops.
     """
-    quant_workflow_ops = _QUANTIZE_OPS + _DEQUANTIZE_OPS
+    if quantize_ops is None:
+        quantize_ops = _QUANTIZE_OPS
+    if dequantize_ops is None:
+        dequantize_ops = _DEQUANTIZE_OPS
+    quant_workflow_ops = quantize_ops + dequantize_ops
     quant_workflow_ops.append(torch.ops.quantized_decomposed.choose_qparams.tensor)
     while dest.target in quant_workflow_ops:
         if not isinstance(dest.args[0], torch.fx.Node):

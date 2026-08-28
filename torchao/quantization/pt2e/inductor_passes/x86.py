@@ -1906,6 +1906,356 @@ def _register_linear_dynamic_fp16_weight_prepack():
             )
 
 
+def _smooth_quant_get_pattern_no_bias(
+    reshape_a: bool = True,
+    convert_scaled_matmul: bool = False,
+    use_u8s8: bool = False,
+):
+    int_mm_input_pattern = (
+        CallFunction(
+            aten.reshape.default,
+            KeywordArg("a"),
+            KeywordArg("in_shape"),
+        )
+        if reshape_a
+        else KeywordArg("a")
+    )
+
+    if use_u8s8:
+        int_mm_input_pattern = CallFunction(
+            prims.convert_element_type.default,
+            CallFunction(
+                aten.add.Tensor,
+                CallFunction(
+                    prims.convert_element_type.default,
+                    int_mm_input_pattern,
+                    KeywordArg("x_type_i32"),
+                ),
+                KeywordArg("x_zp_u8"),
+            ),
+            KeywordArg("x_type_u8"),
+        )
+
+    int_mm_pattern = CallFunction(
+        aten._int_mm.default,
+        int_mm_input_pattern,
+        KeywordArg("b"),
+    )
+
+    if use_u8s8:
+        int_mm_pattern = CallFunction(
+            aten.sub.Tensor,
+            int_mm_pattern,
+            KeywordArg("comp"),
+        )
+
+    mul_x_scale_pattern = CallFunction(
+        aten.mul.Tensor,
+        CallFunction(
+            prims.convert_element_type.default,
+            int_mm_pattern,
+            KeywordArg("x_scale_dtype"),
+        ),
+        KeywordArg("x_scale"),
+    )
+
+    if convert_scaled_matmul:
+        mul_x_scale_pattern = CallFunction(
+            prims.convert_element_type.default,
+            mul_x_scale_pattern,
+            KeywordArg("scaled_matmul_dtype"),
+        )
+
+    return CallFunction(
+        aten.mul.Tensor,
+        mul_x_scale_pattern,
+        KeywordArg("w_scale"),
+    )
+
+
+def _smooth_quant_validate_pattern(match: Match):
+    # Valid node counts correspond to different pattern variations:
+    # 4: pattern_no_reshape_no_bias (int_mm + convert + mul + mul)
+    # 5: pattern_no_reshape_with_bias (pattern_no_reshape_no_bias + add)
+    # 6: pattern_no_reshape_no_bias_with_output_convert
+    #    (int_mm + convert + mul + scaled-matmul convert + mul + output convert)
+    #    pattern_with_reshape_no_bias (reshape + int_mm + convert + mul + mul + reshape)
+    # 7: pattern_no_reshape_with_bias_with_output_convert
+    #    (pattern_no_reshape_no_bias_with_output_convert + add)
+    #    pattern_with_reshape_with_bias (pattern_with_reshape_no_bias + add)
+    # 8: pattern_with_reshape_no_bias_with_output_convert
+    #    (reshape + int_mm + convert + mul + scaled-matmul convert + mul + reshape + output convert)
+    #    pattern_u8s8_no_reshape_no_bias
+    #    (convert_i32 + add_128 + convert_u8 + int_mm + sub_comp + convert + mul + mul)
+    # 9: pattern_with_reshape_with_bias_with_output_convert
+    #    (reshape + int_mm + convert + mul + scaled-matmul convert + mul + reshape + add + output convert)
+    #    pattern_u8s8_no_reshape_with_bias (pattern_u8s8_no_reshape_no_bias + add)
+    # 10: pattern_u8s8_no_reshape_no_bias_with_output_convert
+    #     (convert_i32 + add_128 + convert_u8 + int_mm + sub_comp + convert + mul + scaled-matmul convert + mul + output convert)
+    #     pattern_u8s8_with_reshape_no_bias
+    #     (reshape + convert_i32 + add_128 + convert_u8 + int_mm + sub_comp + convert + mul + mul + reshape)
+    # 11: pattern_u8s8_no_reshape_with_bias_with_output_convert
+    #     (pattern_u8s8_no_reshape_no_bias_with_output_convert + add)
+    #     pattern_u8s8_with_reshape_with_bias (pattern_u8s8_with_reshape_no_bias + add)
+    # 12: pattern_u8s8_with_reshape_no_bias_with_output_convert
+    #     (reshape + convert_i32 + add_128 + convert_u8 + int_mm + sub_comp + convert + mul + scaled-matmul convert + mul + reshape + output convert)
+    # 13: pattern_u8s8_with_reshape_with_bias_with_output_convert
+    #     (pattern_u8s8_with_reshape_no_bias_with_output_convert + add)
+    if len(match.nodes) not in [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]:
+        return False
+    # Make sure weight is a constant
+    aten_int_mm_node = filter_nodes(match.nodes, aten._int_mm.default)[0]
+    if not isinstance(aten_int_mm_node.args[1], torch.fx.node.Node):
+        return False
+    if aten_int_mm_node.args[1].op != "get_attr":
+        return False
+
+    # Check bias shape
+    if "bias" in match.kwargs:
+        bias_node = match.kwargs["bias"]
+        if not isinstance(bias_node, torch.fx.node.Node):
+            return False
+        if len(bias_node.meta.get("tensor_meta").shape) != 1:
+            return False
+
+    return True
+
+
+def _smooth_quant_u8s8_convert_x(match, x):
+    """Insert the i32 -> +128 -> u8 conversion chain for a u8s8 activation."""
+    x_i32 = match.graph.call_function(
+        prims.convert_element_type.default,
+        args=(x, torch.int32),
+    )
+    x_add_128 = match.graph.call_function(
+        aten.add.Tensor,
+        args=(x_i32, 128),
+    )
+    return match.graph.call_function(
+        prims.convert_element_type.default,
+        args=(x_add_128, torch.uint8),
+    )
+
+
+def _smooth_quant_emit_scalar_scale_qlinear(
+    match,
+    out_node,
+    x,
+    x_scale,
+    prepack_weight_node,
+    w_scale,
+    w_zp,
+    bias,
+    dtype,
+    use_u8s8,
+):
+    """Emit ``qlinear_pointwise.tensor`` for the per-tensor x-scale case."""
+    if use_u8s8:
+        x_qlinear = _smooth_quant_u8s8_convert_x(match, x)
+        x_zp = match.graph.call_function(
+            aten.full.default,
+            args=([], 128),
+            kwargs={"dtype": torch.int32},
+        )
+    else:
+        x_qlinear = x
+        x_zp = None
+
+    new_args = (
+        x_qlinear,
+        x_scale,
+        x_zp,  # x_zp
+        prepack_weight_node,
+        w_scale,
+        w_zp,  # w_zp
+        bias,
+        1.0,  # output_scale
+        0,  # output_zero_point
+        dtype,  # output_dtype
+        "none",  # post op name
+        [],  # post op args
+        "",  # post op algorithm
+    )
+    new_linear_node = match.graph.call_function(
+        torch.ops.onednn.qlinear_pointwise.tensor, args=new_args
+    )
+    out_node.replace_all_uses_with(new_linear_node)
+    new_linear_node.meta.update(out_node.meta)
+
+
+def _smooth_quant_emit_per_channel_qlinear(
+    match,
+    out_node,
+    kwargs,
+    x,
+    x_scale,
+    x_scale_dtype,
+    prepack_weight_node,
+    w_scale,
+    w_zp,
+    bias,
+    use_u8s8,
+):
+    """Emit qlinear plus x-scale/bias/reshape for the per-channel x-scale case.
+
+    onednn.qlinear does not support per-channel quantization of x, so here we
+    apply x scale and add bias ourselves after qlinear.
+    """
+    has_output_convert = "output_dtype" in kwargs
+    in_shape = kwargs.get("in_shape", None)
+    if in_shape is None:
+        x_reshaped = x
+    else:
+        x_reshaped = match.graph.call_function(aten.reshape.default, args=(x, in_shape))
+
+    if use_u8s8:
+        x_qlinear = _smooth_quant_u8s8_convert_x(match, x_reshaped)
+        x_zp = 128
+    else:
+        x_qlinear = x_reshaped
+        x_zp = 0
+
+    new_args = (
+        x_qlinear,
+        1.0,  # x_scale
+        x_zp,  # x_zp
+        prepack_weight_node,
+        w_scale,
+        w_zp,  # w_zp
+        None,  # bias
+        1.0,  # output_scale
+        0,  # output_zero_point
+        x_scale_dtype,  # output_dtype
+        "none",  # post op name
+        [],  # post op args
+        "",  # post op algorithm
+    )
+    new_linear_node = match.graph.call_function(
+        torch.ops.onednn.qlinear_pointwise, args=new_args
+    )
+    # apply x scale
+    new_out_node = match.graph.call_function(
+        aten.mul.Tensor, args=(new_linear_node, x_scale)
+    )
+
+    # Add bias and reshape
+    out_shape = kwargs.get("out_shape", None)
+    if bias is not None:
+        new_out_node = match.graph.call_function(
+            aten.add.Tensor, args=(new_out_node, bias)
+        )
+    if out_shape is not None:
+        new_out_node = match.graph.call_function(
+            aten.reshape.default,
+            args=(new_out_node, out_shape),
+        )
+
+    if has_output_convert:
+        new_out_node = match.graph.call_function(
+            prims.convert_element_type.default,
+            args=(new_out_node, kwargs["output_dtype"]),
+        )
+    out_node.replace_all_uses_with(new_out_node)
+    new_out_node.meta.update(out_node.meta)
+
+
+def _smooth_quant_int_mm_weight_prepack(match: Match, *args, **kwargs):
+    bias = kwargs.get("bias", None)
+    x = kwargs["a"]
+    weight = kwargs["b"]
+    x_scale_dtype = kwargs["x_scale_dtype"]
+    x_scale = kwargs["x_scale"]
+    w_scale = kwargs["w_scale"]
+    x_shape = x.meta.get("tensor_meta").shape
+    # For Int8Tensor, the scaled-matmul convert and the output convert use the same output_dtype.
+    if "output_dtype" in kwargs and "scaled_matmul_dtype" in kwargs:
+        assert kwargs["output_dtype"] == kwargs["scaled_matmul_dtype"]
+    dtype = kwargs.get("output_dtype", kwargs.get("scaled_matmul_dtype", x_scale_dtype))
+    if has_free_symbols(x_shape):
+        # For dynamic shape case, we can't get activation shape ahead of runtime.
+        x_shape = None
+    x_type_i32 = kwargs.get("x_type_i32", None)
+    x_zp_u8 = kwargs.get("x_zp_u8", None)
+    x_type_u8 = kwargs.get("x_type_u8", None)
+    comp = kwargs.get("comp", None)
+    if x_type_i32 is not None:
+        assert x_type_i32 == torch.int32
+    if x_zp_u8 is not None:
+        assert x_zp_u8 == 128
+    if x_type_u8 is not None:
+        assert x_type_u8 == torch.uint8
+
+    # Check if all u8s8 related parameters are present
+    use_u8s8 = (
+        x_type_i32 is not None
+        and x_zp_u8 is not None
+        and x_type_u8 is not None
+        and comp is not None
+    )
+    w_zp = None
+
+    out_node = match.output_node()
+    with match.graph.inserting_before(out_node):
+        transpose_node = match.graph.call_function(
+            aten.permute.default, args=(weight, [1, 0])
+        )
+        contig_node = match.graph.call_function(
+            aten.contiguous.default, args=(transpose_node,)
+        )
+        packed_weight_inputs = (
+            contig_node,
+            x_shape,
+        )
+        packed_weight_op = torch.ops.onednn.qlinear_prepack
+        prepack_weight_node = match.graph.call_function(
+            packed_weight_op, args=packed_weight_inputs
+        )
+
+        w_scale = match.graph.call_function(
+            prims.convert_element_type.default, args=(w_scale, torch.float32)
+        )
+
+        x_scale_shape = x_scale.meta.get("tensor_meta").shape
+        x_scale_is_scalar = False
+        if not has_free_symbols(x_scale_shape):
+            prod = 1
+            for d in x_scale_shape:
+                prod *= d
+            x_scale_is_scalar = prod == 1
+
+        if x_scale_is_scalar:
+            _smooth_quant_emit_scalar_scale_qlinear(
+                match,
+                out_node,
+                x,
+                x_scale,
+                prepack_weight_node,
+                w_scale,
+                w_zp,
+                bias,
+                dtype,
+                use_u8s8,
+            )
+        else:
+            _smooth_quant_emit_per_channel_qlinear(
+                match,
+                out_node,
+                kwargs,
+                x,
+                x_scale,
+                x_scale_dtype,
+                prepack_weight_node,
+                w_scale,
+                w_zp,
+                bias,
+                use_u8s8,
+            )
+        for node in reversed(match.nodes):
+            match.graph.erase_node(node)
+        counters["inductor"]["qlinear_weight_prepack_matcher_count"] += 1
+        counters["inductor"]["qlinear_weight_prepack_matcher_nodes"] += len(match.nodes)
+
+
 def _register_smooth_quant_int_mm_pattern():
     """
     The pattern is:
@@ -1916,71 +2266,7 @@ def _register_smooth_quant_int_mm_pattern():
          pattern_no_bias -> add
     """
 
-    def get_pattern_no_bias(
-        reshape_a: bool = True,
-        convert_scaled_matmul: bool = False,
-        use_u8s8: bool = False,
-    ):
-        int_mm_input_pattern = (
-            CallFunction(
-                aten.reshape.default,
-                KeywordArg("a"),
-                KeywordArg("in_shape"),
-            )
-            if reshape_a
-            else KeywordArg("a")
-        )
-
-        if use_u8s8:
-            int_mm_input_pattern = CallFunction(
-                prims.convert_element_type.default,
-                CallFunction(
-                    aten.add.Tensor,
-                    CallFunction(
-                        prims.convert_element_type.default,
-                        int_mm_input_pattern,
-                        KeywordArg("x_type_i32"),
-                    ),
-                    KeywordArg("x_zp_u8"),
-                ),
-                KeywordArg("x_type_u8"),
-            )
-
-        int_mm_pattern = CallFunction(
-            aten._int_mm.default,
-            int_mm_input_pattern,
-            KeywordArg("b"),
-        )
-
-        if use_u8s8:
-            int_mm_pattern = CallFunction(
-                aten.sub.Tensor,
-                int_mm_pattern,
-                KeywordArg("comp"),
-            )
-
-        mul_x_scale_pattern = CallFunction(
-            aten.mul.Tensor,
-            CallFunction(
-                prims.convert_element_type.default,
-                int_mm_pattern,
-                KeywordArg("x_scale_dtype"),
-            ),
-            KeywordArg("x_scale"),
-        )
-
-        if convert_scaled_matmul:
-            mul_x_scale_pattern = CallFunction(
-                prims.convert_element_type.default,
-                mul_x_scale_pattern,
-                KeywordArg("scaled_matmul_dtype"),
-            )
-
-        return CallFunction(
-            aten.mul.Tensor,
-            mul_x_scale_pattern,
-            KeywordArg("w_scale"),
-        )
+    get_pattern_no_bias = _smooth_quant_get_pattern_no_bias
 
     def _with_outer_reshape(pattern):
         return CallFunction(aten.reshape.default, pattern, KeywordArg("out_shape"))
@@ -2100,53 +2386,6 @@ def _register_smooth_quant_int_mm_pattern():
         KeywordArg("output_dtype"),
     )
 
-    def _validate_pattern(match: Match):
-        # Valid node counts correspond to different pattern variations:
-        # 4: pattern_no_reshape_no_bias (int_mm + convert + mul + mul)
-        # 5: pattern_no_reshape_with_bias (pattern_no_reshape_no_bias + add)
-        # 6: pattern_no_reshape_no_bias_with_output_convert
-        #    (int_mm + convert + mul + scaled-matmul convert + mul + output convert)
-        #    pattern_with_reshape_no_bias (reshape + int_mm + convert + mul + mul + reshape)
-        # 7: pattern_no_reshape_with_bias_with_output_convert
-        #    (pattern_no_reshape_no_bias_with_output_convert + add)
-        #    pattern_with_reshape_with_bias (pattern_with_reshape_no_bias + add)
-        # 8: pattern_with_reshape_no_bias_with_output_convert
-        #    (reshape + int_mm + convert + mul + scaled-matmul convert + mul + reshape + output convert)
-        #    pattern_u8s8_no_reshape_no_bias
-        #    (convert_i32 + add_128 + convert_u8 + int_mm + sub_comp + convert + mul + mul)
-        # 9: pattern_with_reshape_with_bias_with_output_convert
-        #    (reshape + int_mm + convert + mul + scaled-matmul convert + mul + reshape + add + output convert)
-        #    pattern_u8s8_no_reshape_with_bias (pattern_u8s8_no_reshape_no_bias + add)
-        # 10: pattern_u8s8_no_reshape_no_bias_with_output_convert
-        #     (convert_i32 + add_128 + convert_u8 + int_mm + sub_comp + convert + mul + scaled-matmul convert + mul + output convert)
-        #     pattern_u8s8_with_reshape_no_bias
-        #     (reshape + convert_i32 + add_128 + convert_u8 + int_mm + sub_comp + convert + mul + mul + reshape)
-        # 11: pattern_u8s8_no_reshape_with_bias_with_output_convert
-        #     (pattern_u8s8_no_reshape_no_bias_with_output_convert + add)
-        #     pattern_u8s8_with_reshape_with_bias (pattern_u8s8_with_reshape_no_bias + add)
-        # 12: pattern_u8s8_with_reshape_no_bias_with_output_convert
-        #     (reshape + convert_i32 + add_128 + convert_u8 + int_mm + sub_comp + convert + mul + scaled-matmul convert + mul + reshape + output convert)
-        # 13: pattern_u8s8_with_reshape_with_bias_with_output_convert
-        #     (pattern_u8s8_with_reshape_no_bias_with_output_convert + add)
-        if len(match.nodes) not in [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]:
-            return False
-        # Make sure weight is a constant
-        aten_int_mm_node = filter_nodes(match.nodes, aten._int_mm.default)[0]
-        if not isinstance(aten_int_mm_node.args[1], torch.fx.node.Node):
-            return False
-        if aten_int_mm_node.args[1].op != "get_attr":
-            return False
-
-        # Check bias shape
-        if "bias" in match.kwargs:
-            bias_node = match.kwargs["bias"]
-            if not isinstance(bias_node, torch.fx.node.Node):
-                return False
-            if len(bias_node.meta.get("tensor_meta").shape) != 1:
-                return False
-
-        return True
-
     pattern_to_pass_number = {
         pattern_u8s8_with_reshape_with_bias_with_output_convert: 0,
         pattern_u8s8_with_reshape_with_bias: 0,
@@ -2166,200 +2405,11 @@ def _register_smooth_quant_int_mm_pattern():
         pattern_no_reshape_no_bias: 3,
     }
     for pattern, pass_number in pattern_to_pass_number.items():
-
-        @register_freezing_graph_pattern(
+        register_freezing_graph_pattern(
             pattern,
-            extra_check=_validate_pattern,
+            extra_check=_smooth_quant_validate_pattern,
             pass_number=pass_number,
-        )
-        def _int_mm_weight_prepack(match: Match, *args, **kwargs):
-            bias = kwargs.get("bias", None)
-            x = kwargs["a"]
-            weight = kwargs["b"]
-            x_scale_dtype = kwargs["x_scale_dtype"]
-            x_scale = kwargs["x_scale"]
-            w_scale = kwargs["w_scale"]
-            x_shape = x.meta.get("tensor_meta").shape
-            # For Int8Tensor, the scaled-matmul convert and the output convert use the same output_dtype.
-            if "output_dtype" in kwargs and "scaled_matmul_dtype" in kwargs:
-                assert kwargs["output_dtype"] == kwargs["scaled_matmul_dtype"]
-            dtype = kwargs.get(
-                "output_dtype", kwargs.get("scaled_matmul_dtype", x_scale_dtype)
-            )
-            if has_free_symbols(x_shape):
-                # For dynamic shape case, we can't get activation shape ahead of runtime.
-                x_shape = None
-            x_type_i32 = kwargs.get("x_type_i32", None)
-            x_zp_u8 = kwargs.get("x_zp_u8", None)
-            x_type_u8 = kwargs.get("x_type_u8", None)
-            comp = kwargs.get("comp", None)
-            if x_type_i32 is not None:
-                assert x_type_i32 == torch.int32
-            if x_zp_u8 is not None:
-                assert x_zp_u8 == 128
-            if x_type_u8 is not None:
-                assert x_type_u8 == torch.uint8
-
-            # Check if all u8s8 related parameters are present
-            use_u8s8 = (
-                x_type_i32 is not None
-                and x_zp_u8 is not None
-                and x_type_u8 is not None
-                and comp is not None
-            )
-            w_zp = None
-
-            out_node = match.output_node()
-            with match.graph.inserting_before(out_node):
-                transpose_node = match.graph.call_function(
-                    aten.permute.default, args=(weight, [1, 0])
-                )
-                contig_node = match.graph.call_function(
-                    aten.contiguous.default, args=(transpose_node,)
-                )
-                packed_weight_inputs = (
-                    contig_node,
-                    x_shape,
-                )
-                packed_weight_op = torch.ops.onednn.qlinear_prepack
-                prepack_weight_node = match.graph.call_function(
-                    packed_weight_op, args=packed_weight_inputs
-                )
-
-                w_scale = match.graph.call_function(
-                    prims.convert_element_type.default, args=(w_scale, torch.float32)
-                )
-
-                x_scale_shape = x_scale.meta.get("tensor_meta").shape
-                x_scale_is_scalar = False
-                if not has_free_symbols(x_scale_shape):
-                    prod = 1
-                    for d in x_scale_shape:
-                        prod *= d
-                    x_scale_is_scalar = prod == 1
-
-                new_args: tuple[Any, ...]
-                if x_scale_is_scalar:
-                    if use_u8s8:
-                        x_i32 = match.graph.call_function(
-                            prims.convert_element_type.default,
-                            args=(x, torch.int32),
-                        )
-                        x_add_128 = match.graph.call_function(
-                            aten.add.Tensor,
-                            args=(x_i32, 128),
-                        )
-                        x_qlinear = match.graph.call_function(
-                            prims.convert_element_type.default,
-                            args=(x_add_128, torch.uint8),
-                        )
-                        x_zp = match.graph.call_function(
-                            aten.full.default,
-                            args=([], 128),
-                            kwargs={"dtype": torch.int32},
-                        )
-                    else:
-                        x_qlinear = x
-                        x_zp = None
-
-                    new_args = (
-                        x_qlinear,
-                        x_scale,
-                        x_zp,  # x_zp
-                        prepack_weight_node,
-                        w_scale,
-                        w_zp,  # w_zp
-                        bias,
-                        1.0,  # output_scale
-                        0,  # output_zero_point
-                        dtype,  # output_dtype
-                        "none",  # post op name
-                        [],  # post op args
-                        "",  # post op algorithm
-                    )
-                    new_linear_node = match.graph.call_function(
-                        torch.ops.onednn.qlinear_pointwise.tensor, args=new_args
-                    )
-                    out_node.replace_all_uses_with(new_linear_node)
-                    new_linear_node.meta.update(out_node.meta)
-                else:
-                    # onednn.qlinear does not support per-channel quantization of x
-                    # so in this case, we have to apply x scale and add bias ourselves after qlinear
-                    has_output_convert = "output_dtype" in kwargs
-                    in_shape = kwargs.get("in_shape", None)
-                    if in_shape is None:
-                        x_reshaped = x
-                    else:
-                        x_reshaped = match.graph.call_function(
-                            aten.reshape.default, args=(x, in_shape)
-                        )
-
-                    if use_u8s8:
-                        x_i32 = match.graph.call_function(
-                            prims.convert_element_type.default,
-                            args=(x_reshaped, torch.int32),
-                        )
-                        x_add_128 = match.graph.call_function(
-                            aten.add.Tensor,
-                            args=(x_i32, 128),
-                        )
-                        x_qlinear = match.graph.call_function(
-                            prims.convert_element_type.default,
-                            args=(x_add_128, torch.uint8),
-                        )
-                        x_zp = 128
-                    else:
-                        x_qlinear = x_reshaped
-                        x_zp = 0
-
-                    new_args = (
-                        x_qlinear,
-                        1.0,  # x_scale
-                        x_zp,  # x_zp
-                        prepack_weight_node,
-                        w_scale,
-                        w_zp,  # w_zp
-                        None,  # bias
-                        1.0,  # output_scale
-                        0,  # output_zero_point
-                        x_scale_dtype,  # output_dtype
-                        "none",  # post op name
-                        [],  # post op args
-                        "",  # post op algorithm
-                    )
-                    new_linear_node = match.graph.call_function(
-                        torch.ops.onednn.qlinear_pointwise, args=new_args
-                    )
-                    # apply x scale
-                    new_out_node = match.graph.call_function(
-                        aten.mul.Tensor, args=(new_linear_node, x_scale)
-                    )
-
-                    # Add bias and reshape
-                    out_shape = kwargs.get("out_shape", None)
-                    if bias is not None:
-                        new_out_node = match.graph.call_function(
-                            aten.add.Tensor, args=(new_out_node, bias)
-                        )
-                    if out_shape is not None:
-                        new_out_node = match.graph.call_function(
-                            aten.reshape.default,
-                            args=(new_out_node, out_shape),
-                        )
-
-                    if has_output_convert:
-                        new_out_node = match.graph.call_function(
-                            prims.convert_element_type.default,
-                            args=(new_out_node, kwargs["output_dtype"]),
-                        )
-                    out_node.replace_all_uses_with(new_out_node)
-                    new_out_node.meta.update(out_node.meta)
-                for node in reversed(match.nodes):
-                    match.graph.erase_node(node)
-                counters["inductor"]["qlinear_weight_prepack_matcher_count"] += 1
-                counters["inductor"]["qlinear_weight_prepack_matcher_nodes"] += len(
-                    match.nodes
-                )
+        )(_smooth_quant_int_mm_weight_prepack)
 
 
 class PostOpAttr:
