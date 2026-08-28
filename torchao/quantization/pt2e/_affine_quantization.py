@@ -724,6 +724,6 @@ class AffineQuantizedPlaceholderObserver(AffineQuantizedObserverBase):
         return input
 
     def calculate_qparams(self):
-        raise Exception(  # noqa: TRY002
+        raise Exception(
             "calculate_qparams should not be called for PlaceholderObserver"
         )

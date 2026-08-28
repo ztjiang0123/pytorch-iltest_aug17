@@ -114,40 +114,44 @@ def get_configs_compute_bound():
 
 MIXED_MM_HEURISTICS = {
     "EVEN_K": lambda args: args["K"] % (args["BLOCK_K"] * args["SPLIT_K"]) == 0,
-    "BLOCK_K": lambda args: min(args["BLOCK_K"], args["QGROUP_SIZE"])
-    if not args["TRANSPOSED"]
-    else args["BLOCK_K"],
-    "BLOCK_N": lambda args: min(args["BLOCK_N"], args["QGROUP_SIZE"])
-    if args["TRANSPOSED"]
-    else args["BLOCK_N"],
-    "SPLIT_K": lambda args: 1
-    if args["IS_BFLOAT16"]
-    else args["SPLIT_K"],  # atomic add not supported for bfloat16
+    "BLOCK_K": lambda args: (
+        min(args["BLOCK_K"], args["QGROUP_SIZE"])
+        if not args["TRANSPOSED"]
+        else args["BLOCK_K"]
+    ),
+    "BLOCK_N": lambda args: (
+        min(args["BLOCK_N"], args["QGROUP_SIZE"])
+        if args["TRANSPOSED"]
+        else args["BLOCK_N"]
+    ),
+    "SPLIT_K": lambda args: (
+        1 if args["IS_BFLOAT16"] else args["SPLIT_K"]
+    ),  # atomic add not supported for bfloat16
 }
 
 
 @triton.jit
 def _mixed_mm_kernel(
-    # Operands
+    # Operands: A, B, scales, zeros, C
     A,
     B,
     scales_ptr,
     zeros_ptr,
     C,
-    # Matrix dims.
+    # Matrix dims
     M,
     N,
     K,
-    # a, b, c, scales / zeros strides
+    # a / b / c / scale / zero strides
     stride_am,
-    stride_ak,  #
+    stride_ak,
     stride_bk,
-    stride_bn,  #
+    stride_bn,
     stride_cm,
     stride_cn,
     stride_scale_k,
     stride_scale_n,
-    # Meta-params
+    # Meta-params (constexpr): dtype flag, quant group size, block / split sizes
     IS_BFLOAT16: tl.constexpr,
     QGROUP_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -157,38 +161,27 @@ def _mixed_mm_kernel(
     EVEN_K: tl.constexpr,
     TRANSPOSED: tl.constexpr = False,
     GROUP_M: tl.constexpr = 8,
-    # tl.dot options
+    # tl.dot options and debug toggle
     acc_dtype: tl.constexpr = tl.float32,
     input_precision: tl.constexpr = "ieee",
     fp8_fast_accum: tl.constexpr = False,
-    # Only used for debugging
     DEBUG: tl.constexpr = False,
 ):
-    """Mixed matmul kernel
+    """Mixed matmul kernel.
 
-    A has shape (M, K) and is float16, bfloat16, or float32
+    A is (M, K) float16 / bfloat16 / float32. B is i4 / s4 packed as uint8 / int8
+    with shape (K // 2, N) (see ``packed_2xint4``). Scales and zeros are (NUM_GROUPS, N),
+    same dtype as A, where NUM_GROUPS = K // QGROUP_SIZE; QGROUP_SIZE must be a multiple
+    of BLOCK_K so one scale / zero vector broadcasts to the block per mainloop iteration.
 
-    B is i4 / s4 and has shape (K // 2, N) and is packed as uint8 / int8. See `packed_2xint4` for details.
+    In the transposed case A is M x N and B is K x N and we reduce along "N": rows of A and
+    blocks of B are loaded, each B block dequantized and transposed (BLK_N x BLK_K ->
+    BLK_K x BLK_N) so the matmul is transposed without unpacking / repacking B. Scale / zero
+    indexing flips accordingly, iterating the non-grouping dim within the mac loop and the
+    grouping dim across blocks.
 
-    Scales and zeros are of shape (NUM_GROUPS, N) and are same dtype as A, where NUM_GROUPS = (K // QGROUP_SIZE)
-    QGROUP_SIZE should be a multiple of BLOCK_K such that a vector of scales / zeros is loaded and broadcasted to block shape
-    per mainloop iteration.
-
-    In the transposed case, A is M x N and B is K x N, and we reduce along "N":
-    - TLDR: we are loading rows of A and B blocks at a time, dequantizing and transposing each block of B to achieve the overall
-    effect of a transposed matmul. This is necessary to perform a transposed matmul without unpacking and repacking the B matrix.
-        - Indexing remains the same for A (the reduction dim (BLK_K / K) corresponds to axis 1 of A -- "N" above)
-            - We load a BLK_M x BLK_K block of A
-        - Indexing for B is now flipped: N <-> K
-            - We load BLK_N x BLK_K block of B (remembering that the reduction dimension is axis 1 of B)
-            - We dequantize and transpose to BLK_K x BLK_N
-            - scale / zero indexing also change, since we are now iterating along the non-grouping dim within the mac loop and along
-            the grouping dim across blocks.
-        - Each mac loop calculates BLK_M x BLK_N -> M x "N"(= K)
-        - Within the mac loop for each block, we iterate along axis=1 for **both** A and B since axis = 1 is now the reduction dim for B.
-
-    NOTE: Assumes that the quantization grouping was done along the K dimension originally (i.e., QGROUP_SIZE consecutive elements
-    of original weight matrix in the K dimension were grouped together when calculating min / max scaling factors).
+    NOTE: Assumes quantization grouping was done along the K dimension originally (QGROUP_SIZE
+    consecutive K-dim elements grouped together when computing min / max scaling factors).
     """
 
     if not TRANSPOSED:
@@ -196,7 +189,6 @@ def _mixed_mm_kernel(
     else:
         tl.static_assert(QGROUP_SIZE % BLOCK_N == 0)
 
-    # TODO: refactor swizzling to separate function
     # Threadblock swizzling
     pid = tl.program_id(0)
     pid_z = tl.program_id(1)
@@ -215,17 +207,13 @@ def _mixed_mm_kernel(
         ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
     else:
         ram = rm
-    # rn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
-    # rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
     rak = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
 
     # BLOCK_K for b is effectively BLOCK_K // 2
     if not TRANSPOSED:
         rn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
         if not DEBUG:
-            rbn = tl.max_contiguous(
-                tl.multiple_of(rn % N, BLOCK_N), BLOCK_N
-            )  # rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+            rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
         else:
             rbn = rn
         rbk = pid_z * BLOCK_K // 2 + tl.arange(0, BLOCK_K // 2)
@@ -242,15 +230,12 @@ def _mixed_mm_kernel(
     if not TRANSPOSED:
         B = B + (rbk[:, None] * stride_bk + rbn[None, :] * stride_bn)
     else:
-        # Note: in the transposed case, we are loading BLK_N x BLK_K, but we need to transpose to BLK_K x BLK_N
-        # the strides are adjusted accordingly, since we to stride by stride_bk to get rows of BLK_N
-        # and stride_bn to get columns of BLK_K
+        # Transposed: load BLK_N x BLK_K but transpose to BLK_K x BLK_N, so B strides
+        # are swapped (stride_bk for rows of BLK_N, stride_bn for columns of BLK_K).
         B = B + (rbn[:, None] * stride_bk + rbk[None, :] * stride_bn)
 
-    # Grouping is along K, so in the forward pass, each block loads a row vector of BLK_K x BLK_N
-    # where grouping varies along N, hence the mainloop marches down the K dimension, where
-    # group idx is given by K // QGROUP_SIZE
-
+    # Grouping is along K: the mainloop marches down K (group idx = K // QGROUP_SIZE)
+    # while grouping varies along N, so each block loads a BLK_K x BLK_N row vector.
     if not TRANSPOSED:
         offsets_scale_n = (
             pid_n * stride_scale_n * BLOCK_N + tl.arange(0, BLOCK_N) * stride_scale_n
@@ -292,37 +277,26 @@ def _mixed_mm_kernel(
         qb_lo = (qb << _4_i8) >> _4_i8
         qb_hi = qb >> _4_i8
 
-        # Upcast to fp16
-        # TODO: better bfloat16 conversion? compilation error if direct conversion from int8 to bfloat16
+        # Upcast to fp16. bfloat16 needs an intermediate fp16 hop (direct int8 ->
+        # bfloat16 conversion triggers a compilation error).
         if IS_BFLOAT16:
-            dq_b = (
-                tl.join(
-                    qb_lo.to(tl.float16).to(A.dtype.element_ty),
-                    qb_hi.to(tl.float16).to(A.dtype.element_ty),
-                ).permute(0, 2, 1)
-                # .reshape(BLOCK_K, BLOCK_N)
-            )
+            dq_b = tl.join(
+                qb_lo.to(tl.float16).to(A.dtype.element_ty),
+                qb_hi.to(tl.float16).to(A.dtype.element_ty),
+            ).permute(0, 2, 1)
         else:
-            dq_b = (
-                tl.join(
-                    qb_lo.to(A.dtype.element_ty),
-                    qb_hi.to(A.dtype.element_ty),
-                ).permute(0, 2, 1)
-                # .reshape(BLOCK_K, BLOCK_N)
-            )
+            dq_b = tl.join(
+                qb_lo.to(A.dtype.element_ty),
+                qb_hi.to(A.dtype.element_ty),
+            ).permute(0, 2, 1)
         if not TRANSPOSED:
             dq_b = dq_b.reshape(BLOCK_K, BLOCK_N)
         else:
             dq_b = dq_b.reshape(BLOCK_N, BLOCK_K)
 
-        # Scale upcasted weights
-        # Note that we broadcast the scales --> the assumption is that all scales fall within a single QGROUP
-        # This condition is statically check (see assertions above)
-
-        zeros = zeros[None, :]
-        scales = scales[None, :]
-
-        dq_b = (dq_b - zeros) * scales
+        # Scale upcasted weights, broadcasting scales / zeros across the block
+        # (all scales fall within a single QGROUP -- statically checked above).
+        dq_b = (dq_b - zeros[None, :]) * scales[None, :]
 
         if TRANSPOSED:
             dq_b = tl.trans(dq_b)
