@@ -126,38 +126,36 @@ def _to_fp8_row_major_t(spec: RowMajorTLaunchSpec, grid) -> None:
     than a long, error-prone positional argument list.
     """
     _to_fp8_row_major_t_kernel[grid](
-        spec.input,
-        spec.output,
-        spec.scale,
-        spec.input.numel(),
-        spec.fp8_dtype_min,
-        spec.fp8_dtype_max,
-        spec.input_num_rows,
-        spec.input_num_cols,
-        input_dtype=spec.input_dtype,
-        output_dtype=spec.output_dtype,
+        (spec.input, spec.output, spec.scale),
+        (
+            spec.input.numel(),
+            spec.input_num_rows,
+            spec.input_num_cols,
+            spec.fp8_dtype_min,
+            spec.fp8_dtype_max,
+        ),
+        dtypes=(spec.input_dtype, spec.output_dtype),
     )
 
 
 @triton.autotune(
     configs=kernel_configs_2D,
-    key=["num_elements"],
+    key=["meta"],
 )
 @triton.jit
 def _to_fp8_row_major_t_kernel(
-    input_ptr,
-    out_ptr,
-    scale_ptr,
-    num_elements: int,
-    fp8_dtype_min: float,
-    fp8_dtype_max: float,
-    input_num_rows: int,
-    input_num_cols: int,
-    input_dtype: tl.constexpr,
-    output_dtype: tl.constexpr,
+    ptrs,
+    meta,
+    dtypes: tl.constexpr,
     BLOCK_SIZE_ROWS: tl.constexpr,
     BLOCK_SIZE_COLS: tl.constexpr,
 ):
+    # unpack the grouped launch arguments
+    input_ptr, out_ptr, scale_ptr = ptrs
+    _num_elements, input_num_rows, input_num_cols, fp8_dtype_min, fp8_dtype_max = meta
+    input_dtype: tl.constexpr = dtypes[0]
+    output_dtype: tl.constexpr = dtypes[1]
+
     block_row_id = tl.program_id(axis=0)
     block_col_id = tl.program_id(axis=1)
 
