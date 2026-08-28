@@ -111,6 +111,14 @@ row-major).
  */
 namespace detail {
 
+// The column range of the current n-strip: `n_idx` is the strip's first
+// column and `n` is the total column count, used to zero-pad columns that
+// fall past the end of the weight matrix.
+struct StripColumns {
+  int n_idx;
+  int n;
+};
+
 // Writes the 16-element float LUT for one n-strip and advances `out_ptr`.
 template <int nr_>
 TORCHAO_ALWAYS_INLINE inline void write_strip_lut(
@@ -137,10 +145,9 @@ TORCHAO_ALWAYS_INLINE inline void write_block_scales(
     const float* weight_scales,
     int scale_idx,
     int scales_per_col,
-    int n_idx,
-    int n) {
+    StripColumns cols) {
   for (int j = 0; j < nr_; j++) {
-    float scale = (n_idx + j < n)
+    float scale = (cols.n_idx + j < cols.n)
         ? weight_scales[scale_idx + j * scales_per_col]
         : 0.0f;
     std::memcpy(out_ptr, &scale, sizeof(float));
@@ -156,11 +163,10 @@ TORCHAO_ALWAYS_INLINE inline void gather_weight_tile(
     const uint8_t* weight_qval_indices,
     int w_idx,
     int k,
-    int n_idx,
-    int n) {
+    StripColumns cols) {
   std::memset(padded_tile.data(), 0, 128);
   for (int j = 0; j < nr_; j++) {
-    if (n_idx + j < n) {
+    if (cols.n_idx + j < cols.n) {
       std::memcpy(
           padded_tile.data() + j * kr_,
           weight_qval_indices + w_idx + j * k,
@@ -174,10 +180,9 @@ template <int nr_>
 TORCHAO_ALWAYS_INLINE inline void write_strip_bias(
     uint8_t*& out_ptr,
     const float* bias,
-    int n_idx,
-    int n) {
+    StripColumns cols) {
   for (int i = 0; i < nr_; i++) {
-    float current_bias = (n_idx + i < n) ? bias[n_idx + i] : 0.0f;
+    float current_bias = (cols.n_idx + i < cols.n) ? bias[cols.n_idx + i] : 0.0f;
     std::memcpy(out_ptr, &current_bias, sizeof(float));
     out_ptr += sizeof(float);
   }
@@ -233,6 +238,7 @@ TORCHAO_ALWAYS_INLINE inline void pack_weights(
   const int scales_per_col = k / scale_group_size;
 
   for (int n_idx = 0; n_idx < n; n_idx += nr_) {
+    const detail::StripColumns cols{n_idx, n};
     int current_lut_idx = (n_idx * k) / lut_group_size;
     detail::write_strip_lut<nr_>(
         out_ptr, lut_buffer, weight_luts, current_lut_idx, lut_size);
@@ -246,12 +252,11 @@ TORCHAO_ALWAYS_INLINE inline void pack_weights(
             weight_scales,
             w_idx / scale_group_size,
             scales_per_col,
-            n_idx,
-            n);
+            cols);
       }
       // Write 128 packed tile (kr x nr)
       detail::gather_weight_tile<nr_, kr_>(
-          padded_tile, weight_qval_indices, w_idx, k, n_idx, n);
+          padded_tile, weight_qval_indices, w_idx, k, cols);
       torchao::weight_packing::pack_values(
           tmp_buffer.data(), padded_tile.data(), nr_, kr_, sr_);
       const uint8_t* buffer = tmp_buffer.data();
@@ -269,7 +274,7 @@ TORCHAO_ALWAYS_INLINE inline void pack_weights(
     } // k_idx
 
     if (has_bias) {
-      detail::write_strip_bias<nr_>(out_ptr, bias, n_idx, n);
+      detail::write_strip_bias<nr_>(out_ptr, bias, cols);
     }
   }
 }

@@ -13,6 +13,7 @@ import torch
 from torchao.utils import ceil_div
 
 from .cute_utils import (
+    issue_tma_store_s2g,
     make_kernel_namespace,
     make_tile_2d_smem_layouts,
     run_quantize_2d_kernel,
@@ -56,6 +57,26 @@ def _select_cutedsl_config(
 
 
 @dataclass(frozen=True)
+class _RawKernelArgs:
+    """The raw kernel-shaping arguments passed to the compile driver.
+
+    Bundling these keeps :func:`_compute_kernel_config`'s signature small; the
+    values still hash individually through the cached
+    :func:`_compile_mxfp8_quantize_2d_cutedsl` entry point.
+    """
+
+    input_dtype_name: str
+    scaling_mode: str
+    compute_warps: int
+    tile_m: int
+    tile_k: int
+    requested_stage_count: int
+    k_tiles_per_cta: int
+    is_full_k_tiles: bool
+    blocked_scale_output: bool
+
+
+@dataclass(frozen=True)
 class _CuteDSLKernelConfig:
     """Derived compile-time constants for the 1x32 MXFP8 CuTeDSL kernel.
 
@@ -95,17 +116,7 @@ def _resolve_input_cutlass_dtype(input_dtype_name: str):
     )
 
 
-def _compute_kernel_config(
-    input_dtype_name: str,
-    scaling_mode: str,
-    compute_warps: int,
-    tile_m: int,
-    tile_k: int,
-    requested_stage_count: int,
-    k_tiles_per_cta: int,
-    is_full_k_tiles: bool,
-    blocked_scale_output: bool,
-) -> _CuteDSLKernelConfig:
+def _compute_kernel_config(raw: _RawKernelArgs) -> _CuteDSLKernelConfig:
     """Validate the raw kernel arguments and derive compile-time constants."""
     # Warp-specialized TMA kernel:
     # - warp 0: producer (issues TMA G2S and S2G)
@@ -114,38 +125,38 @@ def _compute_kernel_config(
     # warp).  A split load-warp/store-warp design was tested and
     # mostly regressed throughput, so this layout is the tuned
     # default.
-    assert compute_warps >= 1
-    assert tile_m > 0 and tile_k > 0
-    assert tile_k % 32 == 0
+    assert raw.compute_warps >= 1
+    assert raw.tile_m > 0 and raw.tile_k > 0
+    assert raw.tile_k % 32 == 0
 
     scale_dim_k = 32
-    k_blocks_per_tile = tile_k // scale_dim_k
+    k_blocks_per_tile = raw.tile_k // scale_dim_k
     assert k_blocks_per_tile > 0
-    assert requested_stage_count >= 1
+    assert raw.requested_stage_count >= 1
     # B200 sweeps on our representative shapes showed no benefit
     # beyond 2 stages. We keep stage setup generic so future tuning can
     # revisit this, but the current tuned contract is 1 or 2 stages.
-    assert requested_stage_count <= 2
-    assert k_tiles_per_cta >= 1
+    assert raw.requested_stage_count <= 2
+    assert raw.k_tiles_per_cta >= 1
 
-    input_elem_bytes = 4 if input_dtype_name == "torch.float32" else 2
-    m_threads = compute_warps * 32
+    input_elem_bytes = 4 if raw.input_dtype_name == "torch.float32" else 2
+    m_threads = raw.compute_warps * 32
     return _CuteDSLKernelConfig(
-        input_dtype_name=input_dtype_name,
-        scaling_mode=scaling_mode,
-        compute_warps=compute_warps,
-        tile_m=tile_m,
-        tile_k=tile_k,
-        k_tiles_per_cta=k_tiles_per_cta,
-        is_full_k_tiles=is_full_k_tiles,
-        blocked_scale_output=blocked_scale_output,
-        threads_per_block=(1 + compute_warps) * 32,
+        input_dtype_name=raw.input_dtype_name,
+        scaling_mode=raw.scaling_mode,
+        compute_warps=raw.compute_warps,
+        tile_m=raw.tile_m,
+        tile_k=raw.tile_k,
+        k_tiles_per_cta=raw.k_tiles_per_cta,
+        is_full_k_tiles=raw.is_full_k_tiles,
+        blocked_scale_output=raw.blocked_scale_output,
+        threads_per_block=(1 + raw.compute_warps) * 32,
         scale_dim_k=scale_dim_k,
         k_blocks_per_tile=k_blocks_per_tile,
-        stage_count=min(requested_stage_count, k_tiles_per_cta),
-        tile_copy_bytes=tile_m * tile_k * input_elem_bytes,
+        stage_count=min(raw.requested_stage_count, raw.k_tiles_per_cta),
+        tile_copy_bytes=raw.tile_m * raw.tile_k * input_elem_bytes,
         m_threads=m_threads,
-        m_iters_per_lane=ceil_div(tile_m, m_threads),
+        m_iters_per_lane=ceil_div(raw.tile_m, m_threads),
     )
 
 
@@ -210,19 +221,20 @@ def _build_fake_compile_inputs(cfg: _CuteDSLKernelConfig, has_offs: bool):
     return fake_inp, fake_out, fake_scales, fake_stream, fake_offs, compile_options
 
 
-def _make_device_helpers():
+def _make_device_helpers(scale_dim: int):
     """Build the device-side ``@cute.jit`` block load/store helpers.
 
-    Returned as plain free functions (the established ``cute_utils`` pattern);
-    the kernel class exposes them as thin methods so ``cute_utils`` can call
-    them via ``kernel._<name>``.
+    ``scale_dim`` (the per-block element count) is captured here so the load
+    helpers don't carry it as a parameter. Returned as plain free functions
+    (the established ``cute_utils`` pattern); the kernel class exposes them as
+    thin methods so ``cute_utils`` can call them via ``kernel._<name>``. The
+    S2G store lives in the shared ``issue_tma_store_s2g`` helper.
     """
     import cutlass
     import cutlass.cute as cute
-    from cutlass.cute.nvgpu import cpasync
 
     @cute.jit
-    def load_block_full(sIN_tile, m_rel, k_base, scale_dim: cutlass.Constexpr[int]):
+    def load_block_full(sIN_tile, m_rel, k_base):
         # Load a full ``scale_dim``-element block from smem to registers (no bounds check).
         vals_block = cute.make_rmem_tensor((scale_dim,), cutlass.Float32)
         for i in range(scale_dim):
@@ -230,9 +242,7 @@ def _make_device_helpers():
         return vals_block
 
     @cute.jit
-    def load_block_tail(
-        sIN_tile, k0, m_rel, k_base, K, scale_dim: cutlass.Constexpr[int]
-    ):
+    def load_block_tail(sIN_tile, k0, m_rel, k_base, K):
         # Bounds-checked block load; out-of-bounds elements are set to 0.0.
         vals_block = cute.make_rmem_tensor((scale_dim,), cutlass.Float32)
         for i in range(scale_dim):
@@ -250,47 +260,17 @@ def _make_device_helpers():
         q_fp8_vals4_u32 = cute.recast_tensor(q_fp8_vals4, cutlass.Uint32)
         sOUT_tile_u32[lane_rel, chunk_base // cutlass.Int32(4)] = q_fp8_vals4_u32[0]
 
-    @cute.jit
-    def issue_tma_store(tma_atom_out, gOUT_tile, sOUT_tile, warp_idx):
-        # Sync then issue the S2G TMA store on warp 0 only.
-        cute.arch.fence_proxy("async.shared", space="cta")
-        cute.arch.sync_threads()
-        if warp_idx == 0:
-            cta_layout = cute.make_layout((1,))
-            sOUT_for_tma_partition = cute.group_modes(sOUT_tile, 0, 1)
-            gOUT_for_tma_partition = cute.group_modes(gOUT_tile, 0, 1)
-            tOUTs, tOUTg = cpasync.tma_partition(
-                tma_atom_out,
-                0,
-                cta_layout,
-                sOUT_for_tma_partition,
-                gOUT_for_tma_partition,
-            )
-            cute.copy(tma_atom_out, tOUTs[(None, 0)], tOUTg[(None, 0)])
-
-    return load_block_full, load_block_tail, store_q_fp8, issue_tma_store
+    return load_block_full, load_block_tail, store_q_fp8
 
 
-def _run_1x32_kernel_body(
-    kernel_self,
-    cfg: _CuteDSLKernelConfig,
-    storage,
-    tma_atom_in,
-    tma_tensor_in,
-    tma_atom_out,
-    tma_tensor_out,
-    scales_out_u8,
-    M,
-    K,
-    k_blocks,
-    blocked_scale_layout,
-    offs,
-):
+def _run_1x32_kernel_body(kernel_self, cfg: _CuteDSLKernelConfig, ctx):
     """Build the kernel namespaces and dispatch the shared 2D quantize loop.
 
     Plain (non-``@cute.jit``) helper: its cute ops inline into the calling
-    ``@cute.kernel``. Split out of the kernel method so the axis mapping and IO
-    wiring read as one focused step.
+    ``@cute.kernel``. ``ctx`` is the launch namespace built by the kernel
+    method (``storage``, the ``tma`` quad, ``scales_out_u8``, ``M``/``K``/
+    ``k_blocks``, ``blocked_scale_layout`` and ``offs``). Split out so the axis
+    mapping and IO wiring read as one focused step.
     """
     import cutlass
 
@@ -312,29 +292,24 @@ def _run_1x32_kernel_body(
             lane_tile_size=cfg.tile_m,
             lane_iters=cfg.m_iters_per_lane,
             lane_threads=cfg.m_threads,
-            lane_axis_size=M,
+            lane_axis_size=ctx.M,
             block_tile_size=cfg.tile_k,
             blocks_per_tile=cfg.k_blocks_per_tile,
             scale_dim=cfg.scale_dim_k,
-            block_axis_size=K,
-            num_blocks=k_blocks,
+            block_axis_size=ctx.K,
+            num_blocks=ctx.k_blocks,
             is_full_tiles=cfg.is_full_k_tiles,
         )
 
     io = make_kernel_namespace(
-        storage=storage,
+        storage=ctx.storage,
         smem_layouts=_make_tile_smem_layouts(cfg.tile_m, cfg.tile_k),
-        tma=make_kernel_namespace(
-            atom_in=tma_atom_in,
-            tensor_in=tma_tensor_in,
-            atom_out=tma_atom_out,
-            tensor_out=tma_tensor_out,
-        ),
+        tma=ctx.tma,
         shape=shape,
-        offs=offs,
-        scales_out_u8=scales_out_u8,
+        offs=ctx.offs,
+        scales_out_u8=ctx.scales_out_u8,
         blocked_scale_output=cfg.blocked_scale_output,
-        blocked_scale_layout=blocked_scale_layout,
+        blocked_scale_layout=ctx.blocked_scale_layout,
         opts=make_kernel_namespace(
             use_rceil=(cfg.scaling_mode == "rceil"),
             blocked_scale_output=cfg.blocked_scale_output,
@@ -412,14 +387,12 @@ def _build_quantize_2d_kernel_class(cfg: _CuteDSLKernelConfig) -> Any:
     TILE_M = cfg.tile_m
     TILE_K = cfg.tile_k
     STAGE_COUNT_VALUE = cfg.stage_count
-    SCALE_DIM_K_VALUE = cfg.scale_dim_k
 
     (
         _load_block_full,
         _load_block_tail,
         _store_q_fp8,
-        _issue_tma_store_impl,
-    ) = _make_device_helpers()
+    ) = _make_device_helpers(cfg.scale_dim_k)
 
     @cute.struct
     class SharedStorage:
@@ -448,7 +421,7 @@ def _build_quantize_2d_kernel_class(cfg: _CuteDSLKernelConfig) -> Any:
             m_rel: cutlass.Int32,
             k_base: cutlass.Int32,
         ):
-            return _load_block_full(sIN_tile, m_rel, k_base, SCALE_DIM_K_VALUE)
+            return _load_block_full(sIN_tile, m_rel, k_base)
 
         @cute.jit
         def _load_block_tail_smem_to_reg(
@@ -459,7 +432,7 @@ def _build_quantize_2d_kernel_class(cfg: _CuteDSLKernelConfig) -> Any:
             k_base: cutlass.Int32,
             K: cutlass.Int64,
         ):
-            return _load_block_tail(sIN_tile, k0, m_rel, k_base, K, SCALE_DIM_K_VALUE)
+            return _load_block_tail(sIN_tile, k0, m_rel, k_base, K)
 
         @cute.jit
         def _store_q_fp8_reg_to_smem(
@@ -479,7 +452,8 @@ def _build_quantize_2d_kernel_class(cfg: _CuteDSLKernelConfig) -> Any:
             sOUT_tile: cute.Tensor,
             warp_idx: cutlass.Int32,
         ):
-            _issue_tma_store_impl(tma_atom_out, gOUT_tile, sOUT_tile, warp_idx)
+            # 2D tiles group a single leading mode for the TMA partition.
+            issue_tma_store_s2g(tma_atom_out, gOUT_tile, sOUT_tile, warp_idx, 1)
 
         @cute.kernel
         def kernel(
@@ -512,21 +486,22 @@ def _build_quantize_2d_kernel_class(cfg: _CuteDSLKernelConfig) -> Any:
             supplies the 1x32 axis mapping via ``_axis_1x32``.
             """
             storage = utils.SmemAllocator().allocate(SharedStorage)
-            _run_1x32_kernel_body(
-                self,
-                cfg,
-                storage,
-                tma_atom_in,
-                tma_tensor_in,
-                tma_atom_out,
-                tma_tensor_out,
-                scales_out_u8,
-                M,
-                K,
-                k_blocks,
-                blocked_scale_layout,
-                offs,
+            ctx = make_kernel_namespace(
+                storage=storage,
+                tma=make_kernel_namespace(
+                    atom_in=tma_atom_in,
+                    tensor_in=tma_tensor_in,
+                    atom_out=tma_atom_out,
+                    tensor_out=tma_tensor_out,
+                ),
+                scales_out_u8=scales_out_u8,
+                M=M,
+                K=K,
+                k_blocks=k_blocks,
+                blocked_scale_layout=blocked_scale_layout,
+                offs=offs,
             )
+            _run_1x32_kernel_body(self, cfg, ctx)
 
         @cute.jit
         def __call__(
@@ -629,15 +604,17 @@ def _compile_mxfp8_quantize_2d_cutedsl(
     # - FLOOR still uses a different lowered sequence than C++
     #   helper routines.
     cfg = _compute_kernel_config(
-        input_dtype_name,
-        scaling_mode,
-        compute_warps,
-        tile_m,
-        tile_k,
-        requested_stage_count,
-        k_tiles_per_cta,
-        is_full_k_tiles,
-        blocked_scale_output,
+        _RawKernelArgs(
+            input_dtype_name=input_dtype_name,
+            scaling_mode=scaling_mode,
+            compute_warps=compute_warps,
+            tile_m=tile_m,
+            tile_k=tile_k,
+            requested_stage_count=requested_stage_count,
+            k_tiles_per_cta=k_tiles_per_cta,
+            is_full_k_tiles=is_full_k_tiles,
+            blocked_scale_output=blocked_scale_output,
+        )
     )
 
     kernel_cls = _build_quantize_2d_kernel_class(cfg)

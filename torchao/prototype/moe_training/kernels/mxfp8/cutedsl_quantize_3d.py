@@ -28,6 +28,7 @@ from .cute_utils import (
     compute_amax,
     compute_scale_from_amax,
     issue_tma_load_g2s,
+    issue_tma_store_s2g,
     load_vals_chunk_full,
     load_vals_chunk_tail,
     quantize_chunk_to_fp8_reg,
@@ -416,29 +417,8 @@ class _Mxfp8Quantize3dKernel:
         sOUT_tile: cute.Tensor,
         warp_idx: cutlass.Int32,
     ):
-        cute.arch.fence_proxy(
-            "async.shared",
-            space="cta",
-        )
-        cute.arch.sync_threads()
-        if warp_idx == 0:
-            cta_layout = cute.make_layout((1,))
-            sOUT_for_tma_partition = cute.group_modes(sOUT_tile, 0, 2)
-            gOUT_for_tma_partition = cute.group_modes(gOUT_tile, 0, 2)
-            tOUTs, tOUTg = cpasync.tma_partition(
-                tma_atom_out,
-                0,
-                cta_layout,
-                sOUT_for_tma_partition,
-                gOUT_for_tma_partition,
-            )
-            tOUTs_stage0 = tOUTs[(None, 0)]
-            tOUTg_stage0 = tOUTg[(None, 0)]
-            cute.copy(
-                tma_atom_out,
-                tOUTs_stage0,
-                tOUTg_stage0,
-            )
+        # 3D tiles group two leading modes for the TMA partition.
+        issue_tma_store_s2g(tma_atom_out, gOUT_tile, sOUT_tile, warp_idx, 2)
 
     def _select_stage_tiles(self, stage_idx, tiles0, tiles1, mbar0):
         """Pick the (input, output, mbar) triple for a pipeline stage."""
