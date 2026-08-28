@@ -576,48 +576,52 @@ inline void copy_bias(const float* bias_ptr, float* y_buf, int64_t m) {
   }
 }
 
+#if defined(CPU_CAPABILITY_AVX512)
+// Convert one 16-wide float vector and store it as `out_dtype`. The dtype
+// dispatch lives here, in a single (non-nested) `if constexpr`, so the caller
+// loop stays flat.
+template<typename out_dtype>
+inline void store_vec16(__m512 y_vec, out_dtype* c_ptr) {
+  if constexpr (std::is_same<out_dtype, float>::value) {
+    _mm512_storeu_ps(c_ptr, y_vec);
+  } else if constexpr (std::is_same<out_dtype, at::BFloat16>::value) {
+    _mm256_storeu_si256(
+        reinterpret_cast<__m256i*>(c_ptr), at::vec::cvtfp32_bf16(y_vec));
+  } else if constexpr (std::is_same<out_dtype, at::Half>::value) {
+    _mm256_storeu_si256(
+        reinterpret_cast<__m256i*>(c_ptr), at::vec::cvtfp32_fp16(y_vec));
+  } else {
+    TORCH_CHECK(false, "Unsupported output dtype");
+  }
+}
+#endif
+
+// Store a single row of the float accumulation buffer into the output row,
+// converting to `out_dtype`. The per-dtype dispatch lives in store_vec16 and in
+// out_dtype's own conversion constructor, so both loops here stay flat.
+template<typename out_dtype, int64_t N>
+inline void store_out_row(const float* y_row, out_dtype* c_row) {
+  static_assert(
+      std::is_same<out_dtype, float>::value ||
+          std::is_same<out_dtype, at::BFloat16>::value ||
+          std::is_same<out_dtype, at::Half>::value,
+      "Unsupported output dtype");
+  int j = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+#pragma GCC unroll 2
+  for (; j < N; j += 16) {
+    store_vec16<out_dtype>(_mm512_loadu_ps(y_row + j), c_row + j);
+  }
+#endif
+  for (; j < N; ++j) {
+    c_row[j] = static_cast<out_dtype>(y_row[j]);
+  }
+}
+
 template<typename out_dtype, int64_t N>
 inline void store_out(const float* y_buf, out_dtype* c_ptr, int64_t m, /* int64_t n, */ int64_t lda) {
   for (int i = 0; i < m; ++i) {
-    int j = 0;
-    if constexpr (std::is_same<out_dtype, float>::value) {
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 y_vec = _mm512_loadu_ps(y_buf + i * N + j);
-        _mm512_storeu_ps(c_ptr + i * lda + j, y_vec);
-      }
-#endif
-      for (; j < N; ++j) {
-        c_ptr[i * lda + j] = y_buf[i * N + j];
-      }
-    } else if constexpr (std::is_same<out_dtype, at::BFloat16>::value) {
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 y_vec = _mm512_loadu_ps(y_buf + i * N + j);
-        __m256i y_bf16_vec = at::vec::cvtfp32_bf16(y_vec);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c_ptr + i * lda + j), y_bf16_vec);
-      }
-#endif
-      for (; j < N; ++j) {
-        c_ptr[i * lda + j] = at::BFloat16(y_buf[i * N + j]);
-      }
-    } else if constexpr (std::is_same<out_dtype, at::Half>::value) {
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 y_vec = _mm512_loadu_ps(y_buf + i * N + j);
-        __m256i y_fp16_vec = at::vec::cvtfp32_fp16(y_vec);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c_ptr + i * lda + j), y_fp16_vec);
-      }
-#endif
-      for (; j < N; ++j) {
-        c_ptr[i * lda + j] = at::Half(y_buf[i * N + j]);
-      }
-    } else {
-      TORCH_CHECK(false, "Unsupported output dtype");
-    }
+    store_out_row<out_dtype, N>(y_buf + i * N, c_ptr + i * lda);
   }
 }
 

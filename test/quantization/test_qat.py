@@ -34,6 +34,7 @@ from torchao.quantization.granularity import (
     PerToken,
 )
 from torchao.quantization.linear_quant_modules import (
+    _Linear8da4wReplaceSettings,
     _replace_linear_8da4w,
     _replace_linear_int4,
 )
@@ -1112,10 +1113,12 @@ class TestQAT(TestCase):
         )
         _replace_linear_8da4w(
             module,
-            256,
-            False,
-            torch.float32,
-            torch.float32,
+            _Linear8da4wReplaceSettings(
+                groupsize=256,
+                padding_allowed=False,
+                precision=torch.float32,
+                scales_precision=torch.float32,
+            ),
             Int8DynActInt4WeightQATLinear,
             copy_weights=True,
         )

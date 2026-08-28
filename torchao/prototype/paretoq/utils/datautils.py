@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import json
-import random
 from typing import Dict, Sequence
 
 import numpy as np
