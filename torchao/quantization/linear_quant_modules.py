@@ -41,6 +41,20 @@ __all__ = [
 ]
 
 
+def _quantize_via_state_dict(quantizer, model: torch.nn.Module) -> torch.nn.Module:
+    """Shared quantization flow: build a quantized state dict, convert the model
+    for runtime, then load the quantized weights back in.
+
+    Both ``Int4WeightOnlyQuantizer`` and ``Int8DynActInt4WeightQuantizer`` use
+    this same sequence, so it lives here to avoid duplicated implementations.
+    """
+    state_dict = quantizer._create_quantized_state_dict(model)
+    model = quantizer._convert_for_runtime(model)
+    # TODO: make it strict
+    model.load_state_dict(state_dict, strict=False)
+    return model
+
+
 def _check_linear_int4_k(k, groupsize=1, inner_k_tiles=None):
     k_divisible_by_groupsize = k % groupsize == 0
     if inner_k_tiles is not None:
@@ -356,11 +370,7 @@ class Int4WeightOnlyQuantizer:
     def quantize(
         self, model: torch.nn.Module, *args: Any, **kwargs: Any
     ) -> torch.nn.Module:
-        state_dict = self._create_quantized_state_dict(model)
-        model = self._convert_for_runtime(model)
-        # TODO: make it strict
-        model.load_state_dict(state_dict, strict=False)
-        return model
+        return _quantize_via_state_dict(self, model)
 
 
 def linear_forward_8da4w(
@@ -674,8 +684,4 @@ class Int8DynActInt4WeightQuantizer:
     def quantize(
         self, model: torch.nn.Module, *args: Any, **kwargs: Any
     ) -> torch.nn.Module:
-        state_dict = self._create_quantized_state_dict(model)
-        model = self._convert_for_runtime(model)
-        # TODO: make it strict
-        model.load_state_dict(state_dict, strict=False)
-        return model
+        return _quantize_via_state_dict(self, model)

@@ -203,6 +203,73 @@ ALLOWED_AO_MODULES = {
 }
 
 
+def _is_serialized_config(value: Any) -> bool:
+    """Return True if ``value`` is a dict produced by :func:`config_to_dict`."""
+    return isinstance(value, dict) and "_type" in value and "_data" in value
+
+
+def _resolve_config_class(type_path: str) -> type:
+    """Look up ``type_path`` in the allowed modules, raising if it is not found."""
+    for module_path in ALLOWED_AO_MODULES:
+        try:
+            module = importlib.import_module(module_path)
+            return getattr(module, type_path)
+        except (ImportError, AttributeError):
+            continue  # Try the next module
+
+    allowed_modules_str = ", ".join(ALLOWED_AO_MODULES)
+    raise ValueError(
+        f"Failed to find class {type_path} in any of the allowed modules: {allowed_modules_str}"
+    )
+
+
+def _warn_on_version_mismatch(cls: type, stored_version: int) -> int:
+    """Warn if the stored version differs from the class default and return the default."""
+    current_default_version = getattr(cls, "version", _DEFAULT_VERSION)
+    if stored_version != current_default_version:
+        warnings.warn(
+            f"Stored version is not the same as current default version of the config: {stored_version=}, {current_default_version=}, please check the deprecation warning"
+        )
+    return current_default_version
+
+
+def _deserialize_primitive(cls: type, obj_data: Any) -> Any:
+    """Deserialize a non-dict ``_data`` payload (enum member or primitive)."""
+    if issubclass(cls, enum.Enum):
+        # For enums, convert string to enum value
+        return getattr(cls, obj_data)
+    # For other primitive types, create an instance with the value
+    try:
+        return cls(obj_data)
+    except Exception:
+        return obj_data
+
+
+def _deserialize_value(value: Any) -> Any:
+    """Recursively deserialize a single field value from a config dict."""
+    if _is_serialized_config(value):
+        # Recursively handle nested configs
+        return config_from_dict(value)
+    if isinstance(value, list):
+        # Handle lists of possible configs
+        return [
+            config_from_dict(item) if _is_serialized_config(item) else item
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        raise NotImplementedError(
+            "Tuples will be serialized as List in JSON, so we recommend to use "
+            f"Lists instead to avoid surprises. got: {value}"
+        )
+    if isinstance(value, dict):
+        # Handle dicts of possible configs
+        return {
+            k: config_from_dict(v) if _is_serialized_config(v) else v
+            for k, v in value.items()
+        }
+    return value
+
+
 def config_from_dict(data: Dict[str, Any]) -> AOBaseConfig:
     """
     Create an AOBaseConfig subclass instance from a dictionary.
@@ -228,43 +295,14 @@ def config_from_dict(data: Dict[str, Any]) -> AOBaseConfig:
 
     # Handle torch.dtype
     if type_path == "torch.dtype":
-        import torch
-
         return getattr(torch, obj_data)
-    # Try to find the class in any of the allowed modules
-    cls = None
-    for module_path in ALLOWED_AO_MODULES:
-        try:
-            module = importlib.import_module(module_path)
-            cls = getattr(module, type_path)
-            break  # Found the class, exit the loop
-        except (ImportError, AttributeError):
-            continue  # Try the next module
 
-    # If we couldn't find the class in any allowed module, raise an error
-    if cls is None:
-        allowed_modules_str = ", ".join(ALLOWED_AO_MODULES)
-        raise ValueError(
-            f"Failed to find class {type_path} in any of the allowed modules: {allowed_modules_str}"
-        )
+    cls = _resolve_config_class(type_path)
+    current_default_version = _warn_on_version_mismatch(cls, stored_version)
 
-    current_default_version = getattr(cls, "version", _DEFAULT_VERSION)
-    if stored_version != current_default_version:
-        warnings.warn(
-            f"Stored version is not the same as current default version of the config: {stored_version=}, {current_default_version=}, please check the deprecation warning"
-        )
-
-    # Handle the case where obj_data is not a dictionary
+    # Handle the case where obj_data is not a dictionary (enum or primitive)
     if not isinstance(obj_data, dict):
-        if issubclass(cls, enum.Enum):
-            # For enums, convert string to enum value
-            return getattr(cls, obj_data)
-        else:
-            # For other primitive types, create an instance with the value
-            try:
-                return cls(obj_data)
-            except:
-                return obj_data
+        return _deserialize_primitive(cls, obj_data)
 
     # Process nested structures for dictionary obj_data
     if stored_version != current_default_version:
@@ -273,32 +311,7 @@ def config_from_dict(data: Dict[str, Any]) -> AOBaseConfig:
         processed_data = {}
 
     for key, value in obj_data.items():
-        if isinstance(value, dict) and "_type" in value and "_data" in value:
-            # Recursively handle nested configs
-            processed_data[key] = config_from_dict(value)
-        elif isinstance(value, list):
-            # Handle lists or tuples of possible configs
-            processed_data[key] = [
-                config_from_dict(item)
-                if isinstance(item, dict) and "_type" in item and "_data" in item
-                else item
-                for item in value
-            ]
-        elif isinstance(value, tuple):
-            raise NotImplementedError(
-                "Tuples will be serialized as List in JSON, so we recommend to use "
-                f"Lists instead to avoid surprises. got: {value}"
-            )
-        elif isinstance(value, dict):
-            # Handle dicts of possible configs
-            processed_data[key] = {
-                k: config_from_dict(v)
-                if isinstance(v, dict) and "_type" in v and "_data" in v
-                else v
-                for k, v in value.items()
-            }
-        else:
-            processed_data[key] = value
+        processed_data[key] = _deserialize_value(value)
 
     # Create and return the instance
     try:

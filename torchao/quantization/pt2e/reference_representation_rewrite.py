@@ -820,11 +820,19 @@ def _reference_quantized_max_pool2d(
     return out_i8
 
 
+def _apply_per_tensor_int8_op(op, *args):
+    return op(*args, torch.int8)
+
+
 def _quantize_per_tensor_int8(x_fp32, scale, zero_point, quant_min, quant_max):
-    x = torch.ops.quantized_decomposed.quantize_per_tensor(
-        x_fp32, scale, zero_point, quant_min, quant_max, torch.int8
+    return _apply_per_tensor_int8_op(
+        torch.ops.quantized_decomposed.quantize_per_tensor,
+        x_fp32,
+        scale,
+        zero_point,
+        quant_min,
+        quant_max,
     )
-    return x
 
 
 def _reference_quantize_per_tensor_int8(
@@ -844,10 +852,14 @@ def _reference_quantize_per_tensor_int8(
 
 
 def _dequantize_per_tensor_int8(x_i8, scale, zero_point, quant_min, quant_max):
-    x_fp32 = torch.ops.quantized_decomposed.dequantize_per_tensor(
-        x_i8, scale, zero_point, quant_min, quant_max, torch.int8
+    return _apply_per_tensor_int8_op(
+        torch.ops.quantized_decomposed.dequantize_per_tensor,
+        x_i8,
+        scale,
+        zero_point,
+        quant_min,
+        quant_max,
     )
-    return x_fp32
 
 
 def _reference_dequantize_per_tensor_int8(
