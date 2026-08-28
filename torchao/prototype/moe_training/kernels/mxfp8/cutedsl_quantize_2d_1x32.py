@@ -12,12 +12,8 @@ import torch
 from torchao.utils import ceil_div
 
 from .cute_utils import (
-    make_axis_spec,
-    make_kernel_io,
-    make_quant_opts,
+    make_kernel_namespace,
     make_tile_2d_smem_layouts,
-    make_tile_shape,
-    make_tma_handles,
     run_quantize_2d_kernel,
 )
 
@@ -330,7 +326,7 @@ def _compile_mxfp8_quantize_2d_cutedsl(
             """
             smem_allocator = utils.SmemAllocator()
             storage = smem_allocator.allocate(SharedStorage)
-            shape = make_tile_shape(
+            shape = make_kernel_namespace(
                 tile_m=TILE_M,
                 tile_k=TILE_K,
                 stage_count=STAGE_COUNT_VALUE,
@@ -339,7 +335,7 @@ def _compile_mxfp8_quantize_2d_cutedsl(
 
             def _axis_1x32(bidx, bidy):
                 # 1x32: M is the fixed CTA tile (bidy), K is grouped (bidx).
-                return make_axis_spec(
+                return make_kernel_namespace(
                     shape=shape,
                     tiles_per_cta=K_TILES_PER_CTA,
                     group_tile_idx=cutlass.Int64(bidx),
@@ -357,10 +353,10 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                     is_full_tiles=IS_FULL_K_TILES,
                 )
 
-            io = make_kernel_io(
+            io = make_kernel_namespace(
                 storage=storage,
                 smem_layouts=_make_tile_smem_layouts(TILE_M, TILE_K),
-                tma=make_tma_handles(
+                tma=make_kernel_namespace(
                     atom_in=tma_atom_in,
                     tensor_in=tma_tensor_in,
                     atom_out=tma_atom_out,
@@ -371,7 +367,7 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                 scales_out_u8=scales_out_u8,
                 blocked_scale_output=BLOCKED_SCALE_OUTPUT_VALUE,
                 blocked_scale_layout=blocked_scale_layout,
-                opts=make_quant_opts(
+                opts=make_kernel_namespace(
                     use_rceil=USE_RCEIL,
                     blocked_scale_output=BLOCKED_SCALE_OUTPUT_VALUE,
                 ),
