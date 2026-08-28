@@ -9,6 +9,7 @@ Triton kernels for scaling high precision tensors to float8.
 """
 
 from enum import Enum
+from typing import NamedTuple
 
 import torch
 import triton
@@ -93,12 +94,57 @@ def _to_fp8_row_major(
     tl.store(out_ptr + block_offs, fp8_vals, mask=mask)
 
 
+class RowMajorTLaunchSpec(NamedTuple):
+    """Grouped launch arguments for :func:`_to_fp8_row_major_t`.
+
+    Bundles the values that always travel together when converting a
+    contiguous, row-major high-precision tensor into its transposed fp8
+    output: the input/output/scale buffers, the fp8 clamp bounds, the input
+    shape, and the Triton element dtypes. Strides and output dimensions are
+    derived inside the kernel from contiguity and the transpose relationship,
+    so they are intentionally not carried here.
+    """
+
+    input: torch.Tensor
+    output: torch.Tensor
+    scale: torch.Tensor
+    fp8_dtype_min: float
+    fp8_dtype_max: float
+    input_num_rows: int
+    input_num_cols: int
+    # Triton element dtypes (e.g. tl.float8e4nv); typed loosely since triton
+    # does not expose a stable public dtype annotation.
+    input_dtype: object
+    output_dtype: object
+
+
+def _to_fp8_row_major_t(spec: RowMajorTLaunchSpec, grid) -> None:
+    """Launch the transposed row-major fp8 conversion kernel.
+
+    Groups the kernel's launch arguments into ``spec`` (see
+    :class:`RowMajorTLaunchSpec`) so callers pass a single value object rather
+    than a long, error-prone positional argument list.
+    """
+    _to_fp8_row_major_t_kernel[grid](
+        spec.input,
+        spec.output,
+        spec.scale,
+        spec.input.numel(),
+        spec.fp8_dtype_min,
+        spec.fp8_dtype_max,
+        spec.input_num_rows,
+        spec.input_num_cols,
+        input_dtype=spec.input_dtype,
+        output_dtype=spec.output_dtype,
+    )
+
+
 @triton.autotune(
     configs=kernel_configs_2D,
     key=["num_elements"],
 )
 @triton.jit
-def _to_fp8_row_major_t(
+def _to_fp8_row_major_t_kernel(
     input_ptr,
     out_ptr,
     scale_ptr,
@@ -107,15 +153,10 @@ def _to_fp8_row_major_t(
     fp8_dtype_max: float,
     input_num_rows: int,
     input_num_cols: int,
-    input_stride_row: int,
-    input_stride_col: int,
-    output_stride_row: int,
-    output_stride_col: int,
     input_dtype: tl.constexpr,
     output_dtype: tl.constexpr,
     BLOCK_SIZE_ROWS: tl.constexpr,
     BLOCK_SIZE_COLS: tl.constexpr,
-    EPS: tl.constexpr,
 ):
     block_row_id = tl.program_id(axis=0)
     block_col_id = tl.program_id(axis=1)
@@ -123,6 +164,13 @@ def _to_fp8_row_major_t(
     # the output is the transpose of the input, so its dims are swapped
     output_num_rows = input_num_cols
     output_num_cols = input_num_rows
+
+    # input is contiguous (row-major) and the output is a freshly allocated
+    # contiguous transpose buffer, so all strides follow from the shapes
+    input_stride_row = input_num_cols
+    input_stride_col = 1
+    output_stride_row = output_num_cols
+    output_stride_col = 1
 
     # load scaling factor
     scale = tl.load(scale_ptr).to(tl.float32)
@@ -606,7 +654,6 @@ def hp_to_fp8_row_major_t(
 ) -> Float8TrainingTensor:
     assert hp_tensor.is_contiguous(), "input tensor must be contiguous"
 
-    num_elements = hp_tensor.numel()
     input_num_rows, input_num_cols = hp_tensor.shape
     output_num_rows, output_num_cols = input_num_cols, input_num_rows
     tl_input_dtype = FP8_DTYPE_MAP[hp_tensor.dtype]
@@ -631,22 +678,19 @@ def hp_to_fp8_row_major_t(
         triton.cdiv(input_num_rows, meta["BLOCK_SIZE_ROWS"]),
         triton.cdiv(input_num_cols, meta["BLOCK_SIZE_COLS"]),
     )
-    _to_fp8_row_major_t[grid](
-        hp_tensor,
-        output_buffer,
-        scale,
-        num_elements,
-        fp8_dtype_min,
-        fp8_dtype_max,
-        input_num_rows,
-        input_num_cols,
-        hp_tensor.stride(0),
-        hp_tensor.stride(1),
-        output_buffer.stride(0),
-        output_buffer.stride(1),
-        input_dtype=tl_input_dtype,
-        output_dtype=tl_output_dtype,
-        EPS=EPS,
+    _to_fp8_row_major_t(
+        RowMajorTLaunchSpec(
+            input=hp_tensor,
+            output=output_buffer,
+            scale=scale,
+            fp8_dtype_min=fp8_dtype_min,
+            fp8_dtype_max=fp8_dtype_max,
+            input_num_rows=input_num_rows,
+            input_num_cols=input_num_cols,
+            input_dtype=tl_input_dtype,
+            output_dtype=tl_output_dtype,
+        ),
+        grid,
     )
 
     # wrap output tensor in Float8TrainingTensor
