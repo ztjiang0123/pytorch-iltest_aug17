@@ -454,7 +454,39 @@ void _dequant_gemm_accum_small_M(
       qzeros_b, \
       K, \
       lda, \
-      ldc);
+      ldc); \
+  return true;
+
+// Dispatch to the M-specialized small-M kernel when the AVX512-VNNI fast path
+// applies. Returns true when it handled the call, false when the caller should
+// fall back to the generic path. Extracting this keeps the switch out of
+// `_dequant_gemm_accum`, avoiding a deeply nested main path there.
+template <int64_t N, int64_t ldb, bool sym_quant_a>
+bool _try_dequant_gemm_accum_small_M(
+    float* C,
+    const uint8_t* A,
+    const float* scales_a,
+    const int32_t* qzeros_a,
+    const uint8_t* B,
+    const float* scales_b,
+    const int8_t* qzeros_b,
+    int64_t M,
+    int64_t K,
+    int64_t lda,
+    int64_t ldc) {
+  switch (M) {
+    case 1:
+      call_dequant_gemm_accum_small_M(1);
+    case 2:
+      call_dequant_gemm_accum_small_M(2);
+    case 3:
+      call_dequant_gemm_accum_small_M(3);
+    case 4:
+      call_dequant_gemm_accum_small_M(4);
+    default:
+      return false;
+  }
+}
 #endif
 
 // Buffers and strides for the scalar reference GEMM, grouped so the helper
@@ -520,21 +552,10 @@ void _dequant_gemm_accum(
   // Compute GEMM int8 * int8 -> int32
   // dequant result to float by applying scales/qzeros
 #if defined(CPU_CAPABILITY_AVX512_VNNI)
-  if (M <= 4 && cpublas_can_pack) {
-    switch (M) {
-      case 1:
-        call_dequant_gemm_accum_small_M(1);
-        return;
-      case 2:
-        call_dequant_gemm_accum_small_M(2);
-        return;
-      case 3:
-        call_dequant_gemm_accum_small_M(3);
-        return;
-      case 4:
-        call_dequant_gemm_accum_small_M(4);
-        return;
-    }
+  if (M <= 4 && cpublas_can_pack &&
+      _try_dequant_gemm_accum_small_M<N, ldb, sym_quant_a>(
+          C, A, scales_a, qzeros_a, B, scales_b, qzeros_b, M, K, lda, ldc)) {
+    return;
   }
 #endif
 
