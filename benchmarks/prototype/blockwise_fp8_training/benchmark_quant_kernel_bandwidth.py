@@ -64,6 +64,22 @@ class KernelSpec:
     reference_runner: Callable[[torch.Tensor, int], Tuple[torch.Tensor, torch.Tensor]]
 
 
+@dataclass(frozen=True)
+class QuantOutput:
+    """Quantized tensor and its scales, produced by a single kernel run."""
+
+    y: torch.Tensor
+    s: torch.Tensor
+
+
+@dataclass(frozen=True)
+class Tolerance:
+    """Relative and absolute tolerances for correctness comparisons."""
+
+    rtol: float
+    atol: float
+
+
 def _validate_k_divisible(shape: Tuple[int, int], block_size: int) -> Optional[str]:
     _, k = shape
     if k % block_size != 0:
@@ -186,25 +202,24 @@ def _resolve_gpu_specs(use_roofline_utils: bool = False) -> GpuBandwidthSpec:
 
 def _benchmark_kernel(
     kernel: KernelSpec, input_tensor: torch.Tensor, block_size: int
-) -> Tuple[float, torch.Tensor, torch.Tensor]:
+) -> Tuple[float, QuantOutput]:
     y, s = kernel.runner(input_tensor, block_size)
     kernel_us = benchmark_cuda_function_in_microseconds(
         kernel.runner,
         input_tensor,
         block_size,
     )
-    return kernel_us, y, s
+    return kernel_us, QuantOutput(y=y, s=s)
 
 
 def _check_correctness(
     kernel: KernelSpec,
     input_tensor: torch.Tensor,
     block_size: int,
-    y: torch.Tensor,
-    s: torch.Tensor,
-    rtol: float,
-    atol: float,
+    output: QuantOutput,
+    tolerance: Tolerance,
 ) -> None:
+    y, s = output.y, output.s
     ref_y, ref_s = kernel.reference_runner(input_tensor, block_size)
 
     assert ref_y.shape == y.shape, (
@@ -223,25 +238,25 @@ def _check_correctness(
     torch.testing.assert_close(
         y.to(torch.float32),
         ref_y.to(torch.float32),
-        rtol=rtol,
-        atol=atol,
+        rtol=tolerance.rtol,
+        atol=tolerance.atol,
         msg=f"{kernel.name}: quantized outputs differ from Torch reference",
     )
     torch.testing.assert_close(
         s,
         ref_s,
-        rtol=rtol,
-        atol=atol,
+        rtol=tolerance.rtol,
+        atol=tolerance.atol,
         msg=f"{kernel.name}: scales differ from Torch reference",
     )
 
 
 def _calculate_logical_io_gbps(
     input_tensor: torch.Tensor,
-    y: torch.Tensor,
-    s: torch.Tensor,
+    output: QuantOutput,
     kernel_us: float,
 ) -> float:
+    y, s = output.y, output.s
     bytes_per_input_el = torch.finfo(input_tensor.dtype).bits / 8
     bytes_per_output_el = torch.finfo(y.dtype).bits / 8
     bytes_per_scale_el = torch.finfo(s.dtype).bits / 8
@@ -277,21 +292,18 @@ def _run_suite(
                 continue
 
             input_tensor = torch.randn(*shape, dtype=torch.bfloat16, device="cuda")
-            kernel_us, y, s = _benchmark_kernel(kernel, input_tensor, block_size)
+            kernel_us, output = _benchmark_kernel(kernel, input_tensor, block_size)
             if check_correctness:
                 _check_correctness(
                     kernel=kernel,
                     input_tensor=input_tensor,
                     block_size=block_size,
-                    y=y,
-                    s=s,
-                    rtol=correctness_rtol,
-                    atol=correctness_atol,
+                    output=output,
+                    tolerance=Tolerance(rtol=correctness_rtol, atol=correctness_atol),
                 )
             effective_logical_io_gbps = _calculate_logical_io_gbps(
                 input_tensor=input_tensor,
-                y=y,
-                s=s,
+                output=output,
                 kernel_us=kernel_us,
             )
             logical_io_vs_achievable_pct = None

@@ -21,6 +21,9 @@ import triton.language as tl
 from tabulate import tabulate
 from triton.testing import do_bench
 
+from torchao.prototype.moe_training.kernels.jagged_float8_scales import (
+    _triton_fp8_per_group_colwise_scales_kernel,
+)
 from torchao.prototype.moe_training.utils import generate_jagged_offs
 
 EPS = 1e-12
@@ -31,61 +34,14 @@ FP8_DTYPE_MAP = {
 
 device = torch.device("cuda")
 
-
-# ---------------------------------------------------------------------------
-# Standalone colwise kernel (no autotune wrapper) so we can inject any config.
-# Mirrors the production _triton_fp8_per_group_colwise_scales_kernel exactly.
-# Input shape: (K, N) where K=token rows (jagged dim), N=hidden cols.
-# BLOCK_SIZE tiles N; BLOCK_SIZE_ITER tiles K in the inner loop.
-# ---------------------------------------------------------------------------
-@triton.jit
-def _colwise_kernel(
-    input_ptr,
-    offsets_ptr,
-    out_ptr,
-    scales_ptr,
-    K: tl.int64,
-    N: tl.int64,
-    N_GROUPS: tl.int64,
-    str_ir: tl.int64,
-    str_ic: tl.int64,
-    str_or: tl.int64,
-    str_oc: tl.int64,
-    fp8_min: tl.constexpr,
-    fp8_max: tl.constexpr,
-    in_dtype: tl.constexpr,
-    out_dtype: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    BLOCK_SIZE_ITER: tl.constexpr,
-    EPS: tl.constexpr,
-):
-    bcol = tl.program_id(0)
-    gidx = tl.program_id(1)
-    rs = tl.load(offsets_ptr + gidx - 1, mask=gidx > 0, other=0)
-    re = tl.load(offsets_ptr + gidx)
-    col_offs = (bcol * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)).to(tl.int64)
-    amax = tl.zeros((BLOCK_SIZE,), dtype=in_dtype)
-    for r0 in range(rs, re, BLOCK_SIZE_ITER):
-        row_offs = (r0 + tl.arange(0, BLOCK_SIZE_ITER)).to(tl.int64)
-        offs = row_offs[:, None] * str_ir + col_offs[None, :] * str_ic
-        mask = (row_offs[:, None] < re) & (col_offs[None, :] < N)
-        d = tl.load(input_ptr + offs, mask=mask, other=0.0).to(in_dtype)
-        amax = tl.maximum(amax, tl.max(tl.abs(d), axis=0)).to(in_dtype)
-    amax = amax.to(tl.float64)
-    s = (fp8_max / tl.clamp(amax, min=EPS, max=float("inf"))).to(tl.float32)
-    s = tl.exp2(tl.floor(tl.log2(s)))
-    sc_offs = col_offs + N * gidx
-    sc_mask = tl.arange(0, BLOCK_SIZE) < N
-    tl.store(scales_ptr + sc_offs, s, mask=sc_mask)
-    for r0 in range(rs, re, BLOCK_SIZE_ITER):
-        row_offs = (r0 + tl.arange(0, BLOCK_SIZE_ITER)).to(tl.int64)
-        offs = row_offs[:, None] * str_ir + col_offs[None, :] * str_ic
-        mask = (row_offs[:, None] < re) & (col_offs[None, :] < N)
-        d = tl.load(input_ptr + offs, mask=mask, other=0.0).to(in_dtype)
-        sd = d * s[None, :]
-        fp8d = tl.clamp(sd, min=fp8_min, max=fp8_max).to(out_dtype)
-        o_offs = row_offs[:, None] * str_or + col_offs[None, :] * str_oc
-        tl.store(out_ptr + o_offs, fp8d, mask=mask)
+# We benchmark the production colwise kernel directly rather than keeping a
+# standalone copy in sync. `_triton_fp8_per_group_colwise_scales_kernel` is
+# autotuned in production; `.fn` is the underlying triton.jit function, which we
+# launch with an explicit (BLOCK_SIZE, BLOCK_SIZE_ITER, num_warps) config to
+# bypass autotune and sweep configs ourselves. The production kernel takes the
+# input column stride and output row stride as constexprs fixed to 1, which
+# matches our contiguous (K, N) input and column-major output layout.
+_colwise_kernel = _triton_fp8_per_group_colwise_scales_kernel.fn
 
 
 @dataclass(frozen=True)
@@ -162,20 +118,21 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
             offs,
             out,
             sc,
-            M,
-            K,
+            M,  # K in the kernel: token rows (jagged dim)
+            K,  # N in the kernel: hidden cols
             n_groups,
-            inp.stride(0),
-            inp.stride(1),
-            out.stride(0),
-            out.stride(1),
+            inp.stride(0),  # stride_input_row
+            out.stride(1),  # stride_output_col
             fp8_min,
             fp8_max,
             tl.bfloat16,
             tl_fp8_dtype,
+            True,  # round_scales_to_power_of_2 (matches prior benchmark behavior)
             BLOCK_SIZE=bs,
             BLOCK_SIZE_ITER=bsi,
             EPS=EPS,
+            STRIDE_OUTPUT_ROW=out.stride(0),
+            STRIDE_INPUT_COL=inp.stride(1),
             num_warps=nw,
             num_stages=2,
         )
