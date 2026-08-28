@@ -15,7 +15,7 @@ from torchao.quantization import (
     PerTensor,
     PerToken,
 )
-from torchao.quantization.pt2e._numeric_debugger import (  # noqa: F401
+from torchao.quantization.pt2e._numeric_debugger import (
     CUSTOM_KEY,
     FROM_NODE_KEY,
     NUMERIC_DEBUG_HANDLE_KEY,

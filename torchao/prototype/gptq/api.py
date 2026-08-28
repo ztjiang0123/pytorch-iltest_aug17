@@ -308,6 +308,192 @@ else:
     _nvfp4_q_fn = _nvfp4_with_precalculated_scales_q
 
 
+@dataclass
+class _GPTQBlockConfig:
+    """Resolved per-tensor blocking parameters for a GPTQ run.
+
+    Groups the values derived from the base config that the update loop and
+    result construction both need to share.
+    """
+
+    group_size: int
+    block_size: list
+    # Only set for NVFP4; the per-tensor global scale computed before the loop.
+    nvfp4_global_scale: object = None
+
+
+def _resolve_gptq_block_config(base_config, W_t: torch.Tensor) -> _GPTQBlockConfig:
+    """Derive group/block sizes (and NVFP4 global scale) from the base config."""
+    if isinstance(base_config, Int4WeightOnlyConfig):
+        group_size = base_config.group_size
+        return _GPTQBlockConfig(group_size=group_size, block_size=[1, group_size])
+    if isinstance(base_config, Int8WeightOnlyConfig):
+        assert isinstance(base_config.granularity, PerRow), (
+            "GPTQ only supports per-row quantization"
+        )
+        block_size = list(get_block_size(W_t.shape, base_config.granularity))
+        return _GPTQBlockConfig(group_size=block_size[-1], block_size=block_size)
+    if isinstance(base_config, NVFP4DynamicActivationNVFP4WeightConfig):
+        assert base_config.use_dynamic_per_tensor_scale, "unsupported"
+        group_size = 16
+        # for per-tensor nvfp4, we need to calculate the global scale over the
+        # entire tensor before we enter the GPTQ loop
+        tensor_amax = torch.max(torch.abs(W_t))
+        nvfp4_global_scale = per_tensor_amax_to_scale(tensor_amax)
+        return _GPTQBlockConfig(
+            group_size=group_size,
+            block_size=[1, group_size],
+            nvfp4_global_scale=nvfp4_global_scale,
+        )
+    raise AssertionError("unsupported")
+
+
+def _compute_inverse_hessian(H: torch.Tensor, W_t: torch.Tensor, percdamp: float):
+    """Zero out dead columns and return the upper-triangular inverse Hessian.
+
+    Mutates ``H`` and ``W_t`` in place (dead-column handling) and returns the
+    Cholesky-factored inverse Hessian used by the GPTQ update loop.
+    """
+    columns = W_t.shape[1]
+    device = W_t.device
+
+    dead = torch.diag(H) == 0
+    H[dead, dead] = 1
+    W_t[:, dead] = 0
+
+    # Apply damping and compute inverse Hessian for numerical stability
+    damp = percdamp * torch.mean(torch.diag(H))
+    diag = torch.arange(columns, device=device)
+    H[diag, diag] += damp
+    H = torch.linalg.cholesky(H)
+    H = torch.cholesky_inverse(H)
+    H = torch.linalg.cholesky(H, upper=True)
+    return H
+
+
+@dataclass
+class _GroupQParams:
+    """Frozen quantization parameters for one group of columns.
+
+    The active fields depend on the base config: Int4 uses ``scale`` and
+    ``zero_point``, Int8 uses ``quantized_tensor``, and NVFP4 uses ``scale``.
+    """
+
+    scale: object = None
+    zero_point: object = None
+    quantized_tensor: object = None
+
+
+def _init_group_qparams(base_config, block, nvfp4_global_scale, group_size):
+    """Freeze the quantization qparams for one group of columns.
+
+    Returns ``(qparams, group_qparam)`` where ``qparams`` is a
+    :class:`_GroupQParams` and ``group_qparam`` is the value (if any) to append
+    to the running per-group qparams list.
+    """
+    if isinstance(base_config, Int4WeightOnlyConfig):
+        _, scale, zero_point = int4_row_quantize_zp(block, group_size)
+        return _GroupQParams(scale=scale, zero_point=zero_point), (scale, zero_point)
+    if isinstance(base_config, Int8WeightOnlyConfig):
+        quantized_tensor = Int8Tensor.from_hp(block, base_config.granularity)
+        return _GroupQParams(quantized_tensor=quantized_tensor), None
+    if isinstance(base_config, NVFP4DynamicActivationNVFP4WeightConfig):
+        # quantize this slice using pre-calculated global scale, to get the
+        # blockwise dynamic scales, they will be frozen after this point
+        scale, _data_lp = nvfp4_quantize(
+            block.contiguous(),
+            per_tensor_scale=nvfp4_global_scale,
+        )
+        # TODO(future PR): simpler version of `nvfp4_quantize` which just
+        # calculates the scale, since we are throwing away the quantized packed
+        # data here. For now, just call the full one.
+        del _data_lp
+        return _GroupQParams(scale=scale), scale
+    raise AssertionError("unsupported")
+
+
+def _qdq_column(base_config, w_t, qparams, group_size, nvfp4_global_scale):
+    """Quantize-then-dequantize a single column using the frozen group qparams."""
+    if isinstance(base_config, Int4WeightOnlyConfig):
+        q = _int4_row_quantize_zp_precomputed_qparams(
+            w_t, qparams.scale, qparams.zero_point, group_size
+        )
+        return _int4_row_dequantize_zp(q, qparams.scale, qparams.zero_point, group_size)
+    if isinstance(base_config, Int8WeightOnlyConfig):
+        q = Int8Tensor.from_hp(
+            w_t,
+            granularity=base_config.granularity,
+            scale=qparams.quantized_tensor.scale,
+        )
+        return q.dequantize(output_dtype=torch.float)
+    if isinstance(base_config, NVFP4DynamicActivationNVFP4WeightConfig):
+        return _nvfp4_qdq_fn(w_t, nvfp4_global_scale, qparams.scale.squeeze(-1))
+    raise AssertionError("unsupported")
+
+
+def _build_quantized_result(base_config, W_t, group_qparams, block_cfg, qparams):
+    """Assemble the final quantized tensor from the accumulated group qparams."""
+    group_size = block_cfg.group_size
+    if isinstance(base_config, Int4WeightOnlyConfig):
+        scale, zero_point = [torch.cat(x, dim=0) for x in zip(*group_qparams)]
+        wq_t = _int4_row_quantize_zp_precomputed_qparams(
+            W_t, scale, zero_point, group_size
+        )
+        return Int4Tensor(
+            qdata=pack_int4(wq_t),
+            scale=scale.to(W_t.dtype),
+            zero_point=zero_point.to(W_t.dtype),
+            block_size=block_cfg.block_size,
+            shape=W_t.shape,
+            act_pre_scale=None,
+        )
+    if isinstance(base_config, Int8WeightOnlyConfig):
+        return Int8Tensor.from_hp(
+            W_t,
+            granularity=base_config.granularity,
+            scale=qparams.quantized_tensor.scale,
+        )
+
+    N, K = W_t.shape
+    nvfp4_global_scale = block_cfg.nvfp4_global_scale
+    # TODO(future PR): clean up the line below. Context: the current nvfp4
+    # code follows the int4 code - we save the blockwise scales to an array
+    # and concat it. This leads to the necessity of t().contiguous().t() to
+    # get the scales back into the right layout for W_t. This is not
+    # intuitive, likely better to initialize the scales holder ahead of time
+    # and write the scales directly to their final place.
+    combined_scale = (
+        torch.cat(group_qparams, dim=0).reshape(K // group_size, N).t().contiguous()
+    )
+    qdata = _nvfp4_q_fn(W_t, nvfp4_global_scale, combined_scale)
+
+    act_quant_kwargs = QuantizeTensorToNVFP4Kwargs(
+        use_dynamic_per_tensor_scale=base_config.use_dynamic_per_tensor_scale,
+        use_triton_kernel=base_config.use_triton_kernel,
+        is_swizzled_scales=True,
+    )
+
+    # swizzle the block scales
+    combined_scale_swizzled = to_blocked(combined_scale).flatten()
+    scale_N, scale_K = hp_data_dims_to_swizzled_scale_dims_nvfp4(N, K)
+    combined_scale_swizzled = combined_scale_swizzled.view(scale_N, scale_K)
+
+    return NVFP4Tensor(
+        qdata,
+        combined_scale_swizzled,
+        block_size=group_size,
+        orig_dtype=W_t.dtype,
+        per_tensor_scale=nvfp4_global_scale,
+        # TODO(future): get act_per_tensor_scale from calibration data?
+        # for now, set it to None here to calculate it dynamically at
+        # runtime
+        act_per_tensor_scale=None,
+        is_swizzled_scales=True,
+        use_triton_kernel=base_config.use_triton_kernel,
+        act_quant_kwargs=act_quant_kwargs,
+    )
+
+
 def gptq_quantize(H: torch.Tensor, W_t: torch.Tensor, config: GPTQConfig):
     """
     This function implements the GPTQ algorithm described in this paper: https://arxiv.org/abs/2210.17323 (Algorithm 1)
@@ -360,27 +546,9 @@ def gptq_quantize(H: torch.Tensor, W_t: torch.Tensor, config: GPTQConfig):
     percdamp = config.percdamp
     base_config = config.base_config
 
-    if isinstance(base_config, Int4WeightOnlyConfig):
-        group_size = config.base_config.group_size
-        block_size = [1, group_size]
-    elif isinstance(base_config, Int8WeightOnlyConfig):
-        assert isinstance(base_config.granularity, PerRow), (
-            "GPTQ only supports per-row quantization"
-        )
-        block_size = get_block_size(W_t.shape, base_config.granularity)
-        block_size = list(block_size)
-        group_size = block_size[-1]
-    elif isinstance(base_config, NVFP4DynamicActivationNVFP4WeightConfig):
-        assert base_config.use_dynamic_per_tensor_scale, "unsupported"
-        group_size = 16
-        block_size = [1, group_size]
-        # for per-tensor nvfp4, we need to calculate the global scale over the
-        # entire tensor before we enter the GPTQ loop
-        tensor_amax = torch.max(torch.abs(W_t))
-        nvfp4_global_scale = per_tensor_amax_to_scale(tensor_amax)
-    else:
-        raise AssertionError("unsupported")
-
+    block_cfg = _resolve_gptq_block_config(base_config, W_t)
+    group_size = block_cfg.group_size
+    nvfp4_global_scale = block_cfg.nvfp4_global_scale
     assert group_size > 0
 
     W_t = W_t.view(-1, W_t.shape[-1]).detach()
@@ -389,18 +557,7 @@ def gptq_quantize(H: torch.Tensor, W_t: torch.Tensor, config: GPTQConfig):
 
     assert device.type == "cuda", "GPTQ only supports CUDA currently"
 
-    dead = torch.diag(H) == 0
-    H[dead, dead] = 1
-    W_t[:, dead] = 0
-
-    # Apply damping and compute inverse Hessian for numerical stability
-    damp = percdamp * torch.mean(torch.diag(H))
-    diag = torch.arange(columns, device=device)
-    H[diag, diag] += damp
-    H = torch.linalg.cholesky(H)
-    H = torch.cholesky_inverse(H)
-    H = torch.linalg.cholesky(H, upper=True)
-    Hinv = H
+    Hinv = _compute_inverse_hessian(H, W_t, percdamp)
 
     # GPTQ update loop:
     #
@@ -444,12 +601,15 @@ def gptq_quantize(H: torch.Tensor, W_t: torch.Tensor, config: GPTQConfig):
     #
 
     group_qparams = []
+    # qparams holds the frozen quantization parameters for the current group; it
+    # is set inside the loop before it is read.
+    qparams = None
     for B_cur, B_cur_k_start in zip(
         torch.split(W_t, gptq_quantize_block_size, dim=1),
         range(0, columns, gptq_quantize_block_size),
     ):
         B_cur_k_end = min(B_cur_k_start + gptq_quantize_block_size, columns)
-        B_cur_Err1 = torch.zeros_like(B_cur, dtype=H.dtype)
+        B_cur_Err1 = torch.zeros_like(B_cur, dtype=Hinv.dtype)
         Hinv_cur = Hinv[B_cur_k_start:B_cur_k_end, B_cur_k_start:B_cur_k_end]
 
         # If we are doing per-row quantization, the group_size is equal to the number of columns and this will only run once.
@@ -459,67 +619,23 @@ def gptq_quantize(H: torch.Tensor, W_t: torch.Tensor, config: GPTQConfig):
 
             # We only need to calculate initial qparams for the group once
             if G_k_start % group_size == 0:
-                if isinstance(base_config, Int4WeightOnlyConfig):
-                    _, scale, zero_point = int4_row_quantize_zp(
-                        B_cur[
-                            :,
-                            G_k_start - B_cur_k_start : G_k_end - B_cur_k_start,
-                        ],
-                        group_size,
-                    )
-                    group_qparams.append((scale, zero_point))
-                elif isinstance(base_config, Int8WeightOnlyConfig):
-                    quantized_tensor = Int8Tensor.from_hp(
-                        B_cur[
-                            :,
-                            G_k_start - B_cur_k_start : G_k_end - B_cur_k_start,
-                        ],
-                        base_config.granularity,
-                    )
-                elif isinstance(base_config, NVFP4DynamicActivationNVFP4WeightConfig):
-                    tensor_slice = B_cur[
-                        :,
-                        G_k_start - B_cur_k_start : G_k_end - B_cur_k_start,
-                    ].contiguous()
-                    # quantize this slice using pre-calculated global scale, to
-                    # get the blockwise dynamic scales, they will be frozen
-                    # after this point
-                    scale, _data_lp = nvfp4_quantize(
-                        tensor_slice,
-                        per_tensor_scale=nvfp4_global_scale,
-                    )
-                    group_qparams.append(scale)
-                    # TODO(future PR): simpler version of `nvfp4_quantize` which
-                    # just calculates the scale, since we are throwing away the
-                    # quantized packed data here. For now, just call the full
-                    # one.
-                    del _data_lp
-
-                else:
-                    raise AssertionError("unsupported")
+                group_block = B_cur[
+                    :,
+                    G_k_start - B_cur_k_start : G_k_end - B_cur_k_start,
+                ]
+                qparams, group_qparam = _init_group_qparams(
+                    base_config, group_block, nvfp4_global_scale, group_size
+                )
+                if group_qparam is not None:
+                    group_qparams.append(group_qparam)
 
             # Quantize each column and propagate errors to subsequent columns
             for k in range(G_k_start - B_cur_k_start, G_k_end - B_cur_k_start):
                 # k is relative to the start of B_cur
                 w_t = B_cur[:, k].unsqueeze(1)
-                if isinstance(base_config, Int4WeightOnlyConfig):
-                    q = _int4_row_quantize_zp_precomputed_qparams(
-                        w_t, scale, zero_point, group_size
-                    )
-                    dq = _int4_row_dequantize_zp(q, scale, zero_point, group_size)
-                elif isinstance(base_config, Int8WeightOnlyConfig):
-                    q = Int8Tensor.from_hp(
-                        w_t,
-                        granularity=base_config.granularity,
-                        scale=quantized_tensor.scale,
-                    )
-                    dq = q.dequantize(output_dtype=torch.float)
-                elif isinstance(base_config, NVFP4DynamicActivationNVFP4WeightConfig):
-                    dq = _nvfp4_qdq_fn(
-                        w_t,
-                        nvfp4_global_scale,
-                        scale.squeeze(-1),
-                    )
+                dq = _qdq_column(
+                    base_config, w_t, qparams, group_size, nvfp4_global_scale
+                )
 
                 err1 = (w_t - dq) / Hinv_cur[k, k]
                 B_cur[:, k:] -= err1.matmul(Hinv_cur[k, k:].unsqueeze(0))
@@ -534,67 +650,7 @@ def gptq_quantize(H: torch.Tensor, W_t: torch.Tensor, config: GPTQConfig):
     torch.cuda.synchronize()
 
     # Create the final quantized tensor, which has the same qparams (scale, zero_point), but different qdata
-    if isinstance(base_config, Int4WeightOnlyConfig):
-        scale, zero_point = [torch.cat(x, dim=0) for x in zip(*group_qparams)]
-        wq_t = _int4_row_quantize_zp_precomputed_qparams(
-            W_t, scale, zero_point, group_size
-        )
-        result = Int4Tensor(
-            qdata=pack_int4(wq_t),
-            scale=scale.to(W_t.dtype),
-            zero_point=zero_point.to(W_t.dtype),
-            block_size=block_size,
-            shape=W_t.shape,
-            act_pre_scale=None,
-        )
-    elif isinstance(base_config, Int8WeightOnlyConfig):
-        result = Int8Tensor.from_hp(
-            W_t, granularity=base_config.granularity, scale=quantized_tensor.scale
-        )
-    else:
-        N, K = W_t.shape
-        # TODO(future PR): clean up the line below. Context: the current nvfp4
-        # code follows the int4 code - we save the blockwise scales to an array
-        # and concat it. This leads to the necessity of t().contiguous().t() to
-        # get the scales back into the right layout for W_t. This is not
-        # intuitive, likely better to initialize the scales holder ahead of time
-        # and write the scales directly to their final place.
-        combined_scale = (
-            torch.cat(group_qparams, dim=0).reshape(K // group_size, N).t().contiguous()
-        )
-        qdata = _nvfp4_q_fn(
-            W_t,
-            nvfp4_global_scale,
-            combined_scale,
-        )
-
-        act_quant_kwargs = QuantizeTensorToNVFP4Kwargs(
-            use_dynamic_per_tensor_scale=base_config.use_dynamic_per_tensor_scale,
-            use_triton_kernel=base_config.use_triton_kernel,
-            is_swizzled_scales=True,
-        )
-
-        # swizzle the block scales
-        combined_scale_swizzled = to_blocked(combined_scale).flatten()
-        scale_N, scale_K = hp_data_dims_to_swizzled_scale_dims_nvfp4(N, K)
-        combined_scale_swizzled = combined_scale_swizzled.view(scale_N, scale_K)
-
-        result = NVFP4Tensor(
-            qdata,
-            combined_scale_swizzled,
-            block_size=group_size,
-            orig_dtype=W_t.dtype,
-            per_tensor_scale=nvfp4_global_scale,
-            # TODO(future): get act_per_tensor_scale from calibration data?
-            # for now, set it to None here to calculate it dynamically at
-            # runtime
-            act_per_tensor_scale=None,
-            is_swizzled_scales=True,
-            use_triton_kernel=base_config.use_triton_kernel,
-            act_quant_kwargs=act_quant_kwargs,
-        )
-
-    return result
+    return _build_quantized_result(base_config, W_t, group_qparams, block_cfg, qparams)
 
 
 def gptq_quantize_3d(H: torch.Tensor, W_t: torch.Tensor, config: GPTQConfig):
