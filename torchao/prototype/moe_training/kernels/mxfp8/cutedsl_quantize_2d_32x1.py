@@ -5,9 +5,20 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
+# NOTE: This module is only imported on the CuTeDSL quantization path (lazily,
+# from ``quant.py``), which requires the ``cutlass`` runtime to be installed. It
+# is intentionally not importable in a CPU-only / cutlass-free environment (the
+# ``cute_utils`` re-exports below already require cutlass), so importing cutlass
+# at module scope here does not regress any CPU import path.
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+import cutlass.utils as utils
 import torch
+from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from torchao.utils import ceil_div
 
@@ -56,6 +67,395 @@ def _select_cutedsl_config(
     return config_name, _CUTEDSL_CONFIGS[config_name]
 
 
+def _resolve_input_cutlass_dtype_32x1(input_dtype_name: str):
+    if input_dtype_name == "torch.float32":
+        return cutlass.Float32
+    if input_dtype_name == "torch.bfloat16":
+        return cutlass.BFloat16
+    raise ValueError(
+        f"Unsupported input dtype for CuTeDSL quantize_2d_32x1: {input_dtype_name}"
+    )
+
+
+def _make_shared_storage_struct_32x1(input_cutlass_dtype, stage_count, stage_elems):
+    """Build the per-compile ``@cute.struct`` for staged input/output SMEM.
+
+    Depends on the tuned tile geometry, so it is created once per compiled
+    specialization rather than shared at module scope.
+    """
+
+    @cute.struct
+    class SharedStorage:
+        tma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, stage_count]
+        in_smem: cute.struct.Align[
+            cute.struct.MemRange[input_cutlass_dtype, stage_count * stage_elems],
+            128,
+        ]
+        out_smem: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float8E4M3FN, stage_count * stage_elems],
+            128,
+        ]
+
+    return SharedStorage
+
+
+@dataclass(frozen=True)
+class _Mxfp8Quantize2d32x1Config:
+    """Tuned compile-time configuration for the MXFP8 2D 32x1 quantize kernel.
+
+    Bundles the ``@functools.cache``-keyed specialization constants (plus the
+    per-compile ``SharedStorage`` struct) so the kernel object is constructed
+    from a single value instead of a long keyword list.
+    """
+
+    shared_storage: object
+    input_cutlass_dtype: object
+    scaling_mode: str
+    compute_warps: int
+    tile_m: int
+    tile_k: int
+    m_tiles_per_cta: int
+    is_full_m_tiles: bool
+    blocked_scale_output: bool
+    scale_dim_m: int
+    m_blocks_per_tile: int
+    stage_count: int
+    threads_per_block: int
+    tile_copy_bytes: int
+    k_threads: int
+    k_iters_per_lane: int
+
+
+class _Mxfp8Quantize2d32x1Kernel:
+    """MXFP8 2D 32x1 quantization kernel.
+
+    All tuned/config values are stored as plain-Python attributes so the
+    ``@cute.jit`` / ``@cute.kernel`` methods can consume them as compile-time
+    constants (via ``cutlass.const_expr`` / ``range``) during tracing.
+
+    Warp-specialized TMA kernel:
+    - warp 0: producer (issues TMA G2S and S2G)
+    - warps [1..compute_warps]: consumers (quantize)
+    Note: we intentionally keep store on warp 0 (no dedicated store warp). A
+    split load-warp/store-warp design was tested and mostly regressed
+    throughput, so this layout is the tuned default.
+    """
+
+    def __init__(self, config: "_Mxfp8Quantize2d32x1Config"):
+        # Expose the tuned/config constants as attributes so the traced
+        # ``@cute.jit`` / ``@cute.kernel`` methods keep reading ``self.TILE_M``
+        # etc. as compile-time constexpr.
+        self.SharedStorage = config.shared_storage
+        self.INPUT_CUTLASS_DTYPE = config.input_cutlass_dtype
+        self.SCALING_MODE = config.scaling_mode
+        self.COMPUTE_WARPS = config.compute_warps
+        self.TILE_M = config.tile_m
+        self.TILE_K = config.tile_k
+        self.M_TILES_PER_CTA = config.m_tiles_per_cta
+        self.IS_FULL_M_TILES = config.is_full_m_tiles
+        self.BLOCKED_SCALE_OUTPUT = config.blocked_scale_output
+        self.SCALE_DIM_M = config.scale_dim_m
+        self.M_BLOCKS_PER_TILE = config.m_blocks_per_tile
+        self.STAGE_COUNT = config.stage_count
+        self.THREADS_PER_BLOCK = config.threads_per_block
+        self.TILE_COPY_BYTES = config.tile_copy_bytes
+        self.K_THREADS = config.k_threads
+        self.K_ITERS_PER_LANE = config.k_iters_per_lane
+
+    @cute.jit
+    def _load_block_full_smem_to_reg(
+        self,
+        sIN_tile: cute.Tensor,
+        k_rel: cutlass.Int32,
+        m_base: cutlass.Int32,
+    ):
+        """Load a full 32-element quantization block from shared memory to registers.
+
+        Loads all elements without bounds checking. For 32x1 scaling, we load 32 elements
+        along the M dimension for a given K position.
+
+        Args:
+            sIN_tile: Input tile in shared memory (TILE_M, TILE_K)
+            k_rel: Column index within tile
+            m_base: Starting M index for this block within tile
+
+        Returns:
+            vals_block: 32 input elements in register memory
+        """
+        vals_block = cute.make_rmem_tensor((self.SCALE_DIM_M,), cutlass.Float32)
+        for i in range(self.SCALE_DIM_M):
+            vals_block[i] = cutlass.Float32(sIN_tile[m_base + i, k_rel])
+        return vals_block
+
+    @cute.jit
+    def _load_block_tail_smem_to_reg(
+        self,
+        sIN_tile: cute.Tensor,
+        m0: cutlass.Int64,
+        k_rel: cutlass.Int32,
+        m_base: cutlass.Int32,
+        M: cutlass.Int64,
+    ):
+        """Load a 32-element quantization block from shared memory to registers with bounds checking.
+
+        Out-of-bounds elements are set to 0.0. For 32x1 scaling, we check M dimension bounds.
+
+        Args:
+            sIN_tile: Input tile in shared memory (TILE_M, TILE_K)
+            m0: Global M offset for this tile
+            k_rel: Column index within tile
+            m_base: Starting M index for this block within tile
+            M: Total M dimension size for bounds checking
+
+        Returns:
+            vals_block: 32 input elements in register memory (out-of-bounds set to 0.0)
+        """
+        vals_block = cute.make_rmem_tensor((self.SCALE_DIM_M,), cutlass.Float32)
+        for i in range(self.SCALE_DIM_M):
+            m = m0 + m_base + i
+            if m < M:
+                vals_block[i] = cutlass.Float32(sIN_tile[m_base + i, k_rel])
+            else:
+                vals_block[i] = cutlass.Float32(0.0)
+        return vals_block
+
+    @cute.jit
+    def _store_q_fp8_reg_to_smem(
+        self,
+        q_fp8_vals4: cute.Tensor,
+        sOUT_tile: cute.Tensor,
+        lane_rel: cutlass.Int32,
+        chunk_base: cutlass.Int32,
+    ):
+        """Store 4 quantized FP8 values from registers to shared memory.
+
+        For 32x1 scaling with column-major SMEM, the 4 values are stored along
+        the M dimension. Called by the shared ``quantize_block_store_full``/
+        ``_tail`` loops in ``cute_utils`` with the canonical
+        ``(lane_rel, chunk_base)`` coordinate pair; for the 32x1 kernel the
+        axes are transposed relative to 1x32, so the lane is the tile column
+        (K) and ``chunk_base`` the starting M index of the chunk.
+
+        Args:
+            q_fp8_vals4: 4 quantized FP8 values in register memory
+            sOUT_tile: Output tile in shared memory (TILE_M, TILE_K) with column-major layout
+            lane_rel: Column index within tile (K)
+            chunk_base: Starting M index for this chunk within tile
+
+        Storage locations:
+            Input: q_fp8_vals4 (registers)
+            Output: sOUT_tile (shared memory, column-major)
+        """
+        for i in range(4):
+            sOUT_tile[chunk_base + i, lane_rel] = q_fp8_vals4[i]
+
+    @cute.jit
+    def _issue_tma_store(
+        self,
+        tma_atom_out: cute.CopyAtom,
+        gOUT_tile: cute.Tensor,
+        sOUT_tile: cute.Tensor,
+        warp_idx: cutlass.Int32,
+    ):
+        """Issue TMA store from shared to global memory (2D tiles, group end 1).
+
+        Delegates to the shared ``issue_tma_store_s2g`` helper; the 32x1 kernel
+        uses ``group_modes_end=1`` for its 2D tiles.
+        """
+        issue_tma_store_s2g(tma_atom_out, gOUT_tile, sOUT_tile, warp_idx, 1)
+
+    @cute.kernel
+    def kernel(
+        self,
+        inp_mk: cute.Tensor,
+        tma_atom_in: cute.CopyAtom,
+        tma_tensor_in: cute.Tensor,
+        out_mk: cute.Tensor,
+        tma_atom_out: cute.CopyAtom,
+        tma_tensor_out: cute.Tensor,
+        scales_out_u8: cute.Tensor,
+        M: cutlass.Int64,
+        K: cutlass.Int64,
+        m_blocks: cutlass.Int64,
+        m_cta_tiles: cutlass.Int64,
+        k_cta_tiles: cutlass.Int64,
+        blocked_scale_layout: cute.Layout,
+        offs: Optional[cute.Tensor],
+        SCALE_DIM_M: cutlass.Constexpr[int],
+        USE_RCEIL: cutlass.Constexpr[bool],
+        IS_FULL_M_TILES: cutlass.Constexpr[bool],
+        STAGE_COUNT: cutlass.Constexpr[int],
+    ):
+        """MXFP8 32x1 quantization kernel (scales along M, M//32 per column).
+
+        This is the transpose of the 1x32 kernel: K indexes the fixed CTA
+        tile axis while M is the grouped, per-32-element-block scaling axis,
+        so each column carries M//32 scales. block_idx.x selects the grouped
+        M tile and block_idx.y the fixed K tile. The warp-specialized TMA
+        pipeline body is shared in ``run_quantize_2d_kernel``; ``_axis_32x1``
+        supplies this kernel's transposed axis mapping.
+        """
+        smem_allocator = utils.SmemAllocator()
+        storage = smem_allocator.allocate(self.SharedStorage)
+        shape = make_kernel_namespace(
+            tile_m=self.TILE_M,
+            tile_k=self.TILE_K,
+            stage_count=self.STAGE_COUNT,
+            tile_copy_bytes=self.TILE_COPY_BYTES,
+        )
+        tma = make_kernel_namespace(
+            atom_in=tma_atom_in,
+            tensor_in=tma_tensor_in,
+            atom_out=tma_atom_out,
+            tensor_out=tma_tensor_out,
+        )
+        opts = make_kernel_namespace(
+            use_rceil=USE_RCEIL,
+            blocked_scale_output=self.BLOCKED_SCALE_OUTPUT,
+        )
+
+        def _axis_32x1(bidx, bidy):
+            # 32x1: K is the fixed CTA tile (bidy), M is grouped (bidx).
+            return make_kernel_namespace(
+                shape=shape,
+                tiles_per_cta=self.M_TILES_PER_CTA,
+                group_tile_idx=cutlass.Int64(bidx),
+                fixed_tile=cutlass.Int64(bidy),
+                group_is_first_coord=True,
+                lane_tile_size=self.TILE_K,
+                lane_iters=self.K_ITERS_PER_LANE,
+                lane_threads=self.K_THREADS,
+                lane_axis_size=K,
+                block_tile_size=self.TILE_M,
+                blocks_per_tile=self.M_BLOCKS_PER_TILE,
+                scale_dim=self.SCALE_DIM_M,
+                block_axis_size=M,
+                num_blocks=m_blocks,
+                is_full_tiles=IS_FULL_M_TILES,
+            )
+
+        io = make_kernel_namespace(
+            storage=storage,
+            smem_layouts=_make_tile_smem_layouts(self.TILE_M, self.TILE_K),
+            tma=tma,
+            shape=shape,
+            offs=offs,
+            scales_out_u8=scales_out_u8,
+            blocked_scale_output=self.BLOCKED_SCALE_OUTPUT,
+            blocked_scale_layout=blocked_scale_layout,
+            opts=opts,
+            compute_warps=self.COMPUTE_WARPS,
+        )
+        run_quantize_2d_kernel(self, io, _axis_32x1)
+
+    @cute.jit
+    def __call__(
+        self,
+        inp_mk: cute.Tensor,
+        out_mk: cute.Tensor,
+        scales_out_u8: cute.Tensor,
+        M: cutlass.Int64,
+        K: cutlass.Int64,
+        m_blocks: cutlass.Int64,
+        m_cta_tiles: cutlass.Int64,
+        k_cta_tiles: cutlass.Int64,
+        stream: cuda.CUstream,
+        offs: Optional[cute.Tensor],
+    ):
+        """Kernel launcher that sets up TMA descriptors and blocked scale layout.
+
+        Args:
+            inp_mk: Input tensor in global memory (M, K)
+            out_mk: Output quantized data tensor in global memory (M, K)
+            scales_out_u8: Output scales tensor in global memory (M//32, K) or blocked layout
+            M: M dimension size
+            K: K dimension size
+            m_blocks: Number of 32-element blocks in M
+            m_cta_tiles: Number of tiles in M dimension
+            k_cta_tiles: Number of tile groups in K dimension
+            stream: CUDA stream
+            offs: Tensor of group end offsets for validation (group sizes must be multiples of 128)
+
+        Storage locations:
+            All tensors in global memory
+        """
+        smem_layout_in, smem_layout_out = _make_tile_smem_layouts(
+            self.TILE_M, self.TILE_K
+        )
+        # Use tcgen05.CtaGroup.ONE for the optimised single-CTA Blackwell (SM 10.x) TMA load path.
+        g2s_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
+        tma_atom_in, tma_tensor_in = cpasync.make_tiled_tma_atom(
+            g2s_op,
+            inp_mk,
+            smem_layout_in,
+            (self.TILE_M, self.TILE_K),
+        )
+        out_colmajor = cute.make_tensor(
+            out_mk.iterator,
+            cute.make_layout((M, K), stride=(1, M)),  # col major
+        )
+        tma_atom_out, tma_tensor_out = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileS2GOp(),
+            out_colmajor,
+            smem_layout_out,
+            (
+                self.TILE_M,
+                self.TILE_K,
+            ),  # Keep original tile dimensions to match global memory expectation
+        )
+
+        blocked_scale_layout = cute.make_layout((1,))
+        if cutlass.const_expr(self.BLOCKED_SCALE_OUTPUT):
+            # Use same blocked layout as regular 2D kernel but for (K, M//32) tensor
+            # For scales shape (K, M//32): K is rows, M//32 is columns
+            padded_scale_rows = cute.round_up(
+                K, 128
+            )  # K rounded to multiple of 128 (first dim)
+            padded_scale_cols = cute.round_up(
+                m_blocks, 4
+            )  # M//32 rounded to multiple of 4 (second dim)
+            m_block_tiles = padded_scale_rows // cutlass.Int64(
+                128
+            )  # Number of 128-row tiles
+            k_block_tiles = padded_scale_cols // cutlass.Int64(
+                4
+            )  # Number of 4-col tiles
+            blocked_scale_layout = cute.make_layout(
+                ((32, 4, m_block_tiles), (4, k_block_tiles)),
+                stride=(
+                    (16, 4, cutlass.Int64(128) * padded_scale_cols),
+                    (1, cutlass.Int64(512)),
+                ),
+            )
+
+        self.kernel(
+            inp_mk,
+            tma_atom_in,
+            tma_tensor_in,
+            out_mk,
+            tma_atom_out,
+            tma_tensor_out,
+            scales_out_u8,
+            M,
+            K,
+            m_blocks,
+            m_cta_tiles,
+            k_cta_tiles,
+            blocked_scale_layout,
+            offs,
+            SCALE_DIM_M=self.SCALE_DIM_M,
+            USE_RCEIL=(self.SCALING_MODE == "rceil"),
+            IS_FULL_M_TILES=self.IS_FULL_M_TILES,
+            STAGE_COUNT=self.STAGE_COUNT,
+        ).launch(
+            grid=(m_cta_tiles, k_cta_tiles, 1),
+            block=(self.THREADS_PER_BLOCK, 1, 1),
+            cluster=(1, 1, 1),
+            smem=self.SharedStorage.size_in_bytes(),  # pyrefly: ignore [missing-attribute]
+            stream=stream,
+        )
+
+
 @functools.cache
 def _compile_mxfp8_quantize_2d_32x1_cutedsl(
     input_dtype_name: str,
@@ -89,359 +489,55 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
     Returns:
         Compiled CuTeDSL kernel callable
     """
-    import cuda.bindings.driver as cuda
-    import cutlass
-    import cutlass.cute as cute
-    import cutlass.utils as utils
-    from cutlass.cute.nvgpu import cpasync, tcgen05
     from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
-    if input_dtype_name == "torch.float32":
-        INPUT_CUTLASS_DTYPE = cutlass.Float32
-    elif input_dtype_name == "torch.bfloat16":
-        INPUT_CUTLASS_DTYPE = cutlass.BFloat16
-    else:
-        raise ValueError(
-            f"Unsupported input dtype for CuTeDSL quantize_2d_32x1: {input_dtype_name}"
-        )
+    input_cutlass_dtype = _resolve_input_cutlass_dtype_32x1(input_dtype_name)
 
     # Warp-specialized TMA kernel:
     # - warp 0: producer (issues TMA G2S and S2G)
     # - warps [1..compute_warps]: consumers (quantize)
-    COMPUTE_WARPS = compute_warps
-    TILE_M = tile_m
-    TILE_K = tile_k
-    M_TILES_PER_CTA = m_tiles_per_cta
-    IS_FULL_M_TILES_VALUE = is_full_m_tiles
-    BLOCKED_SCALE_OUTPUT_VALUE = blocked_scale_output
+    assert compute_warps >= 1
+    assert tile_m > 0 and tile_k > 0
+    assert tile_m % 32 == 0  # Changed from TILE_K % 32 == 0 for 32x1 scaling
 
-    THREADS_PER_BLOCK = (1 + COMPUTE_WARPS) * 32
-    assert COMPUTE_WARPS >= 1
-    assert TILE_M > 0 and TILE_K > 0
-    assert TILE_M % 32 == 0  # Changed from TILE_K % 32 == 0 for 32x1 scaling
-
-    SCALE_DIM_M_VALUE = 32  # Changed from SCALE_DIM_K_VALUE for 32x1 scaling
-    M_BLOCKS_PER_TILE = TILE_M // SCALE_DIM_M_VALUE
-    assert M_BLOCKS_PER_TILE > 0
+    scale_dim_m = 32  # Changed from SCALE_DIM_K_VALUE for 32x1 scaling
+    m_blocks_per_tile = tile_m // scale_dim_m
+    assert m_blocks_per_tile > 0
     assert requested_stage_count >= 1
     assert requested_stage_count <= 2
-    assert M_TILES_PER_CTA >= 1
-    STAGE_COUNT_VALUE = min(requested_stage_count, M_TILES_PER_CTA)
+    assert m_tiles_per_cta >= 1
+    stage_count = min(requested_stage_count, m_tiles_per_cta)
 
+    threads_per_block = (1 + compute_warps) * 32
     input_elem_bytes = 4 if input_dtype_name == "torch.float32" else 2
-    TILE_COPY_BYTES = TILE_M * TILE_K * input_elem_bytes
-    K_THREADS = COMPUTE_WARPS * 32  # Changed from M_THREADS for 32x1 scaling
-    K_ITERS_PER_LANE = ceil_div(TILE_K, K_THREADS)
+    tile_copy_bytes = tile_m * tile_k * input_elem_bytes
+    k_threads = compute_warps * 32  # Changed from M_THREADS for 32x1 scaling
+    k_iters_per_lane = ceil_div(tile_k, k_threads)
+    stage_elems = tile_m * tile_k
 
-    @cute.struct
-    class SharedStorage:
-        tma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, STAGE_COUNT_VALUE]
-        in_smem: cute.struct.Align[
-            cute.struct.MemRange[
-                INPUT_CUTLASS_DTYPE, STAGE_COUNT_VALUE * TILE_M * TILE_K
-            ],
-            128,
-        ]
-        out_smem: cute.struct.Align[
-            cute.struct.MemRange[
-                cutlass.Float8E4M3FN, STAGE_COUNT_VALUE * TILE_M * TILE_K
-            ],
-            128,
-        ]
+    shared_storage = _make_shared_storage_struct_32x1(
+        input_cutlass_dtype, stage_count, stage_elems
+    )
 
-    class Mxfp8Quantize2dKernel32x1:
-        @cute.jit
-        def _load_block_full_smem_to_reg(
-            self,
-            sIN_tile: cute.Tensor,
-            k_rel: cutlass.Int32,
-            m_base: cutlass.Int32,
-        ):
-            """Load a full 32-element quantization block from shared memory to registers.
-
-            Loads all elements without bounds checking. For 32x1 scaling, we load 32 elements
-            along the M dimension for a given K position.
-
-            Args:
-                sIN_tile: Input tile in shared memory (TILE_M, TILE_K)
-                k_rel: Column index within tile
-                m_base: Starting M index for this block within tile
-
-            Returns:
-                vals_block: 32 input elements in register memory
-            """
-            vals_block = cute.make_rmem_tensor((SCALE_DIM_M_VALUE,), cutlass.Float32)
-            for i in range(SCALE_DIM_M_VALUE):
-                vals_block[i] = cutlass.Float32(sIN_tile[m_base + i, k_rel])
-            return vals_block
-
-        @cute.jit
-        def _load_block_tail_smem_to_reg(
-            self,
-            sIN_tile: cute.Tensor,
-            m0: cutlass.Int64,
-            k_rel: cutlass.Int32,
-            m_base: cutlass.Int32,
-            M: cutlass.Int64,
-        ):
-            """Load a 32-element quantization block from shared memory to registers with bounds checking.
-
-            Out-of-bounds elements are set to 0.0. For 32x1 scaling, we check M dimension bounds.
-
-            Args:
-                sIN_tile: Input tile in shared memory (TILE_M, TILE_K)
-                m0: Global M offset for this tile
-                k_rel: Column index within tile
-                m_base: Starting M index for this block within tile
-                M: Total M dimension size for bounds checking
-
-            Returns:
-                vals_block: 32 input elements in register memory (out-of-bounds set to 0.0)
-            """
-            vals_block = cute.make_rmem_tensor((SCALE_DIM_M_VALUE,), cutlass.Float32)
-            for i in range(SCALE_DIM_M_VALUE):
-                m = m0 + m_base + i
-                if m < M:
-                    vals_block[i] = cutlass.Float32(sIN_tile[m_base + i, k_rel])
-                else:
-                    vals_block[i] = cutlass.Float32(0.0)
-            return vals_block
-
-        @cute.jit
-        def _store_q_fp8_reg_to_smem(
-            self,
-            q_fp8_vals4: cute.Tensor,
-            sOUT_tile: cute.Tensor,
-            lane_rel: cutlass.Int32,
-            chunk_base: cutlass.Int32,
-        ):
-            """Store 4 quantized FP8 values from registers to shared memory.
-
-            For 32x1 scaling with column-major SMEM, the 4 values are stored along
-            the M dimension. Called by the shared ``quantize_block_store_full``/
-            ``_tail`` loops in ``cute_utils`` with the canonical
-            ``(lane_rel, chunk_base)`` coordinate pair; for the 32x1 kernel the
-            axes are transposed relative to 1x32, so the lane is the tile column
-            (K) and ``chunk_base`` the starting M index of the chunk.
-
-            Args:
-                q_fp8_vals4: 4 quantized FP8 values in register memory
-                sOUT_tile: Output tile in shared memory (TILE_M, TILE_K) with column-major layout
-                lane_rel: Column index within tile (K)
-                chunk_base: Starting M index for this chunk within tile
-
-            Storage locations:
-                Input: q_fp8_vals4 (registers)
-                Output: sOUT_tile (shared memory, column-major)
-            """
-            for i in range(4):
-                sOUT_tile[chunk_base + i, lane_rel] = q_fp8_vals4[i]
-
-        @cute.jit
-        def _issue_tma_store(
-            self,
-            tma_atom_out: cute.CopyAtom,
-            gOUT_tile: cute.Tensor,
-            sOUT_tile: cute.Tensor,
-            warp_idx: cutlass.Int32,
-        ):
-            """Issue TMA store from shared memory to global memory (producer warp only).
-
-            Synchronizes threads before store; only warp 0 executes the store.
-            2D tiles group a single leading mode for the TMA partition.
-            """
-            issue_tma_store_s2g(tma_atom_out, gOUT_tile, sOUT_tile, warp_idx, 1)
-
-        @cute.kernel
-        def kernel(
-            self,
-            inp_mk: cute.Tensor,
-            tma_atom_in: cute.CopyAtom,
-            tma_tensor_in: cute.Tensor,
-            out_mk: cute.Tensor,
-            tma_atom_out: cute.CopyAtom,
-            tma_tensor_out: cute.Tensor,
-            scales_out_u8: cute.Tensor,
-            M: cutlass.Int64,
-            K: cutlass.Int64,
-            m_blocks: cutlass.Int64,
-            m_cta_tiles: cutlass.Int64,
-            k_cta_tiles: cutlass.Int64,
-            blocked_scale_layout: cute.Layout,
-            offs: Optional[cute.Tensor],
-            SCALE_DIM_M: cutlass.Constexpr[int],
-            USE_RCEIL: cutlass.Constexpr[bool],
-            IS_FULL_M_TILES: cutlass.Constexpr[bool],
-            STAGE_COUNT: cutlass.Constexpr[int],
-        ):
-            """MXFP8 32x1 quantization kernel (scales along M, M//32 per column).
-
-            This is the transpose of the 1x32 kernel: K indexes the fixed CTA
-            tile axis while M is the grouped, per-32-element-block scaling axis,
-            so each column carries M//32 scales. block_idx.x selects the grouped
-            M tile and block_idx.y the fixed K tile. The warp-specialized TMA
-            pipeline body is shared in ``run_quantize_2d_kernel``; ``_axis_32x1``
-            supplies this kernel's transposed axis mapping.
-            """
-            smem_allocator = utils.SmemAllocator()
-            storage = smem_allocator.allocate(SharedStorage)
-            shape = make_kernel_namespace(
-                tile_m=TILE_M,
-                tile_k=TILE_K,
-                stage_count=STAGE_COUNT_VALUE,
-                tile_copy_bytes=TILE_COPY_BYTES,
-            )
-            tma = make_kernel_namespace(
-                atom_in=tma_atom_in,
-                tensor_in=tma_tensor_in,
-                atom_out=tma_atom_out,
-                tensor_out=tma_tensor_out,
-            )
-            opts = make_kernel_namespace(
-                use_rceil=USE_RCEIL,
-                blocked_scale_output=BLOCKED_SCALE_OUTPUT_VALUE,
-            )
-
-            def _axis_32x1(bidx, bidy):
-                # 32x1: K is the fixed CTA tile (bidy), M is grouped (bidx).
-                return make_kernel_namespace(
-                    shape=shape,
-                    tiles_per_cta=M_TILES_PER_CTA,
-                    group_tile_idx=cutlass.Int64(bidx),
-                    fixed_tile=cutlass.Int64(bidy),
-                    group_is_first_coord=True,
-                    lane_tile_size=TILE_K,
-                    lane_iters=K_ITERS_PER_LANE,
-                    lane_threads=K_THREADS,
-                    lane_axis_size=K,
-                    block_tile_size=TILE_M,
-                    blocks_per_tile=M_BLOCKS_PER_TILE,
-                    scale_dim=SCALE_DIM_M_VALUE,
-                    block_axis_size=M,
-                    num_blocks=m_blocks,
-                    is_full_tiles=IS_FULL_M_TILES,
-                )
-
-            io = make_kernel_namespace(
-                storage=storage,
-                smem_layouts=_make_tile_smem_layouts(TILE_M, TILE_K),
-                tma=tma,
-                shape=shape,
-                offs=offs,
-                scales_out_u8=scales_out_u8,
-                blocked_scale_output=BLOCKED_SCALE_OUTPUT_VALUE,
-                blocked_scale_layout=blocked_scale_layout,
-                opts=opts,
-                compute_warps=compute_warps,
-            )
-            run_quantize_2d_kernel(self, io, _axis_32x1)
-
-        @cute.jit
-        def __call__(
-            self,
-            inp_mk: cute.Tensor,
-            out_mk: cute.Tensor,
-            scales_out_u8: cute.Tensor,
-            M: cutlass.Int64,
-            K: cutlass.Int64,
-            m_blocks: cutlass.Int64,
-            m_cta_tiles: cutlass.Int64,
-            k_cta_tiles: cutlass.Int64,
-            stream: cuda.CUstream,
-            offs: Optional[cute.Tensor],
-        ):
-            """Kernel launcher that sets up TMA descriptors and blocked scale layout.
-
-            Args:
-                inp_mk: Input tensor in global memory (M, K)
-                out_mk: Output quantized data tensor in global memory (M, K)
-                scales_out_u8: Output scales tensor in global memory (M//32, K) or blocked layout
-                M: M dimension size
-                K: K dimension size
-                m_blocks: Number of 32-element blocks in M
-                m_cta_tiles: Number of tiles in M dimension
-                k_cta_tiles: Number of tile groups in K dimension
-                stream: CUDA stream
-                offs: Tensor of group end offsets for validation (group sizes must be multiples of 128)
-
-            Storage locations:
-                All tensors in global memory
-            """
-            smem_layout_in, smem_layout_out = _make_tile_smem_layouts(TILE_M, TILE_K)
-            # Use tcgen05.CtaGroup.ONE for the optimised single-CTA Blackwell (SM 10.x) TMA load path.
-            g2s_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
-            tma_atom_in, tma_tensor_in = cpasync.make_tiled_tma_atom(
-                g2s_op,
-                inp_mk,
-                smem_layout_in,
-                (TILE_M, TILE_K),
-            )
-            out_colmajor = cute.make_tensor(
-                out_mk.iterator,
-                cute.make_layout((M, K), stride=(1, M)),  # col major
-            )
-            tma_atom_out, tma_tensor_out = cpasync.make_tiled_tma_atom(
-                cpasync.CopyBulkTensorTileS2GOp(),
-                out_colmajor,
-                smem_layout_out,
-                (
-                    TILE_M,
-                    TILE_K,
-                ),  # Keep original tile dimensions to match global memory expectation
-            )
-
-            blocked_scale_layout = cute.make_layout((1,))
-            if cutlass.const_expr(BLOCKED_SCALE_OUTPUT_VALUE):
-                # Use same blocked layout as regular 2D kernel but for (K, M//32) tensor
-                # For scales shape (K, M//32): K is rows, M//32 is columns
-                padded_scale_rows = cute.round_up(
-                    K, 128
-                )  # K rounded to multiple of 128 (first dim)
-                padded_scale_cols = cute.round_up(
-                    m_blocks, 4
-                )  # M//32 rounded to multiple of 4 (second dim)
-                m_block_tiles = padded_scale_rows // cutlass.Int64(
-                    128
-                )  # Number of 128-row tiles
-                k_block_tiles = padded_scale_cols // cutlass.Int64(
-                    4
-                )  # Number of 4-col tiles
-                blocked_scale_layout = cute.make_layout(
-                    ((32, 4, m_block_tiles), (4, k_block_tiles)),
-                    stride=(
-                        (16, 4, cutlass.Int64(128) * padded_scale_cols),
-                        (1, cutlass.Int64(512)),
-                    ),
-                )
-
-            self.kernel(
-                inp_mk,
-                tma_atom_in,
-                tma_tensor_in,
-                out_mk,
-                tma_atom_out,
-                tma_tensor_out,
-                scales_out_u8,
-                M,
-                K,
-                m_blocks,
-                m_cta_tiles,
-                k_cta_tiles,
-                blocked_scale_layout,
-                offs,
-                SCALE_DIM_M=SCALE_DIM_M_VALUE,
-                USE_RCEIL=(scaling_mode == "rceil"),
-                IS_FULL_M_TILES=IS_FULL_M_TILES_VALUE,
-                STAGE_COUNT=STAGE_COUNT_VALUE,
-            ).launch(
-                grid=(m_cta_tiles, k_cta_tiles, 1),
-                block=(THREADS_PER_BLOCK, 1, 1),
-                cluster=(1, 1, 1),
-                smem=SharedStorage.size_in_bytes(),  # pyrefly: ignore [missing-attribute]
-                stream=stream,
-            )
-
-    kernel = Mxfp8Quantize2dKernel32x1()
+    config = _Mxfp8Quantize2d32x1Config(
+        shared_storage=shared_storage,
+        input_cutlass_dtype=input_cutlass_dtype,
+        scaling_mode=scaling_mode,
+        compute_warps=compute_warps,
+        tile_m=tile_m,
+        tile_k=tile_k,
+        m_tiles_per_cta=m_tiles_per_cta,
+        is_full_m_tiles=is_full_m_tiles,
+        blocked_scale_output=blocked_scale_output,
+        scale_dim_m=scale_dim_m,
+        m_blocks_per_tile=m_blocks_per_tile,
+        stage_count=stage_count,
+        threads_per_block=threads_per_block,
+        tile_copy_bytes=tile_copy_bytes,
+        k_threads=k_threads,
+        k_iters_per_lane=k_iters_per_lane,
+    )
+    kernel = _Mxfp8Quantize2d32x1Kernel(config)
 
     m = cute.sym_int(divisibility=32)
     k = cute.sym_int(divisibility=128)
@@ -452,7 +548,7 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
     scale_stride1 = cute.sym_int()
 
     fake_inp = make_fake_tensor(
-        INPUT_CUTLASS_DTYPE,
+        input_cutlass_dtype,
         (m, k),
         stride=(inp_stride0, inp_stride1),
     )
