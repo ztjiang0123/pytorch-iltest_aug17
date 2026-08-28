@@ -175,42 +175,46 @@ struct PackLayout {
   const int8_t* weight_qvals;
 };
 
-// Pack one group (group_size values) of the next nr columns starting at
-// (n_idx, k_idx) into the packed buffer, accumulating per-column value sums.
-// Columns past the end of n are zero-filled. Advances the cursor past the
-// packed qvals.
+// Packs one group of qvals at a time into a moving output cursor, accumulating
+// per-column value sums. Bundling the loop-invariant output cursor, layout, and
+// sums keeps pack_group's argument list to just the (n_idx, k_idx) position.
 template <int weight_nbit, int nr, int kr, int sr>
-inline void pack_group_qvals(
-    char*& cursor,
-    const PackLayout& layout,
-    int n_idx,
-    int k_idx,
-    std::array<int32_t, nr>& qvals_sum) {
-  constexpr int packed_buffer_bytes = weight_nbit * nr * kr / 8;
-  std::array<int8_t, nr * kr> buffer;
-  int8_t packed_values[nr * kr];
+struct GroupPacker {
+  char*& cursor;
+  const PackLayout& layout;
+  std::array<int32_t, nr>& qvals_sum;
 
-  for (int idx_in_group = 0; idx_in_group < layout.group_size;
-       idx_in_group += kr) {
-    // Fill buffer with the next kr values from the next nr columns.
-    // If there are fewer than nr columns, 0s are stored.
-    buffer.fill(0);
-    for (int j = 0; j < nr; j++) {
-      if (n_idx + j < layout.n) {
-        std::memcpy(
-            buffer.data() + kr * j,
-            layout.weight_qvals + (n_idx + j) * layout.k + (k_idx + idx_in_group),
-            kr);
-        qvals_sum[j] += impl::compute_sum(buffer.data() + kr * j, kr);
+  // Pack the group_size values of the next nr columns starting at (n_idx,
+  // k_idx). Columns past the end of n are zero-filled. Advances the cursor
+  // past the packed qvals.
+  void pack_group(int n_idx, int k_idx) {
+    constexpr int packed_buffer_bytes = weight_nbit * nr * kr / 8;
+    std::array<int8_t, nr * kr> buffer;
+    int8_t packed_values[nr * kr];
+
+    for (int idx_in_group = 0; idx_in_group < layout.group_size;
+         idx_in_group += kr) {
+      // Fill buffer with the next kr values from the next nr columns.
+      // If there are fewer than nr columns, 0s are stored.
+      buffer.fill(0);
+      for (int j = 0; j < nr; j++) {
+        if (n_idx + j < layout.n) {
+          std::memcpy(
+              buffer.data() + kr * j,
+              layout.weight_qvals + (n_idx + j) * layout.k +
+                  (k_idx + idx_in_group),
+              kr);
+          qvals_sum[j] += impl::compute_sum(buffer.data() + kr * j, kr);
+        }
       }
-    }
 
-    torchao::weight_packing::pack_values(
-        packed_values, buffer.data(), nr, kr, sr);
-    impl::pack_buffer<weight_nbit, kr, nr>(cursor, packed_values);
-    cursor += packed_buffer_bytes;
+      torchao::weight_packing::pack_values(
+          packed_values, buffer.data(), nr, kr, sr);
+      impl::pack_buffer<weight_nbit, kr, nr>(cursor, packed_values);
+      cursor += packed_buffer_bytes;
+    }
   }
-}
+};
 
 // Store one float attribute per column (nr columns), zero-filling columns past
 // the end of n. `value_for` maps a valid global column index to its value.
@@ -272,6 +276,8 @@ inline void pack_weights(
   char* cursor = reinterpret_cast<char*>(packed_weights);
 
   const detail::PackLayout layout{n, k, group_size, weight_qvals};
+  detail::GroupPacker<weight_nbit, nr, kr, sr> group_packer{
+      cursor, layout, qvals_sum};
 
   // Loop over n by nr.
   for (int n_idx = 0; n_idx < n; n_idx += nr) {
@@ -280,8 +286,7 @@ inline void pack_weights(
       qvals_sum.fill(0);
 
       // Pack the group's qvals for the next nr columns and accumulate sums.
-      detail::pack_group_qvals<weight_nbit, nr, kr, sr>(
-          cursor, layout, n_idx, group_idx * group_size, qvals_sum);
+      group_packer.pack_group(n_idx, group_idx * group_size);
 
       // Store the group's per-column attributes (scale, qval sums, zeros).
       // Columns past the end of n are zero-filled.
