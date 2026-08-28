@@ -2595,6 +2595,28 @@ int get_l2_cache_size_linux() {
     return -1; // Error
 }
 
+// Dispatch on the runtime q_split_size to the matching templated kernel
+// instantiation. Extracted from int8_sdpa_fused_kernel so the mask/no-mask
+// branches stay flat instead of nesting the q_split_size chain inside them.
+template <typename mask_t>
+inline void int8_sdpa_dispatch_qsplit(
+    int64_t q_split_size,
+    bool use_one_parallel_loop,
+    const Int8SdpaTensors& tensors,
+    const Int8SdpaConfig& config,
+    const Int8SdpaScales& scales) {
+  if (q_split_size == 256) {
+    int8_sdpa_fused_kernel_impl<unsigned char, mask_t, 256, 64>(
+      use_one_parallel_loop, tensors, config, scales);
+  } else if (q_split_size == 64) {
+    int8_sdpa_fused_kernel_impl<unsigned char, mask_t, 64, 64>(
+      use_one_parallel_loop, tensors, config, scales);
+  } else {
+    int8_sdpa_fused_kernel_impl<unsigned char, mask_t, 32, 64>(
+      use_one_parallel_loop, tensors, config, scales);
+  }
+}
+
 void int8_sdpa_fused_kernel(
     const at::Tensor& output,
     const at::Tensor& query,
@@ -2642,28 +2664,12 @@ void int8_sdpa_fused_kernel(
                         a_scale, a_zp, o_scale, o_zp};
 
   if (!attn_mask.has_value()) {
-    if (q_split_size == 256) {
-      int8_sdpa_fused_kernel_impl<unsigned char, float, 256, 64>(
-        use_one_parallel_loop, tensors, config, scales);
-    } else if (q_split_size == 64) {
-      int8_sdpa_fused_kernel_impl<unsigned char, float, 64, 64>(
-        use_one_parallel_loop, tensors, config, scales);
-    } else {
-      int8_sdpa_fused_kernel_impl<unsigned char, float, 32, 64>(
-        use_one_parallel_loop, tensors, config, scales);
-    }
+    int8_sdpa_dispatch_qsplit<float>(
+      q_split_size, use_one_parallel_loop, tensors, config, scales);
   } else {
     AT_DISPATCH_MASK_TYPES(attn_mask.value().scalar_type(), "sdpa_mask", [&]() {
-      if (q_split_size == 256) {
-        int8_sdpa_fused_kernel_impl<unsigned char, mask_t, 256, 64>(
-          use_one_parallel_loop, tensors, config, scales);
-      } else if (q_split_size == 64) {
-        int8_sdpa_fused_kernel_impl<unsigned char, mask_t, 64, 64>(
-          use_one_parallel_loop, tensors, config, scales);
-      } else {
-        int8_sdpa_fused_kernel_impl<unsigned char, mask_t, 32, 64>(
-          use_one_parallel_loop, tensors, config, scales);
-      }
+      int8_sdpa_dispatch_qsplit<mask_t>(
+        q_split_size, use_one_parallel_loop, tensors, config, scales);
     });
   }
 }
