@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.functional import ScalingType, SwizzleType
 from utils import (
+    BenchmarkConfig,
     do_benchmarks,
     get_name_to_shapes_iter,
 )
@@ -253,7 +254,7 @@ def run(config: MatmulBenchConfig = _DEFAULT_CONFIG):
         A = torch.randn(M, K, device=device, dtype=dtype)
         m_ref = nn.Sequential(nn.Linear(K, N, dtype=dtype, device=device, bias=False))
         ref_time_sec, ref_tops_sec, ref_pct_top_peak = do_benchmarks(
-            tops, bf16_peak_tops, use_gpu_kernel_time, m_ref, A
+            BenchmarkConfig(tops, bf16_peak_tops, use_gpu_kernel_time), m_ref, A
         )
         print(
             f"{dtype} time_sec {ref_time_sec:.2E}, tops/sec {ref_tops_sec:.2E}, pct_peak {ref_pct_top_peak:.3f}"
@@ -280,9 +281,7 @@ def run(config: MatmulBenchConfig = _DEFAULT_CONFIG):
         do_matmul = _select_matmul(recipe, operands, dtype, fast_accum)
 
         time_sec, tops_sec, pct_top_peak = do_benchmarks(
-            tops,
-            operands.peak_tops,
-            use_gpu_kernel_time,
+            BenchmarkConfig(tops, operands.peak_tops, use_gpu_kernel_time),
             do_matmul,
             operands.A,
             operands.B,

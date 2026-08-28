@@ -7,7 +7,7 @@
 import collections
 import json
 import re
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch.utils.benchmark as benchmark
 from torch._inductor.utils import do_bench_using_profiling
@@ -515,20 +515,33 @@ def benchmark_fn_in_sec(f, *args, **kwargs):
     return measurement.mean
 
 
+class BenchmarkConfig(NamedTuple):
+    """Grouping of the roofline parameters that travel together for a benchmark.
+
+    Args:
+        tops: total number of tensor ops for the measured operation.
+        peak_tops: peak achievable tops/sec used to compute utilization.
+        use_gpu_kernel_time: if True, measure just the GPU gemm kernel time;
+            otherwise measure end-to-end time including launch overhead.
+    """
+
+    tops: float
+    peak_tops: float
+    use_gpu_kernel_time: bool
+
+
 def do_benchmarks(
-    tops,
-    peak_tops,
-    use_gpu_kernel_time,
+    config: BenchmarkConfig,
     f,
     *args,
     **kwargs,
 ):
-    if use_gpu_kernel_time:
+    if config.use_gpu_kernel_time:
         # just the gemm GPU kernel
         time_sec = get_gpu_kernel_gemm_time_s(f, *args, **kwargs)
     else:
         # e2e time including kernel launch overhead
         time_sec = benchmark_fn_in_sec(f, *args, **kwargs)
-    tops_sec = float(tops) / time_sec
-    pct_top_peak = tops_sec / peak_tops
+    tops_sec = float(config.tops) / time_sec
+    pct_top_peak = tops_sec / config.peak_tops
     return time_sec, tops_sec, pct_top_peak

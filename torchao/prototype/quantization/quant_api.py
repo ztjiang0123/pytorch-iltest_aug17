@@ -13,7 +13,10 @@ import logging
 import types
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from torchao.quantization.observer import AffineQuantizedMinMaxObserver
 
 import torch
 import torch.nn.functional as F
@@ -325,11 +328,11 @@ class Float8ObservedLinear(torch.nn.Linear):
         self,
         in_features: int,
         out_features: int,
-        input_act_obs: "AffineQuantizedMinMaxObserver",  # noqa: F821
+        input_act_obs: "AffineQuantizedMinMaxObserver",
         bias: bool = True,
         device=None,
         dtype=None,
-        output_act_obs: Optional["AffineQuantizedMinMaxObserver"] = None,  # noqa: F821
+        output_act_obs: Optional["AffineQuantizedMinMaxObserver"] = None,
     ):
         super().__init__(in_features, out_features, bias, device, dtype)
         self.input_act_obs = input_act_obs
@@ -346,8 +349,8 @@ class Float8ObservedLinear(torch.nn.Linear):
     def from_float(
         cls,
         float_linear: torch.nn.Linear,
-        input_act_obs: "AffineQuantizedMinMaxObserver",  # noqa: F821
-        output_act_obs: Optional["AffineQuantizedMinMaxObserver"] = None,  # noqa: F821
+        input_act_obs: "AffineQuantizedMinMaxObserver",
+        output_act_obs: Optional["AffineQuantizedMinMaxObserver"] = None,
     ) -> "Float8ObservedLinear":
         """Create an observed linear from a float linear module."""
         observed_linear = cls(

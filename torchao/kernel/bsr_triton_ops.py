@@ -451,79 +451,37 @@ _triton_initialized = False
 _bsr_strided_addmm_kernel = None
 
 
-def _lazy_init_triton():
-    global _triton_initialized, _bsr_strided_addmm_kernel
-    if _triton_initialized:
-        return
-    _triton_initialized = True
+def _build_bsr_strided_addmm_kernel(triton, tl):
+    """Build and return the compiled ``bsr_strided_addmm`` Triton kernel.
 
-    if not has_triton():
-        return
-
-    import triton
-    import triton.language as tl
+    Extracted from :func:`_lazy_init_triton` so the lazy-init entry point stays a
+    short, readable sequence and the (large) kernel definition lives on its own.
+    """
 
     @triton.jit
     def _bsr_strided_addmm_kernel_impl(
-        # values prologue
-        values_ptr,
-        values_batch_stride,
-        values_nnz_stride,
-        values_row_block_stride,
-        values_col_block_stride,
-        # values epilogue
-        # crow_indices prologue
-        crow_indices_ptr,
-        crow_indices_batch_stride,
-        crow_indices_stride,
-        # crow_indices epilogue
-        # col_indices prologue
-        col_indices_ptr,
-        col_indices_batch_stride,
-        col_indices_stride,
-        # col_indices epilogue
-        # input prologue
-        input_ptr,
-        input_batch_stride,
-        input_tiled_row_stride,
-        input_tiled_col_stride,
-        input_row_block_stride,
-        input_col_block_stride,
-        # input epilogue
-        # dense prologue
-        dense_ptr,
-        dense_batch_stride,
-        dense_tiled_row_stride,
-        dense_tiled_col_stride,
-        dense_row_block_stride,
-        dense_col_block_stride,
-        # dense epilogue
-        # left_alpha prologue
-        left_alpha_ptr,
-        left_alpha_batch_stride,
-        left_alpha_tiled_row_stride,
+        # Each tensor contributes a base pointer followed by its strides. Grouped
+        # one tensor per line (order unchanged) to keep the signature scannable.
+        values_ptr, values_batch_stride, values_nnz_stride,
+        values_row_block_stride, values_col_block_stride,
+        crow_indices_ptr, crow_indices_batch_stride, crow_indices_stride,
+        col_indices_ptr, col_indices_batch_stride, col_indices_stride,
+        input_ptr, input_batch_stride, input_tiled_row_stride,
+        input_tiled_col_stride, input_row_block_stride, input_col_block_stride,
+        dense_ptr, dense_batch_stride, dense_tiled_row_stride,
+        dense_tiled_col_stride, dense_row_block_stride, dense_col_block_stride,
+        left_alpha_ptr, left_alpha_batch_stride, left_alpha_tiled_row_stride,
         left_alpha_tiled_col_stride: tl.constexpr,
         left_alpha_row_block_stride,
         left_alpha_col_block_stride: tl.constexpr,
-        # left_alpha epilogue
-        # right_alpha prologue
-        right_alpha_ptr,
-        right_alpha_batch_stride,
+        right_alpha_ptr, right_alpha_batch_stride,
         right_alpha_tiled_row_stride: tl.constexpr,
         right_alpha_tiled_col_stride,
         right_alpha_row_block_stride: tl.constexpr,
         right_alpha_col_block_stride,
-        # right_alpha epilogue
-        # output prologue
-        output_ptr,
-        output_batch_stride,
-        output_tiled_row_stride,
-        output_tiled_col_stride,
-        output_row_block_stride,
-        output_col_block_stride,
-        # output epilogue
-        beta,
-        alpha,
+        output_ptr, output_batch_stride, output_tiled_row_stride,
+        output_tiled_col_stride, output_row_block_stride, output_col_block_stride,
+        beta, alpha,
         beta_is_one: tl.constexpr,
         beta_is_nonzero: tl.constexpr,
         alpha_is_one: tl.constexpr,
@@ -679,4 +637,19 @@ def _lazy_init_triton():
             mask=col_block_arange[None, :] < BLOCKSIZE_COL,
         )
 
-    _bsr_strided_addmm_kernel = _bsr_strided_addmm_kernel_impl
+    return _bsr_strided_addmm_kernel_impl
+
+
+def _lazy_init_triton():
+    global _triton_initialized, _bsr_strided_addmm_kernel
+    if _triton_initialized:
+        return
+    _triton_initialized = True
+
+    if not has_triton():
+        return
+
+    import triton
+    import triton.language as tl
+
+    _bsr_strided_addmm_kernel = _build_bsr_strided_addmm_kernel(triton, tl)
