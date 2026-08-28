@@ -18,32 +18,12 @@ _fp8_blockwise_weight_quant_kernel = None
 _fp8_blockwise_weight_dequant_kernel = None
 
 
-def _lazy_init_triton():
-    global _triton_initialized, _triton_available
-    global _blockwise_fp8_gemm_impl
-    global _fp8_blockwise_act_quant_kernel
-    global _fp8_blockwise_weight_quant_kernel
-    global _fp8_blockwise_weight_dequant_kernel
+def _build_blockwise_fp8_gemm_op(triton, tl, Config):
+    """Build and return the ``ao::blockwise_fp8_gemm`` custom op.
 
-    if _triton_initialized:
-        return
-
-    _triton_initialized = True
-
-    from torch.utils._triton import has_triton
-
-    if not has_triton():
-        _triton_available = False
-        return
-
-    _triton_available = True
-
-    import triton
-    import triton.language as tl
-    from triton import Config
-
-    # Original implementation at https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/kernel.py
-
+    Original implementation at
+    https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/kernel.py
+    """
     fp8_gemm_configs = [
         Config(
             {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n},
@@ -135,7 +115,11 @@ def _lazy_init_triton():
         c = a.new_empty(*a.size()[:-1], N, dtype=torch.bfloat16)
         return c
 
-    _blockwise_fp8_gemm_impl = _blockwise_fp8_gemm_op
+    return _blockwise_fp8_gemm_op
+
+
+def _build_act_quant_kernel(triton, tl):
+    """Build and return the blockwise fp8 activation-quantization kernel."""
 
     @triton.jit
     def _fp8_blockwise_act_quant_kernel_impl(
@@ -162,7 +146,11 @@ def _lazy_init_triton():
         tl.store(y_ptr + offs, y)
         tl.store(s_ptr + pid, s)
 
-    _fp8_blockwise_act_quant_kernel = _fp8_blockwise_act_quant_kernel_impl
+    return _fp8_blockwise_act_quant_kernel_impl
+
+
+def _build_weight_quant_kernel(triton, tl):
+    """Build and return the blockwise fp8 weight-quantization kernel."""
 
     @triton.jit
     def _fp8_blockwise_weight_quant_kernel_impl(
@@ -193,7 +181,11 @@ def _lazy_init_triton():
         tl.store(y_ptr + offs, y, mask=mask)
         tl.store(s_ptr + pid_m * n + pid_n, s)
 
-    _fp8_blockwise_weight_quant_kernel = _fp8_blockwise_weight_quant_kernel_impl
+    return _fp8_blockwise_weight_quant_kernel_impl
+
+
+def _build_weight_dequant_kernel(triton, tl):
+    """Build and return the blockwise fp8 weight-dequantization kernel."""
 
     @triton.jit
     def _fp8_blockwise_weight_dequant_kernel_impl(
@@ -225,7 +217,37 @@ def _lazy_init_triton():
         y = x * s
         tl.store(y_ptr + offs, y, mask=mask)
 
-    _fp8_blockwise_weight_dequant_kernel = _fp8_blockwise_weight_dequant_kernel_impl
+    return _fp8_blockwise_weight_dequant_kernel_impl
+
+
+def _lazy_init_triton():
+    global _triton_initialized, _triton_available
+    global _blockwise_fp8_gemm_impl
+    global _fp8_blockwise_act_quant_kernel
+    global _fp8_blockwise_weight_quant_kernel
+    global _fp8_blockwise_weight_dequant_kernel
+
+    if _triton_initialized:
+        return
+
+    _triton_initialized = True
+
+    from torch.utils._triton import has_triton
+
+    if not has_triton():
+        _triton_available = False
+        return
+
+    _triton_available = True
+
+    import triton
+    import triton.language as tl
+    from triton import Config
+
+    _blockwise_fp8_gemm_impl = _build_blockwise_fp8_gemm_op(triton, tl, Config)
+    _fp8_blockwise_act_quant_kernel = _build_act_quant_kernel(triton, tl)
+    _fp8_blockwise_weight_quant_kernel = _build_weight_quant_kernel(triton, tl)
+    _fp8_blockwise_weight_dequant_kernel = _build_weight_dequant_kernel(triton, tl)
 
 
 def blockwise_fp8_gemm(

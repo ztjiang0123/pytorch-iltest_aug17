@@ -30,7 +30,7 @@ def get_module_input_data(
     data: torch.Tensor,
     module: nn.Module,
     batch_size: int,
-    layer_kwargs: Dict[str, torch.Tensor] = {},  # noqa
+    layer_kwargs: Dict[str, torch.Tensor] = {},
 ) -> torch.Tensor:
     with torch.no_grad():
         if isinstance(data, list):

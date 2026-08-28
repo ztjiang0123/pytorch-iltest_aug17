@@ -33,6 +33,34 @@ static inline bool cpublas_could_pack() {
   return cpublas_can_pack;
 }
 
+#if defined(CPU_CAPABILITY_AVX512)
+// Reorder a single [block_k, block_n] weight block into its VNNI packed layout.
+// packed shape = [block_k / vnni_size, block_n, vnni_size] viewed as
+// [block_k, block_n].
+//
+// Each plain element (n, kk) maps to the packed position where the innermost
+// vnni_size rows are interleaved: ki = kk % vnni_size is the lane within the
+// group and k = kk - ki is the group's base row. Flattening the column
+// (nb, ni) and row (k, ki) pairs into single loops keeps this to two nested
+// loops while producing the exact same layout as the tiled form.
+static inline void pack_weight_block_to_vnni(
+    const uint8_t* __restrict__ in_ptr,
+    uint8_t* __restrict__ out_ptr,
+    int block_k,
+    int block_n,
+    int vnni_size) {
+  for (int n = 0; n < block_n; ++n) {
+    for (int kk = 0; kk < block_k; ++kk) {
+      int ki = kk % vnni_size;
+      int k = kk - ki;
+      int src_idx = n + kk * block_n;
+      int dst_idx = n * vnni_size + k * block_n + ki;
+      *(out_ptr + dst_idx) = *(in_ptr + src_idx);
+    }
+  }
+}
+#endif
+
 /*
 return: packed_weight, packed_scales
 */
@@ -92,23 +120,8 @@ float8_linear_prepack_impl(
       for (const auto i : c10::irange(begin, end)) {
         auto in_ptr = weight_ptr + i * block_k * block_n;
         auto out_ptr = blocked_weight_ptr + i * block_k * block_n;
-
-        // Reorder weight block to VNNI
-        // plain shape = [block_k, block_n]
-        // packed shape = [block_k / VNNI_SIZE, block_n, VNNI_SIZE] viewed as [block_k, block_n]
-        constexpr int n_group_size = 8;
-        constexpr int n_group = block_n / n_group_size; // 4
-        for (int nb = 0; nb < n_group; ++nb) {
-          for (int k = 0; k < block_k; k += vnni_size) {
-            for (int ni = 0; ni < n_group_size; ++ni) {
-              for (int ki = 0; ki < vnni_size; ++ki) {
-                int src_idx = nb * n_group_size + ni + (k + ki) * block_n;
-                int dst_idx = (nb * n_group_size + ni) * vnni_size + k * block_n + ki;
-                *(out_ptr + dst_idx) = *(in_ptr + src_idx);
-              }
-            }
-          }
-        }
+        // Reorder weight block to VNNI layout.
+        pack_weight_block_to_vnni(in_ptr, out_ptr, block_k, block_n, vnni_size);
       }
     });
   } else
