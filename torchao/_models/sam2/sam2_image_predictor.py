@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -14,6 +15,36 @@ from PIL.Image import Image
 from torchao._models.sam2.modeling.sam2_base import SAM2Base
 from torchao._models.sam2.utils.misc import SAM2HFPretrainedMixin, get_image_size
 from torchao._models.sam2.utils.transforms import SAM2Transforms
+
+
+@dataclass
+class SAM2Prompts:
+    """Input prompts for :meth:`SAM2ImagePredictor.predict`.
+
+    Groups the prompt arrays that are always supplied together for a single
+    prediction, along with how their coordinates should be normalized.
+
+    Attributes:
+      point_coords (np.ndarray or None): A Nx2 array of point prompts to the
+        model. Each point is in (X,Y) in pixels.
+      point_labels (np.ndarray or None): A length N array of labels for the
+        point prompts. 1 indicates a foreground point and 0 indicates a
+        background point.
+      box (np.ndarray or None): A length 4 array given a box prompt to the
+        model, in XYXY format.
+      mask_input (np.ndarray or None): A low resolution mask input to the model,
+        typically coming from a previous prediction iteration. Has form 1xHxW,
+        where for SAM, H=W=256.
+      normalize_coords (bool): If true, the point coordinates will be normalized
+        to the range [0,1] and point_coords is expected to be wrt. image
+        dimensions.
+    """
+
+    point_coords: Optional[np.ndarray] = None
+    point_labels: Optional[np.ndarray] = None
+    box: Optional[np.ndarray] = None
+    mask_input: Optional[np.ndarray] = None
+    normalize_coords: bool = True
 
 
 class SAM2ImagePredictor(torch.nn.Module, SAM2HFPretrainedMixin):
@@ -238,29 +269,18 @@ class SAM2ImagePredictor(torch.nn.Module, SAM2HFPretrainedMixin):
 
     def predict(
         self,
-        point_coords: Optional[np.ndarray] = None,
-        point_labels: Optional[np.ndarray] = None,
-        box: Optional[np.ndarray] = None,
-        mask_input: Optional[np.ndarray] = None,
+        prompts: Optional[SAM2Prompts] = None,
         multimask_output: bool = True,
         return_logits: bool = False,
-        normalize_coords=True,
         return_type: str = "numpy",
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Predict masks for the given input prompts, using the currently set image.
 
         Arguments:
-          point_coords (np.ndarray or None): A Nx2 array of point prompts to the
-            model. Each point is in (X,Y) in pixels.
-          point_labels (np.ndarray or None): A length N array of labels for the
-            point prompts. 1 indicates a foreground point and 0 indicates a
-            background point.
-          box (np.ndarray or None): A length 4 array given a box prompt to the
-            model, in XYXY format.
-          mask_input (np.ndarray): A low resolution mask input to the model, typically
-            coming from a previous prediction iteration. Has form 1xHxW, where
-            for SAM, H=W=256.
+          prompts (SAM2Prompts): The point/box/mask prompts and coordinate
+            normalization setting. See :class:`SAM2Prompts` for the individual
+            fields. Defaults to an empty prompt set.
           multimask_output (bool): If true, the model will return three masks.
             For ambiguous input prompts (such as a single click), this will often
             produce better masks than a single prediction. If only a single
@@ -269,7 +289,6 @@ class SAM2ImagePredictor(torch.nn.Module, SAM2HFPretrainedMixin):
             input prompts, multimask_output=False can give better results.
           return_logits (bool): If true, returns un-thresholded masks logits
             instead of a binary mask.
-          normalize_coords (bool): If true, the point coordinates will be normalized to the range [0,1] and point_coords is expected to be wrt. image dimensions.
 
         Returns:
           (np.ndarray): The output masks in CxHxW format, where C is the
@@ -280,6 +299,8 @@ class SAM2ImagePredictor(torch.nn.Module, SAM2HFPretrainedMixin):
             of masks and H=W=256. These low resolution logits can be passed to
             a subsequent iteration as mask input.
         """
+        if prompts is None:
+            prompts = SAM2Prompts()
         if return_type not in ["numpy", "torch"]:
             raise ValueError(
                 f"Expected return_type to be either numpy or torch, but got {return_type}"
@@ -292,7 +313,11 @@ class SAM2ImagePredictor(torch.nn.Module, SAM2HFPretrainedMixin):
         # Transform input prompts
 
         mask_input, unnorm_coords, labels, unnorm_box = self._prep_prompts(
-            point_coords, point_labels, box, mask_input, normalize_coords
+            prompts.point_coords,
+            prompts.point_labels,
+            prompts.box,
+            prompts.mask_input,
+            prompts.normalize_coords,
         )
 
         masks, iou_predictions, low_res_masks = self._predict(

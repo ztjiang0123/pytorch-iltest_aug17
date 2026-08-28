@@ -701,22 +701,32 @@ def triton_fp8_blockwise_act_quant_rhs(
 @triton.autotune(configs=quant_kernel_configs_with_groups, key=["K"])
 @triton.jit
 def triton_fp8_blockwise_act_quant_transposed_lhs_kernel(
-    x_ptr,
-    x_stride_dim_0,
-    x_stride_dim_1,
-    y_ptr,
-    y_stride_dim_0,
-    y_stride_dim_1,
-    s_ptr,
-    s_stride_dim_0,
-    s_stride_dim_1,
-    M,
+    # (x_ptr, y_ptr, s_ptr): input, output and scale tensor base pointers.
+    tensors,
+    # Runtime scalars that travel together: the M dimension, the (dim_0, dim_1)
+    # strides of the x, y and s tensors, and the numeric constants (EPS, FP8_MAX).
+    dims_strides,
+    # K is a standalone named parameter because @triton.autotune keys on it.
     K: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,  # For scaling groups, not for grid/parallelization
-    NUM_GROUPS: tl.constexpr,  # For grid/parallelization, not for scaling groups
-    EPS: tl.constexpr,
-    FP8_MAX: tl.constexpr,
+    # BLOCK_SIZE (scaling-group size) is named because the launch grid reads it.
+    BLOCK_SIZE: tl.constexpr,
+    # NUM_GROUPS (grid/parallelization) is injected by the @triton.autotune config,
+    # so it must remain a standalone named parameter.
+    NUM_GROUPS: tl.constexpr,
 ):
+    x_ptr, y_ptr, s_ptr = tensors
+    (
+        M,
+        x_stride_dim_0,
+        x_stride_dim_1,
+        y_stride_dim_0,
+        y_stride_dim_1,
+        s_stride_dim_0,
+        s_stride_dim_1,
+        EPS,
+        FP8_MAX,
+    ) = dims_strides
+
     # This kernel reads data in row-major format, and writes to an output tensor with
     # transposed dims and in column major format. To facilitate this, given that for a
     # LHS operator the scales must be rowwise, we will be computing colwise scales on the
@@ -786,20 +796,20 @@ def triton_fp8_blockwise_act_quant_transposed_lhs(
         )
 
     wrap_triton(triton_fp8_blockwise_act_quant_transposed_lhs_kernel)[grid](
-        x,
-        x.stride(0),
-        x.stride(1),
-        y,
-        y.stride(0),
-        y.stride(1),
-        s,
-        s.stride(0),
-        s.stride(1),
-        M,
+        (x, y, s),
+        (
+            M,
+            x.stride(0),
+            x.stride(1),
+            y.stride(0),
+            y.stride(1),
+            s.stride(0),
+            s.stride(1),
+            EPS,
+            fp8_max,
+        ),
         K=K,
         BLOCK_SIZE=block_size,  # Scaling group size
-        EPS=EPS,
-        FP8_MAX=fp8_max,
     )
     return y, s
 
