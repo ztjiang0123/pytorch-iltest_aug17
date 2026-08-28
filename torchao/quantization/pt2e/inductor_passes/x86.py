@@ -1035,7 +1035,27 @@ def _get_linear_dq_node(
     return dequant_node, act_reshape_node, activation_to_bf16_node, act_expand_node
 
 
-def _is_valid_dequant_linear_pattern(dtype, input_dim_exceeds_two, input_contiguous):
+@dataclass
+class _DequantLinearPatternConfig:
+    """The flags describing which dequant→linear variant a pass targets.
+
+    ``dtype``, ``input_dim_exceeds_two``, ``input_contiguous`` and ``is_fp8``
+    always travel together when registering, validating and rewriting a
+    weight-prepack pass. Bundling them into a single value lets those helpers
+    take one config argument instead of repeating the same long flag list.
+    """
+
+    dtype: Any = torch.float32
+    input_dim_exceeds_two: bool = False
+    input_contiguous: bool = True
+    is_fp8: bool = False
+
+
+def _is_valid_dequant_linear_pattern(config: _DequantLinearPatternConfig):
+    dtype = config.dtype
+    input_dim_exceeds_two = config.input_dim_exceeds_two
+    input_contiguous = config.input_contiguous
+
     def _inner(match):
         # Check dequant pattern has only 1 user.
         (
@@ -1210,16 +1230,16 @@ def _erase_dequant_linear_pattern(ctx: _DequantLinearPattern, graph):
 def _register_qlinear_weight_prepack_pass(
     pattern,
     pass_number,
-    dtype=torch.float32,
-    input_dim_exceeds_two=False,
-    input_contiguous=True,
-    is_fp8=False,
+    config: _DequantLinearPatternConfig,
 ):
+    dtype = config.dtype
+    input_dim_exceeds_two = config.input_dim_exceeds_two
+    input_contiguous = config.input_contiguous
+    is_fp8 = config.is_fp8
+
     @register_freezing_graph_pattern(
         pattern,
-        extra_check=_is_valid_dequant_linear_pattern(
-            dtype, input_dim_exceeds_two, input_contiguous
-        ),
+        extra_check=_is_valid_dequant_linear_pattern(config),
         pass_number=pass_number,
     )
     def qlinear_weight_prepack(match: Match, *args, **kwargs):
@@ -1676,9 +1696,11 @@ def _register_qlinear_weight_prepack():
             _register_qlinear_weight_prepack_pass(
                 weight_prepack_pattern,
                 pass_number=1,
-                dtype=dtype,
-                input_dim_exceeds_two=input_dim_exceeds_two,
-                is_fp8=is_fp8,
+                config=_DequantLinearPatternConfig(
+                    dtype=dtype,
+                    input_dim_exceeds_two=input_dim_exceeds_two,
+                    is_fp8=is_fp8,
+                ),
             )
 
     # Step 2: register patterns from bmm
@@ -1705,10 +1727,12 @@ def _register_qlinear_weight_prepack():
             pass_number=1
             if with_bias
             else 2,  # if with_bias, there is an output add, so we should try to match it firstly
-            dtype=dtype,
-            input_dim_exceeds_two=True,
-            input_contiguous=False,
-            is_fp8=is_fp8,
+            config=_DequantLinearPatternConfig(
+                dtype=dtype,
+                input_dim_exceeds_two=True,
+                input_contiguous=False,
+                is_fp8=is_fp8,
+            ),
         )
 
 
