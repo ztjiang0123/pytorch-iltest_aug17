@@ -12,7 +12,6 @@ import torch
 from torchao.utils import ceil_div
 
 from .cute_utils import (
-    issue_tma_load_g2s,
     make_axis_spec,
     make_kernel_io,
     make_quant_opts,
@@ -242,39 +241,6 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
                 sOUT_tile[chunk_base + i, lane_rel] = q_fp8_vals4[i]
 
         @cute.jit
-        def _issue_tma_load(
-            self,
-            tma_atom_in: cute.CopyAtom,
-            gIN_tile: cute.Tensor,
-            sIN_tile: cute.Tensor,
-            tma_mbar_ptr: cutlass.Int64,
-            warp_idx: cutlass.Int32,
-        ):
-            """Issue TMA load from global memory to shared memory (producer warp only).
-
-            Only warp 0 executes the TMA load and updates the barrier. 2D tiles
-            group a single leading mode; see ``issue_tma_load_g2s``.
-
-            Args:
-                tma_atom_in: TMA copy atom for G2S
-                gIN_tile: Input tile in global memory (TILE_M, TILE_K)
-                sIN_tile: Input tile in shared memory (TILE_M, TILE_K)
-                tma_mbar_ptr: TMA barrier pointer
-                warp_idx: Warp index
-
-            Storage locations:
-                Source: gIN_tile (global memory)
-                Destination: sIN_tile (shared memory)
-            """
-            issue_tma_load_g2s(
-                tma_atom_in,
-                (gIN_tile, sIN_tile),
-                tma_mbar_ptr,
-                warp_idx,
-                (TILE_COPY_BYTES, 1),
-            )
-
-        @cute.jit
         def _issue_tma_store(
             self,
             tma_atom_out: cute.CopyAtom,
@@ -354,7 +320,10 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
             smem_allocator = utils.SmemAllocator()
             storage = smem_allocator.allocate(SharedStorage)
             shape = make_tile_shape(
-                tile_m=TILE_M, tile_k=TILE_K, stage_count=STAGE_COUNT_VALUE
+                tile_m=TILE_M,
+                tile_k=TILE_K,
+                stage_count=STAGE_COUNT_VALUE,
+                tile_copy_bytes=TILE_COPY_BYTES,
             )
             tma = make_tma_handles(
                 atom_in=tma_atom_in,

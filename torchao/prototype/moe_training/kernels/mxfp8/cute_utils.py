@@ -497,9 +497,14 @@ if _cutedsl_runtime_available():
                 "Group sizes must be multiples of 128",
             )
 
-    def make_tile_shape(*, tile_m, tile_k, stage_count):
+    def make_tile_shape(*, tile_m, tile_k, stage_count, tile_copy_bytes):
         """Bundle compile-time tile geometry for the MXFP8 kernels."""
-        return SimpleNamespace(tile_m=tile_m, tile_k=tile_k, stage_count=stage_count)
+        return SimpleNamespace(
+            tile_m=tile_m,
+            tile_k=tile_k,
+            stage_count=stage_count,
+            tile_copy_bytes=tile_copy_bytes,
+        )
 
     def make_tma_handles(*, atom_in, tensor_in, atom_out, tensor_out):
         """Bundle the input/output TMA atoms and tensor views for a kernel."""
@@ -620,7 +625,7 @@ if _cutedsl_runtime_available():
 
     def _issue_tile_loads(state, tile_step, tile_eff, sIN_tile, tma_mbar_ptr):
         """Issue the current-tile TMA load and prefetch the next tile's load."""
-        kernel, tma, shape, axis = state.kernel, state.tma, state.shape, state.axis
+        tma, shape, axis = state.tma, state.shape, state.axis
         stage_count = shape.stage_count
         tiles_per_cta = axis.tiles_per_cta
         tile_shape = (shape.tile_m, shape.tile_k)
@@ -634,8 +639,12 @@ if _cutedsl_runtime_available():
                 tile_shape,
                 _axis_tile_coord(axis, tile_eff, axis.fixed_tile),
             )
-            kernel._issue_tma_load(
-                tma.atom_in, gIN_tile, sIN_tile, tma_mbar_ptr, warp_idx
+            issue_tma_load_g2s(
+                tma.atom_in,
+                (gIN_tile, sIN_tile),
+                tma_mbar_ptr,
+                warp_idx,
+                (shape.tile_copy_bytes, 1),
             )
 
         if cutlass.const_expr(stage_count > 1 and tiles_per_cta > 1):
@@ -651,8 +660,12 @@ if _cutedsl_runtime_available():
                     tile_shape,
                     _axis_tile_coord(axis, tile_next, axis.fixed_tile),
                 )
-                kernel._issue_tma_load(
-                    tma.atom_in, gIN_tile_next, sIN_tile_next, mbar_next, warp_idx
+                issue_tma_load_g2s(
+                    tma.atom_in,
+                    (gIN_tile_next, sIN_tile_next),
+                    mbar_next,
+                    warp_idx,
+                    (shape.tile_copy_bytes, 1),
                 )
 
     def _quantize_lane_full(state, tiles, lane, tile_eff):
