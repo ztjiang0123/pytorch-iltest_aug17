@@ -30,6 +30,7 @@ from .cute_utils import (
     make_tile_2d_smem_layouts,
     resolve_input_cutlass_dtype,
     run_quantize_2d_kernel,
+    select_cutedsl_config,
 )
 
 
@@ -48,26 +49,6 @@ _CUTEDSL_CONFIGS = {
     "bf16_default": (4, 32, 128, 4),
     "fallback": (6, 32, 128, 2),
 }
-
-
-def _select_cutedsl_config(
-    input_dtype: torch.dtype,
-    scaling_mode: str,
-) -> Tuple[str, Tuple[int, int, int, int]]:
-    """Select kernel configuration based on input dtype.
-
-    Args:
-        input_dtype: Input dtype
-        scaling_mode: Scaling mode ("floor" or "rceil")
-
-    Returns:
-        Tuple of (config_name, (compute_warps, tile_m, tile_k, m_tiles_per_cta))
-    """
-    if input_dtype == torch.bfloat16:
-        config_name = "bf16_default"
-    else:
-        config_name = "fallback"
-    return config_name, _CUTEDSL_CONFIGS[config_name]
 
 
 @dataclass(frozen=True)
@@ -604,7 +585,7 @@ def mxfp8_quantize_cutedsl_2d_32x1(
         assert offs.dtype == torch.int32, "offs must be int32 tensor"
         assert offs.dim() == 1, "offs must be 1D tensor"
 
-    _, config = _select_cutedsl_config(x.dtype, scaling_mode)
+    _, config = select_cutedsl_config(x.dtype, _CUTEDSL_CONFIGS)
     compute_warps, tile_m, tile_k, m_tiles_per_cta = config
     assert stage_count >= 1, "stage_count must be >= 1"
     assert stage_count <= 2, "stage_count must be <= 2"

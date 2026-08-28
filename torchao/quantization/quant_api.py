@@ -1592,6 +1592,25 @@ def _handler_supports_fqn_quantization(
     return inspect.signature(handler).parameters.get("parameter_name", None) is not None
 
 
+def _apply_param_config(
+    module: torch.nn.Module,
+    c: AOBaseConfig,
+    parameter_name: str,
+):
+    """Apply a (non-None) config to a single top-level parameter of ``module``.
+
+    Raises NotImplementedError if the config's handler does not support
+    parameter-level quantization.
+    """
+    handler = _QUANTIZE_CONFIG_HANDLER[type(c)]
+    if not _handler_supports_fqn_quantization(handler):
+        raise NotImplementedError(
+            f"{type(c)} does not yet support parameter quantization! Please see https://github.com/pytorch/ao/issues/3252 for more details"
+        )
+    # may be more than one param specified, so don't return prematurely
+    return handler(module, c, parameter_name=parameter_name)
+
+
 def _fqn_to_config_handler(
     module: torch.nn.Module,
     fqn: str,
@@ -1629,14 +1648,7 @@ def _fqn_to_config_handler(
             if c is None:
                 top_level_params.pop(i)
             else:
-                handler = _QUANTIZE_CONFIG_HANDLER[type(c)]
-                if _handler_supports_fqn_quantization(handler):
-                    # may be more than one param specified, so don't return prematurely
-                    module = handler(module, c, parameter_name=parameter_name)
-                else:
-                    raise NotImplementedError(
-                        f"{type(c)} does not yet support parameter quantization! Please see https://github.com/pytorch/ao/issues/3252 for more details"
-                    )
+                module = _apply_param_config(module, c, parameter_name)
 
     # then we see if we match module_fqn exactly
     if not parameter_config_found and fqn in config.fqn_to_config:
@@ -1654,14 +1666,7 @@ def _fqn_to_config_handler(
                 parameter_config_found = True
                 c = config.fqn_to_config[pattern]
                 if c is not None:
-                    handler = _QUANTIZE_CONFIG_HANDLER[type(c)]
-                    if _handler_supports_fqn_quantization(handler):
-                        # may be more than one param specified, so don't return prematurely
-                        module = handler(module, c, parameter_name=parameter_name)
-                    else:
-                        raise NotImplementedError(
-                            f"{type(c)} does not yet support parameter quantization! Please see https://github.com/pytorch/ao/issues/3252 for more details"
-                        )
+                    module = _apply_param_config(module, c, parameter_name)
 
     # try to match regex on module fqn
     if not parameter_config_found:

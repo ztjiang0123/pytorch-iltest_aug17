@@ -573,21 +573,11 @@ class SAM2Base(torch.nn.Module):
                     out = unselected_cond_outputs.get(prev_frame_idx, None)
                 t_pos_and_prevs.append((t_pos, out))
 
-            for t_pos, prev in t_pos_and_prevs:
-                if prev is None:
-                    continue  # skip padding frames
-                # "maskmem_features" might have been offloaded to CPU in demo use cases,
-                # so we load it back to GPU (it's a no-op if it's already on GPU).
-                feats = prev["maskmem_features"].to(device, non_blocking=True)
-                to_cat_memory.append(feats.flatten(2).permute(2, 0, 1))
-                # Spatial positional encoding (it might have been offloaded to CPU in eval)
-                maskmem_enc = prev["maskmem_pos_enc"][-1].to(device)
-                maskmem_enc = maskmem_enc.flatten(2).permute(2, 0, 1)
-                # Temporal positional encoding
-                maskmem_enc = (
-                    maskmem_enc + self.maskmem_tpos_enc[self.num_maskmem - t_pos - 1]
-                )
-                to_cat_memory_pos_embed.append(maskmem_enc)
+            maskmem, maskmem_pos = self._encode_maskmem_memories(
+                t_pos_and_prevs, device
+            )
+            to_cat_memory.extend(maskmem)
+            to_cat_memory_pos_embed.extend(maskmem_pos)
 
             # Construct the list of past object pointers
             if self.use_obj_ptrs_in_encoder:
@@ -640,6 +630,31 @@ class SAM2Base(torch.nn.Module):
         # reshape the output (HW)BC => BCHW
         pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(B, C, H, W)
         return pix_feat_with_mem
+
+    def _encode_maskmem_memories(self, t_pos_and_prevs, device):
+        """Encode selected previous frames' mask memories for cross attention.
+
+        For each non-padding ``(t_pos, prev)`` entry, returns the flattened mask
+        memory features and their spatial+temporal positional encodings as two
+        parallel lists ready to concatenate into the fused memory.
+        """
+        to_cat_memory, to_cat_memory_pos_embed = [], []
+        for t_pos, prev in t_pos_and_prevs:
+            if prev is None:
+                continue  # skip padding frames
+            # "maskmem_features" might have been offloaded to CPU in demo use cases,
+            # so we load it back to GPU (it's a no-op if it's already on GPU).
+            feats = prev["maskmem_features"].to(device, non_blocking=True)
+            to_cat_memory.append(feats.flatten(2).permute(2, 0, 1))
+            # Spatial positional encoding (it might have been offloaded to CPU in eval)
+            maskmem_enc = prev["maskmem_pos_enc"][-1].to(device)
+            maskmem_enc = maskmem_enc.flatten(2).permute(2, 0, 1)
+            # Temporal positional encoding
+            maskmem_enc = (
+                maskmem_enc + self.maskmem_tpos_enc[self.num_maskmem - t_pos - 1]
+            )
+            to_cat_memory_pos_embed.append(maskmem_enc)
+        return to_cat_memory, to_cat_memory_pos_embed
 
     def _get_maskmem_frame_idx(self, frame_idx, t_rel, stride, track_in_reverse):
         """Return the previous frame index whose mask memory feeds ``t_pos``.

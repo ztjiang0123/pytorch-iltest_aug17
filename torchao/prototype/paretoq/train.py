@@ -95,7 +95,7 @@ def train():
     )
 
     if training_args.do_train:
-        train_result = trainer.train()
+        trainer.train()
         trainer.save_state()
         utils.safe_save_model_for_hf_trainer(trainer, model_args.output_model_local_path)
 

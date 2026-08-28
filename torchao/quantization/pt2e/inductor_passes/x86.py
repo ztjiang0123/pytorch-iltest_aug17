@@ -3189,179 +3189,168 @@ def _register_qlinear_binary_fusion():
             if x_scale_zp_are_tensors
             else torch.ops.onednn.qlinear_pointwise.binary
         )
-        unary_postop_list = ["none", "relu"]
-        unary_postop_dict = {
-            "none": None,
-            "relu": aten.relu.default,
-        }
-        convert_dtype_after_binary_list = [False, True]
-
-        # Priority 1 to match: QLinear Binary or Binary-Unary pattern with int8 output
-        # Covers case (1) of int8-mixed-fp32 and case (1)(3)(5) of int8-mixed-bf16,
-        # totally 3 patterns (2 are identical)
-        swap_binary_inputs_list = [False, True]
-        int8_mixed_bf16_list = [False, True]
-        is_fp8_list = [False, True]
-        combinations = itertools.product(
-            unary_postop_list,
-            int8_mixed_bf16_list,
-            swap_binary_inputs_list,
-            convert_dtype_after_binary_list,
-            is_fp8_list,
+        _register_qlinear_binary_int8_out(x_scale_zp_are_tensors, qlinear_binary_op)
+        _register_qlinear_binary_unary_float_out(
+            x_scale_zp_are_tensors, qlinear_binary_op
         )
-        qlinear_binary_replace_patterns = {}
-        for (
-            unary_op,
-            int8_mixed_bf16,
-            swap_inputs,
-            cvt_dtype_binary,
-            is_fp8,
-        ) in combinations:
-            if not int8_mixed_bf16 and cvt_dtype_binary:
-                # No convert node after binary node if dtypes are all fp32
-                continue
-            qlinear_binary_replace_patterns.update(
-                {
-                    PostOpAttr(
-                        "add", 1.0, unary_op, [], ""
-                    ): generate_pattern_with_output_quant(
-                        generate_pattern_with_unary(
-                            generate_pattern_with_binary(
-                                aten.add.Tensor,
-                                get_qlinear_pt2e_pattern(x_scale_zp_are_tensors),
-                                KeywordArg("other"),
-                                # If fp32 extra input is inplace added to bf16 linear output,
-                                # a to_bf16 node is inserted after binary
-                                dtype_convert=cvt_dtype_binary,
-                                swap_inputs=swap_inputs,
-                            ),
-                            unary_postop_dict[unary_op],
-                        ),
-                        is_fp8=is_fp8,
-                    )
-                }
-            )
-        for binary_unary_attr, patterns in qlinear_binary_replace_patterns.items():
-            _register_qlinear_post_op_fusion_pass(
-                patterns,
-                3,  # pass_number
-                qlinear_binary_op,  # computation_op
-                binary_unary_attr,
-            )
+        _register_qlinear_binary_float_out(x_scale_zp_are_tensors, qlinear_binary_op)
 
-        # Priority 2.1 to match: QLinear Binary-Unary pattern with fp32/bfloat16 output
-        # Covers case (2) of int8-mixed-fp32 and case (2)(4) of int8-mixed-bf16,
-        # totally 2 patterns (2 are identical)
-        binary_replace_float_out_patterns = {}
-        for swap_binary_inputs in swap_binary_inputs_list:
-            binary_replace_float_out_patterns.update(
-                {
-                    PostOpAttr("sum", 1.0, "relu", [], ""): generate_pattern_with_unary(
-                        generate_pattern_with_binary(
-                            aten.add.Tensor,
-                            get_qlinear_pt2e_pattern(x_scale_zp_are_tensors),
-                            KeywordArg("accum"),
-                            dtype_convert=False,
-                            swap_inputs=swap_binary_inputs,
-                        ),
-                        aten.relu.default,
-                    ),
-                }
-            )
-        for (
-            binary_unary_attr,
+
+def _register_qlinear_post_op_fusion_passes(patterns_dict, pass_number, computation_op):
+    """Register every ``(attr, pattern)`` in ``patterns_dict`` for one pass."""
+    for binary_unary_attr, patterns in patterns_dict.items():
+        _register_qlinear_post_op_fusion_pass(
             patterns,
-        ) in binary_replace_float_out_patterns.items():
-            _register_qlinear_post_op_fusion_pass(
-                patterns,
-                4,  # pass_number
-                qlinear_binary_op,  # computation_op
-                binary_unary_attr,
-            )
-        # Priority 2.2 to match: QLinear Binary-Unary pattern with fp32/bfloat16 output
-        # Covers case (6) of int8-mixed-bf16
-        binary_replace_float_out_patterns = {}
-        for swap_binary_inputs in swap_binary_inputs_list:
-            binary_replace_float_out_patterns.update(
-                {
-                    PostOpAttr("add", 1.0, "relu", [], ""): generate_pattern_with_unary(
+            pass_number,
+            computation_op,  # computation_op
+            binary_unary_attr,
+        )
+
+
+def _register_qlinear_binary_int8_out(x_scale_zp_are_tensors, qlinear_binary_op):
+    """Priority 1: QLinear Binary or Binary-Unary pattern with int8 output.
+
+    Covers case (1) of int8-mixed-fp32 and case (1)(3)(5) of int8-mixed-bf16,
+    totally 3 patterns (2 are identical).
+    """
+    unary_postop_dict = {
+        "none": None,
+        "relu": aten.relu.default,
+    }
+    combinations = itertools.product(
+        ["none", "relu"],  # unary_postop_list
+        [False, True],  # int8_mixed_bf16_list
+        [False, True],  # swap_binary_inputs_list
+        [False, True],  # convert_dtype_after_binary_list
+        [False, True],  # is_fp8_list
+    )
+    qlinear_binary_replace_patterns = {}
+    for (
+        unary_op,
+        int8_mixed_bf16,
+        swap_inputs,
+        cvt_dtype_binary,
+        is_fp8,
+    ) in combinations:
+        if not int8_mixed_bf16 and cvt_dtype_binary:
+            # No convert node after binary node if dtypes are all fp32
+            continue
+        qlinear_binary_replace_patterns.update(
+            {
+                PostOpAttr(
+                    "add", 1.0, unary_op, [], ""
+                ): generate_pattern_with_output_quant(
+                    generate_pattern_with_unary(
                         generate_pattern_with_binary(
                             aten.add.Tensor,
                             get_qlinear_pt2e_pattern(x_scale_zp_are_tensors),
                             KeywordArg("other"),
-                            dtype_convert=True,
-                            swap_inputs=swap_binary_inputs,
+                            # If fp32 extra input is inplace added to bf16 linear output,
+                            # a to_bf16 node is inserted after binary
+                            dtype_convert=cvt_dtype_binary,
+                            swap_inputs=swap_inputs,
                         ),
-                        aten.relu.default,
+                        unary_postop_dict[unary_op],
                     ),
-                }
-            )
-        for (
-            binary_unary_attr,
-            patterns,
-        ) in binary_replace_float_out_patterns.items():
-            _register_qlinear_post_op_fusion_pass(
-                patterns,
-                4,  # pass_number
-                qlinear_binary_op,  # computation_op
-                binary_unary_attr,
-            )
+                    is_fp8=is_fp8,
+                )
+            }
+        )
+    _register_qlinear_post_op_fusion_passes(
+        qlinear_binary_replace_patterns, 3, qlinear_binary_op
+    )
 
-        # Priority 3.1: QLinear Binary pattern with fp32/bfloat16 output
-        # Covers case (2) of int8-mixed-fp32 and case (2)(4) of int8-mixed-bf16,
-        # totally 2 patterns (2 are identical)
-        binary_replace_float_out_patterns = {}
-        for swap_binary_inputs in swap_binary_inputs_list:
-            binary_replace_float_out_patterns.update(
-                {
-                    PostOpAttr(
-                        "sum", 1.0, "none", [], ""
-                    ): generate_pattern_with_binary(
+
+def _register_qlinear_binary_unary_float_out(x_scale_zp_are_tensors, qlinear_binary_op):
+    """Priority 2: QLinear Binary-Unary pattern with fp32/bfloat16 output.
+
+    2.1 covers case (2) of int8-mixed-fp32 and case (2)(4) of int8-mixed-bf16
+    (sum post op); 2.2 covers case (6) of int8-mixed-bf16 (add post op).
+    """
+    swap_binary_inputs_list = [False, True]
+    # Priority 2.1: sum post op, no dtype convert after binary.
+    binary_replace_float_out_patterns = {}
+    for swap_binary_inputs in swap_binary_inputs_list:
+        binary_replace_float_out_patterns.update(
+            {
+                PostOpAttr("sum", 1.0, "relu", [], ""): generate_pattern_with_unary(
+                    generate_pattern_with_binary(
                         aten.add.Tensor,
                         get_qlinear_pt2e_pattern(x_scale_zp_are_tensors),
                         KeywordArg("accum"),
                         dtype_convert=False,
                         swap_inputs=swap_binary_inputs,
                     ),
-                }
-            )
-        for (
-            binary_unary_attr,
-            patterns,
-        ) in binary_replace_float_out_patterns.items():
-            _register_qlinear_post_op_fusion_pass(
-                patterns,
-                5,  # pass_number
-                qlinear_binary_op,  # computation_op
-                binary_unary_attr,
-            )
-        # Priority 3.2: QLinear Binary pattern with fp32/bfloat16 output
-        # Covers (6) of int8-mixed-bf16
-        binary_replace_float_out_patterns = {}
-        for swap_binary_inputs in swap_binary_inputs_list:
-            binary_replace_float_out_patterns.update(
-                {
-                    PostOpAttr(
-                        "add", 1.0, "none", [], ""
-                    ): generate_pattern_with_binary(
+                    aten.relu.default,
+                ),
+            }
+        )
+    _register_qlinear_post_op_fusion_passes(
+        binary_replace_float_out_patterns, 4, qlinear_binary_op
+    )
+    # Priority 2.2: add post op, dtype convert after binary.
+    binary_replace_float_out_patterns = {}
+    for swap_binary_inputs in swap_binary_inputs_list:
+        binary_replace_float_out_patterns.update(
+            {
+                PostOpAttr("add", 1.0, "relu", [], ""): generate_pattern_with_unary(
+                    generate_pattern_with_binary(
                         aten.add.Tensor,
                         get_qlinear_pt2e_pattern(x_scale_zp_are_tensors),
                         KeywordArg("other"),
                         dtype_convert=True,
                         swap_inputs=swap_binary_inputs,
                     ),
-                }
-            )
-        for (
-            binary_unary_attr,
-            patterns,
-        ) in binary_replace_float_out_patterns.items():
-            _register_qlinear_post_op_fusion_pass(
-                patterns,
-                5,  # pass_number
-                qlinear_binary_op,  # computation_op
-                binary_unary_attr,
-            )
+                    aten.relu.default,
+                ),
+            }
+        )
+    _register_qlinear_post_op_fusion_passes(
+        binary_replace_float_out_patterns, 4, qlinear_binary_op
+    )
+
+
+def _register_qlinear_binary_float_out(x_scale_zp_are_tensors, qlinear_binary_op):
+    """Priority 3: QLinear Binary pattern with fp32/bfloat16 output.
+
+    3.1 covers case (2) of int8-mixed-fp32 and case (2)(4) of int8-mixed-bf16
+    (sum post op); 3.2 covers case (6) of int8-mixed-bf16 (add post op).
+    """
+    swap_binary_inputs_list = [False, True]
+    # Priority 3.1: sum post op, no dtype convert after binary.
+    binary_replace_float_out_patterns = {}
+    for swap_binary_inputs in swap_binary_inputs_list:
+        binary_replace_float_out_patterns.update(
+            {
+                PostOpAttr("sum", 1.0, "none", [], ""): generate_pattern_with_binary(
+                    aten.add.Tensor,
+                    get_qlinear_pt2e_pattern(x_scale_zp_are_tensors),
+                    KeywordArg("accum"),
+                    dtype_convert=False,
+                    swap_inputs=swap_binary_inputs,
+                ),
+            }
+        )
+    _register_qlinear_post_op_fusion_passes(
+        binary_replace_float_out_patterns, 5, qlinear_binary_op
+    )
+    # Priority 3.2: add post op, dtype convert after binary.
+    binary_replace_float_out_patterns = {}
+    for swap_binary_inputs in swap_binary_inputs_list:
+        binary_replace_float_out_patterns.update(
+            {
+                PostOpAttr("add", 1.0, "none", [], ""): generate_pattern_with_binary(
+                    aten.add.Tensor,
+                    get_qlinear_pt2e_pattern(x_scale_zp_are_tensors),
+                    KeywordArg("other"),
+                    dtype_convert=True,
+                    swap_inputs=swap_binary_inputs,
+                ),
+            }
+        )
+    _register_qlinear_post_op_fusion_passes(
+        binary_replace_float_out_patterns, 5, qlinear_binary_op
+    )
 
 
 def _register_scaled_embedding_bag_pass(pattern, pass_number, dtype=torch.float32):
