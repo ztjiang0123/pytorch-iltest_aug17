@@ -180,6 +180,28 @@ def resolve_input_cutlass_dtype(input_dtype_name: str, kernel_name: str):
     )
 
 
+def select_cutedsl_config(input_dtype, configs: dict):
+    """Select a kernel configuration tuple from ``configs`` based on dtype.
+
+    Shared by the 1x32 / 32x1 (2D) MXFP8 compile paths. bfloat16 inputs use the
+    ``"bf16_default"`` config; every other supported dtype uses ``"fallback"``.
+    The config tuples themselves differ per kernel and are supplied by the
+    caller via ``configs``.
+
+    Args:
+        input_dtype: The input ``torch.dtype``.
+        configs: Mapping of config name to the kernel's config tuple, containing
+            at least ``"bf16_default"`` and ``"fallback"`` keys.
+
+    Returns:
+        Tuple of ``(config_name, config_tuple)``.
+    """
+    import torch
+
+    config_name = "bf16_default" if input_dtype == torch.bfloat16 else "fallback"
+    return config_name, configs[config_name]
+
+
 def bind_kernel_config(kernel, config):
     """Expose a frozen kernel-config dataclass as uppercase kernel attributes.
 

@@ -30,6 +30,7 @@ from .cute_utils import (
     make_tile_2d_smem_layouts,
     resolve_input_cutlass_dtype,
     run_quantize_2d_kernel,
+    select_cutedsl_config,
 )
 
 
@@ -63,11 +64,7 @@ def _select_cutedsl_config(
     Returns:
         Tuple of (config_name, (compute_warps, tile_m, tile_k, m_tiles_per_cta))
     """
-    if input_dtype == torch.bfloat16:
-        config_name = "bf16_default"
-    else:
-        config_name = "fallback"
-    return config_name, _CUTEDSL_CONFIGS[config_name]
+    return select_cutedsl_config(input_dtype, _CUTEDSL_CONFIGS)
 
 
 @dataclass(frozen=True)
