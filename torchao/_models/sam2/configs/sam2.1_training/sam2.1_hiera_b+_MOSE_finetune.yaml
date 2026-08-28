@@ -79,8 +79,10 @@ trainer:
           normalize: true
           scale: null
           temperature: 10000
-        d_model: 256
-        backbone_channel_list: [896, 448, 224, 112]
+        conv:
+          _target_: sam2.modeling.backbones.image_encoder.FpnConv
+          backbone_channel_list: [896, 448, 224, 112]
+          d_model: 256
         fusion:
           _target_: sam2.modeling.backbones.image_encoder.FpnFusion
           top_down_levels: [2, 3]  # output level 0 and 1 directly use the backbone features

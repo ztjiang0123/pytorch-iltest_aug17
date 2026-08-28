@@ -14,8 +14,15 @@ import torch.nn.functional as F
 
 @dataclass
 class FpnConv:
-    """Configuration for the lateral 1x1 convolutions in :class:`FpnNeck`."""
+    """Configuration for the lateral convolutions in :class:`FpnNeck`.
 
+    Bundles the per-level input channels (``backbone_channel_list``), the shared
+    output dimension (``d_model``), and the conv geometry, since these values
+    travel together to build the lateral projection convolutions.
+    """
+
+    backbone_channel_list: List[int]
+    d_model: int
     kernel_size: int = 1
     stride: int = 1
     padding: int = 0
@@ -81,34 +88,28 @@ class FpnNeck(nn.Module):
     def __init__(
         self,
         position_encoding: nn.Module,
-        d_model: int,
-        backbone_channel_list: List[int],
-        conv: Optional[FpnConv] = None,
+        conv: FpnConv,
         fusion: Optional[FpnFusion] = None,
     ):
         """Initialize the neck
         :param position_encoding: the positional encoding to use
-        :param d_model: the dimension of the model
-        :param backbone_channel_list: input channels of each backbone level
-        :param conv: kernel size, stride, and padding of the lateral convs
+        :param conv: input channels, output dim, and geometry of the lateral convs
         :param fusion: interpolation mode, fuse type, and top-down levels
         """
         super().__init__()
-        if conv is None:
-            conv = FpnConv()
         if fusion is None:
             fusion = FpnFusion()
         self.position_encoding = position_encoding
         self.convs = nn.ModuleList()
-        self.backbone_channel_list = backbone_channel_list
-        self.d_model = d_model
-        for dim in backbone_channel_list:
+        self.backbone_channel_list = conv.backbone_channel_list
+        self.d_model = conv.d_model
+        for dim in conv.backbone_channel_list:
             current = nn.Sequential()
             current.add_module(
                 "conv",
                 nn.Conv2d(
                     in_channels=dim,
-                    out_channels=d_model,
+                    out_channels=conv.d_model,
                     kernel_size=conv.kernel_size,
                     stride=conv.stride,
                     padding=conv.padding,

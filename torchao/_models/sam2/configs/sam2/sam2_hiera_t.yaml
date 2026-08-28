@@ -21,8 +21,10 @@ model:
         normalize: true
         scale: null
         temperature: 10000
-      d_model: 256
-      backbone_channel_list: [768, 384, 192, 96]
+      conv:
+        _target_: torchao._models.sam2.modeling.backbones.image_encoder.FpnConv
+        backbone_channel_list: [768, 384, 192, 96]
+        d_model: 256
       fusion:
         _target_: torchao._models.sam2.modeling.backbones.image_encoder.FpnFusion
         top_down_levels: [2, 3]  # output level 0 and 1 directly use the backbone features
