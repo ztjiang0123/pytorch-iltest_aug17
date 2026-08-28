@@ -51,22 +51,6 @@ _CUTEDSL_CONFIGS = {
 }
 
 
-def _select_cutedsl_config(
-    input_dtype: torch.dtype,
-    scaling_mode: str,
-) -> Tuple[str, Tuple[int, int, int, int]]:
-    """Select kernel configuration based on input dtype.
-
-    Args:
-        input_dtype: Input dtype
-        scaling_mode: Scaling mode ("floor" or "rceil")
-
-    Returns:
-        Tuple of (config_name, (compute_warps, tile_m, tile_k, m_tiles_per_cta))
-    """
-    return select_cutedsl_config(input_dtype, _CUTEDSL_CONFIGS)
-
-
 @dataclass(frozen=True)
 class _Mxfp8Quantize2d32x1Config:
     """Tuned compile-time configuration for the MXFP8 2D 32x1 quantize kernel.
@@ -601,7 +585,7 @@ def mxfp8_quantize_cutedsl_2d_32x1(
         assert offs.dtype == torch.int32, "offs must be int32 tensor"
         assert offs.dim() == 1, "offs must be 1D tensor"
 
-    _, config = _select_cutedsl_config(x.dtype, scaling_mode)
+    _, config = select_cutedsl_config(x.dtype, _CUTEDSL_CONFIGS)
     compute_warps, tile_m, tile_k, m_tiles_per_cta = config
     assert stage_count >= 1, "stage_count must be >= 1"
     assert stage_count <= 2, "stage_count must be <= 2"

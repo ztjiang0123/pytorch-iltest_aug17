@@ -38,22 +38,6 @@ _CUTEDSL_CONFIGS = {
 }
 
 
-def _select_cutedsl_config(
-    input_dtype: torch.dtype,
-    scaling_mode: str,
-) -> Tuple[str, Tuple[int, int, int, int]]:
-    """Select kernel configuration based on input dtype.
-
-    Args:
-        input_dtype: Input dtype
-        scaling_mode: Scaling mode ("floor" or "rceil")
-
-    Returns:
-        Tuple of (config_name, (compute_warps, tile_m, tile_k, k_tiles_per_cta))
-    """
-    return select_cutedsl_config(input_dtype, _CUTEDSL_CONFIGS)
-
-
 @dataclass(frozen=True)
 class _RawKernelArgs:
     """The raw kernel-shaping arguments passed to the compile driver.
@@ -670,7 +654,7 @@ def mxfp8_quantize_cutedsl_2d_1x32(
         assert offs.dtype == torch.int32, "offs must be int32 tensor"
         assert offs.dim() == 1, "offs must be 1D tensor"
 
-    _, config = _select_cutedsl_config(x.dtype, scaling_mode)
+    _, config = select_cutedsl_config(x.dtype, _CUTEDSL_CONFIGS)
     compute_warps, tile_m, tile_k, k_tiles_per_cta = config
     # B200 sweeps over representative shapes showed no
     # measurable benefit above 2 stages. We keep this configurable for
