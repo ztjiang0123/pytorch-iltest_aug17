@@ -6,6 +6,7 @@
 
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Generator, Optional
 
@@ -30,6 +31,16 @@ if HAS_DTENSOR:
     from torch.distributed.tensor import distribute_tensor
     from torch.distributed.tensor.experimental import local_map
     from torch.distributed.tensor.placement_types import Shard
+
+
+@dataclass
+class _GroupQuantContext:
+    """Per-group quantization constants shared across all params in one ``step`` group."""
+
+    quantizer: Quantizer
+    quant_bits: int
+    gamma: float
+    quant_update: bool
 
 
 class QuantOptimizer(BaseWrappedOptimizer):
@@ -213,19 +224,8 @@ class QuantOptimizer(BaseWrappedOptimizer):
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.base_optimizer.load_state_dict(state_dict)
 
-    @torch.no_grad()
-    def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
-        """Performs a single optimization step.
-        Arguments:
-            closure (callable, optional): A closure that reevaluates the model
-                and returns the loss.
-        """
-        if self.num_steps < self.warmup_steps:
-            # warmup stage: running the base optimizer only
-            loss = self.base_optimizer.step(closure=closure)  # pyre-ignore[6]
-            self.num_steps += 1
-            return loss
-
+    def _prepare_latent_params(self, closure) -> Optional[float]:
+        """Save/restore latent params around the base optimizer step and run it."""
         if self.num_steps == self.warmup_steps:
             # first step of qat, save latent params, instead of restore
             self.save_latent_params()
@@ -243,100 +243,141 @@ class QuantOptimizer(BaseWrappedOptimizer):
                 self.base_optimizer.state[p]["latent"] = self._state[p]["latent"]
             del self._state
 
+        return loss
+
+    def _maybe_init_quants(self, state, p, ctx) -> None:
+        """(Re)allocate the per-parameter quantization target buffer into ``state``.
+
+        ``p`` is the (possibly reshaped) tensor whose shape/device the buffer must match,
+        while ``state`` is the original parameter's state dict so the buffer is stored where
+        the rest of ``step`` looks for it.
+        """
+        per_channel = self.quant_per_channel and p.dim() > 1
+        quant_size = ctx.quantizer.get_quant_size(ctx.quant_bits)
+        if per_channel:
+            quant_size = (p.size(0), quant_size)
+        state["quants"] = torch.empty(quant_size, device=p.device)
+        if is_dtensor(p):
+            state["quants"] = distribute_tensor(
+                state["quants"],
+                device_mesh=p.device_mesh,
+                placements=p.placements,
+            )
+
+    def _reshape_for_blocks(self, p, block_size):
+        """Reshape p into (-1, block_size) rows when block quantization is enabled."""
+        if block_size is None:
+            return p
+        assert p.size(-1) % block_size == 0, (
+            f"{p.size(-1)=} is not divisible by {block_size=}"
+        )
+        assert p.dim() <= 2, f"Invalid {p.dim()=} for {block_size=}"
+        if p.dim() == 1:
+            p = p.unsqueeze(0)
+        # row-major ordering ensures this is correct
+        return p.view(-1, block_size)
+
+    def _quantize_param(self, p, group, ctx):
+        """Quantize a single parameter in place and return its PARQ inverse slope."""
+        state = self.state[p]
+        # save latent parameters, need detach()? or copy p)
+        state["latent"].copy_(p)
+
+        # in-place scaling of parameters by 1/gamma if specified
+        if self.quant_shrink:
+            p.div_(ctx.gamma)
+
+        # reshape p according to block size if specified
+        p = self._reshape_for_blocks(p, group.get("quant_block_size"))
+
+        # quantization by channel or by layer; update quantization targets periodically
+        per_channel = self.quant_per_channel and p.dim() > 1
+        if ctx.quant_update:
+            self._maybe_init_quants(state, p, ctx)
+
+        dim = -1 if per_channel else None
+        if per_channel and p.dim() > 2:
+            p = p.flatten(start_dim=1)
+
+        q = None
+        if ctx.quant_update:
+            qfunc = partial(
+                self.quantize_, quantizer=ctx.quantizer, b=ctx.quant_bits, dim=dim
+            )
+            if is_dtensor(p):
+                qfunc = local_map(
+                    qfunc,
+                    out_placements=[*p.placements],
+                    in_placements=([Shard(0)], [Shard(0)]),
+                )
+            q = qfunc(p, state["quants"])
+
+        # apply (step-dependent) proximal mapping in place
+        pfunc = partial(self.prox_map.apply_, step_count=self.num_steps, dim=dim)
+        if is_dtensor(p):
+            pfunc = local_map(
+                pfunc,
+                out_placements=None,
+                in_placements=(
+                    [Shard(0)],
+                    None if q is None else [Shard(0)],
+                    [Shard(0)],
+                ),
+            )
+        return pfunc(p, q, state["quants"])
+
+    def _anneal_weight_decay(self, group, inv_slope) -> None:
+        """Update the group's weight decay from the shared PARQ inverse slope."""
+        if not inv_slope:
+            return
+        if self.anneal_wd_frac > 0:
+            group["weight_decay"] = (
+                inv_slope * self.anneal_wd_frac * group["initial_wd"]
+                + (1 - self.anneal_wd_frac) * group["initial_wd"]
+            )
+        group["inv_slope"] = inv_slope  # save for tensorboard
+
+    def _quantize_group(self, i, group, quant_update) -> None:
+        """Quantize every trainable parameter in a group and anneal its weight decay."""
+        # AProx in practice: ensure shrinkage coefficient >= 1
+        group["cumu_lr"] += group["lr"]
+        ctx = _GroupQuantContext(
+            # Override quantizer if specified in the group
+            quantizer=self._get_quantizer(i),
+            quant_bits=group["quant_bits"],
+            gamma=max(1.0, group["cumu_lr"]),
+            quant_update=quant_update,
+        )
+
+        inv_slope = 0.0
+        for p in group["params"]:
+            if not p.requires_grad:
+                continue
+            inv_slope = self._quantize_param(p, group, ctx)
+
+        # quantized parameters share the same PARQ inverse slope
+        self._anneal_weight_decay(group, inv_slope)
+
+    @torch.no_grad()
+    def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
+        """Performs a single optimization step.
+        Arguments:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        if self.num_steps < self.warmup_steps:
+            # warmup stage: running the base optimizer only
+            loss = self.base_optimizer.step(closure=closure)  # pyre-ignore[6]
+            self.num_steps += 1
+            return loss
+
+        loss = self._prepare_latent_params(closure)
+
         # check if it is time to update set of quantization values Q
-        if (self.num_steps - self.warmup_steps) % self.quant_period == 0:
-            quant_update = True
-        else:
-            quant_update = False
+        quant_update = (self.num_steps - self.warmup_steps) % self.quant_period == 0
 
         for i, group in enumerate(self.regularized_param_groups()):
-            # Override quantizer if specified in the group
-            quantizer = self._get_quantizer(i)
-
-            # AProx in practice: ensure shrinkage coefficient >= 1
-            group["cumu_lr"] += group["lr"]
-            gamma = max(1.0, group["cumu_lr"])
-            b = group["quant_bits"]
-            block_size = group.get("quant_block_size")
-            inv_slope = 0.0
-            for p in group["params"]:
-                if not p.requires_grad:
-                    continue
-                state = self.state[p]
-                # save latent parameters, need detach()? or copy p)
-                state["latent"].copy_(p)
-
-                # in-place scaling of parameters by 1/gamma if specified
-                if self.quant_shrink:
-                    p.div_(gamma)
-
-                # reshape p according to block size if specified
-                if block_size is not None:
-                    assert p.size(-1) % block_size == 0, (
-                        f"{p.size(-1)=} is not divisible by {block_size=}"
-                    )
-                    assert p.dim() <= 2, f"Invalid {p.dim()=} for {block_size=}"
-                    if p.dim() == 1:
-                        p = p.unsqueeze(0)
-
-                    # row-major ordering ensures this is correct
-                    p = p.view(-1, block_size)
-
-                # quantization by channel or by layer
-                # update quantization targets periodically
-                per_channel = self.quant_per_channel and p.dim() > 1
-                if quant_update:
-                    quant_size = quantizer.get_quant_size(b)
-
-                    if per_channel:
-                        quant_size = (p.size(0), quant_size)
-                    state["quants"] = torch.empty(quant_size, device=p.device)
-                    if is_dtensor(p):
-                        state["quants"] = distribute_tensor(
-                            state["quants"],
-                            device_mesh=p.device_mesh,
-                            placements=p.placements,
-                        )
-
-                dim = -1 if per_channel else None
-                if per_channel and p.dim() > 2:
-                    p = p.flatten(start_dim=1)
-
-                q = None
-                if quant_update:
-                    qfunc = partial(self.quantize_, quantizer=quantizer, b=b, dim=dim)
-                    if is_dtensor(p):
-                        qfunc = local_map(
-                            qfunc,
-                            out_placements=[*p.placements],
-                            in_placements=([Shard(0)], [Shard(0)]),
-                        )
-                    q = qfunc(p, state["quants"])
-
-                # apply (step-dependent) proximal mapping in place
-                pfunc = partial(
-                    self.prox_map.apply_, step_count=self.num_steps, dim=dim
-                )
-                if is_dtensor(p):
-                    pfunc = local_map(
-                        pfunc,
-                        out_placements=None,
-                        in_placements=(
-                            [Shard(0)],
-                            None if q is None else [Shard(0)],
-                            [Shard(0)],
-                        ),
-                    )
-                inv_slope = pfunc(p, q, state["quants"])
-
-            # quantized parameters share the same PARQ inverse slope
-            if inv_slope:
-                if self.anneal_wd_frac > 0:
-                    group["weight_decay"] = (
-                        inv_slope * self.anneal_wd_frac * group["initial_wd"]
-                        + (1 - self.anneal_wd_frac) * group["initial_wd"]
-                    )
-                group["inv_slope"] = inv_slope  # save for tensorboard
+            self._quantize_group(i, group, quant_update)
 
         self.num_steps += 1
         return loss
