@@ -555,18 +555,33 @@ def _summarize(data, experiment_filter):
     print("\nSummary of time (ms) by kernel category\n\n", df_p)
 
 
-def main(
-    profile_path_prefix: pathlib.Path,
-    compile: bool = True,
-    float8_recipe_name: Optional[str] = None,
-    mx_recipe_name: Optional[str] = None,
-    model_type: str = "linear",
-    experiment_filter: str = "both",
-    add_inductor_metadata_to_trace: bool = False,
-    enable_activation_checkpointing: bool = False,
-    mode_filter: str = "fwd_bwd",
-    forward_only: bool = False,
-):
+@dataclass
+class MainConfig:
+    """Options controlling a single profiling run."""
+
+    profile_path_prefix: pathlib.Path
+    compile: bool = True
+    float8_recipe_name: Optional[str] = None
+    mx_recipe_name: Optional[str] = None
+    model_type: str = "linear"
+    experiment_filter: str = "both"
+    add_inductor_metadata_to_trace: bool = False
+    enable_activation_checkpointing: bool = False
+    mode_filter: str = "fwd_bwd"
+    forward_only: bool = False
+
+
+def main(opts: MainConfig):
+    profile_path_prefix = opts.profile_path_prefix
+    compile = opts.compile
+    float8_recipe_name = opts.float8_recipe_name
+    mx_recipe_name = opts.mx_recipe_name
+    model_type = opts.model_type
+    experiment_filter = opts.experiment_filter
+    add_inductor_metadata_to_trace = opts.add_inductor_metadata_to_trace
+    enable_activation_checkpointing = opts.enable_activation_checkpointing
+    mode_filter = opts.mode_filter
+
     _validate_main_args(model_type, experiment_filter, mode_filter)
     config = _resolve_config(float8_recipe_name, mx_recipe_name)
 
@@ -696,10 +711,19 @@ def main(
     _summarize(data, experiment_filter)
 
 
+def _cli_main(profile_path_prefix: pathlib.Path, **overrides):
+    """Flat CLI wrapper: assemble MainConfig from flags and delegate to main().
+
+    ``fire`` exposes ``profile_path_prefix`` positionally and every remaining
+    ``MainConfig`` field as an optional ``--flag`` via ``**overrides``.
+    """
+    main(MainConfig(profile_path_prefix=profile_path_prefix, **overrides))
+
+
 def invoke_main() -> None:
     # Example usage: python benchmarks/profile_linear_float8.py benchmarks/data/profiles/current_profile --compile=True --linear_type="dynamic"
     # You can set TORCHINDUCTOR_PROFILE=1 to also capture triton kernel bandwidth
-    fire.Fire(main)
+    fire.Fire(_cli_main)
 
 
 if __name__ == "__main__":
