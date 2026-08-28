@@ -44,6 +44,7 @@ from torchao.quantization.pt2e.quantizer import (
     get_output_act_qspec,
     get_weight_qspec,
 )
+from torchao.quantization.pt2e.quantizer.utils import _create_global_config_filter
 
 FilterFn: TypeAlias = Callable[[list[Node]], bool]
 
@@ -170,20 +171,7 @@ def _create_operator_type_filter(
     return operator_type_filter
 
 
-def _global_config_filter(nodes: list[Node]) -> bool:
-    """Filter function for global configuration.
-
-    This filter function takes a list of nodes and returns True if there is exactly one node
-    in the list that is a default quantizable operation, False otherwise.
-    """
-    num_nodes_in_default_quantizable_ops = sum(
-        node.target in default_quantizable_ops for node in nodes
-    )
-    if num_nodes_in_default_quantizable_ops > 1:
-        raise NotImplementedError(
-            "Several nodes within a single pattern are default quantizable operations."
-        )
-    return num_nodes_in_default_quantizable_ops == 1
+_global_config_filter = _create_global_config_filter(default_quantizable_ops)
 
 
 def _map_module_function_to_aten_operator_type():

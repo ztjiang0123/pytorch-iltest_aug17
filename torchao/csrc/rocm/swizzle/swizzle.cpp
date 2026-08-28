@@ -420,30 +420,58 @@ ScalingType get_scaling_type(
 
 } // namespace
 
+// Bundles the hipBLASLt data/compute types selected for a given element type.
+struct HipBlasLtGemmTypes {
+  hipDataType abcType;
+  hipblasComputeType_t computeType;
+  hipDataType scaleType;
+};
+
+// Primary template intentionally left undefined so that an attempt to look up
+// the hipBLASLt types for an unsupported element type fails to compile with a
+// clear "no definition" error at the point of use.
+template <typename Dtype>
+struct HipBlasLtGemmTypesFor;
+
+template <>
+struct HipBlasLtGemmTypesFor<double> {
+  static constexpr HipBlasLtGemmTypes value{HIP_R_64F, HIPBLAS_COMPUTE_64F, HIP_R_64F};
+};
+template <>
+struct HipBlasLtGemmTypesFor<float> {
+  static constexpr HipBlasLtGemmTypes value{HIP_R_32F, HIPBLAS_COMPUTE_32F, HIP_R_32F};
+};
+template <>
+struct HipBlasLtGemmTypesFor<c10::complex<double>> {
+  static constexpr HipBlasLtGemmTypes value{HIP_C_64F, HIPBLAS_COMPUTE_64F, HIP_C_64F};
+};
+template <>
+struct HipBlasLtGemmTypesFor<c10::complex<float>> {
+  static constexpr HipBlasLtGemmTypes value{HIP_C_32F, HIPBLAS_COMPUTE_32F, HIP_C_32F};
+};
+template <>
+struct HipBlasLtGemmTypesFor<at::Half> {
+  static constexpr HipBlasLtGemmTypes value{HIP_R_16F, HIPBLAS_COMPUTE_32F, HIP_R_32F};
+};
+template <>
+struct HipBlasLtGemmTypesFor<at::BFloat16> {
+  static constexpr HipBlasLtGemmTypes value{HIP_R_16BF, HIPBLAS_COMPUTE_32F, HIP_R_32F};
+};
+
+// Resolve the hipBLASLt data/compute/scale types for the element type `Dtype`.
+// The per-type mapping lives in the HipBlasLtGemmTypesFor specializations above
+// so the matmul flow reads as a sequence of steps rather than a long dispatch.
+template <typename Dtype>
+inline constexpr HipBlasLtGemmTypes hipblaslt_gemm_types_for() {
+  return HipBlasLtGemmTypesFor<Dtype>::value;
+}
+
 template <typename Dtype>
 inline void bgemm_hipblaslt(CUDABLAS_BGEMM_ARGTYPES(Dtype), bool mat1_is_swizzled, bool mat2_is_swizzled) {
-  hipDataType abcType = HIP_R_32F;
-  hipblasComputeType_t computeType = HIPBLAS_COMPUTE_32F;
-  hipDataType scaleType = HIP_R_32F;
-  if constexpr (std::is_same_v<Dtype, double>) {
-    abcType = HIP_R_64F;
-    computeType = HIPBLAS_COMPUTE_64F;
-    scaleType = HIP_R_64F;
-  } else if constexpr (std::is_same_v<Dtype, float>) {
-  } else if constexpr (std::is_same_v<Dtype, c10::complex<double>>) {
-    abcType = HIP_C_64F;
-    computeType = HIPBLAS_COMPUTE_64F;
-    scaleType = HIP_C_64F;
-  } else if constexpr (std::is_same_v<Dtype, c10::complex<float>>) {
-    abcType = HIP_C_32F;
-    scaleType = HIP_C_32F;
-  } else if constexpr (std::is_same_v<Dtype, at::Half>) {
-    abcType = HIP_R_16F;
-  } else if constexpr (std::is_same_v<Dtype, at::BFloat16>) {
-    abcType = HIP_R_16BF;
-  } else {
-    static_assert(false && sizeof(Dtype), "at::cuda::blas::bgemm_internal_cublaslt: not implemented");
-  }
+  constexpr HipBlasLtGemmTypes gemmTypes = hipblaslt_gemm_types_for<Dtype>();
+  const hipDataType abcType = gemmTypes.abcType;
+  const hipblasComputeType_t computeType = gemmTypes.computeType;
+  const hipDataType scaleType = gemmTypes.scaleType;
 
   hipblasLtHandle_t ltHandle = at::cuda::getCurrentCUDABlasLtHandle();
   hipblasOperation_t opa = _cublasOpFromChar(transa);
