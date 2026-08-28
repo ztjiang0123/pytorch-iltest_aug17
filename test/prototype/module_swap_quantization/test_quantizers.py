@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from torchao.prototype.quantization.module_swap import IntQuantizer
+from torchao.prototype.quantization.module_swap import IntQuantizer, QuantRange
 
 
 class TestIntQuantizer(unittest.TestCase):
@@ -43,7 +43,7 @@ class TestIntQuantizer(unittest.TestCase):
         q_min = 0
         q_max = 15
         scale, offset = IntQuantizer.get_scale_offset(
-            x, group_size, quantization_mode, q_min, q_max
+            x, group_size, quantization_mode, QuantRange(q_min, q_max)
         )
         assert scale == 1
         assert offset == 0
@@ -55,7 +55,7 @@ class TestIntQuantizer(unittest.TestCase):
         q_min = -8
         q_max = 7
         scale, offset = IntQuantizer.get_scale_offset(
-            x, group_size, quantization_mode, q_min, q_max
+            x, group_size, quantization_mode, QuantRange(q_min, q_max)
         )
         assert scale == 1
         assert offset is None

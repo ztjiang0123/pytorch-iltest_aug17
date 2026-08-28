@@ -107,8 +107,6 @@ def _to_fp8_row_major_t(
     fp8_dtype_max: float,
     input_num_rows: int,
     input_num_cols: int,
-    output_num_rows: int,
-    output_num_cols: int,
     input_stride_row: int,
     input_stride_col: int,
     output_stride_row: int,
@@ -121,6 +119,10 @@ def _to_fp8_row_major_t(
 ):
     block_row_id = tl.program_id(axis=0)
     block_col_id = tl.program_id(axis=1)
+
+    # the output is the transpose of the input, so its dims are swapped
+    output_num_rows = input_num_cols
+    output_num_cols = input_num_rows
 
     # load scaling factor
     scale = tl.load(scale_ptr).to(tl.float32)
@@ -638,8 +640,6 @@ def hp_to_fp8_row_major_t(
         fp8_dtype_max,
         input_num_rows,
         input_num_cols,
-        output_num_rows,
-        output_num_cols,
         hp_tensor.stride(0),
         hp_tensor.stride(1),
         output_buffer.stride(0),
