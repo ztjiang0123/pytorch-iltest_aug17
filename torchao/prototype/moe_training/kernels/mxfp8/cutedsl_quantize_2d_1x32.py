@@ -12,6 +12,7 @@ import torch
 from torchao.utils import ceil_div
 
 from .cute_utils import (
+    issue_tma_load_g2s,
     make_axis_spec,
     make_kernel_io,
     make_quant_opts,
@@ -252,7 +253,6 @@ def _compile_mxfp8_quantize_2d_cutedsl(
             q_fp8_vals4_u32 = cute.recast_tensor(q_fp8_vals4, cutlass.Uint32)
             sOUT_tile_u32[lane_rel, chunk_base // cutlass.Int32(4)] = q_fp8_vals4_u32[0]
 
-        @cute.jit
         def _issue_tma_load(
             self,
             tma_atom_in: cute.CopyAtom,
@@ -263,7 +263,8 @@ def _compile_mxfp8_quantize_2d_cutedsl(
         ):
             """Issue TMA load from global memory to shared memory (producer warp only).
 
-            Only warp 0 executes the TMA load and updates the barrier.
+            Only warp 0 executes the TMA load and updates the barrier. 2D tiles
+            group a single leading mode; see ``issue_tma_load_g2s``.
 
             Args:
                 tma_atom_in: TMA copy atom for G2S
@@ -276,29 +277,13 @@ def _compile_mxfp8_quantize_2d_cutedsl(
                 Source: gIN_tile (global memory)
                 Destination: sIN_tile (shared memory)
             """
-            if warp_idx == 0:
-                cta_layout = cute.make_layout((1,))
-                sIN_for_tma_partition = cute.group_modes(sIN_tile, 0, 1)
-                gIN_for_tma_partition = cute.group_modes(gIN_tile, 0, 1)
-                tINs, tINg = cpasync.tma_partition(
-                    tma_atom_in,
-                    0,
-                    cta_layout,
-                    sIN_for_tma_partition,
-                    gIN_for_tma_partition,
-                )
-                tINg_stage0 = tINg[(None, 0)]
-                tINs_stage0 = tINs[(None, 0)]
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        tma_mbar_ptr, TILE_COPY_BYTES
-                    )
-                cute.copy(
-                    tma_atom_in,
-                    tINg_stage0,
-                    tINs_stage0,
-                    tma_bar_ptr=tma_mbar_ptr,
-                )
+            issue_tma_load_g2s(
+                tma_atom_in,
+                (gIN_tile, sIN_tile),
+                tma_mbar_ptr,
+                warp_idx,
+                (TILE_COPY_BYTES, 1),
+            )
 
         @cute.jit
         def _issue_tma_store(

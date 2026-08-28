@@ -77,6 +77,50 @@ def make_tile_2d_smem_layouts(tile_m: int, tile_k: int, out_column_major: bool):
     return smem_layout_in, smem_layout_out
 
 
+def issue_tma_load_g2s(tma_atom_in, tiles, tma_mbar_ptr, warp_idx, spec):
+    """Issue a bulk-tensor TMA load from global to shared memory (producer warp).
+
+    Shared by the 1x32 / 32x1 (2D) and 3D MXFP8 kernels: only warp 0 partitions
+    the tiles, arrives on the mbarrier with the expected transaction bytes, and
+    issues the copy. Plain (non-``@cute.jit``) helper: its cute ops inline into
+    the caller's trace, so the only per-kernel differences arrive via arguments.
+
+    Args:
+        tma_atom_in: TMA copy atom for the global-to-shared load.
+        tiles: ``(gIN_tile, sIN_tile)`` global/shared input tiles.
+        tma_mbar_ptr: TMA mbarrier pointer.
+        warp_idx: Warp index (only warp 0 issues the load).
+        spec: ``(tile_copy_bytes, group_modes_end)`` where ``group_modes_end`` is
+            1 for 2D tiles and 2 for 3D tiles.
+    """
+    import cutlass.cute as cute
+    from cutlass.cute.nvgpu import cpasync
+
+    gIN_tile, sIN_tile = tiles
+    tile_copy_bytes, group_modes_end = spec
+    if warp_idx == 0:
+        cta_layout = cute.make_layout((1,))
+        sIN_for_tma_partition = cute.group_modes(sIN_tile, 0, group_modes_end)
+        gIN_for_tma_partition = cute.group_modes(gIN_tile, 0, group_modes_end)
+        tINs, tINg = cpasync.tma_partition(
+            tma_atom_in,
+            0,
+            cta_layout,
+            sIN_for_tma_partition,
+            gIN_for_tma_partition,
+        )
+        tINg_stage0 = tINg[(None, 0)]
+        tINs_stage0 = tINs[(None, 0)]
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(tma_mbar_ptr, tile_copy_bytes)
+        cute.copy(
+            tma_atom_in,
+            tINg_stage0,
+            tINs_stage0,
+            tma_bar_ptr=tma_mbar_ptr,
+        )
+
+
 if _cutedsl_runtime_available():
     import cutlass
     import cutlass.cute as cute
