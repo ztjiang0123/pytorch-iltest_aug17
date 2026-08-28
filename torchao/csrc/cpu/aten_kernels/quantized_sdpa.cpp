@@ -918,6 +918,256 @@ inline void _fp8_dequant_quant_fusion_kernel(
   }
 }
 
+// Input tensors for the fused int8 SDPA kernel, grouped to keep the public
+// kernel entry point to a small parameter list.
+struct Int8SdpaTensors {
+  const at::Tensor& output;
+  const at::Tensor& q;
+  const at::Tensor& k;
+  const at::Tensor& v;
+};
+
+// Attention configuration shared by the int8 kernels.
+struct Int8SdpaConfig {
+  double dropout_p;
+  bool is_causal;
+  std::optional<at::Tensor> attn_mask;
+  std::optional<double> scale;
+};
+
+// Per-tensor quantization scales and zero points for the int8 attention
+// computation (q/k/v activations, attention probabilities `a`, output `o`).
+struct Int8SdpaScales {
+  float q_scale;
+  int32_t q_zp;
+  float k_scale;
+  int32_t k_zp;
+  float v_scale;
+  int32_t v_zp;
+  float a_scale;
+  int32_t a_zp;
+  float o_scale;
+  int32_t o_zp;
+};
+
+// Derived shapes, strides, scales, and base data pointers shared by the fused
+// int8 kernel and its extracted block helpers. Grouping them keeps every helper
+// to a small parameter list (mirrors `Fp8SdpaContext`).
+template <typename scalar_t, typename mask_t>
+struct Int8SdpaContext {
+  // Sizes
+  int64_t kvSize;
+  int64_t headSize;
+  // Split sizes / slices and their padded forms
+  int64_t qSplitSize;
+  int64_t kvSplitSize;
+  int64_t kvSlice;
+  int64_t rndHeadSize;
+  int64_t rndkvSplitSize;
+  int64_t av_gemm_K;
+  int64_t qk_gemm_K;
+  int64_t block_64;
+  // Strides
+  int64_t kStrideB, kStrideN, kStrideH;
+  int64_t vStrideB, vStrideN, vStrideH;
+  int64_t oStrideB, oStrideM, oStrideH;
+  int64_t mStrideB, mStrideH, mStrideM, mStrideN;
+  // Reorder-buffer row strides
+  int64_t qk_reduce_strideL;
+  int64_t v_reorder_strideL;
+  // Flags / scaling
+  bool headSize_mul64;
+  bool has_attn_mask;
+  float scaling_factor;
+  at::ScalarType u8_dt;
+  Int8SdpaScales scales;
+  // Base data ptrs
+  const scalar_t* q_data;
+  const scalar_t* k_data;
+  const scalar_t* v_data;
+  mask_t* mask_data;
+  scalar_t* out_data;
+};
+
+// Per-thread scratch buffers (into the shared per-thread arena) plus the
+// reordered K/V buffers used while attending one query block.
+template <typename scalar_t>
+struct Int8SdpaThreadBuffers {
+  float* qk_data;
+  float* qk_local_data;
+  scalar_t* qk_reduced_data;
+  int32_t* qk_s32_data;
+  int32_t* dst_s32_data;
+  float* sfm_sum_ptr;
+  int32_t* q_sum_ptr;
+  int32_t* a_sum_ptr;
+  float* sfm_max_ptr;
+  scalar_t* query_t_padding_ptr;
+  int32_t* k_sum_ptr;
+  int32_t* v_sum_ptr;
+  scalar_t* key_reorder_ptr;
+  scalar_t* value_reorder_ptr;
+  uint8_t* B_blocked_xform_u8;
+};
+
+// One (i, j) head, query-block-start m, and its derived per-block sizes.
+struct Int8SdpaQueryBlock {
+  int64_t i;
+  int64_t j;
+  int64_t m;         // query block start row
+  int64_t rkvSlice;  // number of kv slices to attend for this block
+  int64_t qBlockSize;
+};
+
+// Transpose+pack K and pack V into the reordered buffers for one (i, j) head.
+// Extracted from the fused int8 kernel so the packing loops read as a focused
+// unit rather than adding depth to the main parallel loop.
+template <typename scalar_t, typename mask_t>
+inline void _int8_sdpa_reorder_kv_one_head(
+    const Int8SdpaContext<scalar_t, mask_t>& ctx,
+    const Int8SdpaThreadBuffers<scalar_t>& bufs,
+    int64_t i,
+    int64_t j) {
+  const int64_t block_64 = ctx.block_64;
+  for (int64_t n = 0; n < ctx.kvSize; n += ctx.kvSplitSize) {
+    int64_t kvBlockSize = std::min(ctx.kvSplitSize, ctx.kvSize - n);
+    for (int64_t b = 0; b < kvBlockSize; b += block_64) {
+      bool istail = kvBlockSize - b < block_64;
+      int64_t trans_rows = istail ? kvBlockSize - b : block_64;
+      do_transpose(
+          reinterpret_cast<const uint8_t*>(ctx.k_data + i * ctx.kStrideB + j * ctx.kStrideH + n * ctx.kStrideN + b * ctx.kStrideN),
+          bufs.B_blocked_xform_u8,
+          trans_rows,
+          ctx.headSize,
+          ctx.kStrideN,
+          block_64);
+      if (!ctx.headSize_mul64 || istail) {
+        pad_remain_row_col(
+            bufs.B_blocked_xform_u8,
+            ctx.headSize,
+            trans_rows,
+            ctx.qk_gemm_K,
+            block_64,
+            block_64
+          );
+      }
+      at::native::cpublas::pack(
+              ctx.qk_gemm_K, // K
+              block_64, // N
+              block_64, // ld_in
+              block_64, // ld_out
+              ctx.u8_dt, // dt_in
+              ctx.u8_dt, // dt_out
+              bufs.B_blocked_xform_u8,
+              bufs.key_reorder_ptr + n * ctx.qk_gemm_K +
+                  b * ctx.qk_gemm_K);
+    }
+    // split headSize to block_64, block_64, block_64 ...
+    // [av_gemm_K, headSize] -> [av_gemm_K,  block_64 ...]
+    for (int64_t b = 0; b < ctx.rndHeadSize; b += block_64) {
+      at::native::cpublas::pack(
+              ctx.av_gemm_K,
+              block_64,
+              ctx.vStrideN,
+              block_64,
+              ctx.u8_dt,
+              ctx.u8_dt,
+              ctx.v_data + i * ctx.vStrideB + j * ctx.vStrideH + n * ctx.vStrideN + b,
+              bufs.value_reorder_ptr + n * ctx.rndHeadSize +
+                  ctx.av_gemm_K * b);
+    }
+  }
+}
+
+// Compute q @ k.T over all kv blocks for one query block, fusing dequant,
+// optional attention mask and the softmax max reduction. Extracted from the
+// fused int8 kernel to keep the per-kv-block loop out of the main loop nest.
+template <typename scalar_t, typename mask_t>
+inline void _int8_sdpa_qk_and_dequant_one_query_block(
+    const Int8SdpaContext<scalar_t, mask_t>& ctx,
+    const Int8SdpaThreadBuffers<scalar_t>& bufs,
+    const Int8SdpaQueryBlock& blk) {
+  const int64_t block_64 = ctx.block_64;
+  const Int8SdpaScales& s = ctx.scales;
+  for (int64_t l = 0; l < blk.rkvSlice; l++) {
+    int64_t n = l * ctx.kvSplitSize;
+    int64_t kvBlockSize = std::min(ctx.kvSplitSize, ctx.kvSize - n);
+    // Calculate q @ k.T
+    for (int64_t b = 0; b < kvBlockSize; b += block_64) {
+      at::native::cpublas::brgemm(
+            ctx.qSplitSize, block_64, ctx.qk_gemm_K,
+            ctx.qk_gemm_K, // lda
+            block_64, //ldb
+            ctx.rndkvSplitSize, //ldc,
+            false,
+            bufs.query_t_padding_ptr,
+            bufs.key_reorder_ptr + n * ctx.qk_gemm_K +
+                b * ctx.qk_gemm_K,
+            bufs.qk_s32_data + b);
+    }
+
+    // do dequant compensation, add mask, max reduce for softmax, and convert qk from s32 to fp32
+    float* qk_block_data = bufs.qk_data + l * ctx.qSplitSize * ctx.rndkvSplitSize;
+    if (ctx.has_attn_mask) {
+      mask_t* mask_data_offset = ctx.mask_data + blk.i * ctx.mStrideB + blk.j * ctx.mStrideH + blk.m * ctx.mStrideM + (ctx.mStrideN == 0 ? 0 : n);
+      _dequant_mask_max_fusion_kernel(
+        bufs.qk_s32_data, //in
+        mask_data_offset, //mask_ptr
+        bufs.q_sum_ptr, //sum_a_ptr
+        bufs.k_sum_ptr + n, //sum_b_ptr
+        blk.qBlockSize, //M
+        kvBlockSize, //N
+        ctx.rndkvSplitSize, //ldi
+        ctx.mStrideM, //ldm
+        ctx.rndkvSplitSize, //ldo
+        s.q_zp * s.k_zp * ctx.headSize, //zp_a*zp_b*k=beta
+        s.q_scale * s.k_scale * ctx.scaling_factor, //scale_a*scale_b*scale_sdpa=alpha
+        qk_block_data, //out
+        bufs.sfm_max_ptr // sfm_max_ptr
+      );
+    } else {
+      _dequant_max_fusion_kernel(
+        bufs.qk_s32_data, //in
+        bufs.q_sum_ptr, //sum_a_ptr
+        bufs.k_sum_ptr + n, //sum_b_ptr
+        blk.qBlockSize, //M
+        kvBlockSize, //N
+        ctx.rndkvSplitSize, //ldi
+        ctx.rndkvSplitSize, //ldo
+        s.q_zp * s.k_zp * ctx.headSize, //zp_a*zp_b*k=beta
+        s.q_scale * s.k_scale * ctx.scaling_factor, //scale_a*scale_b*scale_sdpa=alpha
+        qk_block_data, //out
+        bufs.sfm_max_ptr // sfm_max_ptr
+      );
+    }
+  }
+}
+
+// Compute Softmax(q @ k.T) @ v for one query block, accumulating over kv slices.
+// Extracted from the fused int8 kernel to keep the nested block/slice loops out
+// of the main loop nest.
+template <typename scalar_t, typename mask_t>
+inline void _int8_sdpa_av_gemm_one_query_block(
+    const Int8SdpaContext<scalar_t, mask_t>& ctx,
+    const Int8SdpaThreadBuffers<scalar_t>& bufs) {
+  const int64_t block_64 = ctx.block_64;
+  for (int64_t b = 0; b < ctx.headSize; b += block_64) {
+    auto value_reorder_b = bufs.value_reorder_ptr + b * ctx.av_gemm_K;
+    auto dst_s32_b = bufs.dst_s32_data + b;
+    for (int64_t s = 0; s < ctx.kvSlice; s++) {
+      at::native::cpublas::brgemm(
+          ctx.qSplitSize, block_64, ctx.av_gemm_K,
+          ctx.av_gemm_K, // lda
+          ctx.rndHeadSize, //ldb
+          ctx.rndHeadSize, //ldc
+          s != 0,
+          bufs.qk_reduced_data + s * ctx.qk_reduce_strideL,
+          value_reorder_b + s * ctx.v_reorder_strideL,
+          dst_s32_b);
+    }
+  }
+}
+
 // UINT8 - one parallel loop with u8u8s32 GEMM
 template <typename scalar_t, typename mask_t,
           int64_t q_split_size, int64_t kv_split_size,
@@ -925,24 +1175,29 @@ template <typename scalar_t, typename mask_t,
           typename std::enable_if_t<use_one_parallel_loop, int> = 0>
 inline typename std::enable_if_t<std::is_same_v<scalar_t, unsigned char>, void>
 int8_sdpa_fused_kernel_impl(
-    const at::Tensor& output,
-    const at::Tensor& q,
-    const at::Tensor& k,
-    const at::Tensor& v,
-    double dropout_p,
-    bool is_causal,
-    std::optional<at::Tensor> attention_mask,
-    std::optional<double> scale,
-    float q_scale,
-    int32_t q_zp,
-    float k_scale,
-    int32_t k_zp,
-    float v_scale,
-    int32_t v_zp,
-    float a_scale,
-    int32_t a_zp,
-    float o_scale,
-    int32_t o_zp) {
+    const Int8SdpaTensors& tensors,
+    const Int8SdpaConfig& config,
+    const Int8SdpaScales& scales) {
+  const at::Tensor& output = tensors.output;
+  const at::Tensor& q = tensors.q;
+  const at::Tensor& k = tensors.k;
+  const at::Tensor& v = tensors.v;
+  [[maybe_unused]] const double dropout_p = config.dropout_p;
+  const bool is_causal = config.is_causal;
+  // Local mutable copy: reshape_attn_mask_to_4d rewrites the mask in place and
+  // must not affect the caller's optional (matching the original by-value param).
+  std::optional<at::Tensor> attention_mask = config.attn_mask;
+  const std::optional<double>& scale = config.scale;
+  const float q_scale = scales.q_scale;
+  const int32_t q_zp = scales.q_zp;
+  const float k_scale = scales.k_scale;
+  const int32_t k_zp = scales.k_zp;
+  const float v_scale = scales.v_scale;
+  const int32_t v_zp = scales.v_zp;
+  const float a_scale = scales.a_scale;
+  const int32_t a_zp = scales.a_zp;
+  const float o_scale = scales.o_scale;
+  const int32_t o_zp = scales.o_zp;
   // Query (Batch x Num_heads  x Q_seq_len  x Dim_per_head)
   //    -> (Batch x Q_seq_len  x Num_heads  x Dim_per_head)
   // Key   (Batch x Num_heads  x KV_seq_len x Dim_per_head)
@@ -1098,6 +1353,28 @@ int8_sdpa_fused_kernel_impl(
 
         uint8_t* B_blocked_xform_u8 = new uint8_t[qk_gemm_K * block_64];
 
+        // Group the loop-invariant sizes/strides/scales/pointers and the
+        // per-thread scratch buffers so the extracted block helpers each take a
+        // small parameter list (mirrors the fp8 SDPA context pattern).
+        Int8SdpaContext<scalar_t, mask_t> ctx{
+            kvSize, headSize,
+            qSplitSize, kvSplitSize, kvSlice,
+            rndHeadSize, rndkvSplitSize, av_gemm_K, qk_gemm_K, block_64,
+            kStrideB, kStrideN, kStrideH,
+            vStrideB, vStrideN, vStrideH,
+            oStrideB, oStrideM, oStrideH,
+            mStrideB, mStrideH, mStrideM, mStrideN,
+            qk_reduce_strideL, v_reorder_strideL,
+            headSize_mul64, has_attn_mask, scaling_factor, u8_dt,
+            {q_scale, q_zp, k_scale, k_zp, v_scale, v_zp,
+             a_scale, a_zp, o_scale, o_zp},
+            q_data, k_data, v_data, mask_data, out_data};
+        Int8SdpaThreadBuffers<scalar_t> bufs{
+            qk_data, qk_local_data, qk_reduced_data, qk_s32_data, dst_s32_data,
+            sfm_sum_ptr, q_sum_ptr, a_sum_ptr, sfm_max_ptr, query_t_padding_ptr,
+            k_sum_ptr, v_sum_ptr, key_reorder_ptr, value_reorder_ptr,
+            B_blocked_xform_u8};
+
         for (const auto z : c10::irange(begin, end)) {
           (void)z; // Suppress unused variable
 
@@ -1118,54 +1395,7 @@ int8_sdpa_fused_kernel_impl(
           }
 
           // transpose and packing
-          for (int64_t n = 0; n < kvSize; n += kvSplitSize) {
-            int64_t kvBlockSize = std::min(kvSplitSize, kvSize - n);
-            for (int64_t b = 0; b < kvBlockSize; b += block_64) {
-              bool istail = kvBlockSize - b < block_64;
-              int64_t trans_rows = istail ? kvBlockSize - b : block_64;
-              do_transpose(
-                  reinterpret_cast<const uint8_t*>(k_data + i * kStrideB + j * kStrideH + n * kStrideN + b * kStrideN),
-                  B_blocked_xform_u8,
-                  trans_rows,
-                  headSize,
-                  kStrideN,
-                  block_64);
-              if (!headSize_mul64 || istail) {
-                pad_remain_row_col(
-                    B_blocked_xform_u8,
-                    headSize,
-                    trans_rows,
-                    qk_gemm_K,
-                    block_64,
-                    block_64
-                  );
-              }
-              at::native::cpublas::pack(
-                      qk_gemm_K, // K
-                      block_64, // N
-                      block_64, // ld_in
-                      block_64, // ld_out
-                      u8_dt, // dt_in
-                      u8_dt, // dt_out
-                      B_blocked_xform_u8,
-                      key_reorder_ptr + n * qk_gemm_K +
-                          b * qk_gemm_K);
-            }
-            // split headSize to block_64, block_64, block_64 ...
-            // [av_gemm_K, headSize] -> [av_gemm_K,  block_64 ...]
-            for (int64_t b = 0; b < rndHeadSize; b += block_64) {
-              at::native::cpublas::pack(
-                      av_gemm_K,
-                      block_64,
-                      vStrideN,
-                      block_64,
-                      u8_dt,
-                      u8_dt,
-                      v_data + i * vStrideB + j * vStrideH + n * vStrideN + b,
-                      value_reorder_ptr + n * rndHeadSize +
-                          av_gemm_K * b);
-            }
-          }
+          _int8_sdpa_reorder_kv_one_head(ctx, bufs, i, j);
 
           // sdpa core
           for (int64_t k = 0; k < qSlice; k++) {
@@ -1197,58 +1427,8 @@ int8_sdpa_fused_kernel_impl(
                 q_sum_ptr, static_cast<int32_t>(0), qSplitSize);
             }
             const int64_t rkvSlice = (num_keys - 1) / kvSplitSize + 1;
-            for (int64_t l = 0; l < rkvSlice; l++) {
-              int64_t n = l * kvSplitSize;
-              int64_t kvBlockSize = std::min(kvSplitSize, kvSize - n);
-              // Calculate q @ k.T
-              for (int64_t b = 0; b < kvBlockSize; b += block_64) {
-                at::native::cpublas::brgemm(
-                      qSplitSize, block_64, qk_gemm_K,
-                      qk_gemm_K, // lda
-                      block_64, //ldb
-                      rndkvSplitSize, //ldc,
-                      false,
-                      query_t_padding_ptr,
-                      key_reorder_ptr + n * qk_gemm_K +
-                          b * qk_gemm_K,
-                      qk_s32_data + b);
-              }
-
-              // do dequant compensation, add mask, max reduce for softmax, and convert qk from s32 to fp32
-              accum_t* qk_block_data = qk_data + l * qSplitSize * rndkvSplitSize;
-              if (has_attn_mask) {
-                mask_t* mask_data_offset = mask_data + i * mStrideB + j * mStrideH + m * mStrideM + (mStrideN == 0 ? 0 : n);
-                _dequant_mask_max_fusion_kernel(
-                  qk_s32_data, //in
-                  mask_data_offset, //mask_ptr
-                  q_sum_ptr, //sum_a_ptr
-                  k_sum_ptr + n, //sum_b_ptr
-                  qBlockSize, //M
-                  kvBlockSize, //N
-                  rndkvSplitSize, //ldi
-                  mStrideM, //ldm
-                  rndkvSplitSize, //ldo
-                  q_zp * k_zp * headSize, //zp_a*zp_b*k=beta
-                  q_scale * k_scale * scaling_factor, //scale_a*scale_b*scale_sdpa=alpha
-                  qk_block_data, //out
-                  sfm_max_ptr // sfm_max_ptr
-                );
-              } else {
-                _dequant_max_fusion_kernel(
-                  qk_s32_data, //in
-                  q_sum_ptr, //sum_a_ptr
-                  k_sum_ptr + n, //sum_b_ptr
-                  qBlockSize, //M
-                  kvBlockSize, //N
-                  rndkvSplitSize, //ldi
-                  rndkvSplitSize, //ldo
-                  q_zp * k_zp * headSize, //zp_a*zp_b*k=beta
-                  q_scale * k_scale * scaling_factor, //scale_a*scale_b*scale_sdpa=alpha
-                  qk_block_data, //out
-                  sfm_max_ptr // sfm_max_ptr
-                );
-              }
-            }
+            Int8SdpaQueryBlock blk{i, j, m, rkvSlice, qBlockSize};
+            _int8_sdpa_qk_and_dequant_one_query_block(ctx, bufs, blk);
             // sub max, exp, sum reduce, div sum for softmax
             // and quant
             // and sum for attention
@@ -1292,21 +1472,7 @@ int8_sdpa_fused_kernel_impl(
               );
             }
             // Calculate Softmax(q @ k.T) @ v
-            for (int64_t b = 0; b < headSize; b += block_64) {
-              auto value_reorder_b = value_reorder_ptr + b * av_gemm_K;
-              auto dst_s32_b = dst_s32_data + b;
-              for (int64_t s = 0; s < kvSlice; s++) {
-                at::native::cpublas::brgemm(
-                    qSplitSize, block_64, av_gemm_K,
-                    av_gemm_K, // lda
-                    rndHeadSize, //ldb
-                    rndHeadSize, //ldc
-                    s != 0,
-                    qk_reduced_data + s * qk_reduce_strideL,
-                    value_reorder_b + s * v_reorder_strideL,
-                    dst_s32_b);
-              }
-            }
+            _int8_sdpa_av_gemm_one_query_block(ctx, bufs);
 
             // After the last gemm,
             // do dequant compensation, quant and convert from s32 to int8
@@ -1353,24 +1519,29 @@ template <typename scalar_t, typename mask_t,
           typename std::enable_if_t<!use_one_parallel_loop, int> = 0>
 inline typename std::enable_if_t<std::is_same_v<scalar_t, unsigned char>, void>
 int8_sdpa_fused_kernel_impl(
-    const at::Tensor& output,
-    const at::Tensor& q,
-    const at::Tensor& k,
-    const at::Tensor& v,
-    double dropout_p,
-    bool is_causal,
-    std::optional<at::Tensor> attention_mask,
-    std::optional<double> scale,
-    float q_scale,
-    int32_t q_zp,
-    float k_scale,
-    int32_t k_zp,
-    float v_scale,
-    int32_t v_zp,
-    float a_scale,
-    int32_t a_zp,
-    float o_scale,
-    int32_t o_zp) {
+    const Int8SdpaTensors& tensors,
+    const Int8SdpaConfig& config,
+    const Int8SdpaScales& scales) {
+  const at::Tensor& output = tensors.output;
+  const at::Tensor& q = tensors.q;
+  const at::Tensor& k = tensors.k;
+  const at::Tensor& v = tensors.v;
+  [[maybe_unused]] const double dropout_p = config.dropout_p;
+  const bool is_causal = config.is_causal;
+  // Local mutable copy: reshape_attn_mask_to_4d rewrites the mask in place and
+  // must not affect the caller's optional (matching the original by-value param).
+  std::optional<at::Tensor> attention_mask = config.attn_mask;
+  const std::optional<double>& scale = config.scale;
+  const float q_scale = scales.q_scale;
+  const int32_t q_zp = scales.q_zp;
+  const float k_scale = scales.k_scale;
+  const int32_t k_zp = scales.k_zp;
+  const float v_scale = scales.v_scale;
+  const int32_t v_zp = scales.v_zp;
+  const float a_scale = scales.a_scale;
+  const int32_t a_zp = scales.a_zp;
+  const float o_scale = scales.o_scale;
+  const int32_t o_zp = scales.o_zp;
   // Query (Batch x Num_heads  x Q_seq_len  x Dim_per_head)
   //    -> (Batch x Q_seq_len  x Num_heads  x Dim_per_head)
   // Key   (Batch x Num_heads  x KV_seq_len x Dim_per_head)
@@ -2369,44 +2540,15 @@ template <typename scalar_t, typename mask_t, int64_t q_split_size, int64_t kv_s
 inline typename std::enable_if_t<std::is_same_v<scalar_t, unsigned char>, void>
 int8_sdpa_fused_kernel_impl(
     bool use_one_parallel_loop,
-    const at::Tensor& output,
-    const at::Tensor& query,
-    const at::Tensor& key,
-    const at::Tensor& value,
-    double dropout_p,
-    bool is_causal,
-    std::optional<at::Tensor> attn_mask,
-    std::optional<double> scale,
-    float q_scale,
-    int32_t q_zp,
-    float k_scale,
-    int32_t k_zp,
-    float v_scale,
-    int32_t v_zp,
-    float a_scale,
-    int32_t a_zp,
-    float o_scale,
-    int32_t o_zp) {
+    const Int8SdpaTensors& tensors,
+    const Int8SdpaConfig& config,
+    const Int8SdpaScales& scales) {
   if (use_one_parallel_loop) {
     int8_sdpa_fused_kernel_impl<scalar_t, mask_t, q_split_size, kv_split_size,
-          /* use_one_parallel_loop */ true>(
-      output, query, key, value,
-      dropout_p, is_causal, attn_mask, scale,
-      q_scale, q_zp,
-      k_scale, k_zp,
-      v_scale, v_zp,
-      a_scale, a_zp,
-      o_scale, o_zp);
+          /* use_one_parallel_loop */ true>(tensors, config, scales);
   } else {
     int8_sdpa_fused_kernel_impl<scalar_t, mask_t, q_split_size, kv_split_size,
-          /* use_one_parallel_loop */ false>(
-      output, query, key, value,
-      dropout_p, is_causal, attn_mask, scale,
-      q_scale, q_zp,
-      k_scale, k_zp,
-      v_scale, v_zp,
-      a_scale, a_zp,
-      o_scale, o_zp);
+          /* use_one_parallel_loop */ false>(tensors, config, scales);
   }
 }
 
@@ -2491,70 +2633,36 @@ void int8_sdpa_fused_kernel(
   int64_t attn_size = q_split_size * kv_seq_len * sizeof(int32_t) * num_thread;
   bool use_one_parallel_loop = (batchSize * num_head > num_thread) &&
       (attn_size > 1.5 * l2_cache_size);
+
+  // Group the raw scalars into structs once so the templated kernel variants
+  // take a small parameter list (mirrors the fp8 SDPA entry point).
+  Int8SdpaTensors tensors{output, query, key, value};
+  Int8SdpaConfig config{dropout_p, is_causal, attn_mask, scale};
+  Int8SdpaScales scales{q_scale, q_zp, k_scale, k_zp, v_scale, v_zp,
+                        a_scale, a_zp, o_scale, o_zp};
+
   if (!attn_mask.has_value()) {
     if (q_split_size == 256) {
       int8_sdpa_fused_kernel_impl<unsigned char, float, 256, 64>(
-        use_one_parallel_loop,
-        output, query, key, value,
-        dropout_p, is_causal, attn_mask, scale,
-        q_scale, q_zp,
-        k_scale, k_zp,
-        v_scale, v_zp,
-        a_scale, a_zp,
-        o_scale, o_zp);
+        use_one_parallel_loop, tensors, config, scales);
     } else if (q_split_size == 64) {
       int8_sdpa_fused_kernel_impl<unsigned char, float, 64, 64>(
-        use_one_parallel_loop,
-        output, query, key, value,
-        dropout_p, is_causal, attn_mask, scale,
-        q_scale, q_zp,
-        k_scale, k_zp,
-        v_scale, v_zp,
-        a_scale, a_zp,
-        o_scale, o_zp);
+        use_one_parallel_loop, tensors, config, scales);
     } else {
       int8_sdpa_fused_kernel_impl<unsigned char, float, 32, 64>(
-        use_one_parallel_loop,
-        output, query, key, value,
-        dropout_p, is_causal, attn_mask, scale,
-        q_scale, q_zp,
-        k_scale, k_zp,
-        v_scale, v_zp,
-        a_scale, a_zp,
-        o_scale, o_zp);
+        use_one_parallel_loop, tensors, config, scales);
     }
   } else {
     AT_DISPATCH_MASK_TYPES(attn_mask.value().scalar_type(), "sdpa_mask", [&]() {
       if (q_split_size == 256) {
         int8_sdpa_fused_kernel_impl<unsigned char, mask_t, 256, 64>(
-          use_one_parallel_loop,
-          output, query, key, value,
-          dropout_p, is_causal, attn_mask, scale,
-          q_scale, q_zp,
-          k_scale, k_zp,
-          v_scale, v_zp,
-          a_scale, a_zp,
-          o_scale, o_zp);
+          use_one_parallel_loop, tensors, config, scales);
       } else if (q_split_size == 64) {
         int8_sdpa_fused_kernel_impl<unsigned char, mask_t, 64, 64>(
-          use_one_parallel_loop,
-          output, query, key, value,
-          dropout_p, is_causal, attn_mask, scale,
-          q_scale, q_zp,
-          k_scale, k_zp,
-          v_scale, v_zp,
-          a_scale, a_zp,
-          o_scale, o_zp);
+          use_one_parallel_loop, tensors, config, scales);
       } else {
         int8_sdpa_fused_kernel_impl<unsigned char, mask_t, 32, 64>(
-          use_one_parallel_loop,
-          output, query, key, value,
-          dropout_p, is_causal, attn_mask, scale,
-          q_scale, q_zp,
-          k_scale, k_zp,
-          v_scale, v_zp,
-          a_scale, a_zp,
-          o_scale, o_zp);
+          use_one_parallel_loop, tensors, config, scales);
       }
     });
   }

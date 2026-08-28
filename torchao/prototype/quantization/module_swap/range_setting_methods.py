@@ -32,7 +32,7 @@ def set_weight_mse(
 ) -> None:
     for _, module in model.named_modules():
         if isinstance(module, QuantizedLinear):
-            loss_fn = lambda m: torch.sum(  # noqa
+            loss_fn = lambda m: torch.sum(
                 torch.pow(torch.abs(m.weight - m.quantized_weight), norm), dim=-1
             )
             best_scale = find_optimal_scales_with_loss(
@@ -112,9 +112,9 @@ def set_weight_range_activation_loss(
                 dim = tuple(range(input_data.dim() - 1))  # all but last
 
                 # TODO: batched loss getting
-                loss_fn = lambda m: torch.mean(  # noqa
+                loss_fn = lambda m: torch.mean(
                     torch.pow(m(input_data) - output_data, 2),
-                    dim=dim,  # noqa
+                    dim=dim,
                 )
 
                 best_scale = find_optimal_scales_with_loss(module, loss_fn, num_points)

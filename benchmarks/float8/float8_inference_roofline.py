@@ -653,6 +653,28 @@ def _validate_run_ops(recipe_name, conv: ConvConfig):
         )
 
 
+def _print_config_table(config: RunConfig):
+    """Print a summary table of the resolved run configuration."""
+    shapes = config.shapes
+    conv = config.conv
+    config_table = [
+        ["GPU", torch.cuda.get_device_name(0)],
+        ["torch version", torch.__version__],
+        ["torchao version", torchao.__version__],
+        ["recipe_name", config.recipe_name],
+        ["do_benchmarks", config.bench.do_benchmarks],
+        ["shape_gen_name", shapes.shape_gen_name],
+        ["enable_fusion_modeling", config.bench.enable_fusion_modeling],
+        ["op_name", conv.op_name],
+        ["MKN", f"{shapes.M} {shapes.K} {shapes.N}"],
+        ["DHW", f"{conv.D} {conv.H} {conv.W}"],
+        ["kernel_size", conv.kernel_size],
+        ["stride", conv.stride],
+        ["padding", conv.padding],
+    ]
+    print(tabulate(config_table, headers=["Parameter", "Value"], tablefmt="simple"))
+
+
 def _build_roofline_model(symbols, recipe_name, op_name, enable_fusion_modeling):
     """Build the ``RooflineModel`` (fp8/bf16 gemm and overhead time expressions)."""
     M, K, N = symbols
@@ -878,6 +900,43 @@ def _benchmark_e2e(shape: Shape, conv: ConvConfig, bench: BenchmarkConfig, recip
     return b_bf16_e2e_time_s, b_fp8_e2e_time_s
 
 
+# Columns of the results table produced by `run`.
+_RESULT_HEADERS = [
+    "fwd_M",  # for conv: batch size
+    "fwd_K",  # for conv: in_channels
+    "fwd_N",  # for conv: out_channels
+    "D",
+    "H",
+    "W",
+    "kernel_size",
+    # roofline - gemm time (fwd + bwd, 3 gemms; for conv: using equivalent implicit gemm dims)
+    "r_bf16_gemm_s",
+    "r_fp8_gemm_s",
+    # roofline - bf16 overhead time (read-write prev activation, only if fusion modeling is on)
+    "r_bf16_ovhd_s",
+    # roofline - fp8 overhead time (by counting reads/writes in the ideal case)
+    "r_fp8_ovhd_s",
+    # roofline - fp8 gemm + fp8 overhead time (does not include LN or sigmoid)
+    "r_fp8_gemm_and_ovhd_s",
+    "r_fp8_gemm_and_ovhd_spdp",
+    # benchmarks - gemm time (fwd + bwd, 3 gemms)
+    "b_bf16_gemm_s",
+    "b_fp8_gemm_s",
+    # benchmarks - e2e LNLinearSigmoid time fwd + bwd
+    "b_bf16_e2e_s",
+    "b_fp8_e2e_s",
+    # note that e2e speedup is not the same as the roofline speedup:
+    # 1. roofline speedup: (bf16_gemm_time) / (fp8_gemm_time + fp8_ovhd_time)
+    # 2. e2e speedup: (ln + bf16_gemm_time + sigmoid) / (ln + fp8_gemm_time + fp8_ovhd_time + sigmoid)
+    # the difference is the fwd+bwd ln and sigmoid terms, for now to keep things simple
+    # we don't break them out and don't have a roofline for them.
+    "b_fp8_e2e_spdp",
+    # how well benchmarked gemms match roofline predicted gemms
+    "rb_bf16_gemm_ratio",
+    "rb_fp8_gemm_ratio",
+]
+
+
 def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
     """
     Args:
@@ -911,7 +970,6 @@ def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
     op_name = conv.op_name
     D, H, W = conv.D, conv.H, conv.W
     kernel_size = conv.kernel_size
-    stride, padding = conv.stride, conv.padding
     outfile = bench.outfile
     do_benchmarks = bench.do_benchmarks
     n_limit = bench.n_limit
@@ -919,23 +977,7 @@ def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
     skip_printing_detailed_metrics = bench.skip_printing_detailed_metrics
 
     _validate_run_ops(recipe_name, conv)
-
-    config_table = [
-        ["GPU", torch.cuda.get_device_name(0)],
-        ["torch version", torch.__version__],
-        ["torchao version", torchao.__version__],
-        ["recipe_name", recipe_name],
-        ["do_benchmarks", do_benchmarks],
-        ["shape_gen_name", shape_gen_name],
-        ["enable_fusion_modeling", enable_fusion_modeling],
-        ["op_name", op_name],
-        ["MKN", f"{M} {K} {N}"],
-        ["DHW", f"{D} {H} {W}"],
-        ["kernel_size", kernel_size],
-        ["stride", stride],
-        ["padding", padding],
-    ]
-    print(tabulate(config_table, headers=["Parameter", "Value"], tablefmt="simple"))
+    _print_config_table(config)
 
     # reassign user specified MKN, so we can use them for sympy
     user_M, user_K, user_N = M, K, N
@@ -952,41 +994,6 @@ def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
     print("fp8_gemm_time_sympy", roofline_model.fp8_gemm)
     print("fp8_ovhd_time_sympy", roofline_model.fp8_ovhd)
     print()
-
-    headers = [
-        "fwd_M",  # for conv: batch size
-        "fwd_K",  # for conv: in_channels
-        "fwd_N",  # for conv: out_channels
-        "D",
-        "H",
-        "W",
-        "kernel_size",
-        # roofline - gemm time (fwd + bwd, 3 gemms; for conv: using equivalent implicit gemm dims)
-        "r_bf16_gemm_s",
-        "r_fp8_gemm_s",
-        # roofline - bf16 overhead time (read-write prev activation, only if fusion modeling is on)
-        "r_bf16_ovhd_s",
-        # roofline - fp8 overhead time (by counting reads/writes in the ideal case)
-        "r_fp8_ovhd_s",
-        # roofline - fp8 gemm + fp8 overhead time (does not include LN or sigmoid)
-        "r_fp8_gemm_and_ovhd_s",
-        "r_fp8_gemm_and_ovhd_spdp",
-        # benchmarks - gemm time (fwd + bwd, 3 gemms)
-        "b_bf16_gemm_s",
-        "b_fp8_gemm_s",
-        # benchmarks - e2e LNLinearSigmoid time fwd + bwd
-        "b_bf16_e2e_s",
-        "b_fp8_e2e_s",
-        # note that e2e speedup is not the same as the roofline speedup:
-        # 1. roofline speedup: (bf16_gemm_time) / (fp8_gemm_time + fp8_ovhd_time)
-        # 2. e2e speedup: (ln + bf16_gemm_time + sigmoid) / (ln + fp8_gemm_time + fp8_ovhd_time + sigmoid)
-        # the difference is the fwd+bwd ln and sigmoid terms, for now to keep things simple
-        # we don't break them out and don't have a roofline for them.
-        "b_fp8_e2e_spdp",
-        # how well benchmarked gemms match roofline predicted gemms
-        "rb_bf16_gemm_ratio",
-        "rb_fp8_gemm_ratio",
-    ]
 
     results = []
 
@@ -1065,7 +1072,7 @@ def run(config: RunConfig = _DEFAULT_RUN_CONFIG):
         )
 
     pd.set_option("display.precision", 2)
-    df = pd.DataFrame(results, columns=headers)
+    df = pd.DataFrame(results, columns=_RESULT_HEADERS)
 
     if outfile is not None:
         df.to_csv(outfile)
