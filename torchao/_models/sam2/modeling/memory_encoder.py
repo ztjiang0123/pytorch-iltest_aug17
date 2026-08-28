@@ -5,7 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
-from typing import Tuple
+from dataclasses import dataclass, fields, replace
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -135,16 +136,55 @@ class Fuser(nn.Module):
         return x
 
 
+@dataclass
+class MemoryEncoderConfig:
+    """Grouped channel dimensions for :class:`MemoryEncoder`.
+
+    The input/output channel counts travel together and can be passed as a
+    single config object or as individual keyword arguments (as the Hydra
+    configs do).
+    """
+
+    out_dim: int = 64
+    in_dim: int = 256  # in_dim of pix_feats
+
+    @classmethod
+    def field_names(cls):
+        return tuple(f.name for f in fields(cls))
+
+
+def _resolve_encoder_config(
+    config: Optional[MemoryEncoderConfig],
+    overrides: Dict[str, Any],
+) -> MemoryEncoderConfig:
+    """Merge an optional config with keyword overrides.
+
+    Keyword arguments matching a config field take precedence over ``config``
+    (or the defaults when ``config`` is ``None``), preserving the historical
+    keyword-based call sites while collapsing the long parameter list.
+    """
+    base = config if config is not None else MemoryEncoderConfig()
+    field_overrides = {
+        k: overrides[k] for k in MemoryEncoderConfig.field_names() if k in overrides
+    }
+    if not field_overrides:
+        return base
+    return replace(base, **field_overrides)
+
+
 class MemoryEncoder(nn.Module):
     def __init__(
         self,
-        out_dim,
         mask_downsampler,
         fuser,
         position_encoding,
-        in_dim=256,  # in_dim of pix_feats
+        config: Optional[MemoryEncoderConfig] = None,
+        **kwargs,
     ):
         super().__init__()
+        config = _resolve_encoder_config(config, kwargs)
+        in_dim = config.in_dim
+        out_dim = config.out_dim
 
         self.mask_downsampler = mask_downsampler
 
