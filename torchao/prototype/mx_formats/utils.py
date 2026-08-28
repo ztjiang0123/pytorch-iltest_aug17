@@ -253,8 +253,19 @@ def _packed_slice_bounds(x: torch.Tensor, start, end):
     return packed_start, packed_end
 
 
-def _slice_swizzled_dim0(x, start, end, step, M, n_row_blocks, n_col_blocks):
+def _swizzled_scale_block_dims(x):
+    """Return (M, K, scale_cols, n_row_blocks, n_col_blocks) for swizzled scales."""
+    M, K = x.shape[0], x.shape[1]
+    scale_cols = K // x.block_size
+    n_row_blocks = ceil_div(M, 128)
+    n_col_blocks = ceil_div(scale_cols, 4)
+    return M, K, scale_cols, n_row_blocks, n_col_blocks
+
+
+def _slice_swizzled_dim0(x, start, end, step):
     """Row slicing of a tensor with swizzled scales."""
+    M, _, _, n_row_blocks, n_col_blocks = _swizzled_scale_block_dims(x)
+
     # Handle sys.maxsize (default slice end)
     if end == sys.maxsize:
         end = M
@@ -289,8 +300,10 @@ def _slice_swizzled_dim0(x, start, end, step, M, n_row_blocks, n_col_blocks):
     return sliced_data, sliced_scale
 
 
-def _slice_swizzled_dim1(x, start, end, step, K, scale_cols, n_row_blocks, n_col_blocks):
+def _slice_swizzled_dim1(x, start, end, step):
     """Column slicing of a tensor with swizzled scales."""
+    _, K, scale_cols, n_row_blocks, n_col_blocks = _swizzled_scale_block_dims(x)
+
     # Handle sys.maxsize (default slice end)
     if end == sys.maxsize:
         end = K
@@ -354,8 +367,9 @@ def _slice_swizzled_dim1(x, start, end, step, K, scale_cols, n_row_blocks, n_col
     return sliced_data, sliced_scale
 
 
-def _slice_unswizzled(x, dim, start, end, step, M, K):
+def _slice_unswizzled(x, dim, start, end, step):
     """Slicing of a tensor with unswizzled (plain) scales."""
+    M, K = x.shape[0], x.shape[1]
     scale_shaped = x.scale.view(M, K // x.block_size)
 
     if dim == 0:
@@ -429,32 +443,22 @@ def _swizzle_aware_slice(
     Output: sliced qdata and scale, does the right thing for unswizzled and swizzled scales
     """
 
-    M, K = x.shape[0], x.shape[1]
-
     # The scale manipulations below assume a flattened scale. For now, we
     # flatten the scale, go through the calculations below, and then reshape
     # it back to the format which matches the shape of `qdata`.
     # TODO(future PR): update this
 
     if x.is_swizzled_scales:
-        scale_cols = K // x.block_size
-        n_row_blocks = ceil_div(M, 128)
-        n_col_blocks = ceil_div(scale_cols, 4)
-
         if dim == 0:
-            sliced_data, sliced_scale = _slice_swizzled_dim0(
-                x, start, end, step, M, n_row_blocks, n_col_blocks
-            )
+            sliced_data, sliced_scale = _slice_swizzled_dim0(x, start, end, step)
         elif dim == 1:
-            sliced_data, sliced_scale = _slice_swizzled_dim1(
-                x, start, end, step, K, scale_cols, n_row_blocks, n_col_blocks
-            )
+            sliced_data, sliced_scale = _slice_swizzled_dim1(x, start, end, step)
         else:
             raise ValueError(
                 f"NVFP4Tensor only supports slicing along dimensions 0 and 1, got dim={dim}"
             )
     else:
-        sliced_data, sliced_scale = _slice_unswizzled(x, dim, start, end, step, M, K)
+        sliced_data, sliced_scale = _slice_unswizzled(x, dim, start, end, step)
 
     # reshape at the end
     sliced_scale = _reshape_sliced_scale(x, sliced_data, sliced_scale)
