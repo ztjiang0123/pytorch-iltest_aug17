@@ -1813,42 +1813,62 @@ def run(
     )
 
 
-def main(
-    K: int = 4096,
-    N: int = 4096,
-    G: int = 8,
-    breakdown_M: int = None,
-    outfile_speedup: str = "roofline_speedup_results.csv",
-    outfile_quant_2d: str = "roofline_quant_2d_results.csv",
-    outfile_quant_3d: str = "roofline_quant_3d_results.csv",
-    plot_file: str = "roofline_unified.png",
-    gpu_name: str = "NVIDIA B200",
-    power_limit_percent: float = 100.0,
-):
+# Mapping of flat CLI flag -> (RooflineDims field). Keeps the historical
+# ``--K``/``--breakdown_M`` interface while the flags feed the grouped dataclass.
+_CLI_DIMS_FIELDS = {
+    "K": "K",
+    "N": "N",
+    "G": "G",
+    "breakdown_M": "breakdown_M",
+}
+
+# Mapping of flat CLI flag -> (RooflineOutputs field).
+_CLI_OUTPUT_FIELDS = {
+    "outfile_speedup": "speedup_csv",
+    "outfile_quant_2d": "quant_2d_csv",
+    "outfile_quant_3d": "quant_3d_csv",
+    "plot_file": "plot_file",
+}
+
+
+def main(**cli_kwargs):
     """CLI entry point: build the grouped options and delegate to :func:`run`.
 
-    Args:
-        K: Reduction dimension (default: 4096)
-        N: Output dimension per group (default: 4096)
-        G: Number of groups (default: 8)
-        breakdown_M: M value to use for kernel breakdown analysis (default: None, uses largest M from configs)
-        outfile_speedup: CSV file for speedup results
-        outfile_quant_2d: CSV file for 2D quantization results
-        outfile_quant_3d: CSV file for 3D quantization results
-        plot_file: PNG file to save unified plot
-        gpu_name: GPU model (default: B200)
-        power_limit_percent: Power limit as percentage (0-100, default: 100.0)
+    Accepts the historical flat flags and routes them into the grouped
+    dataclasses expected by :func:`run`:
+
+        --K / --N / --G / --breakdown_M   -> RooflineDims
+        --outfile_speedup / --outfile_quant_2d / --outfile_quant_3d /
+        --plot_file                       -> RooflineOutputs
+        --gpu_name / --power_limit_percent -> passed through to run()
+
+    Defaults come from the dataclasses and :func:`run`, so unspecified flags
+    keep their previous behavior.
     """
+    # RooflineDims requires K, N, G; supply the historical defaults so callers
+    # may override any subset via the flat flags.
+    dims_kwargs = {"K": 4096, "N": 4096, "G": 8}
+    dims_kwargs.update(
+        {
+            field: cli_kwargs.pop(flag)
+            for flag, field in _CLI_DIMS_FIELDS.items()
+            if flag in cli_kwargs
+        }
+    )
+    output_kwargs = {
+        field: cli_kwargs.pop(flag)
+        for flag, field in _CLI_OUTPUT_FIELDS.items()
+        if flag in cli_kwargs
+    }
+
+    unknown = set(cli_kwargs) - {"gpu_name", "power_limit_percent"}
+    if unknown:
+        raise ValueError(f"Unknown flag(s): {', '.join(sorted(unknown))}")
+
     run(
-        dims=RooflineDims(K=K, N=N, G=G, breakdown_M=breakdown_M),
-        outputs=RooflineOutputs(
-            speedup_csv=outfile_speedup,
-            quant_2d_csv=outfile_quant_2d,
-            quant_3d_csv=outfile_quant_3d,
-            plot_file=plot_file,
-        ),
-        gpu_name=gpu_name,
-        power_limit_percent=power_limit_percent,
+        dims=RooflineDims(**dims_kwargs),
+        outputs=RooflineOutputs(**output_kwargs),
+        **cli_kwargs,
     )
 
 
