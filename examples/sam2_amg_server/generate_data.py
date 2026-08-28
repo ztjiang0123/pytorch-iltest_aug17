@@ -118,22 +118,30 @@ def gen_masks_baseline(
     if task_type == "amg":
         masks = mask_generator.generate(image_tensor)
     elif task_type == "sps":
+        from torchao._models.sam2.sam2_image_predictor import SAM2Prompts
+
         mask_generator.predictor.set_image(image_tensor)
         masks, scores, _ = mask_generator.predictor.predict(
-            point_coords=center_points,
-            point_labels=center_points_label,
+            SAM2Prompts(
+                point_coords=center_points,
+                point_labels=center_points_label,
+            ),
             multimask_output=True,
             return_logits=False,
         )
         masks = torch.from_numpy(masks[np.argmax(scores).item()])
         masks = masks.to(torch.bool)
     elif task_type == "mps":
+        from torchao._models.sam2.sam2_image_predictor import SAM2Prompts
+
         mask_generator.predictor.set_image(image_tensor)
         masks = []
         for i in range(len(center_points)):
             mask, score, _ = mask_generator.predictor.predict(
-                point_coords=center_points[i : i + 1],
-                point_labels=center_points_label[i : i + 1],
+                SAM2Prompts(
+                    point_coords=center_points[i : i + 1],
+                    point_labels=center_points_label[i : i + 1],
+                ),
                 multimask_output=True,
                 return_logits=False,
             )
@@ -241,10 +249,14 @@ def gen_masks_ao(
     if task_type == "amg":
         masks = mask_generator.generate(image_tensor)
     elif task_type == "sps":
+        from torchao._models.sam2.sam2_image_predictor import SAM2Prompts
+
         mask_generator.predictor.set_image(image_tensor)
         masks, scores, _ = mask_generator.predictor.predict(
-            point_coords=center_points,
-            point_labels=center_points_label,
+            SAM2Prompts(
+                point_coords=center_points,
+                point_labels=center_points_label,
+            ),
             multimask_output=True,
             return_logits=False,
             return_type="torch",
@@ -264,9 +276,13 @@ def gen_masks_ao(
 
         center_points_torch = to_map_tensor(center_points_torch)
         center_points_label_torch = to_map_tensor(center_points_label_torch)
+        from torchao._models.sam2.sam2_image_predictor import SAM2Prompts
+
         masks, scores, _ = mask_generator.predictor.predict(
-            point_coords=center_points_torch,
-            point_labels=center_points_label_torch,
+            SAM2Prompts(
+                point_coords=center_points_torch,
+                point_labels=center_points_label_torch,
+            ),
             multimask_output=True,
             return_logits=False,
             return_type="torch",
