@@ -119,112 +119,65 @@ def benchmark(
             "mmlu",
             "bbh",
         ]
+
+    def _run_single_task(tag, fewshot):
+        result = evaluator.simple_evaluate(
+            model_eval,
+            tasks=[tag],
+            num_fewshot=fewshot,
+            batch_size=eval_batch_size,
+            limit=evaluation_limit,
+        )["results"]
+        print(tag, result)
+        return result
+
+    # Standard lm-eval tasks, keyed by the name used in ``tasks``, mapping to the
+    # (tag passed to lm-eval, num_fewshot) pair. Each is evaluated the same way.
+    simple_task_specs = {
+        "truthfulqa_mc2": ("truthfulqa_mc2", 0),
+        "winogrande": ("winogrande", 5),
+        "arc_challenge": ("arc_challenge", 25),
+        "hellaswag": ("hellaswag", 10),
+        "gsm8k": ("gsm8k", 5),
+        "bbh": ("leaderboard_bbh", 3),
+    }
+
     results = {}
     if "PPL" in tasks:
         results["perplexity"] = wiki2_eval(
             model, tokenizer, 512, verbose=True, device=device
         )
-    ############################################
-    if "truthfulqa_mc2" in tasks:
-        for task in [("truthfulqa_mc2", 0)]:
-            tag, fewshot = task
-            results[tag] = evaluator.simple_evaluate(
-                model_eval,
-                tasks=[tag],
-                num_fewshot=fewshot,
-                batch_size=eval_batch_size,
-                limit=evaluation_limit,
-            )["results"]
-            print(tag, results[tag])
-    if "winogrande" in tasks:
-        for task in [("winogrande", 5)]:
-            tag, fewshot = task
-            results[tag] = evaluator.simple_evaluate(
-                model_eval,
-                tasks=[tag],
-                num_fewshot=fewshot,
-                batch_size=eval_batch_size,
-                limit=evaluation_limit,
-            )["results"]
-            print(tag, results[tag])
-    if "arc_challenge" in tasks:
-        for task in [("arc_challenge", 25)]:
-            tag, fewshot = task
-            results[tag] = evaluator.simple_evaluate(
-                model_eval,
-                tasks=[tag],
-                num_fewshot=fewshot,
-                batch_size=eval_batch_size,
-                limit=evaluation_limit,
-            )["results"]
-            print(tag, results[tag])
 
-    # ############################################
-    if "hellaswag" in tasks:
-        for task in [("hellaswag", 10)]:
-            tag, fewshot = task
-            results[tag] = evaluator.simple_evaluate(
-                model_eval,
-                tasks=[tag],
-                num_fewshot=fewshot,
-                batch_size=eval_batch_size,
-                limit=evaluation_limit,
-            )["results"]
-            print(tag, results[tag])
-    if "gsm8k" in tasks:
-        for task in [("gsm8k", 5)]:
-            tag, fewshot = task
-            results[tag] = evaluator.simple_evaluate(
-                model_eval,
-                tasks=[tag],
-                num_fewshot=fewshot,
-                batch_size=eval_batch_size,
-                limit=evaluation_limit,
-            )["results"]
-            print(tag, results[tag])
-    # ############################################
+    for name, (tag, fewshot) in simple_task_specs.items():
+        if name in tasks:
+            results[tag] = _run_single_task(tag, fewshot)
 
     if "mmlu" in tasks:
-        # MMLU
-        results_mmlu = {}
-        for task in [("mmlu", 5)]:
-            tag, fewshot = task
-            results_mmlu[tag] = evaluator.simple_evaluate(
-                model_eval,
-                tasks=[tag],
-                num_fewshot=fewshot,
-                batch_size=eval_batch_size,
-                limit=evaluation_limit,
-            )["results"]
-            print(tag, results_mmlu[tag])
+        results["mmlu"] = _eval_mmlu(_run_single_task, np)
 
-        mmlu_list = "hendrycksTest-abstract_algebra,hendrycksTest-anatomy,hendrycksTest-astronomy,hendrycksTest-business_ethics,hendrycksTest-clinical_knowledge,hendrycksTest-college_biology,hendrycksTest-college_chemistry,hendrycksTest-college_computer_science,hendrycksTest-college_mathematics,hendrycksTest-college_medicine,hendrycksTest-college_physics,hendrycksTest-computer_security,hendrycksTest-conceptual_physics,hendrycksTest-econometrics,hendrycksTest-electrical_engineering,hendrycksTest-elementary_mathematics,hendrycksTest-formal_logic,hendrycksTest-global_facts,hendrycksTest-high_school_biology,hendrycksTest-high_school_chemistry,hendrycksTest-high_school_computer_science,hendrycksTest-high_school_european_history,hendrycksTest-high_school_geography,hendrycksTest-high_school_government_and_politics,hendrycksTest-high_school_macroeconomics,hendrycksTest-high_school_mathematics,hendrycksTest-high_school_microeconomics,hendrycksTest-high_school_physics,hendrycksTest-high_school_psychology,hendrycksTest-high_school_statistics,hendrycksTest-high_school_us_history,hendrycksTest-high_school_world_history,hendrycksTest-human_aging,hendrycksTest-human_sexuality,hendrycksTest-international_law,hendrycksTest-jurisprudence,hendrycksTest-logical_fallacies,hendrycksTest-machine_learning,hendrycksTest-management,hendrycksTest-marketing,hendrycksTest-medical_genetics,hendrycksTest-miscellaneous,hendrycksTest-moral_disputes,hendrycksTest-moral_scenarios,hendrycksTest-nutrition,hendrycksTest-philosophy,hendrycksTest-prehistory,hendrycksTest-professional_accounting,hendrycksTest-professional_law,hendrycksTest-professional_medicine,hendrycksTest-professional_psychology,hendrycksTest-public_relations,hendrycksTest-security_studies,hendrycksTest-sociology,hendrycksTest-us_foreign_policy,hendrycksTest-virology,hendrycksTest-world_religions"
-        mmlu_list = [l.replace("hendrycksTest-", "") for l in mmlu_list.split(",")]
-        results_mmlu = results_mmlu["mmlu"]
-
-        k = []
-        for r in results_mmlu:
-            if np.any([(l in r) for l in mmlu_list]):
-                k.append(results_mmlu[r]["acc,none"])
-
-        assert len(k) == 57
-        print("MMLU avg acc", np.mean(k))
-
-        results["mmlu"] = np.mean(k)
     if "bbh" in tasks:
-        for task in [("leaderboard_bbh", 3)]:
-            tag, fewshot = task
-            results[tag] = evaluator.simple_evaluate(
-                model_eval,
-                tasks=[tag],
-                num_fewshot=fewshot,
-                batch_size=eval_batch_size,
-                limit=evaluation_limit,
-            )["results"]
-            print(tag, results[tag])
-            results["bbh"] = results[tag]
+        # ``bbh`` is also exposed under the plain "bbh" key for convenience.
+        results["bbh"] = results["leaderboard_bbh"]
 
     return results
+
+
+def _eval_mmlu(run_single_task, np):
+    results_mmlu = run_single_task("mmlu", 5)
+
+    mmlu_list = "hendrycksTest-abstract_algebra,hendrycksTest-anatomy,hendrycksTest-astronomy,hendrycksTest-business_ethics,hendrycksTest-clinical_knowledge,hendrycksTest-college_biology,hendrycksTest-college_chemistry,hendrycksTest-college_computer_science,hendrycksTest-college_mathematics,hendrycksTest-college_medicine,hendrycksTest-college_physics,hendrycksTest-computer_security,hendrycksTest-conceptual_physics,hendrycksTest-econometrics,hendrycksTest-electrical_engineering,hendrycksTest-elementary_mathematics,hendrycksTest-formal_logic,hendrycksTest-global_facts,hendrycksTest-high_school_biology,hendrycksTest-high_school_chemistry,hendrycksTest-high_school_computer_science,hendrycksTest-high_school_european_history,hendrycksTest-high_school_geography,hendrycksTest-high_school_government_and_politics,hendrycksTest-high_school_macroeconomics,hendrycksTest-high_school_mathematics,hendrycksTest-high_school_microeconomics,hendrycksTest-high_school_physics,hendrycksTest-high_school_psychology,hendrycksTest-high_school_statistics,hendrycksTest-high_school_us_history,hendrycksTest-high_school_world_history,hendrycksTest-human_aging,hendrycksTest-human_sexuality,hendrycksTest-international_law,hendrycksTest-jurisprudence,hendrycksTest-logical_fallacies,hendrycksTest-machine_learning,hendrycksTest-management,hendrycksTest-marketing,hendrycksTest-medical_genetics,hendrycksTest-miscellaneous,hendrycksTest-moral_disputes,hendrycksTest-moral_scenarios,hendrycksTest-nutrition,hendrycksTest-philosophy,hendrycksTest-prehistory,hendrycksTest-professional_accounting,hendrycksTest-professional_law,hendrycksTest-professional_medicine,hendrycksTest-professional_psychology,hendrycksTest-public_relations,hendrycksTest-security_studies,hendrycksTest-sociology,hendrycksTest-us_foreign_policy,hendrycksTest-virology,hendrycksTest-world_religions"
+    mmlu_list = [l.replace("hendrycksTest-", "") for l in mmlu_list.split(",")]
+    results_mmlu = results_mmlu["mmlu"]
+
+    k = []
+    for r in results_mmlu:
+        if np.any([(l in r) for l in mmlu_list]):
+            k.append(results_mmlu[r]["acc,none"])
+
+    assert len(k) == 57
+    print("MMLU avg acc", np.mean(k))
+
+    return np.mean(k)
 
 
 def quantize_and_eval(
