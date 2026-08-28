@@ -576,49 +576,45 @@ inline void copy_bias(const float* bias_ptr, float* y_buf, int64_t m) {
   }
 }
 
-// Store a single row of the float accumulation buffer into the output row,
-// converting to `out_dtype`. Pulling the per-dtype logic into its own function
-// keeps the store_out loop flat and easy to follow.
-template<typename out_dtype, int64_t N>
-inline void store_out_row(const float* y_row, out_dtype* c_row) {
-  int j = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+// Convert one 16-wide float vector and store it as `out_dtype`. The dtype
+// dispatch lives here, in a single (non-nested) `if constexpr`, so the caller
+// loop stays flat.
+template<typename out_dtype>
+inline void store_vec16(__m512 y_vec, out_dtype* c_ptr) {
   if constexpr (std::is_same<out_dtype, float>::value) {
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-    for (; j < N; j += 16) {
-      __m512 y_vec = _mm512_loadu_ps(y_row + j);
-      _mm512_storeu_ps(c_row + j, y_vec);
-    }
-#endif
-    for (; j < N; ++j) {
-      c_row[j] = y_row[j];
-    }
+    _mm512_storeu_ps(c_ptr, y_vec);
   } else if constexpr (std::is_same<out_dtype, at::BFloat16>::value) {
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-    for (; j < N; j += 16) {
-      __m512 y_vec = _mm512_loadu_ps(y_row + j);
-      __m256i y_bf16_vec = at::vec::cvtfp32_bf16(y_vec);
-      _mm256_storeu_si256(reinterpret_cast<__m256i*>(c_row + j), y_bf16_vec);
-    }
-#endif
-    for (; j < N; ++j) {
-      c_row[j] = at::BFloat16(y_row[j]);
-    }
+    _mm256_storeu_si256(
+        reinterpret_cast<__m256i*>(c_ptr), at::vec::cvtfp32_bf16(y_vec));
   } else if constexpr (std::is_same<out_dtype, at::Half>::value) {
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-    for (; j < N; j += 16) {
-      __m512 y_vec = _mm512_loadu_ps(y_row + j);
-      __m256i y_fp16_vec = at::vec::cvtfp32_fp16(y_vec);
-      _mm256_storeu_si256(reinterpret_cast<__m256i*>(c_row + j), y_fp16_vec);
-    }
-#endif
-    for (; j < N; ++j) {
-      c_row[j] = at::Half(y_row[j]);
-    }
+    _mm256_storeu_si256(
+        reinterpret_cast<__m256i*>(c_ptr), at::vec::cvtfp32_fp16(y_vec));
   } else {
     TORCH_CHECK(false, "Unsupported output dtype");
+  }
+}
+#endif
+
+// Store a single row of the float accumulation buffer into the output row,
+// converting to `out_dtype`. The per-dtype dispatch lives in store_vec16 and in
+// out_dtype's own conversion constructor, so both loops here stay flat.
+template<typename out_dtype, int64_t N>
+inline void store_out_row(const float* y_row, out_dtype* c_row) {
+  static_assert(
+      std::is_same<out_dtype, float>::value ||
+          std::is_same<out_dtype, at::BFloat16>::value ||
+          std::is_same<out_dtype, at::Half>::value,
+      "Unsupported output dtype");
+  int j = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+#pragma GCC unroll 2
+  for (; j < N; j += 16) {
+    store_vec16<out_dtype>(_mm512_loadu_ps(y_row + j), c_row + j);
+  }
+#endif
+  for (; j < N; ++j) {
+    c_row[j] = static_cast<out_dtype>(y_row[j]);
   }
 }
 

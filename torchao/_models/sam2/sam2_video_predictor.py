@@ -205,14 +205,15 @@ class SAM2VideoPredictor(SAM2Base):
             labels = labels.unsqueeze(0)  # add batch dimension
         return points, labels
 
-    def _prepend_box_prompt(
-        self, inference_state, box, points, labels, clear_old_points
-    ):
+    @staticmethod
+    def _prepend_box_prompt(inference_state, box, points_labels, clear_old_points):
         """Add `box` as the first two points with labels 2 and 3.
 
-        This is consistent with how SAM 2 is trained, and the box must be
-        provided before any point prompt.
+        `points_labels` is the current `(points, labels)` pair. This is
+        consistent with how SAM 2 is trained, and the box must be provided
+        before any point prompt.
         """
+        points, labels = points_labels
         if not clear_old_points:
             raise ValueError(
                 "cannot add box without clearing old points, since "
@@ -238,9 +239,11 @@ class SAM2VideoPredictor(SAM2Base):
         return points, labels
 
     def _lookup_prev_sam_mask_logits(
-        self, inference_state, frame_idx, obj_output_dict, obj_temp_output_dict, storage_key
+        self, inference_state, frame_idx, obj_idx, storage_key
     ):
         """Fetch any previously predicted mask logits for this frame/object."""
+        obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
+        obj_temp_output_dict = inference_state["temp_output_dict_per_obj"][obj_idx]
         # lookup temporary output dict first, which contains the most recent output
         # (if not found, then lookup conditioning and non-conditioning frame output)
         prev_out = obj_temp_output_dict[storage_key].get(frame_idx)
@@ -284,7 +287,7 @@ class SAM2VideoPredictor(SAM2Base):
         # along with the user-provided points (consistent with how SAM 2 is trained).
         if box is not None:
             points, labels = self._prepend_box_prompt(
-                inference_state, box, points, labels, clear_old_points
+                inference_state, box, (points, labels), clear_old_points
             )
 
         if normalize_coords:
@@ -326,8 +329,7 @@ class SAM2VideoPredictor(SAM2Base):
         prev_sam_mask_logits = self._lookup_prev_sam_mask_logits(
             inference_state,
             frame_idx,
-            obj_output_dict,
-            obj_temp_output_dict,
+            obj_idx,
             storage_key,
         )
         current_out, _ = self._run_single_frame_inference(
