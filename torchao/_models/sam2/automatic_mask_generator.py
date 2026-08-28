@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # Adapted from https://github.com/facebookresearch/segment-anything/blob/main/segment_anything/automatic_mask_generator.py
+from dataclasses import dataclass, fields, replace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -40,26 +41,41 @@ from torchao._models.sam2.utils.misc import (
 )
 
 
+@dataclass
+class SAM2AutomaticMaskGeneratorConfig:
+    """Grouped configuration for :class:`SAM2AutomaticMaskGenerator`.
+
+    These values travel together as the tuning knobs for mask generation; see
+    :meth:`SAM2AutomaticMaskGenerator.__init__` for a description of each field.
+    """
+
+    points_per_side: Optional[int] = 32
+    points_per_batch: int = 64
+    pred_iou_thresh: float = 0.8
+    stability_score_thresh: float = 0.95
+    stability_score_offset: float = 1.0
+    mask_threshold: float = 0.0
+    box_nms_thresh: float = 0.7
+    crop_n_layers: int = 0
+    crop_nms_thresh: float = 0.7
+    crop_overlap_ratio: float = 512 / 1500
+    crop_n_points_downscale_factor: int = 1
+    point_grids: Optional[List[np.ndarray]] = None
+    min_mask_region_area: int = 0
+    output_mode: str = "binary_mask"
+    use_m2m: bool = False
+    multimask_output: bool = True
+
+    @classmethod
+    def field_names(cls) -> Tuple[str, ...]:
+        return tuple(f.name for f in fields(cls))
+
+
 class SAM2AutomaticMaskGenerator(torch.nn.Module, SAM2HFPretrainedMixin):
     def __init__(
         self,
         model: SAM2Base,
-        points_per_side: Optional[int] = 32,
-        points_per_batch: int = 64,
-        pred_iou_thresh: float = 0.8,
-        stability_score_thresh: float = 0.95,
-        stability_score_offset: float = 1.0,
-        mask_threshold: float = 0.0,
-        box_nms_thresh: float = 0.7,
-        crop_n_layers: int = 0,
-        crop_nms_thresh: float = 0.7,
-        crop_overlap_ratio: float = 512 / 1500,
-        crop_n_points_downscale_factor: int = 1,
-        point_grids: Optional[List[np.ndarray]] = None,
-        min_mask_region_area: int = 0,
-        output_mode: str = "binary_mask",
-        use_m2m: bool = False,
-        multimask_output: bool = True,
+        config: Optional[SAM2AutomaticMaskGeneratorConfig] = None,
         **kwargs,
     ) -> None:
         """
@@ -70,6 +86,10 @@ class SAM2AutomaticMaskGenerator(torch.nn.Module, SAM2HFPretrainedMixin):
 
         Arguments:
           model (Sam): The SAM 2 model to use for mask prediction.
+          config (SAM2AutomaticMaskGeneratorConfig or None): Grouped tuning
+            knobs for mask generation. Any of the fields below may instead be
+            passed directly as keyword arguments, which override the matching
+            value on ``config``.
           points_per_side (int or None): The number of points to be sampled
             along one side of the image. The total number of points is
             points_per_side**2. If None, 'point_grids' must provide explicit
@@ -110,26 +130,28 @@ class SAM2AutomaticMaskGenerator(torch.nn.Module, SAM2HFPretrainedMixin):
           multimask_output (bool): Whether to output multimask at each point of the grid.
         """
         super().__init__()
-        assert (points_per_side is None) != (point_grids is None), (
+        cfg = self._resolve_config(config, kwargs)
+
+        assert (cfg.points_per_side is None) != (cfg.point_grids is None), (
             "Exactly one of points_per_side or point_grid must be provided."
         )
-        if points_per_side is not None:
+        if cfg.points_per_side is not None:
             self.point_grids = build_all_layer_point_grids(
-                points_per_side,
-                crop_n_layers,
-                crop_n_points_downscale_factor,
+                cfg.points_per_side,
+                cfg.crop_n_layers,
+                cfg.crop_n_points_downscale_factor,
             )
-        elif point_grids is not None:
-            self.point_grids = point_grids
+        elif cfg.point_grids is not None:
+            self.point_grids = cfg.point_grids
         else:
             raise ValueError("Can't have both points_per_side and point_grid be None.")
 
-        assert output_mode in [
+        assert cfg.output_mode in [
             "binary_mask",
             "uncompressed_rle",
             "coco_rle",
-        ], f"Unknown output_mode {output_mode}."
-        if output_mode == "coco_rle":
+        ], f"Unknown output_mode {cfg.output_mode}."
+        if cfg.output_mode == "coco_rle":
             try:
                 from pycocotools import mask as mask_utils  # type: ignore  # noqa: F401
             except ImportError as e:
@@ -138,29 +160,48 @@ class SAM2AutomaticMaskGenerator(torch.nn.Module, SAM2HFPretrainedMixin):
 
         self.predictor = SAM2ImagePredictor(
             model,
-            max_hole_area=min_mask_region_area,
-            max_sprinkle_area=min_mask_region_area,
+            max_hole_area=cfg.min_mask_region_area,
+            max_sprinkle_area=cfg.min_mask_region_area,
         )
-        self.points_per_batch = points_per_batch
-        self.pred_iou_thresh = pred_iou_thresh
-        self.stability_score_thresh = stability_score_thresh
-        self.stability_score_offset = stability_score_offset
-        self.mask_threshold = mask_threshold
-        self.box_nms_thresh = box_nms_thresh
-        self.crop_n_layers = crop_n_layers
-        self.crop_nms_thresh = crop_nms_thresh
-        self.crop_overlap_ratio = crop_overlap_ratio
-        self.crop_n_points_downscale_factor = crop_n_points_downscale_factor
-        self.min_mask_region_area = min_mask_region_area
-        self.output_mode = output_mode
-        self.use_m2m = use_m2m
-        self.multimask_output = multimask_output
+        self.points_per_batch = cfg.points_per_batch
+        self.pred_iou_thresh = cfg.pred_iou_thresh
+        self.stability_score_thresh = cfg.stability_score_thresh
+        self.stability_score_offset = cfg.stability_score_offset
+        self.mask_threshold = cfg.mask_threshold
+        self.box_nms_thresh = cfg.box_nms_thresh
+        self.crop_n_layers = cfg.crop_n_layers
+        self.crop_nms_thresh = cfg.crop_nms_thresh
+        self.crop_overlap_ratio = cfg.crop_overlap_ratio
+        self.crop_n_points_downscale_factor = cfg.crop_n_points_downscale_factor
+        self.min_mask_region_area = cfg.min_mask_region_area
+        self.output_mode = cfg.output_mode
+        self.use_m2m = cfg.use_m2m
+        self.multimask_output = cfg.multimask_output
 
         # Store a reference to these on the model so I can overwrite them
         # with compile annotation if desired
 
         self.calculate_stability_score = calculate_stability_score
         self.batched_mask_to_box = batched_mask_to_box
+
+    @staticmethod
+    def _resolve_config(
+        config: Optional[SAM2AutomaticMaskGeneratorConfig],
+        overrides: Dict[str, Any],
+    ) -> SAM2AutomaticMaskGeneratorConfig:
+        """Merge an optional config object with keyword overrides.
+
+        Keyword arguments matching a config field take precedence over the
+        provided ``config`` (or the defaults when ``config`` is ``None``). This
+        keeps the historical keyword-based call sites and ``from_pretrained``
+        forwarding working while collapsing the long parameter list.
+        """
+        base = config if config is not None else SAM2AutomaticMaskGeneratorConfig()
+        known = SAM2AutomaticMaskGeneratorConfig.field_names()
+        field_overrides = {k: overrides[k] for k in known if k in overrides}
+        if not field_overrides:
+            return base
+        return replace(base, **field_overrides)
 
     @torch.no_grad()
     def generate(self, image: np.ndarray) -> List[Dict[str, Any]]:

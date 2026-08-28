@@ -6,6 +6,8 @@
 
 import logging
 import os
+from dataclasses import dataclass, field, fields, replace
+from typing import Any, Dict, List, Optional
 
 import torch
 from hydra import compose
@@ -68,16 +70,53 @@ HF_MODEL_ID_TO_FILENAMES = {
 }
 
 
+@dataclass
+class SAM2BuildConfig:
+    """Grouped build-behavior options for :func:`build_sam2`.
+
+    These knobs govern how the model is post-processed and finalized after the
+    backbone is instantiated; they travel together and can be passed as a single
+    config object or as individual keyword arguments.
+    """
+
+    mode: str = "eval"
+    hydra_overrides_extra: List[str] = field(default_factory=list)
+    apply_postprocessing: bool = True
+
+    @classmethod
+    def field_names(cls):
+        return tuple(f.name for f in fields(cls))
+
+
+def _resolve_build_config(
+    config: Optional[SAM2BuildConfig],
+    overrides: Dict[str, Any],
+) -> SAM2BuildConfig:
+    """Merge an optional :class:`SAM2BuildConfig` with keyword overrides.
+
+    Keyword arguments matching a config field take precedence over ``config``
+    (or the defaults when ``config`` is ``None``), preserving the historical
+    keyword-based call sites while collapsing the long parameter list.
+    """
+    base = config if config is not None else SAM2BuildConfig()
+    field_overrides = {
+        k: overrides[k] for k in SAM2BuildConfig.field_names() if k in overrides
+    }
+    if not field_overrides:
+        return base
+    return replace(base, **field_overrides)
+
+
 def build_sam2(
     config_file,
     ckpt_path=None,
     device="cuda",
-    mode="eval",
-    hydra_overrides_extra=[],
-    apply_postprocessing=True,
+    config: Optional[SAM2BuildConfig] = None,
     **kwargs,
 ):
-    if apply_postprocessing:
+    build_config = _resolve_build_config(config, kwargs)
+    hydra_overrides_extra = build_config.hydra_overrides_extra
+    if build_config.apply_postprocessing:
         hydra_overrides_extra = hydra_overrides_extra.copy()
         hydra_overrides_extra += [
             # dynamically fall back to multi-mask if the single mask is not stable
@@ -91,7 +130,7 @@ def build_sam2(
     model = instantiate(cfg.model, _recursive_=True)
     _load_checkpoint(model, ckpt_path)
     model = model.to(device)
-    if mode == "eval":
+    if build_config.mode == "eval":
         model.eval()
     return model
 
