@@ -958,6 +958,151 @@ def convert_weighted_module(
         setattr(modules[parent_name], name, ref_qmodule)
 
 
+def _normalize_convert_configs(
+    convert_custom_config: Union[ConvertCustomConfig, dict[str, Any], None],
+    qconfig_mapping: Union[QConfigMapping, dict[str, Any], None],
+    backend_config: Union[BackendConfig, dict[str, Any], None],
+) -> tuple[ConvertCustomConfig, Optional[QConfigMapping], BackendConfig]:
+    """Normalize the (possibly dict / None) config arguments to ``convert``.
+
+    Emits the deprecation warnings for dict inputs and fills in defaults so the
+    body of ``convert`` can assume typed config objects.
+    """
+    if convert_custom_config is None:
+        convert_custom_config = ConvertCustomConfig()
+
+    if isinstance(convert_custom_config, dict):
+        warnings.warn(
+            "Passing a convert_custom_config_dict to convert is deprecated and will not be supported "
+            "in a future version. Please pass in a ConvertCustomConfig instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        convert_custom_config = ConvertCustomConfig.from_dict(convert_custom_config)
+
+    if isinstance(qconfig_mapping, dict):
+        warnings.warn(
+            "Passing a QConfig dictionary to convert is deprecated and will not be supported "
+            "in a future version. Please pass in a QConfigMapping instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        qconfig_mapping = (
+            QConfigMapping.from_dict(qconfig_mapping) if qconfig_mapping else None
+        )
+    qconfig_mapping = copy.deepcopy(qconfig_mapping)
+    assert qconfig_mapping is None or isinstance(qconfig_mapping, QConfigMapping)
+
+    if isinstance(backend_config, dict):
+        warnings.warn(
+            "Passing a backend_config_dict to prepare is deprecated and will not be supported "
+            "in a future version. Please pass in a BackendConfig instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        backend_config = BackendConfig.from_dict(backend_config)
+
+    if backend_config is None:
+        backend_config = get_native_backend_config()
+
+    return convert_custom_config, qconfig_mapping, backend_config
+
+
+def _convert_output_node(
+    node: Node,
+    output_quantized_idxs: list[int],
+    graph: Graph,
+) -> None:
+    """Handle an ``output`` node: keep user-requested outputs quantized."""
+    # If the argument is empty we don't need to do anything
+    if len(output_quantized_idxs) == 0:
+        return
+    # Result are kept quantized if the user specified the
+    # output_quantized_idxs override.
+    # Remove the dequantize operator for the node in the end if any
+    return_node = node
+    output = node.args[0]
+    # outputs can be Node, list, tuple, dict, other cases are not supported yet
+    if isinstance(output, (list, tuple)):
+        for idx in output_quantized_idxs:
+            _maybe_recursive_remove_dequantize(output[idx], return_node, graph)
+    elif isinstance(output, (Node, dict)):
+        # we treat dict as a single argument currently, but it can be extended
+        # to support {"key": dtype} after we change output_quantized_idxs to
+        # dict
+        if 0 in output_quantized_idxs:
+            _maybe_recursive_remove_dequantize(output, return_node, graph)
+    else:
+        warnings.warn(
+            f"Unsupported node type for output_quantized_idxs: {type(output)}"
+        )
+
+
+def _convert_call_module_node(
+    node: Node,
+    modules: dict[str, torch.nn.Module],
+    model: GraphModule,
+    node_name_to_scope: dict[str, tuple[str, type]],
+    node_name_to_qconfig: dict[str, QConfigAny],
+    observed_node_names: set[str],
+    model_device: Optional[torch.device],
+    weighted_module_classes: tuple,
+    fused_module_classes: tuple,
+    root_module_classes: tuple,
+    backend_config: BackendConfig,
+    is_reference: bool,
+    is_decomposed: bool,
+) -> None:
+    """Handle a ``call_module`` node by dispatching on the module kind."""
+    mod = _get_module(node, modules)
+    assert mod is not None
+    if _is_activation_post_process(mod):
+        if is_decomposed:
+            _replace_observer_with_quantize_dequantize_node_decomposed(
+                model,
+                node,
+                modules,
+                node_name_to_scope,
+                node_name_to_qconfig,
+                model_device,
+            )
+        else:
+            _replace_observer_with_quantize_dequantize_node(
+                model,
+                node,
+                modules,
+                node_name_to_scope,
+                node_name_to_qconfig,
+                model_device,
+            )
+    elif isinstance(mod, DeQuantStub):
+        _replace_observer_or_dequant_stub_with_dequantize_node(node, model.graph)
+    elif _is_observed_standalone_module(mod):
+        convert_standalone_module(
+            node, modules, model, is_reference, backend_config
+        )
+    # below this point `type_before_parametrizations` is used
+    # instead of `type` to handle situations with fx quant + sparsity
+    elif type_before_parametrizations(mod) in weighted_module_classes:
+        # extra check for fused module classes to make sure they are fused module classes
+        # of target modules
+        if (
+            type_before_parametrizations(mod) in fused_module_classes
+            and type_before_parametrizations(mod[0]) not in root_module_classes
+        ):  # type: ignore[index]
+            return
+        convert_weighted_module(
+            node,
+            modules,
+            observed_node_names,
+            node_name_to_qconfig,
+            backend_config,
+            is_decomposed,
+            is_reference,
+            model_device,
+        )
+
+
 def convert(
     model: GraphModule,
     is_reference: bool = False,
@@ -996,42 +1141,9 @@ def convert(
          input_quantized_idxs, output_quantized_idxs, please
          see docs for :func:`~torch.ao.quantization.prepare_fx` for details
     """
-    if convert_custom_config is None:
-        convert_custom_config = ConvertCustomConfig()
-
-    if isinstance(convert_custom_config, dict):
-        warnings.warn(
-            "Passing a convert_custom_config_dict to convert is deprecated and will not be supported "
-            "in a future version. Please pass in a ConvertCustomConfig instead.",
-            FutureWarning,
-            stacklevel=2,
-        )
-        convert_custom_config = ConvertCustomConfig.from_dict(convert_custom_config)
-
-    if isinstance(qconfig_mapping, dict):
-        warnings.warn(
-            "Passing a QConfig dictionary to convert is deprecated and will not be supported "
-            "in a future version. Please pass in a QConfigMapping instead.",
-            FutureWarning,
-            stacklevel=2,
-        )
-        qconfig_mapping = (
-            QConfigMapping.from_dict(qconfig_mapping) if qconfig_mapping else None
-        )
-    qconfig_mapping = copy.deepcopy(qconfig_mapping)
-    assert qconfig_mapping is None or isinstance(qconfig_mapping, QConfigMapping)
-
-    if isinstance(backend_config, dict):
-        warnings.warn(
-            "Passing a backend_config_dict to prepare is deprecated and will not be supported "
-            "in a future version. Please pass in a BackendConfig instead.",
-            FutureWarning,
-            stacklevel=2,
-        )
-        backend_config = BackendConfig.from_dict(backend_config)
-
-    if backend_config is None:
-        backend_config = get_native_backend_config()
+    convert_custom_config, qconfig_mapping, backend_config = _normalize_convert_configs(
+        convert_custom_config, qconfig_mapping, backend_config
+    )
 
     assert _is_observed_module(model), "incoming model must be produced by prepare_fx"
     observed_graph_module_attrs = model.meta["_observed_graph_module_attrs"]
@@ -1113,6 +1225,10 @@ def convert(
     root_module_classes = tuple(root_module_to_quantized_reference_module.keys())
     qat_module_classes = get_qat_module_classes(backend_config)
     fused_module_classes = get_fused_module_classes(backend_config)
+    # modules that convert_weighted_module is responsible for swapping
+    weighted_module_classes = tuple(
+        set(root_module_classes).union(qat_module_classes).union(fused_module_classes)
+    )
     model_device = _assert_and_get_unique_device(model)
 
     for node in list(model.graph.nodes):
@@ -1126,82 +1242,23 @@ def convert(
                 # floating point inputs in reference quantized models
                 _insert_dequantize_node(node, model.graph)
         elif node.op == "output":
-            # If the argument is empty we don't need to do anything
-            if len(output_quantized_idxs) == 0:
-                continue
-            # Result are kept quantized if the user specified the
-            # output_quantized_idxs override.
-            # Remove the dequantize operator for the node in the end if any
-            return_node = node
-            output = node.args[0]
-            # outputs can be Node, list, tuple, dict, other cases are not supported yet
-            if isinstance(output, (list, tuple)):
-                for idx in output_quantized_idxs:
-                    _maybe_recursive_remove_dequantize(
-                        output[idx], return_node, model.graph
-                    )
-            elif isinstance(output, (Node, dict)):
-                # we treat dict as a single argument currently, but it can be extended
-                # to support {"key": dtype} after we change output_quantized_idxs to
-                # dict
-                if 0 in output_quantized_idxs:
-                    _maybe_recursive_remove_dequantize(output, return_node, model.graph)
-            else:
-                warnings.warn(
-                    f"Unsupported node type for output_quantized_idxs: {type(output)}"
-                )
+            _convert_output_node(node, output_quantized_idxs, model.graph)
         elif node.op == "call_module":
-            mod = _get_module(node, modules)
-            assert mod is not None
-            if _is_activation_post_process(mod):
-                if is_decomposed:
-                    _replace_observer_with_quantize_dequantize_node_decomposed(
-                        model,
-                        node,
-                        modules,
-                        node_name_to_scope,
-                        node_name_to_qconfig,
-                        model_device,
-                    )
-                else:
-                    _replace_observer_with_quantize_dequantize_node(
-                        model,
-                        node,
-                        modules,
-                        node_name_to_scope,
-                        node_name_to_qconfig,
-                        model_device,
-                    )
-            elif isinstance(mod, DeQuantStub):
-                _replace_observer_or_dequant_stub_with_dequantize_node(
-                    node, model.graph
-                )
-            elif _is_observed_standalone_module(mod):
-                convert_standalone_module(
-                    node, modules, model, is_reference, backend_config
-                )
-            # below this point `type_before_parametrizations` is used
-            # instead of `type` to handle situations with fx quant + sparsity
-            elif type_before_parametrizations(mod) in set(root_module_classes).union(
-                qat_module_classes
-            ).union(fused_module_classes):
-                # extra check for fused module classes to make sure they are fused module classes
-                # of target modules
-                if (
-                    type_before_parametrizations(mod) in fused_module_classes
-                    and type_before_parametrizations(mod[0]) not in root_module_classes
-                ):  # type: ignore[index]
-                    continue
-                convert_weighted_module(
-                    node,
-                    modules,
-                    observed_node_names,
-                    node_name_to_qconfig,
-                    backend_config,
-                    is_decomposed,
-                    is_reference,
-                    model_device,
-                )
+            _convert_call_module_node(
+                node,
+                modules,
+                model,
+                node_name_to_scope,
+                node_name_to_qconfig,
+                observed_node_names,
+                model_device,
+                weighted_module_classes,
+                fused_module_classes,
+                root_module_classes,
+                backend_config,
+                is_reference,
+                is_decomposed,
+            )
 
     # remove deadcode after converting observers to quant/dequant ops
     model.graph.eliminate_dead_code()

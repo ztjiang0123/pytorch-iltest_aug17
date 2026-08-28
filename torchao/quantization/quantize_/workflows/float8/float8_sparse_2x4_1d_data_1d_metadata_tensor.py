@@ -36,7 +36,10 @@ __all__ = [
 aten = torch.ops.aten
 
 
-from .float8_tensor import QuantizeTensorToFloat8Kwargs
+from .float8_tensor import (
+    QuantizeTensorToFloat8Kwargs,
+    _float8_sparse_quantization_type,
+)
 
 
 class Float8Sparse2x4_1DData1DMetadataTensor(TorchAOBaseTensor):
@@ -115,7 +118,7 @@ class Float8Sparse2x4_1DData1DMetadataTensor(TorchAOBaseTensor):
         )
 
     def _quantization_type(self):
-        return f"{self.act_quant_kwargs=}, {self.block_size=}, {self.scale.shape=}"
+        return _float8_sparse_quantization_type(self)
 
     def dequantize(self, output_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         in_features = self.shape[1]
