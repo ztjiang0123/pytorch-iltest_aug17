@@ -9,6 +9,7 @@
 # PLESE DON'T MODIFY THIS FILE SO THAT WE DON'T GET OUT OF SYNC
 import logging
 from abc import ABCMeta
+from dataclasses import dataclass
 from typing import Any, List, Optional, Union
 
 import torch
@@ -65,19 +66,68 @@ _DTYPE_TO_QVALUE_BOUNDS: dict[Union[torch.dtype, TorchAODType], tuple[int, int]]
 _DTYPE_TO_QVALUE_BOUNDS.update(_SUB_BYTE_UINT_BOUNDS)
 
 
+@dataclass
+class _AffineQParamsConfig:
+    """Bundle of quantization parameters shared by the ``choose_qparams`` helpers.
+
+    These values always travel together to describe *how* scale/zero_point should
+    be derived, independent of the data (``input`` or ``min_val``/``max_val``) they
+    are derived from. Grouping them keeps the helper signatures small and makes the
+    two data-entry paths (raw ``input`` vs. pre-reduced ``min_val``/``max_val``)
+    share one config object.
+    """
+
+    mapping_type: str
+    block_size: List[int]
+    target_dtype: torch.dtype
+    quant_min: Optional[Union[int, float, bool]] = None
+    quant_max: Optional[Union[int, float, bool]] = None
+    eps: Optional[float] = None
+    scale_dtype: Optional[torch.dtype] = None
+    zero_point_dtype: Optional[torch.dtype] = None
+    preserve_zero: bool = True
+    zero_point_domain: Optional[str] = "INT"
+
+
+@dataclass
+class _QParamsInput:
+    """Data source for the ``choose_qparams`` helpers.
+
+    Either a raw ``input`` tensor (min/max are reduced from it) or pre-reduced
+    ``min_val``/``max_val`` tensors are provided; the two forms are mutually
+    exclusive.
+    """
+
+    input: Optional[torch.Tensor] = None
+    min_val: Optional[torch.Tensor] = None
+    max_val: Optional[torch.Tensor] = None
+
+
+@dataclass
+class MinMaxQParamsConfig:
+    """Quantization parameters for :func:`choose_qparams_affine_with_min_max`.
+
+    Groups the quantization scheme fields (everything other than the
+    ``min_val``/``max_val`` data tensors) that always travel together, using the
+    public enum types (:class:`MappingType`, :class:`ZeroPointDomain`).
+    """
+
+    mapping_type: MappingType
+    block_size: tuple[int, ...]
+    target_dtype: torch.dtype
+    quant_min: Optional[int] = None
+    quant_max: Optional[int] = None
+    eps: Optional[float] = None
+    scale_dtype: Optional[torch.dtype] = None
+    zero_point_dtype: Optional[torch.dtype] = None
+    preserve_zero: bool = True
+    zero_point_domain: Optional[ZeroPointDomain] = ZeroPointDomain.INT
+
+
 def choose_qparams_affine_with_min_max(
     min_val: torch.Tensor,
     max_val: torch.Tensor,
-    mapping_type: MappingType,
-    block_size: tuple[int, ...],
-    target_dtype: torch.dtype,
-    quant_min: Optional[int] = None,
-    quant_max: Optional[int] = None,
-    eps: Optional[float] = None,
-    scale_dtype: Optional[torch.dtype] = None,
-    zero_point_dtype: Optional[torch.dtype] = None,
-    preserve_zero: bool = True,
-    zero_point_domain: Optional[ZeroPointDomain] = ZeroPointDomain.INT,
+    config: MinMaxQParamsConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """A variant of :func:`~torchao.quantization.quant_primitives.choose_qparams_affine`
     operator that pass in min_val and max_val directly instead of deriving these from a single input.
@@ -85,41 +135,36 @@ def choose_qparams_affine_with_min_max(
     tracking all the data in calibration data set.
 
     Args:
-      Mostly same as :func:`~torchao.quantization.quant_primitives.choose_qparams_affine`. with one
-      difference: instead of passing in `input` Tensor and use that to calculate min_val/max_val
-      and then scale/zero_point, we pass in min_val/max_val directly
+      min_val (torch.Tensor): pre-reduced minimum values.
+      max_val (torch.Tensor): pre-reduced maximum values.
+      config (MinMaxQParamsConfig): the quantization parameters, mostly same as
+        :func:`~torchao.quantization.quant_primitives.choose_qparams_affine`. with one
+        difference: instead of passing in `input` Tensor and use that to calculate min_val/max_val
+        and then scale/zero_point, we pass in min_val/max_val directly
     """
+    zero_point_domain = config.zero_point_domain
     return _choose_qparams_affine(
-        None,
-        mapping_type.name,
-        block_size,
-        target_dtype,
-        quant_min,
-        quant_max,
-        eps,
-        scale_dtype,
-        zero_point_dtype,
-        preserve_zero,
-        zero_point_domain.name if zero_point_domain is not None else None,
-        min_val,
-        max_val,
+        _QParamsInput(min_val=min_val, max_val=max_val),
+        _AffineQParamsConfig(
+            mapping_type=config.mapping_type.name,
+            block_size=config.block_size,
+            target_dtype=config.target_dtype,
+            quant_min=config.quant_min,
+            quant_max=config.quant_max,
+            eps=config.eps,
+            scale_dtype=config.scale_dtype,
+            zero_point_dtype=config.zero_point_dtype,
+            preserve_zero=config.preserve_zero,
+            zero_point_domain=(
+                zero_point_domain.name if zero_point_domain is not None else None
+            ),
+        ),
     )
 
 
 def _choose_qparams_affine(
-    input: Optional[torch.Tensor],
-    mapping_type: str,
-    block_size: List[int],
-    target_dtype: torch.dtype,
-    quant_min: Optional[Union[int, float, bool]] = None,
-    quant_max: Optional[Union[int, float, bool]] = None,
-    eps: Optional[float] = None,
-    scale_dtype: Optional[torch.dtype] = None,
-    zero_point_dtype: Optional[torch.dtype] = None,
-    preserve_zero: bool = True,
-    zero_point_domain: Optional[str] = "INT",
-    min_val: Optional[torch.Tensor] = None,
-    max_val: Optional[torch.Tensor] = None,
+    data: _QParamsInput,
+    config: _AffineQParamsConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """op definition that has compatible signatures with custom op library
 
@@ -129,7 +174,21 @@ def _choose_qparams_affine(
     3. calculate quantization parameters based on min_val/max_val based on args like `preserve_zero`
        and `zero_point_domain`
     """
-    quant_min, quant_max = _get_and_check_qmin_qmax(target_dtype, quant_min, quant_max)
+    input = data.input
+    min_val = data.min_val
+    max_val = data.max_val
+    mapping_type = config.mapping_type
+    block_size = config.block_size
+    target_dtype = config.target_dtype
+    eps = config.eps
+    scale_dtype = config.scale_dtype
+    zero_point_dtype = config.zero_point_dtype
+    preserve_zero = config.preserve_zero
+    zero_point_domain = config.zero_point_domain
+
+    quant_min, quant_max = _get_and_check_qmin_qmax(
+        target_dtype, config.quant_min, config.quant_max
+    )
     assert mapping_type in [
         MappingType.SYMMETRIC.name,
         MappingType.SYMMETRIC_NO_CLIPPING_ERR.name,
@@ -564,16 +623,19 @@ class _MinMaxQParamsMixin:
         return choose_qparams_affine_with_min_max(
             self.min_val,
             self.max_val,
-            self.mapping_type,
-            [],  # BlockSize is not needed because the min/max are already reduced
-            self.target_dtype,
-            self.quant_min,
-            self.quant_max,
-            self.eps,
-            self.scale_dtype,
-            self.zero_point_dtype,
-            self.preserve_zero,
-            self.zero_point_domain,
+            MinMaxQParamsConfig(
+                mapping_type=self.mapping_type,
+                # BlockSize is not needed because the min/max are already reduced
+                block_size=[],
+                target_dtype=self.target_dtype,
+                quant_min=self.quant_min,
+                quant_max=self.quant_max,
+                eps=self.eps,
+                scale_dtype=self.scale_dtype,
+                zero_point_dtype=self.zero_point_dtype,
+                preserve_zero=self.preserve_zero,
+                zero_point_domain=self.zero_point_domain,
+            ),
         )
 
 
