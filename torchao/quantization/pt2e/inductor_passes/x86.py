@@ -397,6 +397,8 @@ def _check_node_kwarg_arg_value(check_node, kwarg_name, args_index, expected_val
 
 
 def _is_valid_quantized_op_optimization_pattern(quantized_op, output_dtype_args_index):
+    # Shared check for qconv/qlinear: only keep a matched pattern when the
+    # compute node's output_dtype matches the pattern output_dtype.
     def fn(match):
         output_dtype = _get_pattern_output_dtype(match)
         if output_dtype in [torch.float32, torch.bfloat16]:
@@ -2500,6 +2502,8 @@ class PostOpAttr:
     algorithm_attr: Any = None
 
     def __post_init__(self) -> None:
+        # Normalize falsy values to their canonical defaults, matching the
+        # original constructor behavior.
         self.alpha = self.alpha if self.alpha else 1.0
         self.scalars_attr = self.scalars_attr if self.scalars_attr else []
         self.algorithm_attr = self.algorithm_attr if self.algorithm_attr else ""
