@@ -352,7 +352,7 @@ def _get_edge_or_node_to_group_id(
                 # sharing with other users of the producer node
                 # (arg, user)
                 if not isinstance(arg, Node) or not isinstance(n, Node):
-                    raise Exception(  # noqa: TRY002
+                    raise Exception(
                         f"Expected input_edge to have type Tuple[Node, Node], but got: {arg, n}"
                     )
                 for user in arg.users:
