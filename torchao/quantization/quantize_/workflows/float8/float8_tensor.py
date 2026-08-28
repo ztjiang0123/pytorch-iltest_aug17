@@ -298,15 +298,29 @@ def _(func, types, args, kwargs):
     return torch.nn.functional.embedding(indices, weight_tensor, **kwargs)
 
 
-@implements(aten.linear.default)
-@implements_torch_function(torch.nn.functional.linear)
-def _(func, types, args, kwargs):
+def _float8_linear_dispatch(func, types, args, kwargs):
+    """Shared ``linear`` op handler for the float8 tensor subclasses.
+
+    Registered by both ``Float8Tensor`` and ``PrototypeFloat8Tensor`` so the
+    body lives once. The per-subclass matmul path differs only in
+    ``_float8_addmm_impl``, resolved from the weight tensor's class via
+    ``_FLOAT8_ADDMM_IMPLS``.
+    """
     input_tensor, weight_tensor, bias = (
         args[0],
         args[1],
         args[2] if len(args) > 2 else None,
     )
-    return _float8_addmm_impl(input_tensor, weight_tensor.t(), bias)
+    addmm_impl = next(
+        impl
+        for cls, impl in _FLOAT8_ADDMM_IMPLS.items()
+        if isinstance(weight_tensor, cls)
+    )
+    return addmm_impl(input_tensor, weight_tensor.t(), bias)
+
+
+implements(aten.linear.default)(_float8_linear_dispatch)
+implements_torch_function(torch.nn.functional.linear)(_float8_linear_dispatch)
 
 
 def _float8_mm_dispatch(func, types, args, kwargs):
@@ -331,8 +345,15 @@ implements([aten.matmul.default, aten.mm.default])(_float8_mm_dispatch)
 implements_torch_function([torch.matmul, torch.mm])(_float8_mm_dispatch)
 
 
-@implements(aten.addmm_.default)
-def _(func, types, args, kwargs):
+def _float8_addmm__dispatch(func, types, args, kwargs):
+    """Shared ``aten.addmm_.default`` (in-place addmm) handler for the float8
+    tensor subclasses.
+
+    Registered by both ``Float8Tensor`` and ``PrototypeFloat8Tensor`` so the
+    body lives once. The per-subclass matmul path differs only in
+    ``_float8_addmm_impl``, resolved from the weight tensor's class via
+    ``_FLOAT8_ADDMM_IMPLS``.
+    """
     bias_tensor, input_tensor, weight_tensor = (
         args[0],
         args[1],
@@ -340,8 +361,16 @@ def _(func, types, args, kwargs):
     )
     assert kwargs.get("alpha", 1) == 1, "only alpha=1 is supported"
     assert kwargs.get("beta", 1) == 1, "only beta=1 is supported"
-    out = _float8_addmm_impl(input_tensor, weight_tensor)
+    addmm_impl = next(
+        impl
+        for cls, impl in _FLOAT8_ADDMM_IMPLS.items()
+        if isinstance(weight_tensor, cls)
+    )
+    out = addmm_impl(input_tensor, weight_tensor)
     return bias_tensor.add_(out)
+
+
+implements(aten.addmm_.default)(_float8_addmm__dispatch)
 
 
 @implements(aten.is_pinned.default)

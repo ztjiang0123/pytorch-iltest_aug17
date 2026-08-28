@@ -40,7 +40,9 @@ from torchao.quantization.quantize_.workflows import (
 from torchao.quantization.quantize_.workflows.float8.float8_tensor import (
     _FLOAT8_ADDMM_IMPLS,
     _dispatch_conv3d,
+    _float8_addmm__dispatch,
     _float8_dequantize,
+    _float8_linear_dispatch,
     _float8_mm_dispatch,
     _float8_quantization_type,
 )
@@ -311,16 +313,10 @@ implements = PrototypeFloat8Tensor.implements
 implements_torch_function = PrototypeFloat8Tensor.implements_torch_function
 
 
-@implements(aten.linear.default)
-@implements_torch_function(torch.nn.functional.linear)
-def _(func, types, args, kwargs):
-    input_tensor, weight_tensor, bias = (
-        args[0],
-        args[1],
-        args[2] if len(args) > 2 else None,
-    )
-    result = _float8_addmm_impl(input_tensor, weight_tensor.t(), bias)
-    return result
+# Reuse the shared linear handler; the per-subclass matmul path is resolved
+# from `_FLOAT8_ADDMM_IMPLS` (populated at import time, below).
+implements(aten.linear.default)(_float8_linear_dispatch)
+implements_torch_function(torch.nn.functional.linear)(_float8_linear_dispatch)
 
 
 # Reuse the shared mm/matmul handler; only the addmm impl (registered below)
@@ -329,17 +325,9 @@ implements([aten.matmul.default, aten.mm.default])(_float8_mm_dispatch)
 implements_torch_function([torch.matmul, torch.mm])(_float8_mm_dispatch)
 
 
-@implements(aten.addmm_.default)
-def _(func, types, args, kwargs):
-    bias_tensor, input_tensor, weight_tensor = (
-        args[0],
-        args[1],
-        args[2],
-    )
-    assert kwargs.get("alpha", 1) == 1, "only alpha=1 is supported"
-    assert kwargs.get("beta", 1) == 1, "only beta=1 is supported"
-    out = _float8_addmm_impl(input_tensor, weight_tensor)
-    return bias_tensor.add_(out)
+# Reuse the shared in-place addmm handler; the per-subclass matmul path is
+# resolved from `_FLOAT8_ADDMM_IMPLS` (populated at import time, below).
+implements(aten.addmm_.default)(_float8_addmm__dispatch)
 
 
 def _float8_addmm_impl(
