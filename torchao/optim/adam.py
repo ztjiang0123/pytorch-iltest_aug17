@@ -101,6 +101,59 @@ class _AdamBase(Optimizer):
         out = out.to(p.device)
         return out
 
+    def _init_param_state(self, p, group):
+        """Lazily initialize the optimizer state for a single parameter."""
+        state = self.state[p]
+        if len(state) == 0:
+            state["step"] = torch.tensor(0.0)
+            state["exp_avg"] = self._new_buffer(p, True)
+            state["exp_avg_sq"] = self._new_buffer(p, False)
+            if group["amsgrad"]:
+                state["max_exp_avg_sq"] = self._new_buffer(p, False)
+        return state
+
+    def _step_param(self, p, group):
+        """Run a single Adam update for one parameter, or skip if it has no gradient."""
+        if p.grad is None:
+            return
+
+        grad = p.grad
+        if grad.is_sparse:
+            raise RuntimeError("Sparse gradient is not supported")
+
+        state = self._init_param_state(p, group)
+        state["step"] += 1
+
+        if not isinstance(group["lr"], Tensor):
+            raise RuntimeError(
+                "lr was changed to a non-Tensor object. If you want to update lr, please use "
+                "optim.param_groups[0]['lr'].fill_(new_lr)"
+            )
+
+        use_stochastic_round = (
+            self.bf16_stochastic_round and p.dtype is torch.bfloat16
+        )
+
+        # without calling p.detach(), torch.compile() will have issues with FSDP2 in some cases
+        # https://github.com/pytorch/ao/issues/652#issuecomment-2285040894
+        # thus, by calling p.detach(), DTensor won't have .grad anymore, which is ok since we
+        # are passing grad separately anyway.
+        torch.compile(single_param_adam, fullgraph=True, dynamic=False)(
+            p.detach(),
+            grad,
+            state["step"],
+            state["exp_avg"],
+            state["exp_avg_sq"],
+            state.get("max_exp_avg_sq", None),
+            group["lr"],
+            group["betas"][0],
+            group["betas"][1],
+            group["weight_decay"],
+            group["eps"],
+            self.is_adamw,
+            use_stochastic_round,
+        )
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -113,50 +166,7 @@ class _AdamBase(Optimizer):
         with torch._dynamo.utils.disable_cache_limit():
             for group in self.param_groups:
                 for p in group["params"]:
-                    if p.grad is None:
-                        continue
-
-                    grad = p.grad
-                    if grad.is_sparse:
-                        raise RuntimeError("Sparse gradient is not supported")
-
-                    state = self.state[p]
-
-                    # State initialization
-                    if len(state) == 0:
-                        state["step"] = torch.tensor(0.0)
-                        state["exp_avg"] = self._new_buffer(p, True)
-                        state["exp_avg_sq"] = self._new_buffer(p, False)
-                        if group["amsgrad"]:
-                            state["max_exp_avg_sq"] = self._new_buffer(p, False)
-
-                    state["step"] += 1
-
-                    if not isinstance(group["lr"], Tensor):
-                        raise RuntimeError(
-                            "lr was changed to a non-Tensor object. If you want to update lr, please use "
-                            "optim.param_groups[0]['lr'].fill_(new_lr)"
-                        )
-
-                    # without calling p.detach(), torch.compile() will have issues with FSDP2 in some cases
-                    # https://github.com/pytorch/ao/issues/652#issuecomment-2285040894
-                    # thus, by calling p.detach(), DTensor won't have .grad anymore, which is ok since we
-                    # are passing grad separately anyway.
-                    torch.compile(single_param_adam, fullgraph=True, dynamic=False)(
-                        p.detach(),
-                        grad,
-                        state["step"],
-                        state["exp_avg"],
-                        state["exp_avg_sq"],
-                        state.get("max_exp_avg_sq", None),
-                        group["lr"],
-                        group["betas"][0],
-                        group["betas"][1],
-                        group["weight_decay"],
-                        group["eps"],
-                        self.is_adamw,
-                        self.bf16_stochastic_round and p.dtype is torch.bfloat16,
-                    )
+                    self._step_param(p, group)
 
         return loss
 

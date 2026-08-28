@@ -386,6 +386,38 @@ def quantize_affine(
     )
 
 
+def _quantize_affine_with_dtype_cast(
+    no_dtype_cast_fn: Callable[..., torch.Tensor],
+    input: torch.Tensor,
+    block_size: List[int],
+    scale: torch.Tensor,
+    zero_point: Optional[torch.Tensor],
+    output_dtype: torch.dtype,
+    quant_min: Optional[Union[int, float, bool]],
+    quant_max: Optional[Union[int, float, bool]],
+) -> torch.Tensor:
+    """Shared driver for the affine-quantize wrappers.
+
+    Resolves ``quant_min``/``quant_max`` from ``output_dtype`` when unset, applies the
+    uintx dtype workaround, delegates the actual quantization math to ``no_dtype_cast_fn``,
+    and casts the result to ``output_dtype``. The zero-point domain (INT, FLOAT, or NONE)
+    is determined entirely by which ``no_dtype_cast_fn`` is passed in.
+    """
+    quant_min, quant_max = _get_and_check_qmin_qmax(output_dtype, quant_min, quant_max)
+    # workaround for uintx dtypes, since we don't have native Uintx dtype connected with
+    # torch.uintx dtypes yet
+    if output_dtype in _SUB_BYTE_UINT_BOUNDS:
+        output_dtype = torch.uint8
+    return no_dtype_cast_fn(
+        input,
+        block_size,
+        scale,
+        zero_point,
+        quant_min,
+        quant_max,
+    ).to(output_dtype)
+
+
 @register_custom_op
 def _quantize_affine(
     input: torch.Tensor,
@@ -416,19 +448,16 @@ def _quantize_affine(
         zero_point_domain is pre-defined as INT, meaning:
         quantized_val = (float_val / scale) (integer) + zero_point (integer)
     """
-    quant_min, quant_max = _get_and_check_qmin_qmax(output_dtype, quant_min, quant_max)
-    # workaround for uintx dtypes, since we don't have native Uintx dtype connected with
-    # torch.uintx dtypes yet
-    if output_dtype in _SUB_BYTE_UINT_BOUNDS:
-        output_dtype = torch.uint8
-    return _quantize_affine_no_dtype_cast(
+    return _quantize_affine_with_dtype_cast(
+        _quantize_affine_no_dtype_cast,
         input,
         block_size,
         scale,
         zero_point,
+        output_dtype,
         quant_min,
         quant_max,
-    ).to(output_dtype)
+    )
 
 
 def _quantize_affine_no_dtype_cast(
@@ -530,19 +559,16 @@ def _quantize_affine_tinygemm(
         zero_point_domain is pre-defined as FLOAT, meaning:
         quantized_val = (float_val - (zero_point (float) - scale * mid_point)) / scale
     """
-    quant_min, quant_max = _get_and_check_qmin_qmax(output_dtype, quant_min, quant_max)
-    # workaround for uintx dtypes, since we don't have native Uintx dtype connected with
-    # torch.uintx dtypes yet
-    if output_dtype in _SUB_BYTE_UINT_BOUNDS:
-        output_dtype = torch.uint8
-    return _quantize_affine_tinygemm_no_dtype_cast(
+    return _quantize_affine_with_dtype_cast(
+        _quantize_affine_tinygemm_no_dtype_cast,
         input,
         block_size,
         scale,
         zero_point,
+        output_dtype,
         quant_min,
         quant_max,
-    ).to(output_dtype)
+    )
 
 
 def _quantize_affine_tinygemm_no_dtype_cast(
@@ -645,19 +671,16 @@ def _quantize_affine_no_zero_point(
         quantized_val = (float_val / scale) | This is primarily used for floatx quantization
         where we do not want to round values to nearest integer and instead scale and cast.
     """
-    quant_min, quant_max = _get_and_check_qmin_qmax(output_dtype, quant_min, quant_max)
-    # workaround for uintx dtypes, since we don't have native Uintx dtype connected with
-    # torch.uintx dtypes yet
-    if output_dtype in _SUB_BYTE_UINT_BOUNDS:
-        output_dtype = torch.uint8
-    return _quantize_affine_no_zero_point_no_dtype_cast(
+    return _quantize_affine_with_dtype_cast(
+        _quantize_affine_no_zero_point_no_dtype_cast,
         input,
         block_size,
         scale,
         zero_point,
+        output_dtype,
         quant_min,
         quant_max,
-    ).to(output_dtype)
+    )
 
 
 def _quantize_affine_no_zero_point_no_dtype_cast(
