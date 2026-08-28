@@ -396,20 +396,29 @@ def _check_node_kwarg_arg_value(check_node, kwarg_name, args_index, expected_val
         return actual_value == expected_value
 
 
-def _is_valid_quantized_conv_optimization_pattern():
+def _is_valid_quantized_op_optimization_pattern(quantized_op, output_dtype_args_index):
     def fn(match):
         output_dtype = _get_pattern_output_dtype(match)
         if output_dtype in [torch.float32, torch.bfloat16]:
             # Only keep matched pattern with same output_dtype
-            qconv_node_after_weight_prepack = filter_nodes(
-                match.nodes, torch.ops.onednn.qconv_pointwise
+            quantized_node_after_weight_prepack = filter_nodes(
+                match.nodes, quantized_op
             )[0]
             return _check_node_kwarg_arg_value(
-                qconv_node_after_weight_prepack, "output_dtype", 13, output_dtype
+                quantized_node_after_weight_prepack,
+                "output_dtype",
+                output_dtype_args_index,
+                output_dtype,
             )
         return True
 
     return fn
+
+
+def _is_valid_quantized_conv_optimization_pattern():
+    return _is_valid_quantized_op_optimization_pattern(
+        torch.ops.onednn.qconv_pointwise, 13
+    )
 
 
 def _is_valid_qconv_post_op_fusion_pattern(has_binary_post_op=False):
@@ -421,19 +430,9 @@ def _is_valid_qconv_post_op_fusion_pattern(has_binary_post_op=False):
 
 
 def _is_valid_quantized_linear_optimization_pattern():
-    def fn(match):
-        output_dtype = _get_pattern_output_dtype(match)
-        if output_dtype in [torch.float32, torch.bfloat16]:
-            # Only keep matched pattern with same output_dtype
-            qlinear_node_after_weight_prepack = filter_nodes(
-                match.nodes, torch.ops.onednn.qlinear_pointwise
-            )[0]
-            return _check_node_kwarg_arg_value(
-                qlinear_node_after_weight_prepack, "output_dtype", 9, output_dtype
-            )
-        return True
-
-    return fn
+    return _is_valid_quantized_op_optimization_pattern(
+        torch.ops.onednn.qlinear_pointwise, 9
+    )
 
 
 def _is_valid_qlinear_post_op_fusion_pattern(has_binary_post_op=False):
@@ -1360,13 +1359,27 @@ def _register_qlinear_weight_prepack_pass(
             )
 
 
+@dataclass
+class QLinearWeightPrepackConfig:
+    """Options shared by the qlinear weight-prepack pattern generators.
+
+    Grouping these flags keeps the individual pattern-generation helpers to a
+    small, readable parameter list instead of threading each flag separately.
+    """
+
+    dtype: Any = torch.float32
+    input_dim_exceeds_two: bool = False
+    input_contiguous: bool = True
+    with_bias: bool = False
+    is_tensor_overload: bool = False
+    is_fp8: bool = False
+
+
 def _generate_dequant_linear_node_pattern(
     _dequant_per_channel_pattern,
-    dtype=torch.float32,
-    input_dim_exceeds_two=False,
-    is_tensor_overload=False,
-    is_fp8=False,
+    config: QLinearWeightPrepackConfig,
 ):
+    dtype = config.dtype
     assert dtype in [torch.float32, torch.bfloat16]
     t_pattern = _generate_linear_t_pattern(_dequant_per_channel_pattern, dtype)
     dequant_linear_bias_pattern = _may_generate_pattern_with_reshape(
@@ -1376,18 +1389,18 @@ def _generate_dequant_linear_node_pattern(
             _may_generate_pattern_with_reshape(
                 _may_generate_pattern_with_dtype_convert(
                     get_dequantize_per_tensor_activation_pattern(
-                        is_tensor_overload, is_fp8
+                        config.is_tensor_overload, config.is_fp8
                     ),
                     KeywordArg("autocast_act_dtype"),
                     dtype == torch.bfloat16,
                 ),
                 KeywordArg("act_reshape_size"),
-                input_dim_exceeds_two,
+                config.input_dim_exceeds_two,
             ),
             t_pattern,
         ),
         KeywordArg("output_reshape_size"),
-        input_dim_exceeds_two,
+        config.input_dim_exceeds_two,
     )
     dequant_linear_no_bias_pattern = _may_generate_pattern_with_reshape(
         CallFunction(
@@ -1395,30 +1408,28 @@ def _generate_dequant_linear_node_pattern(
             _may_generate_pattern_with_reshape(
                 _may_generate_pattern_with_dtype_convert(
                     get_dequantize_per_tensor_activation_pattern(
-                        is_tensor_overload, is_fp8
+                        config.is_tensor_overload, config.is_fp8
                     ),
                     KeywordArg("autocast_act_dtype"),
                     dtype == torch.bfloat16,
                 ),
                 KeywordArg("act_reshape_size"),
-                input_dim_exceeds_two,
+                config.input_dim_exceeds_two,
             ),
             t_pattern,
         ),
         KeywordArg("output_reshape_size"),
-        input_dim_exceeds_two,
+        config.input_dim_exceeds_two,
     )
     return dequant_linear_bias_pattern, dequant_linear_no_bias_pattern
 
 
 def _generate_dequant_bmm_node_pattern(
     _dequant_per_channel_pattern,
-    dtype=torch.float32,
-    with_bias=False,
-    is_tensor_overload=False,
-    is_fp8=False,
+    config: QLinearWeightPrepackConfig,
 ):
     # When activation of linear dim exceed 2 and not contiguous
+    dtype = config.dtype
     t_pattern = _generate_linear_t_pattern(_dequant_per_channel_pattern, dtype)
 
     assert dtype in [torch.float32, torch.bfloat16]
@@ -1428,7 +1439,7 @@ def _generate_dequant_bmm_node_pattern(
             aten.expand.default,
             _may_generate_pattern_with_dtype_convert(
                 get_dequantize_per_tensor_activation_pattern(
-                    is_tensor_overload, is_fp8
+                    config.is_tensor_overload, config.is_fp8
                 ),
                 KeywordArg("autocast_act_dtype"),
                 dtype == torch.bfloat16,
@@ -1452,37 +1463,22 @@ def _generate_dequant_bmm_node_pattern(
         else:
             return _dequant_bmm_pattern
 
-    return _generate_pattern_with_output_add(dequant_bmm_pattern, with_bias)
+    return _generate_pattern_with_output_add(dequant_bmm_pattern, config.with_bias)
 
 
 def _generate_qlinear_weight_prepack_patterns(
-    dtype=torch.float32,
-    input_dim_exceeds_two=False,
-    input_contiguous=True,
-    with_bias=False,
-    is_tensor_overload=False,
-    is_fp8=False,
+    config: QLinearWeightPrepackConfig,
 ):
-    if is_fp8:
+    if config.is_fp8:
         dequant_wgt_pattern = dequantize_fp8_weight_pattern
     else:
         dequant_wgt_pattern = dequantize_per_channel_weight_pattern
-    if input_dim_exceeds_two and not input_contiguous:
-        return _generate_dequant_bmm_node_pattern(
-            dequant_wgt_pattern,
-            dtype,
-            with_bias,
-            is_tensor_overload,
-            is_fp8=is_fp8,
-        )
+    if config.input_dim_exceeds_two and not config.input_contiguous:
+        return _generate_dequant_bmm_node_pattern(dequant_wgt_pattern, config)
     else:
-        return _generate_dequant_linear_node_pattern(
-            dequant_wgt_pattern,
-            dtype,
-            input_dim_exceeds_two,
-            is_tensor_overload,
-            is_fp8=is_fp8,
-        )
+        # The linear (non-bmm) pattern reshapes according to input_dim_exceeds_two;
+        # the weight prepack config is otherwise reused as-is.
+        return _generate_dequant_linear_node_pattern(dequant_wgt_pattern, config)
 
 
 def _generate_linear_dynamic_fp16_pattern(
@@ -1668,10 +1664,12 @@ def _register_qlinear_weight_prepack():
         if is_fp8 and not is_tensor_overload:
             continue
         weight_prepack_patterns = _generate_qlinear_weight_prepack_patterns(
-            dtype,
-            input_dim_exceeds_two,
-            is_tensor_overload=is_tensor_overload,
-            is_fp8=is_fp8,
+            QLinearWeightPrepackConfig(
+                dtype=dtype,
+                input_dim_exceeds_two=input_dim_exceeds_two,
+                is_tensor_overload=is_tensor_overload,
+                is_fp8=is_fp8,
+            )
         )
         for weight_prepack_pattern in weight_prepack_patterns:
             # Register to pass_number 1, so we can do dequant promotion in pass_number 0.
@@ -1693,12 +1691,14 @@ def _register_qlinear_weight_prepack():
         [torch.float32, torch.bfloat16], [True, False], [True, False], [True, False]
     ):
         bmm_pattern = _generate_qlinear_weight_prepack_patterns(
-            dtype=dtype,
-            input_dim_exceeds_two=True,
-            input_contiguous=False,
-            with_bias=with_bias,
-            is_tensor_overload=is_tensor_overload,
-            is_fp8=is_fp8,
+            QLinearWeightPrepackConfig(
+                dtype=dtype,
+                input_dim_exceeds_two=True,
+                input_contiguous=False,
+                with_bias=with_bias,
+                is_tensor_overload=is_tensor_overload,
+                is_fp8=is_fp8,
+            )
         )
         _register_qlinear_weight_prepack_pass(
             bmm_pattern,
@@ -1710,6 +1710,58 @@ def _register_qlinear_weight_prepack():
             input_contiguous=False,
             is_fp8=is_fp8,
         )
+
+
+def _find_linear_dynamic_fp16_surrounding_nodes(
+    linear_node,
+    *,
+    input_dim_exceeds_two,
+    input_contiguous,
+    has_bias,
+):
+    """Locate the reshape/expand/add nodes surrounding the matched linear node.
+
+    Returns a tuple of
+    ``(act_reshape_node, output_reshape_node, expand_x_node, expand_w_node,
+    add_bias_node, t_node)`` where entries that do not apply to the current
+    pattern shape are ``None``.
+    """
+    input_index = 1 if linear_node.target is aten.addmm.default else 0
+    weight_index = input_index + 1
+
+    act_reshape_node = None
+    output_reshape_node = None
+    expand_x_node = None
+    expand_w_node = None
+    add_bias_node = None
+
+    if not input_dim_exceeds_two:
+        t_node = linear_node.args[weight_index]
+        return (None, None, None, None, None, t_node)
+
+    if input_contiguous:
+        act_reshape_node = linear_node.args[input_index]
+        t_node = linear_node.args[weight_index]
+        output_reshape_node = next(iter(linear_node.users))
+        assert output_reshape_node.target is aten.reshape.default
+        return (
+            act_reshape_node,
+            output_reshape_node,
+            None,
+            None,
+            None,
+            t_node,
+        )
+
+    # input_dim_exceeds_two and not input_contiguous: linear is decomposed to bmm
+    expand_x_node = linear_node.args[input_index]
+    expand_w_node = linear_node.args[weight_index]
+    assert isinstance(expand_w_node, torch.fx.node.Node)
+    t_node = expand_w_node.args[0]
+    if has_bias:
+        add_bias_node = next(iter(linear_node.users))
+        assert add_bias_node.target is aten.add.Tensor
+    return (None, None, expand_x_node, expand_w_node, add_bias_node, t_node)
 
 
 def _register_linear_dynamic_fp16_weight_prepack_pass(
@@ -1765,8 +1817,6 @@ def _register_linear_dynamic_fp16_weight_prepack_pass(
         assert len(linear_nodes) == 1
         linear_node = linear_nodes[0]
         assert isinstance(linear_node, torch.fx.node.Node)
-        input_index = 1 if linear_node.target is aten.addmm.default else 0
-        weight_index = input_index + 1
 
         # find relu node
         relu_node = None
@@ -1781,24 +1831,13 @@ def _register_linear_dynamic_fp16_weight_prepack_pass(
             expand_x_node,
             expand_w_node,
             add_bias_node,
-        ) = (None, None, None, None, None)
-        t_node = None
-        if input_dim_exceeds_two:
-            if input_contiguous:
-                act_reshape_node = linear_node.args[input_index]
-                t_node = linear_node.args[weight_index]
-                output_reshape_node = next(iter(linear_node.users))
-                assert output_reshape_node.target is aten.reshape.default
-            else:
-                expand_x_node = linear_node.args[input_index]
-                expand_w_node = linear_node.args[weight_index]
-                assert isinstance(expand_w_node, torch.fx.node.Node)
-                t_node = expand_w_node.args[0]
-                if bias:
-                    add_bias_node = next(iter(linear_node.users))
-                    assert add_bias_node.target is aten.add.Tensor
-        else:
-            t_node = linear_node.args[weight_index]
+            t_node,
+        ) = _find_linear_dynamic_fp16_surrounding_nodes(
+            linear_node,
+            input_dim_exceeds_two=input_dim_exceeds_two,
+            input_contiguous=input_contiguous,
+            has_bias=bias is not None,
+        )
         assert isinstance(t_node, torch.fx.node.Node)
 
         w_to_fp32_node = t_node.args[0]
@@ -2410,20 +2449,18 @@ def _register_smooth_quant_int_mm_pattern():
         )(_smooth_quant_int_mm_weight_prepack)
 
 
+@dataclass(eq=False)
 class PostOpAttr:
-    def __init__(
-        self,
-        binary_op_name: str = "none",
-        alpha=None,
-        unary_op_name: str = "none",
-        scalars_attr=None,
-        algorithm_attr=None,
-    ) -> None:
-        self.binary_op_name = binary_op_name
-        self.alpha = alpha if alpha else 1.0
-        self.unary_op_name = unary_op_name
-        self.scalars_attr = scalars_attr if scalars_attr else []
-        self.algorithm_attr = algorithm_attr if algorithm_attr else ""
+    binary_op_name: str = "none"
+    alpha: Any = None
+    unary_op_name: str = "none"
+    scalars_attr: Any = None
+    algorithm_attr: Any = None
+
+    def __post_init__(self) -> None:
+        self.alpha = self.alpha if self.alpha else 1.0
+        self.scalars_attr = self.scalars_attr if self.scalars_attr else []
+        self.algorithm_attr = self.algorithm_attr if self.algorithm_attr else ""
 
 
 def _register_qconv_post_op_fusion_pass(
