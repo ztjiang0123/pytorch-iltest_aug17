@@ -527,6 +527,17 @@ class RooflineDims:
     K: int
     N: int
     G: int
+    breakdown_M: int = None
+
+
+@dataclass
+class RooflineOutputs:
+    """Destination paths for the CSV and plot artifacts produced by a run."""
+
+    speedup_csv: str = "roofline_speedup_results.csv"
+    quant_2d_csv: str = "roofline_quant_2d_results.csv"
+    quant_3d_csv: str = "roofline_quant_3d_results.csv"
+    plot_file: str = "roofline_unified.png"
 
 
 def _print_section_header(title):
@@ -725,7 +736,9 @@ def run_quant_3d_analysis(model, configs, outfile_quant_3d):
 
 def run_rearrange_2d_analysis(model, configs, G):
     """Benchmark the 2D scale-rearrange (block format) kernels."""
-    _print_section_header("2D SCALE REARRANGE KERNELS (Scale Blocking for Grouped GEMM)")
+    _print_section_header(
+        "2D SCALE REARRANGE KERNELS (Scale Blocking for Grouped GEMM)"
+    )
 
     block_size = 32
     num_groups = G
@@ -1627,7 +1640,7 @@ def _plot_kernel_breakdown(ax, breakdown, M_large):
     ax.legend(loc="upper right", fontsize=8)
 
 
-def generate_unified_plots(dfs, configs, breakdown_M, plot_file, dims):
+def generate_unified_plots(dfs, configs, plot_file, dims):
     """Render the six-panel unified roofline figure and save it to disk."""
     _print_section_header("GENERATING UNIFIED PLOTS")
 
@@ -1645,15 +1658,19 @@ def generate_unified_plots(dfs, configs, breakdown_M, plot_file, dims):
 
     _plot_net_speedup(axes[0, 0], df_speedup, dims)
     _plot_quant_2d_and_rearrange(axes[0, 1], df_quant_2d, df_rearrange, dims)
-    _plot_grouped_gemm_speedup(
-        axes[1, 0], df_grouped_gemm, df_grouped_gemm_2d_2d, dims
-    )
+    _plot_grouped_gemm_speedup(axes[1, 0], df_grouped_gemm, df_grouped_gemm_2d_2d, dims)
     _plot_reserved_placeholder(axes[0, 2])
     _plot_quant_3d_and_rearrange(axes[1, 1], df_quant_3d, df_rearrange_3d, dims)
 
-    M_large = _resolve_breakdown_M(configs, breakdown_M)
+    M_large = _resolve_breakdown_M(configs, dims.breakdown_M)
     breakdown = _compute_kernel_breakdown(
-        (df_quant_2d, df_quant_3d, df_rearrange, df_grouped_gemm, df_grouped_gemm_2d_2d),
+        (
+            df_quant_2d,
+            df_quant_3d,
+            df_rearrange,
+            df_grouped_gemm,
+            df_grouped_gemm_2d_2d,
+        ),
         M_large,
         dims,
     )
@@ -1713,14 +1730,8 @@ Configuration:
 
 
 def run(
-    K: int = 4096,
-    N: int = 4096,
-    G: int = 8,
-    breakdown_M: int = None,
-    outfile_speedup: str = "roofline_speedup_results.csv",
-    outfile_quant_2d: str = "roofline_quant_2d_results.csv",
-    outfile_quant_3d: str = "roofline_quant_3d_results.csv",
-    plot_file: str = "roofline_unified.png",
+    dims: RooflineDims,
+    outputs: RooflineOutputs,
     gpu_name: str = "NVIDIA B200",
     power_limit_percent: float = 100.0,
 ):
@@ -1728,17 +1739,14 @@ def run(
     Generate unified roofline analysis for MXFP8 grouped GEMM.
 
     Args:
-        K: Reduction dimension (default: 4096)
-        N: Output dimension per group (default: 4096)
-        G: Number of groups (default: 8)
-        breakdown_M: M value to use for kernel breakdown analysis (default: None, uses largest M from configs)
-        outfile_speedup: CSV file for speedup results
-        outfile_quant_2d: CSV file for 2D quantization results
-        outfile_quant_3d: CSV file for 3D quantization results
-        plot_file: PNG file to save unified plot
+        dims: Fixed problem dimensions (K, N, G) plus the optional breakdown_M
+            value for kernel breakdown analysis.
+        outputs: Destination paths for the CSV and plot artifacts.
         gpu_name: GPU model (default: B200)
         power_limit_percent: Power limit as percentage (0-100, default: 100.0)
     """
+    K, N, G = dims.K, dims.N, dims.G
+
     print(f"GPU: {gpu_name}")
     print(f"Torch version: {torch.__version__}")
     print(f"\nFixed dimensions: K={K}, N={N}, G={G}")
@@ -1751,17 +1759,16 @@ def run(
     print(f"  MXFP8 TFLOPS: {model.mxfp8_tflops}")
     print(f"  Memory Bandwidth: {model.memory_bandwidth_gbs} GB/s")
 
-    dims = RooflineDims(K=K, N=N, G=G)
     configs = generate_shape_configs(K, N, G)
 
     # 1. Net speedup: BF16 vs MXFP8
-    df_speedup = run_net_speedup_analysis(model, configs, outfile_speedup)
+    df_speedup = run_net_speedup_analysis(model, configs, outputs.speedup_csv)
 
     # 2. 2D quantization kernels (forward pass)
-    df_quant_2d = run_quant_2d_analysis(model, configs, outfile_quant_2d)
+    df_quant_2d = run_quant_2d_analysis(model, configs, outputs.quant_2d_csv)
 
     # 3. 3D quantization kernels (transposed weight)
-    df_quant_3d = run_quant_3d_analysis(model, configs, outfile_quant_3d)
+    df_quant_3d = run_quant_3d_analysis(model, configs, outputs.quant_3d_csv)
 
     # 4. 2D scale rearrange kernels
     df_rearrange = run_rearrange_2d_analysis(model, configs, G)
@@ -1787,8 +1794,7 @@ def run(
             df_grouped_gemm_2d_2d,
         ),
         configs,
-        breakdown_M,
-        plot_file,
+        outputs.plot_file,
         dims,
     )
 
@@ -1807,5 +1813,44 @@ def run(
     )
 
 
+def main(
+    K: int = 4096,
+    N: int = 4096,
+    G: int = 8,
+    breakdown_M: int = None,
+    outfile_speedup: str = "roofline_speedup_results.csv",
+    outfile_quant_2d: str = "roofline_quant_2d_results.csv",
+    outfile_quant_3d: str = "roofline_quant_3d_results.csv",
+    plot_file: str = "roofline_unified.png",
+    gpu_name: str = "NVIDIA B200",
+    power_limit_percent: float = 100.0,
+):
+    """CLI entry point: build the grouped options and delegate to :func:`run`.
+
+    Args:
+        K: Reduction dimension (default: 4096)
+        N: Output dimension per group (default: 4096)
+        G: Number of groups (default: 8)
+        breakdown_M: M value to use for kernel breakdown analysis (default: None, uses largest M from configs)
+        outfile_speedup: CSV file for speedup results
+        outfile_quant_2d: CSV file for 2D quantization results
+        outfile_quant_3d: CSV file for 3D quantization results
+        plot_file: PNG file to save unified plot
+        gpu_name: GPU model (default: B200)
+        power_limit_percent: Power limit as percentage (0-100, default: 100.0)
+    """
+    run(
+        dims=RooflineDims(K=K, N=N, G=G, breakdown_M=breakdown_M),
+        outputs=RooflineOutputs(
+            speedup_csv=outfile_speedup,
+            quant_2d_csv=outfile_quant_2d,
+            quant_3d_csv=outfile_quant_3d,
+            plot_file=plot_file,
+        ),
+        gpu_name=gpu_name,
+        power_limit_percent=power_limit_percent,
+    )
+
+
 if __name__ == "__main__":
-    fire.Fire(run)
+    fire.Fire(main)

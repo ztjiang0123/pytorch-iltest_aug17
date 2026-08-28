@@ -73,6 +73,23 @@ class Experiment:
     result: ExperimentResult
 
 
+@dataclass(frozen=True)
+class RoutingContext:
+    """Token distribution and expert-parallel topology shared by both pipelines.
+
+    These values are computed together in :func:`run_experiment` and always
+    travel as a unit, so they are bundled here rather than passed individually.
+    """
+
+    num_tokens_per_expert: torch.Tensor
+    num_tokens_per_expert_group: torch.Tensor
+    input_splits_list: List[int]
+    output_splits_list: List[int]
+    ep_degree: int
+    num_experts: int
+    group: object
+
+
 def get_configs() -> List[ExperimentConfig]:
     """Generate experiment configurations."""
     configs = [
@@ -86,13 +103,7 @@ def get_configs() -> List[ExperimentConfig]:
 def standard_pipeline(
     input_tensor: torch.Tensor,
     expert_weights_t: torch.Tensor,
-    num_tokens_per_expert: torch.Tensor,
-    num_tokens_per_expert_group: torch.Tensor,
-    input_splits_list: List[int],
-    output_splits_list: List[int],
-    ep_degree: int,
-    num_experts: int,
-    group,
+    routing: RoutingContext,
 ) -> torch.Tensor:
     """
     Standard BF16 pipeline:
@@ -103,9 +114,9 @@ def standard_pipeline(
     # Step 1: All-to-all dispatch (BF16)
     dispatched = all_to_all_single(
         input_tensor,
-        output_splits_list,
-        input_splits_list,
-        group=group,
+        routing.output_splits_list,
+        routing.input_splits_list,
+        group=routing.group,
     )
     dispatched = torch.ops._c10d_functional.wait_tensor(dispatched)
 
@@ -113,9 +124,9 @@ def standard_pipeline(
     input_shape, permuted, permuted_indices, num_tokens_per_expert_padded, offsets = (
         permute_and_pad(
             dispatched,
-            num_tokens_per_expert_group,
-            ep_degree,
-            num_experts,
+            routing.num_tokens_per_expert_group,
+            routing.ep_degree,
+            routing.num_experts,
             block_size,
         )
     )
@@ -137,9 +148,9 @@ def standard_pipeline(
     # Step 5: All-to-all combine (BF16)
     final_output = all_to_all_single(
         unpermuted,
-        input_splits_list,
-        output_splits_list,
-        group=group,
+        routing.input_splits_list,
+        routing.output_splits_list,
+        group=routing.group,
     )
     final_output = torch.ops._c10d_functional.wait_tensor(final_output)
 
@@ -149,13 +160,7 @@ def standard_pipeline(
 def mxfp8_pipeline(
     input_tensor: torch.Tensor,
     expert_weights_t: torch.Tensor,
-    num_tokens_per_expert: torch.Tensor,
-    num_tokens_per_expert_group: torch.Tensor,
-    input_splits_list: List[int],
-    output_splits_list: List[int],
-    ep_degree: int,
-    num_experts: int,
-    group,
+    routing: RoutingContext,
 ) -> torch.Tensor:
     """
     MXFP8 optimized pipeline with chained autograd functions:
@@ -167,9 +172,9 @@ def mxfp8_pipeline(
     # Step 1: A2A dispatch - outputs MXTensor
     mx_dispatched = a2a_dispatch_mxfp8_fwd_hp_bwd(
         input_tensor,
-        output_splits_list,
-        input_splits_list,
-        group_name=group.group_name,
+        routing.output_splits_list,
+        routing.input_splits_list,
+        group_name=routing.group.group_name,
     )
 
     # Step 2: Permute - maintains MXTensor
@@ -181,9 +186,9 @@ def mxfp8_pipeline(
         mx_group_offsets,
     ) = permute_mxfp8_fwd_hp_bwd(
         mx_dispatched,
-        num_tokens_per_expert_group,
-        ep_degree,
-        num_experts,
+        routing.num_tokens_per_expert_group,
+        routing.ep_degree,
+        routing.num_experts,
         block_size,
         use_triton_for_bwd=True,
     )
@@ -208,9 +213,9 @@ def mxfp8_pipeline(
     # Step 5: A2A combine - maintains BF16
     final_output = a2a_combine_hp_fwd_mxfp8_bwd(
         unpermuted,
-        output_splits=input_splits_list,
-        input_splits=output_splits_list,
-        group_name=group.group_name,
+        output_splits=routing.input_splits_list,
+        input_splits=routing.output_splits_list,
+        group_name=routing.group.group_name,
         mxfp8_bwd=True,
     )
 
@@ -424,31 +429,21 @@ def run_experiment(
         output_splits_list,
     ) = _compute_token_distribution(config, ep_degree, group)
 
+    routing = RoutingContext(
+        num_tokens_per_expert=num_tokens_per_expert,
+        num_tokens_per_expert_group=num_tokens_per_expert_group,
+        input_splits_list=input_splits_list,
+        output_splits_list=output_splits_list,
+        ep_degree=ep_degree,
+        num_experts=config.num_experts,
+        group=group,
+    )
+
     def bf16_fwd(input_t, weight_t):
-        return standard_pipeline(
-            input_t,
-            weight_t,
-            num_tokens_per_expert,
-            num_tokens_per_expert_group,
-            input_splits_list,
-            output_splits_list,
-            ep_degree,
-            config.num_experts,
-            group,
-        )
+        return standard_pipeline(input_t, weight_t, routing)
 
     def mxfp8_fwd(input_t, weight_t):
-        return mxfp8_pipeline(
-            input_t,
-            weight_t,
-            num_tokens_per_expert,
-            num_tokens_per_expert_group,
-            input_splits_list,
-            output_splits_list,
-            ep_degree,
-            config.num_experts,
-            group,
-        )
+        return mxfp8_pipeline(input_t, weight_t, routing)
 
     # === Benchmark Standard BF16 Pipeline ===
     fwd_bf16_ms, bwd_bf16_ms = _benchmark_pipeline(
