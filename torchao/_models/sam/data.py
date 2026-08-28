@@ -3,6 +3,9 @@
 #
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
+from dataclasses import dataclass
+from typing import Any
+
 import diskcache
 import numpy as np
 import skimage.color as color
@@ -125,21 +128,36 @@ def _get_center_point(mask, ann_id, cache):
     return global_coords
 
 
-def build_datapoint(
-    imgId,
-    coco,
-    pixel_mean,
-    pixel_std,
-    coco_root_dir,
-    coco_slice_name,
-    catIds,
-    cache,
-    predictor,
-    pad_input_image_batch,
-):
+@dataclass
+class DatapointConfig:
+    """Batch-scoped inputs shared by every ``build_datapoint`` call.
+
+    These values are constant for a whole batch (the COCO handle, the
+    normalization stats, dataset paths, the predictor, etc.); grouping them
+    keeps ``build_datapoint`` to a single per-image argument plus this config
+    instead of a long positional parameter list.
+    """
+
+    coco: Any
+    pixel_mean: Any
+    pixel_std: Any
+    coco_root_dir: str
+    coco_slice_name: str
+    catIds: Any
+    cache: Any
+    predictor: Any
+    pad_input_image_batch: bool
+
+
+def build_datapoint(imgId, config: DatapointConfig):
+    coco = config.coco
+    predictor = config.predictor
+
     img = coco.loadImgs(imgId)[0]
 
-    file_location = f"{coco_root_dir}/{coco_slice_name}/{img['file_name']}"
+    file_location = (
+        f"{config.coco_root_dir}/{config.coco_slice_name}/{img['file_name']}"
+    )
     I = io.imread(file_location)
     if len(I.shape) == 2:
         # some images, like img_id==61418, are grayscale
@@ -147,7 +165,7 @@ def build_datapoint(
         I = color.gray2rgb(I)
 
     # load and display instance annotations
-    annIds = coco.getAnnIds(imgIds=img["id"], catIds=catIds, iscrowd=None)
+    annIds = coco.getAnnIds(imgIds=img["id"], catIds=config.catIds, iscrowd=None)
     anns = coco.loadAnns(annIds)
 
     # approximate the center point of each mask
@@ -157,7 +175,7 @@ def build_datapoint(
         ann_id = ann["id"]
         mask = coco.annToMask(ann)
         gt_masks_list.append(torch.tensor(mask))
-        coords = _get_center_point(mask, ann_id, cache)
+        coords = _get_center_point(mask, ann_id, config.cache)
         coords_list.append(coords)
 
     image = I
@@ -172,9 +190,9 @@ def build_datapoint(
     # Preprocess
     x = input_image_torch
     # Normalize colors
-    x = (x - pixel_mean) / pixel_std
+    x = (x - config.pixel_mean) / config.pixel_std
 
-    if pad_input_image_batch:
+    if config.pad_input_image_batch:
         # Pad
         h, w = x.shape[-2:]
         padh = predictor.model.image_encoder.img_size - h
@@ -205,6 +223,18 @@ def build_data(
     pixel_mean = predictor.model.pixel_mean.cpu()
     pixel_std = predictor.model.pixel_std.cpu()
 
+    datapoint_config = DatapointConfig(
+        coco=coco,
+        pixel_mean=pixel_mean,
+        pixel_std=pixel_std,
+        coco_root_dir=coco_root_dir,
+        coco_slice_name=coco_slice_name,
+        catIds=catIds,
+        cache=cache,
+        predictor=predictor,
+        pad_input_image_batch=pad_input_image_batch,
+    )
+
     def build_batch(indicies):
         batch = [[], [], [], [], [], [], [], [], [], [], []]
         batch[3] = [0]
@@ -212,18 +242,7 @@ def build_data(
         for img_idx in indicies:
             imgId = coco_img_ids[img_idx]
 
-            datapoint = build_datapoint(
-                imgId,
-                coco,
-                pixel_mean,
-                pixel_std,
-                coco_root_dir,
-                coco_slice_name,
-                catIds,
-                cache,
-                predictor,
-                pad_input_image_batch,
-            )
+            datapoint = build_datapoint(imgId, datapoint_config)
             I, coords_list, gt_masks_list, anns, x, predictor_input_size = datapoint
             if len(coords_list) == 0:
                 continue

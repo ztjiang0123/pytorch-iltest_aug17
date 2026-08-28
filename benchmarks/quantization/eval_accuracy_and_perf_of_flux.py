@@ -76,20 +76,30 @@ def print_pipeline_architecture(pipe):
     print("=" * 80 + "\n")
 
 
-def generate_image(
-    pipe,
-    prompt: str,
-    seed: int,
-    device: str,
-    num_inference_steps: int,
-    batch_size: int = 1,
-) -> Image.Image:
-    generator = torch.Generator(device=device).manual_seed(seed)
+@dataclass
+class GenerationRequest:
+    """Inputs for a single image-generation call.
 
-    prompts = [prompt] * batch_size
-    image = pipe(
+    Bundles the pipeline handle and its run-scoped generation settings so
+    ``generate_image`` takes one options object instead of a long list of
+    positional arguments that mostly travel together.
+    """
+
+    pipe: object
+    prompt: str
+    device: str
+    num_inference_steps: int
+    seed: int = RANDOM_SEED
+    batch_size: int = 1
+
+
+def generate_image(request: GenerationRequest) -> Image.Image:
+    generator = torch.Generator(device=request.device).manual_seed(request.seed)
+
+    prompts = [request.prompt] * request.batch_size
+    image = request.pipe(
         prompt=prompts,
-        num_inference_steps=num_inference_steps,  # can tweak for speed vs quality
+        num_inference_steps=request.num_inference_steps,  # tweak for speed vs quality
         guidance_scale=7.5,
         generator=generator,
     ).images[0]
@@ -499,7 +509,12 @@ def _generate_baseline_images(ctx):
             )
             t0 = time.time()
             baseline_img = generate_image(
-                ctx.pipe, prompt, RANDOM_SEED, ctx.device, ctx.num_inference_steps
+                GenerationRequest(
+                    pipe=ctx.pipe,
+                    prompt=prompt,
+                    device=ctx.device,
+                    num_inference_steps=ctx.num_inference_steps,
+                )
             )
             t1 = time.time()
             baseline_img.save(img_path)
@@ -511,26 +526,19 @@ def _generate_baseline_images(ctx):
 
 def _measure_generation_perf(ctx, prompt):
     """Warm up compile, then time ``perf_n_iter`` generations. Returns times list."""
-    # warm up compile
-    _ = generate_image(
-        ctx.pipe,
-        prompt,
-        RANDOM_SEED,
-        ctx.device,
-        ctx.num_inference_steps,
+    request = GenerationRequest(
+        pipe=ctx.pipe,
+        prompt=prompt,
+        device=ctx.device,
+        num_inference_steps=ctx.num_inference_steps,
         batch_size=ctx.batch_size,
     )
+    # warm up compile
+    _ = generate_image(request)
     times = []
     for _ in range(ctx.perf_n_iter):
         t0 = time.time()
-        _ = generate_image(
-            ctx.pipe,
-            prompt,
-            RANDOM_SEED,
-            ctx.device,
-            ctx.num_inference_steps,
-            batch_size=ctx.batch_size,
-        )
+        _ = generate_image(request)
         t1 = time.time()
         times.append(t1 - t0)
     return times
@@ -594,7 +602,12 @@ def _run_accuracy_generation(ctx, baseline_data):
         print(f"{ctx.rank_prefix} Generating image for {prompt_idx}")
         t0 = time.time()
         modified_img = generate_image(
-            ctx.pipe, prompt, RANDOM_SEED, ctx.device, ctx.num_inference_steps
+            GenerationRequest(
+                pipe=ctx.pipe,
+                prompt=prompt,
+                device=ctx.device,
+                num_inference_steps=ctx.num_inference_steps,
+            )
         )
         t1 = time.time()
         times.append(t1 - t0)
