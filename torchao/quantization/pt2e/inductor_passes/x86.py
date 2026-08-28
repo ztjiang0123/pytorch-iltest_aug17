@@ -2021,6 +2021,28 @@ def _smooth_quant_validate_pattern(match: Match):
     return True
 
 
+@dataclass
+class _SmoothQuantPrepackContext:
+    """Bundle of values shared by the smooth-quant qlinear emit helpers.
+
+    Grouping these avoids threading the full set of prepack inputs through each
+    helper's signature.
+    """
+
+    match: Match
+    out_node: torch.fx.Node
+    kwargs: dict
+    x: torch.fx.Node
+    x_scale: torch.fx.Node
+    x_scale_dtype: Any
+    prepack_weight_node: torch.fx.Node
+    w_scale: torch.fx.Node
+    w_zp: Any
+    bias: Any
+    dtype: Any
+    use_u8s8: bool
+
+
 def _smooth_quant_u8s8_convert_x(match, x):
     """Insert the i32 -> +128 -> u8 conversion chain for a u8s8 activation."""
     x_i32 = match.graph.call_function(
@@ -2037,41 +2059,32 @@ def _smooth_quant_u8s8_convert_x(match, x):
     )
 
 
-def _smooth_quant_emit_scalar_scale_qlinear(
-    match,
-    out_node,
-    x,
-    x_scale,
-    prepack_weight_node,
-    w_scale,
-    w_zp,
-    bias,
-    dtype,
-    use_u8s8,
-):
+def _smooth_quant_emit_scalar_scale_qlinear(ctx: _SmoothQuantPrepackContext):
     """Emit ``qlinear_pointwise.tensor`` for the per-tensor x-scale case."""
-    if use_u8s8:
-        x_qlinear = _smooth_quant_u8s8_convert_x(match, x)
+    match = ctx.match
+    out_node = ctx.out_node
+    if ctx.use_u8s8:
+        x_qlinear = _smooth_quant_u8s8_convert_x(match, ctx.x)
         x_zp = match.graph.call_function(
             aten.full.default,
             args=([], 128),
             kwargs={"dtype": torch.int32},
         )
     else:
-        x_qlinear = x
+        x_qlinear = ctx.x
         x_zp = None
 
     new_args = (
         x_qlinear,
-        x_scale,
+        ctx.x_scale,
         x_zp,  # x_zp
-        prepack_weight_node,
-        w_scale,
-        w_zp,  # w_zp
-        bias,
+        ctx.prepack_weight_node,
+        ctx.w_scale,
+        ctx.w_zp,  # w_zp
+        ctx.bias,
         1.0,  # output_scale
         0,  # output_zero_point
-        dtype,  # output_dtype
+        ctx.dtype,  # output_dtype
         "none",  # post op name
         [],  # post op args
         "",  # post op algorithm
@@ -2083,32 +2096,26 @@ def _smooth_quant_emit_scalar_scale_qlinear(
     new_linear_node.meta.update(out_node.meta)
 
 
-def _smooth_quant_emit_per_channel_qlinear(
-    match,
-    out_node,
-    kwargs,
-    x,
-    x_scale,
-    x_scale_dtype,
-    prepack_weight_node,
-    w_scale,
-    w_zp,
-    bias,
-    use_u8s8,
-):
+def _smooth_quant_emit_per_channel_qlinear(ctx: _SmoothQuantPrepackContext):
     """Emit qlinear plus x-scale/bias/reshape for the per-channel x-scale case.
 
     onednn.qlinear does not support per-channel quantization of x, so here we
     apply x scale and add bias ourselves after qlinear.
     """
+    match = ctx.match
+    out_node = ctx.out_node
+    kwargs = ctx.kwargs
+    bias = ctx.bias
     has_output_convert = "output_dtype" in kwargs
     in_shape = kwargs.get("in_shape", None)
     if in_shape is None:
-        x_reshaped = x
+        x_reshaped = ctx.x
     else:
-        x_reshaped = match.graph.call_function(aten.reshape.default, args=(x, in_shape))
+        x_reshaped = match.graph.call_function(
+            aten.reshape.default, args=(ctx.x, in_shape)
+        )
 
-    if use_u8s8:
+    if ctx.use_u8s8:
         x_qlinear = _smooth_quant_u8s8_convert_x(match, x_reshaped)
         x_zp = 128
     else:
@@ -2119,13 +2126,13 @@ def _smooth_quant_emit_per_channel_qlinear(
         x_qlinear,
         1.0,  # x_scale
         x_zp,  # x_zp
-        prepack_weight_node,
-        w_scale,
-        w_zp,  # w_zp
+        ctx.prepack_weight_node,
+        ctx.w_scale,
+        ctx.w_zp,  # w_zp
         None,  # bias
         1.0,  # output_scale
         0,  # output_zero_point
-        x_scale_dtype,  # output_dtype
+        ctx.x_scale_dtype,  # output_dtype
         "none",  # post op name
         [],  # post op args
         "",  # post op algorithm
@@ -2135,7 +2142,7 @@ def _smooth_quant_emit_per_channel_qlinear(
     )
     # apply x scale
     new_out_node = match.graph.call_function(
-        aten.mul.Tensor, args=(new_linear_node, x_scale)
+        aten.mul.Tensor, args=(new_linear_node, ctx.x_scale)
     )
 
     # Add bias and reshape
@@ -2223,33 +2230,24 @@ def _smooth_quant_int_mm_weight_prepack(match: Match, *args, **kwargs):
                 prod *= d
             x_scale_is_scalar = prod == 1
 
+        ctx = _SmoothQuantPrepackContext(
+            match=match,
+            out_node=out_node,
+            kwargs=kwargs,
+            x=x,
+            x_scale=x_scale,
+            x_scale_dtype=x_scale_dtype,
+            prepack_weight_node=prepack_weight_node,
+            w_scale=w_scale,
+            w_zp=w_zp,
+            bias=bias,
+            dtype=dtype,
+            use_u8s8=use_u8s8,
+        )
         if x_scale_is_scalar:
-            _smooth_quant_emit_scalar_scale_qlinear(
-                match,
-                out_node,
-                x,
-                x_scale,
-                prepack_weight_node,
-                w_scale,
-                w_zp,
-                bias,
-                dtype,
-                use_u8s8,
-            )
+            _smooth_quant_emit_scalar_scale_qlinear(ctx)
         else:
-            _smooth_quant_emit_per_channel_qlinear(
-                match,
-                out_node,
-                kwargs,
-                x,
-                x_scale,
-                x_scale_dtype,
-                prepack_weight_node,
-                w_scale,
-                w_zp,
-                bias,
-                use_u8s8,
-            )
+            _smooth_quant_emit_per_channel_qlinear(ctx)
         for node in reversed(match.nodes):
             match.graph.erase_node(node)
         counters["inductor"]["qlinear_weight_prepack_matcher_count"] += 1
