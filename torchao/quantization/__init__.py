@@ -20,6 +20,7 @@ from .linear_quant_modules import (
 from .observer import (
     AffineQuantizedMinMaxObserver,
     AffineQuantizedObserverBase,
+    AffineQuantizedObserverConfig,
 )
 from .quant_api import (
     Float8DynamicActivationFloat8WeightConfig,
@@ -103,6 +104,7 @@ __all__ = [
     # building blocks
     "AffineQuantizedMinMaxObserver",
     "AffineQuantizedObserverBase",
+    "AffineQuantizedObserverConfig",
     # quant primitive ops
     "choose_qparams_affine",
     "choose_qparams_affine_with_min_max",

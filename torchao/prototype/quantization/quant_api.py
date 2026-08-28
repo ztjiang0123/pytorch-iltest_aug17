@@ -495,7 +495,10 @@ def _float8_static_activation_float8_weight_transform(
     from torchao.prototype.quantization.float8_static_quant.prototype_float8_tensor import (
         PrototypeFloat8Tensor,
     )
-    from torchao.quantization.observer import AffineQuantizedMinMaxObserver
+    from torchao.quantization.observer import (
+        AffineQuantizedMinMaxObserver,
+        AffineQuantizedObserverConfig,
+    )
 
     step = config.step
     granularity = config.granularity if config.granularity is not None else PerTensor()
@@ -511,10 +514,12 @@ def _float8_static_activation_float8_weight_transform(
             mapping_type=MappingType.SYMMETRIC,
             target_dtype=config.activation_dtype,
             granularity=granularity,
-            eps=torch.finfo(torch.float32).eps,
-            scale_dtype=torch.float32,
-            zero_point_dtype=torch.float32,
-            keepdim=True,
+            config=AffineQuantizedObserverConfig(
+                eps=torch.finfo(torch.float32).eps,
+                scale_dtype=torch.float32,
+                zero_point_dtype=torch.float32,
+                keepdim=True,
+            ),
         )
         # Create output observer if quantize_and_dequantize_output is True
         output_observer = None
@@ -523,10 +528,12 @@ def _float8_static_activation_float8_weight_transform(
                 mapping_type=MappingType.SYMMETRIC,
                 target_dtype=config.activation_dtype,
                 granularity=granularity,
-                eps=torch.finfo(torch.float32).eps,
-                scale_dtype=torch.float32,
-                zero_point_dtype=torch.float32,
-                keepdim=True,
+                config=AffineQuantizedObserverConfig(
+                    eps=torch.finfo(torch.float32).eps,
+                    scale_dtype=torch.float32,
+                    zero_point_dtype=torch.float32,
+                    keepdim=True,
+                ),
             )
         return Float8ObservedLinear.from_float(module, input_observer, output_observer)
 

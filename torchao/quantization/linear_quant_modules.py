@@ -63,32 +63,45 @@ def _check_linear_int4_k(k, groupsize=1, inner_k_tiles=None):
     return k_divisible_by_groupsize
 
 
+@dataclass
+class Int4LinearWeights:
+    """Packed int4 weights plus the metadata needed to run the matmul.
+
+    These values are produced and stored together by
+    :class:`WeightOnlyInt4Linear`, so grouping them keeps
+    :func:`linear_forward_int4` down to its input tensor and the weights it
+    operates on.
+    """
+
+    weight_int4pack: torch.Tensor
+    scales_and_zeros: torch.Tensor
+    out_features: int
+    groupsize: int
+    precision: torch.dtype = torch.bfloat16
+    scales_precision: torch.dtype = torch.bfloat16
+
+
 def linear_forward_int4(
     x: torch.Tensor,
-    weight_int4pack: torch.Tensor,
-    scales_and_zeros: torch.Tensor,
-    out_features: int,
-    groupsize: int,
-    precision: torch.dtype = torch.bfloat16,
-    scales_precision: torch.dtype = torch.bfloat16,
+    weights: Int4LinearWeights,
 ):
     origin_x_size = x.size()
     x = x.reshape(-1, origin_x_size[-1])
     if _is_device(x.device.type, "cpu"):
         c = torch.ops.aten._weight_int4pack_mm_for_cpu(
-            x.to(precision),
-            weight_int4pack,
-            groupsize,
-            scales_and_zeros.to(scales_precision),
+            x.to(weights.precision),
+            weights.weight_int4pack,
+            weights.groupsize,
+            weights.scales_and_zeros.to(weights.scales_precision),
         ).to(dtype=x.dtype)
     else:
         c = torch.ops.aten._weight_int4pack_mm(
-            x.to(precision),
-            weight_int4pack,
-            groupsize,
-            scales_and_zeros.to(scales_precision),
+            x.to(weights.precision),
+            weights.weight_int4pack,
+            weights.groupsize,
+            weights.scales_and_zeros.to(weights.scales_precision),
         ).to(dtype=x.dtype)
-    new_shape = origin_x_size[:-1] + (out_features,)
+    new_shape = origin_x_size[:-1] + (weights.out_features,)
     c = c.reshape(new_shape)
     return c
 
@@ -187,68 +200,79 @@ class WeightOnlyInt4Linear(torch.nn.Module):
             input = F.pad(input, pad=(0, self.in_features - self.origin_in_features))
         return linear_forward_int4(
             input,
-            self.weight,
-            self.scales_and_zeros,
-            self.out_features,
-            self.groupsize,
-            self.precision,
-            self.scales_precision,
+            Int4LinearWeights(
+                weight_int4pack=self.weight,
+                scales_and_zeros=self.scales_and_zeros,
+                out_features=self.out_features,
+                groupsize=self.groupsize,
+                precision=self.precision,
+                scales_precision=self.scales_precision,
+            ),
         )
+
+
+@dataclass
+class _Linear4ReplaceSettings:
+    """Quantization settings that travel together when replacing linear layers.
+
+    Grouping these related values keeps :func:`_replace_linear_int4`'s signature
+    down to the module being traversed and avoids positional-argument mistakes at
+    call sites.
+    """
+
+    groupsize: int
+    inner_k_tiles: Optional[int]
+    padding_allowed: bool
+    skip_layer_func: Optional[Callable] = None
+    precision: torch.dtype = torch.bfloat16
+    scales_precision: torch.dtype = torch.bfloat16
+    linear_class: Type[torch.nn.Module] = WeightOnlyInt4Linear
+    copy_weights: bool = False
 
 
 def _replace_linear_int4(
     module: torch.nn.Module,
-    groupsize: int,
-    inner_k_tiles: Optional[int],
-    padding_allowed: bool,
-    skip_layer_func: Optional[Callable] = None,
-    precision: torch.dtype = torch.bfloat16,
-    scales_precision: torch.dtype = torch.bfloat16,
-    linear_class: Type[torch.nn.Module] = WeightOnlyInt4Linear,
-    copy_weights: bool = False,
+    settings: _Linear4ReplaceSettings,
 ):
     for name, child in module.named_children():
         # TODO: support linear bias
         if (
             isinstance(child, nn.Linear)
             and child.bias is None
-            and (skip_layer_func is None or not skip_layer_func(child.weight))
+            and (
+                settings.skip_layer_func is None
+                or not settings.skip_layer_func(child.weight)
+            )
         ):
             if (
-                _check_linear_int4_k(child.in_features, groupsize, inner_k_tiles)
-                or padding_allowed
+                _check_linear_int4_k(
+                    child.in_features, settings.groupsize, settings.inner_k_tiles
+                )
+                or settings.padding_allowed
             ):
-                new_linear = linear_class(
+                new_linear = settings.linear_class(
                     child.in_features,
                     child.out_features,
                     config=Int4LinearConfig(
                         bias=False,
                         device=child.weight.device,
-                        groupsize=groupsize,
-                        inner_k_tiles=inner_k_tiles,
-                        precision=precision,
-                        scales_precision=scales_precision,
+                        groupsize=settings.groupsize,
+                        inner_k_tiles=settings.inner_k_tiles,
+                        precision=settings.precision,
+                        scales_precision=settings.scales_precision,
                     ),
                 )
                 # TODO: merge with 8da4w?
                 # In distributed training, the model may be instantiated
                 # on the meta device, in which case there is no need to
                 # copy the weights, and doing so will result in an error
-                if copy_weights and child.weight.device != torch.device("meta"):
+                if settings.copy_weights and child.weight.device != torch.device(
+                    "meta"
+                ):
                     new_linear.weight = child.weight
                 setattr(module, name, new_linear)
         else:
-            _replace_linear_int4(
-                child,
-                groupsize,
-                inner_k_tiles,
-                padding_allowed,
-                skip_layer_func,
-                precision,
-                scales_precision,
-                linear_class,
-                copy_weights,
-            )
+            _replace_linear_int4(child, settings)
 
 
 def replace_linear_int4(
@@ -256,11 +280,13 @@ def replace_linear_int4(
 ):
     _replace_linear_int4(
         module,
-        groupsize,
-        inner_k_tiles,
-        padding_allowed,
-        skip_layer_func,
-        linear_class=WeightOnlyInt4Linear,
+        _Linear4ReplaceSettings(
+            groupsize=groupsize,
+            inner_k_tiles=inner_k_tiles,
+            padding_allowed=padding_allowed,
+            skip_layer_func=skip_layer_func,
+            linear_class=WeightOnlyInt4Linear,
+        ),
     )
 
 
@@ -358,12 +384,14 @@ class Int4WeightOnlyQuantizer:
     def _convert_for_runtime(self, model: torch.nn.Module) -> torch.nn.Module:
         _replace_linear_int4(
             model,
-            self.groupsize,
-            self.inner_k_tiles,
-            self.padding_allowed,
-            skip_layer_func=None,
-            precision=self.precision,
-            scales_precision=self.precision,
+            _Linear4ReplaceSettings(
+                groupsize=self.groupsize,
+                inner_k_tiles=self.inner_k_tiles,
+                padding_allowed=self.padding_allowed,
+                skip_layer_func=None,
+                precision=self.precision,
+                scales_precision=self.precision,
+            ),
         )
         return model
 
@@ -373,16 +401,34 @@ class Int4WeightOnlyQuantizer:
         return _quantize_via_state_dict(self, model)
 
 
+@dataclass
+class Int8DynActInt4Weights:
+    """Unpacked int4 weights plus the metadata needed to run the matmul.
+
+    These values are stored together by :class:`Int8DynActInt4WeightLinear`, so
+    grouping them keeps :func:`linear_forward_8da4w` down to its input tensor and
+    the weights it operates on.
+    """
+
+    weight_int8: torch.Tensor
+    bias: Optional[torch.Tensor]
+    scales: torch.Tensor
+    zeros: torch.Tensor
+    out_features: int
+    groupsize: int
+    output_precision: torch.dtype
+
+
 def linear_forward_8da4w(
     x,
-    weight_int8,
-    bias,
-    scales,
-    zeros,
-    out_features,
-    groupsize,
-    output_precision,
+    weights: Int8DynActInt4Weights,
 ):
+    weight_int8 = weights.weight_int8
+    bias = weights.bias
+    scales = weights.scales
+    zeros = weights.zeros
+    groupsize = weights.groupsize
+    output_precision = weights.output_precision
     # uses fp32 to match the PTQ activation quantization scale dtype
     # and activation_scale_dtype in QAT configs
     # TODO: in future add ability to specify activation_scale_dtype to PTQ configs
@@ -523,13 +569,15 @@ class Int8DynActInt4WeightLinear(torch.nn.Module):
         # input = F.pad(input, pad=(0, self.in_features - self.origin_in_features))
         return linear_forward_8da4w(
             input,
-            self.weight,
-            self.bias,
-            self.scales,
-            self.zeros,
-            self.out_features,
-            self.groupsize,
-            self.precision,
+            Int8DynActInt4Weights(
+                weight_int8=self.weight,
+                bias=self.bias,
+                scales=self.scales,
+                zeros=self.zeros,
+                out_features=self.out_features,
+                groupsize=self.groupsize,
+                output_precision=self.precision,
+            ),
         )
 
 

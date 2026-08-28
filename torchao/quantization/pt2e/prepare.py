@@ -22,6 +22,7 @@ from torch.fx.node import Argument
 from torchao.quantization.pt2e import (
     FROM_NODE_KEY,
     DerivedObserverOrFakeQuantize,
+    DerivedQParamsSpec,
     ObserverOrFakeQuantize,
 )
 from torchao.quantization.pt2e.fake_quantize import FixedQParamsFakeQuantize
@@ -90,10 +91,12 @@ def _create_obs_or_fq_from_qspec(
         kwargs = {
             "dtype": quantization_spec.dtype,
             "derive_qparams_fn": quantization_spec.derive_qparams_fn,
-            "quant_min": quantization_spec.quant_min,
-            "quant_max": quantization_spec.quant_max,
-            "qscheme": quantization_spec.qscheme,
-            "ch_axis": quantization_spec.ch_axis,
+            "qparams_spec": DerivedQParamsSpec(
+                quant_min=quantization_spec.quant_min,
+                quant_max=quantization_spec.quant_max,
+                qscheme=quantization_spec.qscheme,
+                ch_axis=quantization_spec.ch_axis,
+            ),
         }
         edge_or_nodes = quantization_spec.derived_from
         obs_or_fqs = [obs_or_fq_map[k] for k in edge_or_nodes]
