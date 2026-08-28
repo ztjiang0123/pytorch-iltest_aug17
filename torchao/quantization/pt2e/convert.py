@@ -1008,12 +1008,32 @@ def _normalize_convert_configs(
     return convert_custom_config, qconfig_mapping, backend_config
 
 
-def _convert_output_node(
-    node: Node,
-    output_quantized_idxs: list[int],
-    graph: Graph,
-) -> None:
+class _ConvertContext(NamedTuple):
+    """Invariant state shared across the per-node conversion loop in ``convert``.
+
+    Bundling it lets the per-node helpers take a single context argument instead
+    of threading a dozen positional parameters through each call.
+    """
+
+    model: GraphModule
+    modules: dict[str, torch.nn.Module]
+    node_name_to_scope: dict[str, tuple[str, type]]
+    node_name_to_qconfig: dict[str, QConfigAny]
+    observed_node_names: set[str]
+    output_quantized_idxs: list[int]
+    model_device: Optional[torch.device]
+    weighted_module_classes: tuple
+    fused_module_classes: tuple
+    root_module_classes: tuple
+    backend_config: BackendConfig
+    is_reference: bool
+    is_decomposed: bool
+
+
+def _convert_output_node(node: Node, ctx: _ConvertContext) -> None:
     """Handle an ``output`` node: keep user-requested outputs quantized."""
+    output_quantized_idxs = ctx.output_quantized_idxs
+    graph = ctx.model.graph
     # If the argument is empty we don't need to do anything
     if len(output_quantized_idxs) == 0:
         return
@@ -1038,68 +1058,56 @@ def _convert_output_node(
         )
 
 
-def _convert_call_module_node(
-    node: Node,
-    modules: dict[str, torch.nn.Module],
-    model: GraphModule,
-    node_name_to_scope: dict[str, tuple[str, type]],
-    node_name_to_qconfig: dict[str, QConfigAny],
-    observed_node_names: set[str],
-    model_device: Optional[torch.device],
-    weighted_module_classes: tuple,
-    fused_module_classes: tuple,
-    root_module_classes: tuple,
-    backend_config: BackendConfig,
-    is_reference: bool,
-    is_decomposed: bool,
-) -> None:
+def _convert_call_module_node(node: Node, ctx: _ConvertContext) -> None:
     """Handle a ``call_module`` node by dispatching on the module kind."""
+    model = ctx.model
+    modules = ctx.modules
     mod = _get_module(node, modules)
     assert mod is not None
     if _is_activation_post_process(mod):
-        if is_decomposed:
+        if ctx.is_decomposed:
             _replace_observer_with_quantize_dequantize_node_decomposed(
                 model,
                 node,
                 modules,
-                node_name_to_scope,
-                node_name_to_qconfig,
-                model_device,
+                ctx.node_name_to_scope,
+                ctx.node_name_to_qconfig,
+                ctx.model_device,
             )
         else:
             _replace_observer_with_quantize_dequantize_node(
                 model,
                 node,
                 modules,
-                node_name_to_scope,
-                node_name_to_qconfig,
-                model_device,
+                ctx.node_name_to_scope,
+                ctx.node_name_to_qconfig,
+                ctx.model_device,
             )
     elif isinstance(mod, DeQuantStub):
         _replace_observer_or_dequant_stub_with_dequantize_node(node, model.graph)
     elif _is_observed_standalone_module(mod):
         convert_standalone_module(
-            node, modules, model, is_reference, backend_config
+            node, modules, model, ctx.is_reference, ctx.backend_config
         )
     # below this point `type_before_parametrizations` is used
     # instead of `type` to handle situations with fx quant + sparsity
-    elif type_before_parametrizations(mod) in weighted_module_classes:
+    elif type_before_parametrizations(mod) in ctx.weighted_module_classes:
         # extra check for fused module classes to make sure they are fused module classes
         # of target modules
         if (
-            type_before_parametrizations(mod) in fused_module_classes
-            and type_before_parametrizations(mod[0]) not in root_module_classes
+            type_before_parametrizations(mod) in ctx.fused_module_classes
+            and type_before_parametrizations(mod[0]) not in ctx.root_module_classes
         ):  # type: ignore[index]
             return
         convert_weighted_module(
             node,
             modules,
-            observed_node_names,
-            node_name_to_qconfig,
-            backend_config,
-            is_decomposed,
-            is_reference,
-            model_device,
+            ctx.observed_node_names,
+            ctx.node_name_to_qconfig,
+            ctx.backend_config,
+            ctx.is_decomposed,
+            ctx.is_reference,
+            ctx.model_device,
         )
 
 
@@ -1231,6 +1239,22 @@ def convert(
     )
     model_device = _assert_and_get_unique_device(model)
 
+    convert_ctx = _ConvertContext(
+        model=model,
+        modules=modules,
+        node_name_to_scope=node_name_to_scope,
+        node_name_to_qconfig=node_name_to_qconfig,
+        observed_node_names=observed_node_names,
+        output_quantized_idxs=output_quantized_idxs,
+        model_device=model_device,
+        weighted_module_classes=weighted_module_classes,
+        fused_module_classes=fused_module_classes,
+        root_module_classes=root_module_classes,
+        backend_config=backend_config,
+        is_reference=is_reference,
+        is_decomposed=is_decomposed,
+    )
+
     for node in list(model.graph.nodes):
         if node.op == "placeholder":
             cur_placeholder_node_idx = placeholder_node_seen_cnt
@@ -1242,23 +1266,9 @@ def convert(
                 # floating point inputs in reference quantized models
                 _insert_dequantize_node(node, model.graph)
         elif node.op == "output":
-            _convert_output_node(node, output_quantized_idxs, model.graph)
+            _convert_output_node(node, convert_ctx)
         elif node.op == "call_module":
-            _convert_call_module_node(
-                node,
-                modules,
-                model,
-                node_name_to_scope,
-                node_name_to_qconfig,
-                observed_node_names,
-                model_device,
-                weighted_module_classes,
-                fused_module_classes,
-                root_module_classes,
-                backend_config,
-                is_reference,
-                is_decomposed,
-            )
+            _convert_call_module_node(node, convert_ctx)
 
     # remove deadcode after converting observers to quant/dequant ops
     model.graph.eliminate_dead_code()
