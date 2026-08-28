@@ -1,3 +1,9 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+//
+// This source code is licensed under the BSD 3-Clause license found in the
+// LICENSE file in the root directory of this source tree.
+
 #pragma once
 
 #if defined(__aarch64__) || defined(__ARM_NEON)
@@ -47,6 +53,136 @@ map_values(int8_t* dst, int8_t* src, int8x16_t lut, int size) {
   }
 }
 
+// Loop-invariant state for the LUT pack routine. Bundling it here lets the
+// per-group/per-column helpers take a single context argument instead of a
+// long parameter list, and keeps the main loop shallow.
+template <int weight_nbit, int nr, int kr, int sr>
+struct PackLutContext {
+  // Inputs
+  const int8_t* weight_qval_idxs;
+  const float* weight_scales;
+  const int8_t* weight_zeros; // nullptr if not packed
+  const float* bias; // nullptr if not packed
+  int n;
+  int k;
+  int groups_per_k;
+
+  // Reused scratch buffers
+  std::array<int8_t, nr * kr>& buffer;
+  int8_t* packed_values;
+  std::array<int8_t, kr>& mapped_val_buffer;
+  std::array<int, nr>& qvals_sum;
+  int packed_buffer_bytes;
+
+  // Current LUT for the nr-column block being packed
+  int8x16_t lut;
+
+  // Output cursor
+  char* out;
+};
+
+// Gather the kr values (per column) for the next nr columns at a given column
+// offset, accumulate their LUT-mapped sums, and pack them into the output.
+// Columns beyond n are zero-filled.
+template <int weight_nbit, int nr, int kr, int sr>
+TORCHAO_ALWAYS_INLINE inline void pack_next_nr_columns(
+    PackLutContext<weight_nbit, nr, kr, sr>& ctx,
+    int n_idx,
+    int col_offset) {
+  // Fill buffer with next kr values from the next nr columns
+  // If there are fewer than nr columns, 0s are stored
+  ctx.buffer.fill(0);
+  for (int j = 0; j < nr; j++) {
+    if (n_idx + j >= ctx.n) {
+      continue;
+    }
+    std::memcpy(
+        ctx.buffer.data() + kr * j,
+        ctx.weight_qval_idxs + (n_idx + j) * ctx.k + col_offset,
+        kr);
+    internal::map_values(
+        ctx.mapped_val_buffer.data(), ctx.buffer.data() + kr * j, ctx.lut, kr);
+    ctx.qvals_sum[j] +=
+        reduction::compute_sum(ctx.mapped_val_buffer.data(), kr);
+  }
+
+  // Pack buffer
+  torchao::weight_packing::pack_values(
+      ctx.packed_values, ctx.buffer.data(), nr, kr, sr);
+  internal::pack_buffer_for_lut<weight_nbit, kr, nr>(ctx.out, ctx.packed_values);
+  ctx.out += ctx.packed_buffer_bytes;
+}
+
+// Pack all kr-strided columns for one group (the inner idx_in_group loop).
+template <int weight_nbit, int nr, int kr, int sr>
+TORCHAO_ALWAYS_INLINE inline void pack_group_columns(
+    PackLutContext<weight_nbit, nr, kr, sr>& ctx,
+    int n_idx,
+    int group_idx,
+    int group_size) {
+  int k_idx = group_idx * group_size;
+  for (int idx_in_group = 0; idx_in_group < group_size; idx_in_group += kr) {
+    pack_next_nr_columns<weight_nbit, nr, kr, sr>(
+        ctx, n_idx, k_idx + idx_in_group);
+  }
+}
+
+// Store the per-group attributes (scales, qval sums, and optional zeros) for
+// the next nr columns. Columns beyond n are zero-filled.
+template <int weight_nbit, int nr, int kr, int sr>
+TORCHAO_ALWAYS_INLINE inline void store_group_attributes(
+    PackLutContext<weight_nbit, nr, kr, sr>& ctx,
+    int n_idx,
+    int group_idx) {
+  // Store weight scales
+  for (int j = 0; j < nr; j++) {
+    float32_t scale = 0.0;
+    if (n_idx + j < ctx.n) {
+      scale = ctx.weight_scales[(n_idx + j) * ctx.groups_per_k + group_idx];
+    }
+    *((float*)ctx.out) = scale;
+    ctx.out += sizeof(float);
+  }
+
+  // Store weight qval sums
+  for (int j = 0; j < nr; j++) {
+    *((int*)ctx.out) = ctx.qvals_sum[j];
+    ctx.out += sizeof(int);
+  }
+
+  // Store weight zeros
+  if (ctx.weight_zeros == nullptr) {
+    return;
+  }
+  for (int j = 0; j < nr; j++) {
+    int32_t zero = 0;
+    if (n_idx + j < ctx.n) {
+      zero = ctx.weight_zeros[(n_idx + j) * ctx.groups_per_k + group_idx];
+    }
+    *((int32_t*)ctx.out) = zero;
+    ctx.out += sizeof(int32_t);
+  }
+}
+
+// Store the optional per-nr-column bias values. Columns beyond n are
+// zero-filled.
+template <int weight_nbit, int nr, int kr, int sr>
+TORCHAO_ALWAYS_INLINE inline void store_bias(
+    PackLutContext<weight_nbit, nr, kr, sr>& ctx,
+    int n_idx) {
+  if (ctx.bias == nullptr) {
+    return;
+  }
+  for (int j = 0; j < nr; j++) {
+    float bias_ = 0.0;
+    if (n_idx + j < ctx.n) {
+      bias_ = ctx.bias[n_idx + j];
+    }
+    *((float*)ctx.out) = bias_;
+    ctx.out += sizeof(float);
+  }
+}
+
 // LUT-specific pack_weights implementation (aarch64-only, uses NEON for LUT mapping)
 template <int weight_nbit, int nr, int kr, int sr>
 TORCHAO_ALWAYS_INLINE inline void pack_weights_with_lut_impl(
@@ -68,16 +204,12 @@ TORCHAO_ALWAYS_INLINE inline void pack_weights_with_lut_impl(
     const float* bias) {
   assert(k % group_size == 0);
   assert(group_size % kr == 0);
-  bool has_weight_zeros = (weight_zeros != nullptr);
-  bool has_bias = (bias != nullptr);
   int groups_per_k = k / group_size;
 
   // LUT has size lut_size, which is <= 16
   // If lut_size < 16, we extend it with 0s in lut_buffer
-  int8x16_t lut;
   constexpr int lut_size = (1 << weight_nbit);
   std::array<int8_t, 16> lut_buffer;
-  int cols_per_lut;
 
   // Buffer to hold kr qvals, mapped with LUT from qval_idxs
   std::array<int8_t, kr> mapped_val_buffer;
@@ -87,7 +219,7 @@ TORCHAO_ALWAYS_INLINE inline void pack_weights_with_lut_impl(
   lut_buffer.fill(0);
 
   assert(n % n_luts == 0);
-  cols_per_lut = n / n_luts;
+  int cols_per_lut = n / n_luts;
   assert((cols_per_lut == n) || (cols_per_lut % nr == 0));
 
   // Buffer to hold (kr * nr) values
@@ -104,8 +236,22 @@ TORCHAO_ALWAYS_INLINE inline void pack_weights_with_lut_impl(
   // Buffer to hold sum of weight_qvals in each column group
   std::array<int, nr> qvals_sum;
 
-  // Data pointer for packed weights
-  auto packed_weights_byte_ptr = (char*)packed_weights;
+  // Bundle the loop-invariant state; ctx.out is the packed-weights cursor.
+  PackLutContext<weight_nbit, nr, kr, sr> ctx{
+      weight_qval_idxs,
+      weight_scales,
+      weight_zeros,
+      bias,
+      n,
+      k,
+      groups_per_k,
+      buffer,
+      packed_values,
+      mapped_val_buffer,
+      qvals_sum,
+      packed_buffer_bytes,
+      vdupq_n_s8(0),
+      (char*)packed_weights};
 
   // Loop over n by nr
   for (int n_idx = 0; n_idx < n; n_idx += nr) {
@@ -115,84 +261,25 @@ TORCHAO_ALWAYS_INLINE inline void pack_weights_with_lut_impl(
       if (group_idx == 0) {
         int lut_idx = n_idx / cols_per_lut;
         std::memcpy(lut_buffer.data(), luts + lut_idx * lut_size, lut_size);
-        lut = vld1q_s8(lut_buffer.data());
-        vst1q_s8((int8_t*)packed_weights_byte_ptr, lut);
-        packed_weights_byte_ptr += 16;
+        ctx.lut = vld1q_s8(lut_buffer.data());
+        vst1q_s8((int8_t*)ctx.out, ctx.lut);
+        ctx.out += 16;
       }
 
       // Initialize qvals_sum for each group to 0
       qvals_sum.fill(0);
 
-      // Loop over group by kr and pack the weights for the next nr columns
-      int k_idx = group_idx * group_size;
-      for (int idx_in_group = 0; idx_in_group < group_size;
-           idx_in_group += kr) {
-        // Fill buffer with next kr values from the next nr columns
-        // If there are fewer than nr columns, 0s are stored
-        buffer.fill(0);
-        for (int j = 0; j < nr; j++) {
-          if (n_idx + j < n) {
-            std::memcpy(
-                buffer.data() + kr * j,
-                weight_qval_idxs + (n_idx + j) * k + (k_idx + idx_in_group),
-                kr);
-            internal::map_values(
-                mapped_val_buffer.data(), buffer.data() + kr * j, lut, kr);
-            qvals_sum[j] +=
-                reduction::compute_sum(mapped_val_buffer.data(), kr);
-          }
-        }
+      // Pack the weights for the next nr columns, group by group
+      pack_group_columns<weight_nbit, nr, kr, sr>(
+          ctx, n_idx, group_idx, group_size);
 
-        // Pack buffer
-        torchao::weight_packing::pack_values(packed_values, buffer.data(), nr, kr, sr);
-        internal::pack_buffer_for_lut<weight_nbit, kr, nr>(
-            packed_weights_byte_ptr, packed_values);
-        packed_weights_byte_ptr += packed_buffer_bytes;
-      } // loop over group (idx_in_group)
-
-      // Store group attributes scale, qval_sums, and zeros for next nr columns
-      // If there are fewer than nr columns, 0s are stored
-
-      // Store weight scales
-      for (int j = 0; j < nr; j++) {
-        float32_t scale = 0.0;
-        if (n_idx + j < n) {
-          scale = weight_scales[(n_idx + j) * groups_per_k + group_idx];
-        }
-        *((float*)packed_weights_byte_ptr) = scale;
-        packed_weights_byte_ptr += sizeof(float);
-      }
-
-      // Store weight qval sums
-      for (int j = 0; j < nr; j++) {
-        *((int*)packed_weights_byte_ptr) = qvals_sum[j];
-        packed_weights_byte_ptr += sizeof(int);
-      }
-
-      // Store weight zeros
-      if (has_weight_zeros) {
-        for (int j = 0; j < nr; j++) {
-          int32_t zero = 0;
-          if (n_idx + j < n) {
-            zero = weight_zeros[(n_idx + j) * groups_per_k + group_idx];
-          }
-          *((int32_t*)packed_weights_byte_ptr) = zero;
-          packed_weights_byte_ptr += sizeof(int32_t);
-        }
-      }
+      // Store group attributes scale, qval_sums, and zeros for next nr columns.
+      // If there are fewer than nr columns, 0s are stored.
+      store_group_attributes<weight_nbit, nr, kr, sr>(ctx, n_idx, group_idx);
     } // loop over k (group_idx)
 
     // Store bias for next nr columns
-    if (has_bias) {
-      for (int j = 0; j < nr; j++) {
-        float bias_ = 0.0;
-        if (n_idx + j < n) {
-          bias_ = bias[n_idx + j];
-        }
-        *((float*)packed_weights_byte_ptr) = bias_;
-        packed_weights_byte_ptr += sizeof(float);
-      }
-    }
+    store_bias<weight_nbit, nr, kr, sr>(ctx, n_idx);
   } // n_idx
 }
 
