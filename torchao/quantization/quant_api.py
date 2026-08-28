@@ -95,7 +95,9 @@ from .granularity import (
 )
 from .linear_quant_modules import (
     Int4WeightOnlyQuantizer,
+    Int4WeightOnlyQuantizerConfig,
     Int8DynActInt4WeightQuantizer,
+    Int8DynActInt4WeightQuantizerConfig,
 )
 from .qat import (
     intx_quantization_aware_training,
@@ -112,10 +114,12 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "swap_conv2d_1x1_to_linear",
     "Int4WeightOnlyQuantizer",
+    "Int4WeightOnlyQuantizerConfig",
     "_get_subclass_inserter",
     "quantize_",
     "intx_quantization_aware_training",
     "Int8DynActInt4WeightQuantizer",
+    "Int8DynActInt4WeightQuantizerConfig",
     "ModuleFqnToConfig",
 ]
 

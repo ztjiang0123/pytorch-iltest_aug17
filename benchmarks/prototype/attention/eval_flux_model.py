@@ -87,6 +87,16 @@ class BenchmarkConfig:
 
 
 @dataclass
+class RunSpec:
+    """Run-level inputs that select what to benchmark, not how to generate."""
+
+    baseline_backend: str = "fa3"
+    test_backend: str = "fa3_fp8"
+    num_prompts: int = 50
+    debug_prompt: Optional[str] = None
+
+
+@dataclass
 class GenSettings:
     """Per-backend generation settings resolved by ``setup_backend``."""
 
@@ -399,22 +409,14 @@ def _report_results(
 
 
 @torch.inference_mode()
-def run_benchmark(
-    baseline_backend: str = "fa3",
-    test_backend: str = "fa3_fp8",
-    num_prompts: int = 50,
-    num_inference_steps: int = 20,
-    height: int = 2048,
-    width: int = 2048,
-    debug_prompt: Optional[str] = None,
-    warmup_iters: int = 2,
-    compile: bool = False,
-):
+def run_benchmark(spec: RunSpec, config: BenchmarkConfig):
     """Run the attention backend benchmark on FLUX.1-schnell."""
-    compile_str = " + torch.compile" if compile else ""
+    compile_str = " + torch.compile" if config.compile else ""
     print("=" * 80)
     print("Attention Backend Benchmark for FLUX.1-schnell")
-    print(f"Baseline: {baseline_backend}  |  Test: {test_backend}{compile_str}")
+    print(
+        f"Baseline: {spec.baseline_backend}  |  Test: {spec.test_backend}{compile_str}"
+    )
     print("=" * 80)
 
     torch.manual_seed(RANDOM_SEED)
@@ -422,30 +424,23 @@ def run_benchmark(
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
 
-    config = BenchmarkConfig(
-        device="cuda",
-        num_inference_steps=num_inference_steps,
-        height=height,
-        width=width,
-        warmup_iters=warmup_iters,
-        compile=compile,
-    )
-
-    prompts = _load_prompts(debug_prompt, num_prompts)
+    prompts = _load_prompts(spec.debug_prompt, spec.num_prompts)
     runner = _load_runner(config)
 
     baseline_data, avg_baseline_ms = _run_baseline_phase(
-        runner, baseline_backend, prompts
+        runner, spec.baseline_backend, prompts
     )
 
     # ----- Cleanup before test phase -----
     cleanup_gpu()
 
-    lpips_values, avg_test_ms = _run_test_phase(runner, test_backend, baseline_data)
+    lpips_values, avg_test_ms = _run_test_phase(
+        runner, spec.test_backend, baseline_data
+    )
 
     return _report_results(
         config,
-        (baseline_backend, test_backend),
+        (spec.baseline_backend, spec.test_backend),
         (avg_baseline_ms, avg_test_ms),
         lpips_values,
         len(prompts),
@@ -514,17 +509,21 @@ def main():
 
     args = parser.parse_args()
 
-    run_benchmark(
+    spec = RunSpec(
         baseline_backend=args.baseline,
         test_backend=args.test,
         num_prompts=args.num_prompts,
+        debug_prompt=args.debug_prompt,
+    )
+    config = BenchmarkConfig(
+        device="cuda",
         num_inference_steps=args.num_inference_steps,
         height=args.height,
         width=args.width,
-        debug_prompt=args.debug_prompt,
         warmup_iters=args.warmup_iters,
         compile=args.compile,
     )
+    run_benchmark(spec, config)
 
 
 if __name__ == "__main__":

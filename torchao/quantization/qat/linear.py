@@ -11,6 +11,8 @@ import torch.nn.functional as F
 
 from torchao.quantization.granularity import PerGroup, PerRow
 from torchao.quantization.linear_quant_modules import (
+    Int4LinearConfig,
+    Int8DynActInt4WeightConfig,
     Int8DynActInt4WeightLinear,
     WeightOnlyInt4Linear,
     _check_linear_int4_k,
@@ -239,10 +241,12 @@ class Int8DynActInt4WeightQATQuantizer(_LegacyQATQuantizer):
                 quantized_linear = Int8DynActInt4WeightLinear(
                     child.in_features,
                     child.out_features,
-                    child.bias is not None,
-                    groupsize=config.group_size,
-                    precision=child.weight.dtype,
-                    scales_precision=config.scale_precision,
+                    config=Int8DynActInt4WeightConfig(
+                        bias=child.bias is not None,
+                        groupsize=config.group_size,
+                        precision=child.weight.dtype,
+                        scales_precision=config.scale_precision,
+                    ),
                 )
                 setattr(module, name, quantized_linear)
 
@@ -302,12 +306,12 @@ class Int8DynActInt4WeightQATLinear(FakeQuantizedLinear):
         self,
         in_features: int,
         out_features: int,
-        bias: bool = False,
-        device: torch.device = None,
-        groupsize: int = 256,
-        precision: torch.dtype = torch.float32,
-        scales_precision: torch.dtype = torch.float32,
+        config: Optional[Int8DynActInt4WeightConfig] = None,
     ) -> None:
+        if config is None:
+            config = Int8DynActInt4WeightConfig(bias=False)
+        groupsize = config.groupsize
+        scales_precision = config.scales_precision
         # Use torch.float32 to match the PTQ activation quantization scale dtype
         # TODO: generalize this
         activation_config = _get_8da4w_activation_config(torch.float32)
@@ -315,11 +319,11 @@ class Int8DynActInt4WeightQATLinear(FakeQuantizedLinear):
         super().__init__(
             in_features,
             out_features,
-            bias,
+            config.bias,
             activation_config,
             weight_config,
-            device=device,
-            dtype=precision,
+            device=config.device,
+            dtype=config.precision,
         )
 
     def enable_fake_quant(self, enabled: bool = True):
@@ -441,12 +445,14 @@ class Int4WeightOnlyQATQuantizer(_LegacyQATQuantizer):
                 quantized_linear = WeightOnlyInt4Linear(
                     in_features,
                     out_features,
-                    bias=False,
-                    groupsize=config.group_size,
-                    inner_k_tiles=inner_k_tiles,
-                    precision=child.weight.dtype,
-                    scales_precision=config.scale_precision,
-                    device=next(child.parameters()).device,
+                    config=Int4LinearConfig(
+                        bias=False,
+                        device=next(child.parameters()).device,
+                        groupsize=config.group_size,
+                        inner_k_tiles=inner_k_tiles,
+                        precision=child.weight.dtype,
+                        scales_precision=config.scale_precision,
+                    ),
                 )
                 setattr(module, name, quantized_linear)
 
@@ -492,13 +498,13 @@ class Int4WeightOnlyQATLinear(FakeQuantizedLinear):
         self,
         in_features: int,
         out_features: int,
-        bias: bool = False,
-        device: torch.device = None,
-        groupsize: int = 256,
-        inner_k_tiles: int = 8,
-        precision: torch.dtype = torch.bfloat16,
-        scales_precision: torch.dtype = torch.bfloat16,
+        config: Optional[Int4LinearConfig] = None,
     ) -> None:
+        if config is None:
+            config = Int4LinearConfig(groupsize=256)
+        groupsize = config.groupsize
+        inner_k_tiles = config.inner_k_tiles
+        scales_precision = config.scales_precision
         assert scales_precision == torch.bfloat16, "only bf16 is supported for scales"
         if not _check_linear_int4_k(in_features, groupsize, inner_k_tiles):
             raise ValueError("Padding for QAT 4w is not supported yet")
@@ -507,11 +513,11 @@ class Int4WeightOnlyQATLinear(FakeQuantizedLinear):
         super().__init__(
             in_features,
             out_features,
-            bias,
+            config.bias,
             activation_config=None,
             weight_config=weight_config,
-            device=device,
-            dtype=precision,
+            device=config.device,
+            dtype=config.precision,
         )
 
     def enable_fake_quant(self, enabled: bool = True):

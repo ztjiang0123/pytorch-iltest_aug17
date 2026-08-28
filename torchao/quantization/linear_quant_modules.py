@@ -9,6 +9,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Type
 
 import torch
@@ -30,6 +31,10 @@ from .utils import (
 aten = torch.ops.aten
 
 __all__ = [
+    "Int4LinearConfig",
+    "Int4WeightOnlyQuantizerConfig",
+    "Int8DynActInt4WeightConfig",
+    "Int8DynActInt4WeightQuantizerConfig",
     "WeightOnlyInt4Linear",
     "Int4WeightOnlyQuantizer",
     "Int8DynActInt4WeightQuantizer",
@@ -74,6 +79,23 @@ def linear_forward_int4(
     return c
 
 
+@dataclass
+class Int4LinearConfig:
+    """Construction options for the int4 weight-only linear layer.
+
+    Grouping these related values (placement plus quantization settings) keeps
+    ``WeightOnlyInt4Linear``'s constructor down to the required in/out shape and
+    makes the settings easy to pass around together.
+    """
+
+    bias: bool = False
+    device: Optional[torch.device] = None
+    groupsize: int = 128
+    inner_k_tiles: int = 8
+    precision: torch.dtype = torch.bfloat16
+    scales_precision: torch.dtype = torch.bfloat16
+
+
 class WeightOnlyInt4Linear(torch.nn.Module):
     __constants__ = ["in_features", "out_features"]
     in_features: int
@@ -84,16 +106,15 @@ class WeightOnlyInt4Linear(torch.nn.Module):
         self,
         in_features: int,
         out_features: int,
-        # TODO: remove dtype field, not used
-        bias=False,
-        device=None,
-        dtype=None,
-        groupsize: int = 128,
-        inner_k_tiles: int = 8,
-        precision: torch.dtype = torch.bfloat16,
-        scales_precision: torch.dtype = torch.bfloat16,
+        config: Optional[Int4LinearConfig] = None,
     ) -> None:
         super().__init__()
+        if config is None:
+            config = Int4LinearConfig()
+        groupsize = config.groupsize
+        inner_k_tiles = config.inner_k_tiles
+        device = config.device
+
         self.padding = not _check_linear_int4_k(in_features, groupsize, inner_k_tiles)
         if self.padding:
             self.origin_in_features = in_features
@@ -101,15 +122,12 @@ class WeightOnlyInt4Linear(torch.nn.Module):
 
         self.in_features = in_features
         self.out_features = out_features
-        assert not bias, "require bias=False"
+        assert not config.bias, "require bias=False"
         self.device = device
         self.groupsize = groupsize
         self.inner_k_tiles = inner_k_tiles
-        self.precision = precision
-        self.scales_precision = scales_precision
-
-        if dtype is not None:
-            raise ValueError("Please specify 'precision' instead of 'dtype'")
+        self.precision = config.precision
+        self.scales_precision = config.scales_precision
 
         assert out_features % 8 == 0, "require out_features % 8 == 0"
         assert in_features % (inner_k_tiles * 16) == 0, (
@@ -141,7 +159,6 @@ class WeightOnlyInt4Linear(torch.nn.Module):
                     device=device,
                 ),
             )
-        self.dtype = dtype
         self.register_buffer(
             "scales_and_zeros",
             torch.zeros(
@@ -190,12 +207,14 @@ def _replace_linear_int4(
                 new_linear = linear_class(
                     child.in_features,
                     child.out_features,
-                    bias=False,
-                    device=child.weight.device,
-                    groupsize=groupsize,
-                    inner_k_tiles=inner_k_tiles,
-                    precision=precision,
-                    scales_precision=scales_precision,
+                    config=Int4LinearConfig(
+                        bias=False,
+                        device=child.weight.device,
+                        groupsize=groupsize,
+                        inner_k_tiles=inner_k_tiles,
+                        precision=precision,
+                        scales_precision=scales_precision,
+                    ),
                 )
                 # TODO: merge with 8da4w?
                 # In distributed training, the model may be instantiated
@@ -231,25 +250,37 @@ def replace_linear_int4(
     )
 
 
+@dataclass
+class Int4WeightOnlyQuantizerConfig:
+    """Options for :class:`Int4WeightOnlyQuantizer`.
+
+    Grouping these related settings keeps the quantizer's constructor small.
+    """
+
+    groupsize: int = 256
+    padding_allowed: bool = True
+    inner_k_tiles: Optional[int] = 8
+    device: torch.device = torch.device("cuda")
+    precision: torch.dtype = torch.bfloat16
+
+
 class Int4WeightOnlyQuantizer:
     def __init__(
         self,
-        groupsize: int = 256,
-        padding_allowed: bool = True,
-        inner_k_tiles: Optional[int] = 8,
-        device: torch.device = torch.device("cuda"),
-        precision: torch.dtype = torch.bfloat16,
+        config: Optional[Int4WeightOnlyQuantizerConfig] = None,
     ) -> None:
         super().__init__()
-        assert inner_k_tiles in [2, 4, 8]
-        assert groupsize in [32, 64, 128, 256]
+        if config is None:
+            config = Int4WeightOnlyQuantizerConfig()
+        assert config.inner_k_tiles in [2, 4, 8]
+        assert config.groupsize in [32, 64, 128, 256]
 
-        self.inner_k_tiles = inner_k_tiles
-        self.groupsize: int = groupsize
-        self.padding_allowed: bool = padding_allowed
-        self.device: torch.device = device
+        self.inner_k_tiles = config.inner_k_tiles
+        self.groupsize: int = config.groupsize
+        self.padding_allowed: bool = config.padding_allowed
+        self.device: torch.device = config.device
         # precision and dtype are being used interchangeably here
-        self.precision: torch.dtype = precision
+        self.precision: torch.dtype = config.precision
 
     @torch.no_grad()
     def _create_quantized_state_dict(
@@ -385,6 +416,22 @@ def linear_forward_8da4w(
     return c
 
 
+@dataclass
+class Int8DynActInt4WeightConfig:
+    """Construction options for the int8-dynamic-act int4-weight linear layer.
+
+    Grouping these related values (placement plus quantization settings) keeps
+    ``Int8DynActInt4WeightLinear``'s constructor down to the required in/out
+    shape and makes the settings easy to pass around together.
+    """
+
+    bias: bool = True
+    device: Optional[torch.device] = None
+    groupsize: int = 256
+    precision: torch.dtype = torch.float32
+    scales_precision: torch.dtype = torch.float32
+
+
 class Int8DynActInt4WeightLinear(torch.nn.Module):
     __constants__ = ["in_features", "out_features"]
 
@@ -406,15 +453,18 @@ class Int8DynActInt4WeightLinear(torch.nn.Module):
         self,
         in_features: int,
         out_features: int,
-        bias=True,
-        device=None,
-        # TODO: remove this field, not used
-        dtype=None,
-        groupsize: int = 256,
-        precision: torch.dtype = torch.float32,
-        scales_precision: torch.dtype = torch.float32,
+        config: Optional[Int8DynActInt4WeightConfig] = None,
     ) -> None:
         super().__init__()
+        if config is None:
+            config = Int8DynActInt4WeightConfig()
+        bias = config.bias
+        groupsize = config.groupsize
+        precision = config.precision
+        scales_precision = config.scales_precision
+        # Note: config.device is accepted for API symmetry but, as in the
+        # original implementation, buffers are created on the default device and
+        # moved later by the caller (e.g. via copy_weights).
         # always pad if needed since it becomes a noop at runtime if not needed
         # self.origin_in_features = in_features
         assert in_features % groupsize == 0, (
@@ -431,9 +481,6 @@ class Int8DynActInt4WeightLinear(torch.nn.Module):
         # output precision of the dynamically quantized linear layer
         # that his module represents.
         self.precision = precision
-
-        if dtype is not None:
-            raise ValueError("Please specify 'precision' instead of 'dtype'")
 
         # currently storing unpacked int8 weights
         self.register_buffer(
@@ -497,11 +544,13 @@ def _replace_linear_8da4w(
         new_linear = linear_class(
             child.in_features,
             child.out_features,
-            bias=child.bias is not None,
-            device=child.weight.device,
-            groupsize=groupsize,
-            precision=precision,
-            scales_precision=scales_precision,
+            config=Int8DynActInt4WeightConfig(
+                bias=child.bias is not None,
+                device=child.weight.device,
+                groupsize=groupsize,
+                precision=precision,
+                scales_precision=scales_precision,
+            ),
         )
         # In distributed training, the model may be instantiated
         # on the meta device, in which case there is no need to
@@ -531,23 +580,35 @@ def replace_linear_8da4w(
     )
 
 
+@dataclass
+class Int8DynActInt4WeightQuantizerConfig:
+    """Options for :class:`Int8DynActInt4WeightQuantizer`.
+
+    Grouping these related settings keeps the quantizer's constructor small.
+    """
+
+    groupsize: int = 256
+    padding_allowed: bool = False
+    precision: torch.dtype = torch.float32
+    scales_precision: torch.dtype = torch.float32
+    device: torch.device = torch.device("cpu")
+    mapping_type: MappingType = MappingType.SYMMETRIC
+
+
 class Int8DynActInt4WeightQuantizer:
     def __init__(
         self,
-        groupsize: int = 256,
-        padding_allowed: bool = False,
-        precision: torch.dtype = torch.float32,
-        scales_precision: torch.dtype = torch.float32,
-        device: torch.device = torch.device("cpu"),
-        mapping_type: MappingType = MappingType.SYMMETRIC,
+        config: Optional[Int8DynActInt4WeightQuantizerConfig] = None,
     ) -> None:
         super().__init__()
-        self.groupsize: int = groupsize
-        self.padding_allowed: bool = padding_allowed
-        self.precision: torch.dtype = precision
-        self.scales_precision: torch.dtype = scales_precision
-        self.device: torch.device = device
-        self.mapping_type: MappingType = mapping_type
+        if config is None:
+            config = Int8DynActInt4WeightQuantizerConfig()
+        self.groupsize: int = config.groupsize
+        self.padding_allowed: bool = config.padding_allowed
+        self.precision: torch.dtype = config.precision
+        self.scales_precision: torch.dtype = config.scales_precision
+        self.device: torch.device = config.device
+        self.mapping_type: MappingType = config.mapping_type
 
     @torch.no_grad()
     def _create_quantized_state_dict(
