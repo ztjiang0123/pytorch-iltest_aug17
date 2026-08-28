@@ -188,6 +188,70 @@ TORCHAO_ALWAYS_INLINE inline void write_strip_bias(
   }
 }
 
+// Read-only inputs and scratch buffers shared by every k-block of a strip.
+// Grouped so the per-block/per-strip helpers keep a short parameter list.
+struct PackStripInputs {
+  const uint8_t* weight_qval_indices;
+  const float* weight_scales;
+  std::vector<uint8_t>& padded_tile;
+  std::vector<uint8_t>& tmp_buffer;
+  int k;
+  int scale_group_size;
+  int scales_per_col;
+  bool has_scales;
+};
+
+// Packs one (nr_ x kr_) k-block: optional interleaved scales, then the
+// bit-packed VNNI tile. Advances `out_ptr` past everything it writes.
+template <int weight_nbit_, int nr_, int kr_, int sr_>
+TORCHAO_ALWAYS_INLINE inline void pack_k_block(
+    uint8_t*& out_ptr,
+    const PackStripInputs& in,
+    StripColumns cols,
+    int k_idx) {
+  constexpr int bytes_per_128_packed_values =
+      ((nr_ * kr_ * weight_nbit_) + 7) / 8;
+  int w_idx = cols.n_idx * in.k + k_idx;
+  // Write scales if k_idx is a multiple of scale_group_size.
+  if (in.has_scales && (k_idx % in.scale_group_size == 0)) {
+    write_block_scales<nr_>(
+        out_ptr,
+        in.weight_scales,
+        w_idx / in.scale_group_size,
+        in.scales_per_col,
+        cols);
+  }
+  // Write 128 packed tile (kr x nr).
+  gather_weight_tile<nr_, kr_>(
+      in.padded_tile, in.weight_qval_indices, w_idx, in.k, cols);
+  torchao::weight_packing::pack_values(
+      in.tmp_buffer.data(), in.padded_tile.data(), nr_, kr_, sr_);
+  const uint8_t* buffer = in.tmp_buffer.data();
+  torchao::bitpacking::vec_pack_128_uintx_values<weight_nbit_>(
+      reinterpret_cast<uint8_t*>(out_ptr),
+      vld1q_u8(buffer),
+      vld1q_u8(buffer + 16),
+      vld1q_u8(buffer + 32),
+      vld1q_u8(buffer + 48),
+      vld1q_u8(buffer + 64),
+      vld1q_u8(buffer + 80),
+      vld1q_u8(buffer + 96),
+      vld1q_u8(buffer + 112));
+  out_ptr += bytes_per_128_packed_values;
+}
+
+// Packs every k-block of one n-strip. Keeps the ``k_idx`` loop (and its inner
+// scale branch) out of ``pack_weights`` so that function stays shallow.
+template <int weight_nbit_, int nr_, int kr_, int sr_>
+TORCHAO_ALWAYS_INLINE inline void pack_strip_blocks(
+    uint8_t*& out_ptr,
+    const PackStripInputs& in,
+    StripColumns cols) {
+  for (int k_idx = 0; k_idx < in.k; k_idx += kr_) {
+    pack_k_block<weight_nbit_, nr_, kr_, sr_>(out_ptr, in, cols, k_idx);
+  }
+}
+
 } // namespace detail
 
 template <int weight_nbit_, int nr_, int kr_, int sr_>
@@ -227,52 +291,27 @@ TORCHAO_ALWAYS_INLINE inline void pack_weights(
   auto* out_ptr = reinterpret_cast<uint8_t*>(packed_weights_ptr);
   constexpr int kLutBufferSize = 16;
   std::vector<float> lut_buffer(kLutBufferSize);
-
   std::vector<uint8_t> padded_tile(nr_ * kr_);
-
   std::vector<uint8_t> tmp_buffer(128);
-  constexpr int bytes_per_128_packed_values =
-      ((nr_ * kr_ * weight_nbit_) + 7) / 8;
 
   const int lut_size = 1 << weight_nbit_;
-  const int scales_per_col = k / scale_group_size;
+  const detail::PackStripInputs strip_inputs{
+      weight_qval_indices,
+      weight_scales,
+      padded_tile,
+      tmp_buffer,
+      k,
+      scale_group_size,
+      /* scales_per_col */ k / scale_group_size,
+      has_scales};
 
   for (int n_idx = 0; n_idx < n; n_idx += nr_) {
     const detail::StripColumns cols{n_idx, n};
     int current_lut_idx = (n_idx * k) / lut_group_size;
     detail::write_strip_lut<nr_>(
         out_ptr, lut_buffer, weight_luts, current_lut_idx, lut_size);
-
-    for (int k_idx = 0; k_idx < k; k_idx += kr_) {
-      int w_idx = n_idx * k + k_idx;
-      // Write scales if k_idx is a multiple of scale_group_size
-      if (has_scales && (k_idx % scale_group_size == 0)) {
-        detail::write_block_scales<nr_>(
-            out_ptr,
-            weight_scales,
-            w_idx / scale_group_size,
-            scales_per_col,
-            cols);
-      }
-      // Write 128 packed tile (kr x nr)
-      detail::gather_weight_tile<nr_, kr_>(
-          padded_tile, weight_qval_indices, w_idx, k, cols);
-      torchao::weight_packing::pack_values(
-          tmp_buffer.data(), padded_tile.data(), nr_, kr_, sr_);
-      const uint8_t* buffer = tmp_buffer.data();
-      torchao::bitpacking::vec_pack_128_uintx_values<weight_nbit_>(
-          reinterpret_cast<uint8_t*>(out_ptr),
-          vld1q_u8(buffer),
-          vld1q_u8(buffer + 16),
-          vld1q_u8(buffer + 32),
-          vld1q_u8(buffer + 48),
-          vld1q_u8(buffer + 64),
-          vld1q_u8(buffer + 80),
-          vld1q_u8(buffer + 96),
-          vld1q_u8(buffer + 112));
-      out_ptr += bytes_per_128_packed_values;
-    } // k_idx
-
+    detail::pack_strip_blocks<weight_nbit_, nr_, kr_, sr_>(
+        out_ptr, strip_inputs, cols);
     if (has_bias) {
       detail::write_strip_bias<nr_>(out_ptr, bias, cols);
     }
