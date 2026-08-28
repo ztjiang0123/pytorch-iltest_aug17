@@ -48,33 +48,20 @@ from torchao.prototype.attention.quantization.triton_qkv_quantization import (
 )
 @triton.jit
 def hadamard_single_phase1_kernel(
-    # Input tensor [B, H, S, D]
-    x_ptr,
-    # Intermediate output tensor [B, H, S, D] - Hadamard'd
-    x_had_ptr,
-    # Temp buffer for Hadamard butterfly [B, H, num_chunks, D]
-    temp_ptr,
-    # Output: partial max values [B * H * num_chunks]
-    partial_max_ptr,
-    # Input strides (for [B, H, S, D] layout)
-    stride_b,
-    stride_h,
-    stride_s,
-    stride_d,
-    # Temp buffer strides [B, H, num_chunks, D]
-    stride_temp_b,
-    stride_temp_h,
-    stride_temp_c,
-    stride_temp_d,
-    # Dimensions
-    S,
-    H,
-    chunk_size,
-    num_chunks,
-    # Compile-time constants
+    # Buffer pointers, in order:
+    #   x_ptr           input tensor            [B, H, S, D]
+    #   x_had_ptr       Hadamard'd intermediate [B, H, S, D]
+    #   temp_ptr        butterfly scratch       [B, H, num_chunks, D] (contiguous)
+    #   partial_max_ptr partial max values      [B * H * num_chunks]
+    ptrs,
+    # Input strides for [B, H, S, D] layout: (stride_b, stride_h, stride_s, stride_d)
+    strides,
+    # Dimensions: (S, H, chunk_size, num_chunks)
+    dims,
+    # Head dimension (kept separate so it can key the autotuner)
     D: tl.constexpr,
-    LOG2_D: tl.constexpr,
-    USE_BFLOAT16: tl.constexpr,
+    # Remaining compile-time constants: (LOG2_D, USE_BFLOAT16)
+    META: tl.constexpr,
 ):
     """
     Phase 1 for a single tensor: Apply Hadamard transform, store to
@@ -82,15 +69,25 @@ def hadamard_single_phase1_kernel(
 
     Grid: (B, H, num_chunks)
     Block: D threads, each handles one d index across all S positions in chunk.
+
+    ``ptrs``, ``strides`` and ``dims`` bundle what would otherwise be long,
+    same-typed parameter runs; the temp buffer is contiguous so its per-block
+    region is derived from the dimensions instead of passed-in strides.
     """
+    x_ptr, x_had_ptr, temp_ptr, partial_max_ptr = ptrs
+    stride_b, stride_h, stride_s, stride_d = strides
+    S, H, chunk_size, num_chunks = dims
+    LOG2_D, USE_BFLOAT16 = META
+
     pid_b = tl.program_id(axis=0)
     pid_h = tl.program_id(axis=1)
     pid_chunk = tl.program_id(axis=2)
 
     d_idx = tl.arange(0, D)
-    temp_base = (
-        pid_b * stride_temp_b + pid_h * stride_temp_h + pid_chunk * stride_temp_c
-    )
+    # temp is contiguous [B, H, num_chunks, D], so each block owns the D-wide
+    # slice starting at (linear block index) * D.
+    block_idx = pid_b * (H * num_chunks) + pid_h * num_chunks + pid_chunk
+    temp_base = block_idx * D
     s_start = pid_chunk * chunk_size
     base = pid_b * stride_b + pid_h * stride_h
 
@@ -115,8 +112,7 @@ def hadamard_single_phase1_kernel(
         x_max = tl.maximum(x_max, tl.abs(x))
 
     x_max_scalar = tl.max(x_max)
-    chunk_idx = pid_b * (H * num_chunks) + pid_h * num_chunks + pid_chunk
-    tl.store(partial_max_ptr + chunk_idx, x_max_scalar)
+    tl.store(partial_max_ptr + block_idx, x_max_scalar)
 
 
 def _hadamard_quantize_one(x, spec):
@@ -143,25 +139,11 @@ def _hadamard_quantize_one(x, spec):
         had = torch.empty_like(x)
         temp = torch.empty(B, H, num_chunks, D, dtype=torch.float32, device=x.device)
         hadamard_single_phase1_kernel[grid](
-            x,
-            had,
-            temp,
-            partial_max,
-            x.stride(0),
-            x.stride(1),
-            x.stride(2),
-            x.stride(3),
-            temp.stride(0),
-            temp.stride(1),
-            temp.stride(2),
-            temp.stride(3),
-            S,
-            H,
-            chunk_size,
-            num_chunks,
+            (x, had, temp, partial_max),
+            (x.stride(0), x.stride(1), x.stride(2), x.stride(3)),
+            (S, H, chunk_size, num_chunks),
             D=D,
-            LOG2_D=LOG2_D,
-            USE_BFLOAT16=use_bfloat16,
+            META=(LOG2_D, use_bfloat16),
         )
         phase2_input = had
     else:
