@@ -80,8 +80,10 @@ else:
                     logger.warning(f"Failed to load {file}: {e}")
             from . import ops
 
-        # The following registers meta kernels for some CPU kernels
-        from torchao.csrc_meta_ops import *  # noqa: F403
+        # The following registers meta kernels for some CPU kernels.
+        # Imported purely for its registration side effects (it exports no
+        # public names), so a plain import is sufficient.
+        from torchao import csrc_meta_ops  # noqa: F401
     except Exception as e:
         logger.debug(f"Skipping import of cpp extensions: {e}")
 

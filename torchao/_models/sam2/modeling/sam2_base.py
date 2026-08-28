@@ -542,28 +542,9 @@ class SAM2Base(torch.nn.Module):
             stride = 1 if self.training else self.memory_temporal_stride_for_eval
             for t_pos in range(1, self.num_maskmem):
                 t_rel = self.num_maskmem - t_pos  # how many frames before current frame
-                if t_rel == 1:
-                    # for t_rel == 1, we take the last frame (regardless of r)
-                    if not track_in_reverse:
-                        # the frame immediately before this frame (i.e. frame_idx - 1)
-                        prev_frame_idx = frame_idx - t_rel
-                    else:
-                        # the frame immediately after this frame (i.e. frame_idx + 1)
-                        prev_frame_idx = frame_idx + t_rel
-                else:
-                    # for t_rel >= 2, we take the memory frame from every r-th frames
-                    if not track_in_reverse:
-                        # first find the nearest frame among every r-th frames before this frame
-                        # for r=1, this would be (frame_idx - 2)
-                        prev_frame_idx = ((frame_idx - 2) // stride) * stride
-                        # then seek further among every r-th frames
-                        prev_frame_idx = prev_frame_idx - (t_rel - 2) * stride
-                    else:
-                        # first find the nearest frame among every r-th frames after this frame
-                        # for r=1, this would be (frame_idx + 2)
-                        prev_frame_idx = -(-(frame_idx + 2) // stride) * stride
-                        # then seek further among every r-th frames
-                        prev_frame_idx = prev_frame_idx + (t_rel - 2) * stride
+                prev_frame_idx = self._get_maskmem_frame_idx(
+                    frame_idx, t_rel, stride, track_in_reverse
+                )
                 out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
                 if out is None:
                     # If an unselected conditioning frame is among the last (self.num_maskmem - 1)
@@ -589,71 +570,22 @@ class SAM2Base(torch.nn.Module):
 
             # Construct the list of past object pointers
             if self.use_obj_ptrs_in_encoder:
-                max_obj_ptrs_in_encoder = min(num_frames, self.max_obj_ptrs_in_encoder)
-                # First add those object pointers from selected conditioning frames
-                # (optionally, only include object pointers in the past during evaluation)
-                if not self.training and self.only_obj_ptrs_in_the_past_for_eval:
-                    ptr_cond_outputs = {
-                        t: out
-                        for t, out in selected_cond_outputs.items()
-                        if (t >= frame_idx if track_in_reverse else t <= frame_idx)
-                    }
-                else:
-                    ptr_cond_outputs = selected_cond_outputs
-                pos_and_ptrs = [
-                    # Temporal pos encoding contains how far away each pointer is from current frame
-                    (
-                        (
-                            (frame_idx - t) * tpos_sign_mul
-                            if self.use_signed_tpos_enc_to_obj_ptrs
-                            else abs(frame_idx - t)
-                        ),
-                        out["obj_ptr"],
-                    )
-                    for t, out in ptr_cond_outputs.items()
-                ]
-                # Add up to (max_obj_ptrs_in_encoder - 1) non-conditioning frames before current frame
-                for t_diff in range(1, max_obj_ptrs_in_encoder):
-                    t = frame_idx + t_diff if track_in_reverse else frame_idx - t_diff
-                    if t < 0 or (num_frames is not None and t >= num_frames):
-                        break
-                    out = output_dict["non_cond_frame_outputs"].get(
-                        t, unselected_cond_outputs.get(t, None)
-                    )
-                    if out is not None:
-                        pos_and_ptrs.append((t_diff, out["obj_ptr"]))
-                # If we have at least one object pointer, add them to the across attention
-                if len(pos_and_ptrs) > 0:
-                    pos_list, ptrs_list = zip(*pos_and_ptrs)
-                    # stack object pointers along dim=0 into [ptr_seq_len, B, C] shape
-                    obj_ptrs = torch.stack(ptrs_list, dim=0)
-                    # a temporal positional embedding based on how far each object pointer is from
-                    # the current frame (sine embedding normalized by the max pointer num).
-                    if self.add_tpos_enc_to_obj_ptrs:
-                        t_diff_max = max_obj_ptrs_in_encoder - 1
-                        tpos_dim = C if self.proj_tpos_enc_in_obj_ptrs else self.mem_dim
-                        obj_pos = (
-                            torch.tensor(pos_list)
-                            .pin_memory()
-                            .to(device=device, non_blocking=True)
-                        )
-                        obj_pos = get_1d_sine_pe(obj_pos / t_diff_max, dim=tpos_dim)
-                        obj_pos = self.obj_ptr_tpos_proj(obj_pos)
-                        obj_pos = obj_pos.unsqueeze(1).expand(-1, B, self.mem_dim)
-                    else:
-                        obj_pos = obj_ptrs.new_zeros(len(pos_list), B, self.mem_dim)
-                    if self.mem_dim < C:
-                        # split a pointer into (C // self.mem_dim) tokens for self.mem_dim < C
-                        obj_ptrs = obj_ptrs.reshape(
-                            -1, B, C // self.mem_dim, self.mem_dim
-                        )
-                        obj_ptrs = obj_ptrs.permute(0, 2, 1, 3).flatten(0, 1)
-                        obj_pos = obj_pos.repeat_interleave(C // self.mem_dim, dim=0)
-                    to_cat_memory.append(obj_ptrs)
-                    to_cat_memory_pos_embed.append(obj_pos)
-                    num_obj_ptr_tokens = obj_ptrs.shape[0]
-                else:
-                    num_obj_ptr_tokens = 0
+                obj_ptr_tokens, obj_ptr_pos_embed = self._collect_obj_ptr_memory(
+                    frame_idx=frame_idx,
+                    num_frames=num_frames,
+                    selected_cond_outputs=selected_cond_outputs,
+                    unselected_cond_outputs=unselected_cond_outputs,
+                    output_dict=output_dict,
+                    track_in_reverse=track_in_reverse,
+                    tpos_sign_mul=tpos_sign_mul,
+                    B=B,
+                    C=C,
+                    device=device,
+                )
+                if obj_ptr_tokens is not None:
+                    to_cat_memory.append(obj_ptr_tokens)
+                    to_cat_memory_pos_embed.append(obj_ptr_pos_embed)
+                    num_obj_ptr_tokens = obj_ptr_tokens.shape[0]
         else:
             # for initial conditioning frames, encode them without using any previous memory
             if self.directly_add_no_mem_embed:
@@ -685,6 +617,104 @@ class SAM2Base(torch.nn.Module):
         # reshape the output (HW)BC => BCHW
         pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(B, C, H, W)
         return pix_feat_with_mem
+
+    def _get_maskmem_frame_idx(self, frame_idx, t_rel, stride, track_in_reverse):
+        """Return the previous frame index whose mask memory feeds ``t_pos``.
+
+        ``t_rel`` is how many frames before the current one the memory sits; the
+        latest memory (``t_rel == 1``) is always the immediately adjacent frame,
+        while earlier memories are sampled on every ``stride``-th frame.
+        """
+        if t_rel == 1:
+            # for t_rel == 1, we take the last frame (regardless of stride):
+            # the frame immediately before (or after, when tracking in reverse) this one.
+            return frame_idx + t_rel if track_in_reverse else frame_idx - t_rel
+
+        # for t_rel >= 2, we take the memory frame from every stride-th frame:
+        # first find the nearest such frame, then seek further among them.
+        if not track_in_reverse:
+            nearest = ((frame_idx - 2) // stride) * stride
+            return nearest - (t_rel - 2) * stride
+        nearest = -(-(frame_idx + 2) // stride) * stride
+        return nearest + (t_rel - 2) * stride
+
+    def _collect_obj_ptr_memory(
+        self,
+        frame_idx,
+        num_frames,
+        selected_cond_outputs,
+        unselected_cond_outputs,
+        output_dict,
+        track_in_reverse,
+        tpos_sign_mul,
+        B,
+        C,
+        device,
+    ):
+        """Gather past object-pointer tokens and their temporal position embeddings.
+
+        Returns a ``(obj_ptrs, obj_pos)`` pair to append to the memory being fused,
+        or ``(None, None)`` when there are no object pointers to attend to.
+        """
+        max_obj_ptrs_in_encoder = min(num_frames, self.max_obj_ptrs_in_encoder)
+        # First add those object pointers from selected conditioning frames
+        # (optionally, only include object pointers in the past during evaluation)
+        if not self.training and self.only_obj_ptrs_in_the_past_for_eval:
+            ptr_cond_outputs = {
+                t: out
+                for t, out in selected_cond_outputs.items()
+                if (t >= frame_idx if track_in_reverse else t <= frame_idx)
+            }
+        else:
+            ptr_cond_outputs = selected_cond_outputs
+        pos_and_ptrs = [
+            # Temporal pos encoding contains how far away each pointer is from current frame
+            (
+                (
+                    (frame_idx - t) * tpos_sign_mul
+                    if self.use_signed_tpos_enc_to_obj_ptrs
+                    else abs(frame_idx - t)
+                ),
+                out["obj_ptr"],
+            )
+            for t, out in ptr_cond_outputs.items()
+        ]
+        # Add up to (max_obj_ptrs_in_encoder - 1) non-conditioning frames before current frame
+        for t_diff in range(1, max_obj_ptrs_in_encoder):
+            t = frame_idx + t_diff if track_in_reverse else frame_idx - t_diff
+            if t < 0 or (num_frames is not None and t >= num_frames):
+                break
+            out = output_dict["non_cond_frame_outputs"].get(
+                t, unselected_cond_outputs.get(t, None)
+            )
+            if out is not None:
+                pos_and_ptrs.append((t_diff, out["obj_ptr"]))
+        # If we have no object pointers, there is nothing to attend to
+        if len(pos_and_ptrs) == 0:
+            return None, None
+
+        pos_list, ptrs_list = zip(*pos_and_ptrs)
+        # stack object pointers along dim=0 into [ptr_seq_len, B, C] shape
+        obj_ptrs = torch.stack(ptrs_list, dim=0)
+        # a temporal positional embedding based on how far each object pointer is from
+        # the current frame (sine embedding normalized by the max pointer num).
+        if self.add_tpos_enc_to_obj_ptrs:
+            t_diff_max = max_obj_ptrs_in_encoder - 1
+            tpos_dim = C if self.proj_tpos_enc_in_obj_ptrs else self.mem_dim
+            obj_pos = (
+                torch.tensor(pos_list).pin_memory().to(device=device, non_blocking=True)
+            )
+            obj_pos = get_1d_sine_pe(obj_pos / t_diff_max, dim=tpos_dim)
+            obj_pos = self.obj_ptr_tpos_proj(obj_pos)
+            obj_pos = obj_pos.unsqueeze(1).expand(-1, B, self.mem_dim)
+        else:
+            obj_pos = obj_ptrs.new_zeros(len(pos_list), B, self.mem_dim)
+        if self.mem_dim < C:
+            # split a pointer into (C // self.mem_dim) tokens for self.mem_dim < C
+            obj_ptrs = obj_ptrs.reshape(-1, B, C // self.mem_dim, self.mem_dim)
+            obj_ptrs = obj_ptrs.permute(0, 2, 1, 3).flatten(0, 1)
+            obj_pos = obj_pos.repeat_interleave(C // self.mem_dim, dim=0)
+        return obj_ptrs, obj_pos
 
     def _encode_new_memory(
         self,
