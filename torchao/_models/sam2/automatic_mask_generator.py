@@ -5,13 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 
 # Adapted from https://github.com/facebookresearch/segment-anything/blob/main/segment_anything/automatic_mask_generator.py
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 from torchvision.ops.boxes import batched_nms, box_area  # type: ignore
 
+from torchao._models.sam2.config_utils import resolve_config
 from torchao._models.sam2.modeling.sam2_base import SAM2Base
 from torchao._models.sam2.sam2_image_predictor import SAM2ImagePredictor
 from torchao._models.sam2.utils.amg import (
@@ -196,12 +197,7 @@ class SAM2AutomaticMaskGenerator(torch.nn.Module, SAM2HFPretrainedMixin):
         keeps the historical keyword-based call sites and ``from_pretrained``
         forwarding working while collapsing the long parameter list.
         """
-        base = config if config is not None else SAM2AutomaticMaskGeneratorConfig()
-        known = SAM2AutomaticMaskGeneratorConfig.field_names()
-        field_overrides = {k: overrides[k] for k in known if k in overrides}
-        if not field_overrides:
-            return base
-        return replace(base, **field_overrides)
+        return resolve_config(config, SAM2AutomaticMaskGeneratorConfig, overrides)
 
     @torch.no_grad()
     def generate(self, image: np.ndarray) -> List[Dict[str, Any]]:

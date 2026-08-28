@@ -10,7 +10,6 @@ from typing import Optional
 import torch
 from torch import Tensor, nn
 
-from torchao._models.sam2.config_utils import resolve_config
 from torchao._models.sam2.modeling.sam.transformer import RoPEAttention
 from torchao._models.sam2.modeling.sam2_utils import get_activation_fn, get_clones
 
@@ -20,8 +19,8 @@ class MemoryAttentionLayerConfig:
     """Grouped hyperparameters for :class:`MemoryAttentionLayer`.
 
     The feedforward sizing, dropout, activation, and the positional-encoding
-    switches all travel together and can be passed as a single config object or
-    as individual keyword arguments (as the Hydra configs do).
+    switches all travel together and are passed as this single options object,
+    collapsing the constructor's long parameter list.
     """
 
     activation: str = "relu"
@@ -39,10 +38,9 @@ class MemoryAttentionLayer(nn.Module):
         self_attention: nn.Module,
         cross_attention: nn.Module,
         config: Optional[MemoryAttentionLayerConfig] = None,
-        **kwargs,
     ):
         super().__init__()
-        config = resolve_config(config, MemoryAttentionLayerConfig, kwargs)
+        config = config if config is not None else MemoryAttentionLayerConfig()
         d_model = config.d_model
         dim_feedforward = config.dim_feedforward
         dropout = config.dropout
