@@ -154,6 +154,30 @@ def _trace_through_views(node: Node) -> Node:
 # Transpose Detection
 
 
+def _is_transpose_1_2(node: Node) -> bool:
+    """True if ``node`` is a transpose of dims 1 and 2 (aten or call_method)."""
+    if not _is_op(node, torch.ops.aten.transpose.int, "transpose"):
+        return False
+    if len(node.args) < 3:
+        return False
+    dim0, dim1 = node.args[1], node.args[2]
+    return (dim0, dim1) in ((1, 2), (2, 1))
+
+
+def _is_permute_0213(node: Node) -> bool:
+    """True if ``node`` is a permute to [0, 2, 1, 3] (aten or call_method)."""
+    if _is_op(node, torch.ops.aten.permute.default):
+        return len(node.args) >= 2 and list(node.args[1]) == [0, 2, 1, 3]
+    if _is_op(node, "permute"):
+        # permute(0, 2, 1, 3) as positional args
+        if len(node.args) >= 5:
+            return list(node.args[1:5]) == [0, 2, 1, 3]
+        # permute([0, 2, 1, 3]) as a single list/tuple arg
+        if len(node.args) >= 2 and isinstance(node.args[1], (list, tuple)):
+            return list(node.args[1]) == [0, 2, 1, 3]
+    return False
+
+
 def _unwrap_transpose(node: Node) -> Optional[Node]:
     """If node is transpose(1,2) or permute([0,2,1,3]), return its input.
 
@@ -175,37 +199,8 @@ def _unwrap_transpose(node: Node) -> Optional[Node]:
     if not isinstance(current, Node):
         return None
 
-    # aten.transpose.int(tensor, 1, 2)
-    if _is_op(current, torch.ops.aten.transpose.int):
-        if len(current.args) >= 3:
-            dim0, dim1 = current.args[1], current.args[2]
-            if (dim0 == 1 and dim1 == 2) or (dim0 == 2 and dim1 == 1):
-                return current.args[0]
-
-    # aten.permute.default(tensor, [0, 2, 1, 3])
-    if _is_op(current, torch.ops.aten.permute.default):
-        if len(current.args) >= 2:
-            perm = current.args[1]
-            if list(perm) == [0, 2, 1, 3]:
-                return current.args[0]
-
-    # call_method transpose(1, 2)
-    if _is_op(current, "transpose"):
-        if len(current.args) >= 3:
-            dim0, dim1 = current.args[1], current.args[2]
-            if (dim0 == 1 and dim1 == 2) or (dim0 == 2 and dim1 == 1):
-                return current.args[0]
-
-    # call_method permute(0, 2, 1, 3)
-    if _is_op(current, "permute"):
-        if len(current.args) >= 5:
-            perm = list(current.args[1:5])
-            if perm == [0, 2, 1, 3]:
-                return current.args[0]
-        elif len(current.args) >= 2 and isinstance(current.args[1], (list, tuple)):
-            perm = current.args[1]
-            if list(perm) == [0, 2, 1, 3]:
-                return current.args[0]
+    if _is_transpose_1_2(current) or _is_permute_0213(current):
+        return current.args[0]
 
     return None
 

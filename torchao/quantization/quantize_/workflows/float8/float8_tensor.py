@@ -69,6 +69,15 @@ def _float8_quantization_type(tensor) -> str:
     return f"{tensor.act_quant_kwargs=}, {tensor.block_size=}, {tensor.mm_config=}, {tensor.scale.shape=}, {tensor.kernel_preference=}"
 
 
+def _float8_sparse_quantization_type(tensor) -> str:
+    """Shared ``_quantization_type`` string for 2:4 sparse float8 tensors.
+
+    Used by both the 1D-data/1D-metadata and 2D-data/2D-metadata sparse tensor
+    implementations so the representation cannot drift between them.
+    """
+    return f"{tensor.act_quant_kwargs=}, {tensor.block_size=}, {tensor.scale.shape=}"
+
+
 def _float8_dequantize(tensor, output_dtype: Optional[torch.dtype] = None):
     """Shared ``dequantize`` implementation for float8 quantized tensors.
 
