@@ -5,13 +5,31 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from torchao._models.sam2.modeling.sam2_utils import DropPath, LayerNorm2d, get_clones
+
+
+@dataclass
+class MaskDownSamplerConfig:
+    """Grouped hyperparameters for :class:`MaskDownSampler`.
+
+    The output channels, per-step conv shape, total downsample factor, and the
+    activation type all travel together and are passed as this single options
+    object, collapsing the constructor's long parameter list.
+    """
+
+    embed_dim: int = 256
+    kernel_size: int = 4
+    stride: int = 4
+    padding: int = 0
+    total_stride: int = 16
+    activation: type = nn.GELU
 
 
 class MaskDownSampler(nn.Module):
@@ -23,16 +41,15 @@ class MaskDownSampler(nn.Module):
     In the end, we linearly project to embed_dim channels.
     """
 
-    def __init__(
-        self,
-        embed_dim=256,
-        kernel_size=4,
-        stride=4,
-        padding=0,
-        total_stride=16,
-        activation=nn.GELU,
-    ):
+    def __init__(self, config: Optional[MaskDownSamplerConfig] = None):
         super().__init__()
+        config = config if config is not None else MaskDownSamplerConfig()
+        embed_dim = config.embed_dim
+        kernel_size = config.kernel_size
+        stride = config.stride
+        padding = config.padding
+        total_stride = config.total_stride
+        activation = config.activation
         num_layers = int(math.log2(total_stride) // math.log2(stride))
         assert stride**num_layers == total_stride
         self.encoder = nn.Sequential()
@@ -58,6 +75,29 @@ class MaskDownSampler(nn.Module):
         return self.encoder(x)
 
 
+@dataclass
+class CXBlockConfig:
+    """Grouped hyperparameters for :class:`CXBlock`.
+
+    The convolution shape, stochastic-depth rate, layer-scale init, and the
+    depthwise-conv switch all travel together and are passed as this single
+    options object, collapsing the constructor's long parameter list.
+
+    Attributes:
+        kernel_size (int): Depthwise conv kernel size. Default: 7
+        padding (int): Depthwise conv padding. Default: 3
+        drop_path (float): Stochastic depth rate. Default: 0.0
+        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
+        use_dwconv (bool): Whether the conv is depthwise. Default: True
+    """
+
+    kernel_size: int = 7
+    padding: int = 3
+    drop_path: float = 0.0
+    layer_scale_init_value: float = 1e-6
+    use_dwconv: bool = True
+
+
 # Lightly adapted from ConvNext (https://github.com/facebookresearch/ConvNeXt)
 class CXBlock(nn.Module):
     r"""ConvNeXt Block. There are two equivalent implementations:
@@ -67,20 +107,17 @@ class CXBlock(nn.Module):
 
     Args:
         dim (int): Number of input channels.
-        drop_path (float): Stochastic depth rate. Default: 0.0
-        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
+        config (CXBlockConfig): Grouped block hyperparameters.
     """
 
-    def __init__(
-        self,
-        dim,
-        kernel_size=7,
-        padding=3,
-        drop_path=0.0,
-        layer_scale_init_value=1e-6,
-        use_dwconv=True,
-    ):
+    def __init__(self, dim, config: Optional[CXBlockConfig] = None):
         super().__init__()
+        config = config if config is not None else CXBlockConfig()
+        kernel_size = config.kernel_size
+        padding = config.padding
+        drop_path = config.drop_path
+        layer_scale_init_value = config.layer_scale_init_value
+        use_dwconv = config.use_dwconv
         self.dwconv = nn.Conv2d(
             dim,
             dim,
@@ -135,16 +172,30 @@ class Fuser(nn.Module):
         return x
 
 
+@dataclass
+class MemoryEncoderConfig:
+    """Grouped channel dimensions for :class:`MemoryEncoder`.
+
+    The input/output channel counts travel together and are passed as this
+    single options object, collapsing the constructor's long parameter list.
+    """
+
+    out_dim: int = 64
+    in_dim: int = 256  # in_dim of pix_feats
+
+
 class MemoryEncoder(nn.Module):
     def __init__(
         self,
-        out_dim,
         mask_downsampler,
         fuser,
         position_encoding,
-        in_dim=256,  # in_dim of pix_feats
+        config: Optional[MemoryEncoderConfig] = None,
     ):
         super().__init__()
+        config = config if config is not None else MemoryEncoderConfig()
+        in_dim = config.in_dim
+        out_dim = config.out_dim
 
         self.mask_downsampler = mask_downsampler
 

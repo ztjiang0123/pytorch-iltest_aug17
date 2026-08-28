@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -13,20 +14,36 @@ from torchao._models.sam2.modeling.sam.transformer import RoPEAttention
 from torchao._models.sam2.modeling.sam2_utils import get_activation_fn, get_clones
 
 
+@dataclass
+class MemoryAttentionLayerConfig:
+    """Grouped hyperparameters for :class:`MemoryAttentionLayer`.
+
+    The feedforward sizing, dropout, activation, and the positional-encoding
+    switches all travel together and are passed as this single options object,
+    collapsing the constructor's long parameter list.
+    """
+
+    activation: str = "relu"
+    d_model: int = 256
+    dim_feedforward: int = 2048
+    dropout: float = 0.1
+    pos_enc_at_attn: bool = False
+    pos_enc_at_cross_attn_keys: bool = True
+    pos_enc_at_cross_attn_queries: bool = False
+
+
 class MemoryAttentionLayer(nn.Module):
     def __init__(
         self,
-        activation: str,
-        cross_attention: nn.Module,
-        d_model: int,
-        dim_feedforward: int,
-        dropout: float,
-        pos_enc_at_attn: bool,
-        pos_enc_at_cross_attn_keys: bool,
-        pos_enc_at_cross_attn_queries: bool,
         self_attention: nn.Module,
+        cross_attention: nn.Module,
+        config: Optional[MemoryAttentionLayerConfig] = None,
     ):
         super().__init__()
+        config = config if config is not None else MemoryAttentionLayerConfig()
+        d_model = config.d_model
+        dim_feedforward = config.dim_feedforward
+        dropout = config.dropout
         self.d_model = d_model
         self.dim_feedforward = dim_feedforward
         self.dropout_value = dropout
@@ -45,13 +62,13 @@ class MemoryAttentionLayer(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
 
-        self.activation_str = activation
-        self.activation = get_activation_fn(activation)
+        self.activation_str = config.activation
+        self.activation = get_activation_fn(config.activation)
 
         # Where to add pos enc
-        self.pos_enc_at_attn = pos_enc_at_attn
-        self.pos_enc_at_cross_attn_queries = pos_enc_at_cross_attn_queries
-        self.pos_enc_at_cross_attn_keys = pos_enc_at_cross_attn_keys
+        self.pos_enc_at_attn = config.pos_enc_at_attn
+        self.pos_enc_at_cross_attn_queries = config.pos_enc_at_cross_attn_queries
+        self.pos_enc_at_cross_attn_keys = config.pos_enc_at_cross_attn_keys
 
     def _forward_sa(self, tgt, query_pos):
         # Self-Attention

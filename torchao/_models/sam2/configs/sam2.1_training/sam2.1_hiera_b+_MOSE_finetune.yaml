@@ -94,10 +94,15 @@ trainer:
       pos_enc_at_input: true
       layer:
         _target_: sam2.modeling.memory_attention.MemoryAttentionLayer
-        activation: relu
-        dim_feedforward: 2048
-        dropout: 0.1
-        pos_enc_at_attn: false
+        config:
+          _target_: sam2.modeling.memory_attention.MemoryAttentionLayerConfig
+          activation: relu
+          dim_feedforward: 2048
+          dropout: 0.1
+          pos_enc_at_attn: false
+          d_model: 256
+          pos_enc_at_cross_attn_keys: true
+          pos_enc_at_cross_attn_queries: false
         self_attention:
           _target_: sam2.modeling.sam.transformer.RoPEAttention
           rope_theta: 10000.0
@@ -106,9 +111,6 @@ trainer:
           num_heads: 1
           downsample_rate: 1
           dropout: 0.1
-        d_model: 256
-        pos_enc_at_cross_attn_keys: true
-        pos_enc_at_cross_attn_queries: false
         cross_attention:
           _target_: sam2.modeling.sam.transformer.RoPEAttention
           rope_theta: 10000.0
@@ -123,7 +125,9 @@ trainer:
 
     memory_encoder:
         _target_: sam2.modeling.memory_encoder.MemoryEncoder
-        out_dim: 64
+        config:
+          _target_: sam2.modeling.memory_encoder.MemoryEncoderConfig
+          out_dim: 64
         position_encoding:
           _target_: sam2.modeling.position_encoding.PositionEmbeddingSine
           num_pos_feats: 64
@@ -132,18 +136,22 @@ trainer:
           temperature: 10000
         mask_downsampler:
           _target_: sam2.modeling.memory_encoder.MaskDownSampler
-          kernel_size: 3
-          stride: 2
-          padding: 1
+          config:
+            _target_: sam2.modeling.memory_encoder.MaskDownSamplerConfig
+            kernel_size: 3
+            stride: 2
+            padding: 1
         fuser:
           _target_: sam2.modeling.memory_encoder.Fuser
           layer:
             _target_: sam2.modeling.memory_encoder.CXBlock
+            config:
+              _target_: sam2.modeling.memory_encoder.CXBlockConfig
+              kernel_size: 7
+              padding: 3
+              layer_scale_init_value: 1e-6
+              use_dwconv: True  # depth-wise convs
             dim: 256
-            kernel_size: 7
-            padding: 3
-            layer_scale_init_value: 1e-6
-            use_dwconv: True  # depth-wise convs
           num_layers: 2
 
     num_maskmem: 7
