@@ -1,3 +1,4 @@
+import importlib
 import logging
 import os
 
@@ -82,8 +83,8 @@ else:
 
         # The following registers meta kernels for some CPU kernels.
         # Imported purely for its registration side effects (it exports no
-        # public names), so a plain import is sufficient.
-        from torchao import csrc_meta_ops  # noqa: F401
+        # public names), so we import the module for its side effects only.
+        importlib.import_module("torchao.csrc_meta_ops")
     except Exception as e:
         logger.debug(f"Skipping import of cpp extensions: {e}")
 

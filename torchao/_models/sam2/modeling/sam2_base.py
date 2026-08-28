@@ -4,6 +4,9 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
 import torch
 import torch.distributed
 import torch.nn.functional as F
@@ -20,6 +23,25 @@ from torchao._models.sam2.modeling.sam2_utils import (
 
 # a large negative value as a placeholder score for missing objects
 NO_OBJ_SCORE = -1024.0
+
+
+@dataclass
+class _ObjPtrMemoryContext:
+    """Per-frame inputs needed to gather past object-pointer memory.
+
+    Bundled into one object so ``_collect_obj_ptr_memory`` stays within a small
+    parameter budget instead of threading ten positional arguments through.
+    """
+
+    frame_idx: int
+    num_frames: Optional[int]
+    selected_cond_outputs: Dict[int, Any]
+    unselected_cond_outputs: Dict[int, Any]
+    output_dict: Dict[str, Any]
+    track_in_reverse: bool
+    B: int
+    C: int
+    device: Any
 
 
 class SAM2Base(torch.nn.Module):
@@ -521,7 +543,6 @@ class SAM2Base(torch.nn.Module):
             return pix_feat
 
         num_obj_ptr_tokens = 0
-        tpos_sign_mul = -1 if track_in_reverse else 1
         # Step 1: condition the visual features of the current frame on previous memories
         if not is_init_cond_frame:
             # Retrieve the memories encoded with the maskmem backbone
@@ -570,17 +591,19 @@ class SAM2Base(torch.nn.Module):
 
             # Construct the list of past object pointers
             if self.use_obj_ptrs_in_encoder:
-                obj_ptr_tokens, obj_ptr_pos_embed = self._collect_obj_ptr_memory(
+                obj_ptr_ctx = _ObjPtrMemoryContext(
                     frame_idx=frame_idx,
                     num_frames=num_frames,
                     selected_cond_outputs=selected_cond_outputs,
                     unselected_cond_outputs=unselected_cond_outputs,
                     output_dict=output_dict,
                     track_in_reverse=track_in_reverse,
-                    tpos_sign_mul=tpos_sign_mul,
                     B=B,
                     C=C,
                     device=device,
+                )
+                obj_ptr_tokens, obj_ptr_pos_embed = self._collect_obj_ptr_memory(
+                    obj_ptr_ctx
                 )
                 if obj_ptr_tokens is not None:
                     to_cat_memory.append(obj_ptr_tokens)
@@ -638,24 +661,21 @@ class SAM2Base(torch.nn.Module):
         nearest = -(-(frame_idx + 2) // stride) * stride
         return nearest + (t_rel - 2) * stride
 
-    def _collect_obj_ptr_memory(
-        self,
-        frame_idx,
-        num_frames,
-        selected_cond_outputs,
-        unselected_cond_outputs,
-        output_dict,
-        track_in_reverse,
-        tpos_sign_mul,
-        B,
-        C,
-        device,
-    ):
+    def _collect_obj_ptr_memory(self, ctx: "_ObjPtrMemoryContext"):
         """Gather past object-pointer tokens and their temporal position embeddings.
 
         Returns a ``(obj_ptrs, obj_pos)`` pair to append to the memory being fused,
         or ``(None, None)`` when there are no object pointers to attend to.
         """
+        frame_idx = ctx.frame_idx
+        num_frames = ctx.num_frames
+        selected_cond_outputs = ctx.selected_cond_outputs
+        unselected_cond_outputs = ctx.unselected_cond_outputs
+        output_dict = ctx.output_dict
+        track_in_reverse = ctx.track_in_reverse
+        tpos_sign_mul = -1 if track_in_reverse else 1
+        B, C, device = ctx.B, ctx.C, ctx.device
+
         max_obj_ptrs_in_encoder = min(num_frames, self.max_obj_ptrs_in_encoder)
         # First add those object pointers from selected conditioning frames
         # (optionally, only include object pointers in the past during evaluation)
