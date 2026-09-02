@@ -417,6 +417,99 @@ void _micro_gemm(
   }
 }
 
+// Immutable view of the pointers and dimensions shared by every block of a
+// single _float8_linear_impl call. Bundling them keeps the per-block worker's
+// signature (and the top-level function) readable.
+template<typename out_dtype>
+struct Float8LinearArgs {
+  const at::Float8_e4m3fn* a_ptr;
+  const float* a_scales_ptr;
+  const at::Float8_e4m3fn* b_ptr;
+  const float* b_scales_ptr;
+  out_dtype* c_ptr;
+  const float* bias_ptr;
+  int64_t K;
+  int64_t N;
+  int64_t Kc;
+  int64_t block_k;
+  int64_t block_m;
+  int64_t block_per_group;
+  int64_t num_groups;
+  int64_t ldsa;
+};
+
+// Per-thread scratch buffers reused across the blocks owned by one task.
+struct Float8LinearBuffers {
+  float* y_buf;
+  float* ukernel_buf;
+  at::BFloat16* dqA_buffer;
+  at::BFloat16* dqB_buffer;
+};
+
+// Compute one output block: the `block_m` rows starting at row-block `mci` for
+// the `block_n` columns of column-block `nc`. This holds the accumulation loop
+// that used to be nested three levels deep inside the parallel_for lambda.
+template<typename out_dtype, bool cpublas_can_pack, int act_quant_mode, int wei_quant_mode>
+inline void _float8_linear_block(
+    const Float8LinearArgs<out_dtype>& a,
+    const Float8LinearBuffers& buf,
+    int64_t M,
+    int64_t mci,
+    int64_t nc) {
+  constexpr int64_t block_n = BLOCK_N;
+  int64_t row_start = mci * a.block_m;
+  bool is_tail_block = row_start + a.block_m > M;
+  int64_t m_size = is_tail_block ? M - row_start : a.block_m;
+
+  memset(buf.y_buf, 0, sizeof(float) * m_size * block_n);
+  for (int kci = 0; kci < a.Kc; ++kci) {
+    int64_t group = kci / a.block_per_group;
+    auto scales_a = a.a_scales_ptr + row_start * a.num_groups + group;
+    auto scales_b = a.b_scales_ptr + nc * block_n * a.num_groups + group * block_n;
+    _micro_gemm<cpublas_can_pack, block_n, act_quant_mode, wei_quant_mode>(
+      /* C */           buf.y_buf,
+      /* A */           a.a_ptr + row_start * a.K + kci * a.block_k,
+      /* scales_a */    scales_a,
+      /* B */           a.b_ptr + (nc * a.Kc + kci) * block_n * a.block_k,
+      /* scales_b */    scales_b,
+      /* M */           m_size,
+      /* K */           a.block_k,
+      /* lda */         a.K,
+      /* ldc */         block_n,
+      /* ldsa */        a.ldsa,
+      /* ukernel_buf */ buf.ukernel_buf,
+      /* dqA_buf */     buf.dqA_buffer,
+      /* dqB_buf */     buf.dqB_buffer);
+  }
+
+  // Select the output scales for the store, which differ from the accumulation
+  // scales above: per-group scales are already folded in by _micro_gemm, so
+  // they are passed as nullptr here.
+  const float* out_scales_a = nullptr;
+  if constexpr (act_quant_mode == PER_TENSOR) {
+    out_scales_a = a.a_scales_ptr;
+  } else if constexpr (act_quant_mode == PER_ROW) {
+    out_scales_a = a.a_scales_ptr + row_start;
+  }
+  const float* out_scales_b = nullptr;
+  if constexpr (wei_quant_mode == PER_TENSOR) {
+    out_scales_b = a.b_scales_ptr;
+  } else if constexpr (wei_quant_mode == PER_ROW) {
+    out_scales_b = a.b_scales_ptr + nc * block_n;
+  }
+  const float* bias_data = a.bias_ptr ? a.bias_ptr + nc * block_n : nullptr;
+
+  // store y_buf to output with dtype conversion
+  store_out<out_dtype, block_n, act_quant_mode, wei_quant_mode>(
+    buf.y_buf,
+    a.c_ptr + row_start * a.N + nc * block_n,
+    m_size,
+    a.N /*lda*/,
+    out_scales_a,
+    out_scales_b,
+    bias_data);
+}
+
 template<typename out_dtype, bool cpublas_can_pack, int act_quant_mode, int wei_quant_mode>
 void _float8_linear_impl(
     const at::Tensor& input,
@@ -458,12 +551,22 @@ void _float8_linear_impl(
               "Float8 linear: unexpected input scales shape, scale shape:", input_scales.sizes(), ", M:", M, ", num_groups:", num_groups);
   auto ldsa = act_quant_mode == PER_TENSOR ? 0 : act_quant_mode == PER_ROW ? 1 : num_groups;
 
-  const at::Float8_e4m3fn* a_ptr = input_view.data_ptr<at::Float8_e4m3fn>();
-  const float* a_scales_ptr = input_scales.data_ptr<float>();
-  const at::Float8_e4m3fn* b_ptr = weight.data_ptr<at::Float8_e4m3fn>();
-  const float* b_scales_ptr = weight_scales.data_ptr<float>();
-  out_dtype* c_ptr = output.data_ptr<out_dtype>();
-  const float* bias_ptr = bias.has_value() ? bias.value().data_ptr<float>() : nullptr;
+  const Float8LinearArgs<out_dtype> args{
+    input_view.data_ptr<at::Float8_e4m3fn>(),
+    input_scales.data_ptr<float>(),
+    weight.data_ptr<at::Float8_e4m3fn>(),
+    weight_scales.data_ptr<float>(),
+    output.data_ptr<out_dtype>(),
+    bias.has_value() ? bias.value().data_ptr<float>() : nullptr,
+    K,
+    N,
+    Kc,
+    block_k,
+    block_m,
+    block_per_group,
+    num_groups,
+    ldsa,
+  };
 
   int64_t block_size = block_m * block_n;
   int64_t num_thread = at::get_num_threads();
@@ -494,47 +597,17 @@ void _float8_linear_impl(
     ukernel_buf = reinterpret_cast<float*>(micro_gemm_buf + block_m * block_k + block_k * block_n);
 #endif
 #endif
+    const Float8LinearBuffers buffers{y_buf, ukernel_buf, dqA_buffer, dqB_buffer};
     int64_t mc = 0, nc = 0;
     at::native::data_index_init(begin, mc, Mc_parallel, nc, Nc);
     for (const auto i : c10::irange(begin, end)) {
       (void)i; // Suppress unused variable
+      // When parallelizing over M, each task owns one (mc, nc) block; otherwise
+      // each task owns a full column-block nc and sweeps every row-block below.
       int64_t mc_end = parallel_on_M ? mc + 1 : Mc;
-
       for (int mci = mc; mci < mc_end; ++mci) {
-        int64_t m_size = mci * block_m + block_m > M ? M - mci * block_m : block_m;
-        memset(y_buf, 0, sizeof(float) * m_size * block_n);
-        for (int kci = 0; kci < Kc; ++kci) {
-          auto scales_a = a_scales_ptr + mci * block_m * num_groups + kci / block_per_group;
-          auto scales_b = b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n;
-          _micro_gemm<cpublas_can_pack, block_n, act_quant_mode, wei_quant_mode>(
-            /* C */           y_buf,
-            /* A */           a_ptr + mci * block_m * K + kci * block_k,
-            /* scales_a */    scales_a,
-            /* B */           b_ptr + (nc * Kc + kci) * block_n * block_k,
-            /* scales_b */    scales_b,
-            /* M */           m_size,
-            /* K */           block_k,
-            /* lda */         K,
-            /* ldc */         block_n,
-            /* ldsa */        ldsa,
-            /* ukernel_buf */ ukernel_buf,
-            /* dqA_buf */     dqA_buffer,
-            /* dqB_buf */     dqB_buffer);
-        }
-        // store y_buf to output with dtype conversion
-        auto scales_a = act_quant_mode == PER_TENSOR ? a_scales_ptr :
-            act_quant_mode == PER_ROW ? a_scales_ptr + mci * block_m : nullptr;
-        auto scales_b = wei_quant_mode == PER_TENSOR ? b_scales_ptr :
-          wei_quant_mode == PER_ROW ? b_scales_ptr + nc * block_n : nullptr;
-        auto bias_data = bias_ptr ? bias_ptr + nc * block_n : nullptr;
-        store_out<out_dtype, block_n, act_quant_mode, wei_quant_mode>(
-          y_buf,
-          c_ptr + mci * block_m * N + nc * block_n,
-          m_size,
-          N /*lda*/,
-          scales_a,
-          scales_b,
-          bias_data);
+        _float8_linear_block<out_dtype, cpublas_can_pack, act_quant_mode, wei_quant_mode>(
+            args, buffers, M, mci, nc);
       }
       at::native::data_index_step(mc, Mc_parallel, nc, Nc);
     }
