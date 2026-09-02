@@ -661,6 +661,91 @@ inline void store_out(const float* y_buf, out_dtype* c_ptr, int64_t m, /* int64_
   }
 }
 
+// Pick the row-block size (block_m) from the number of rows M. Small problems
+// run as a single block; larger ones use progressively bigger blocks so the
+// GEMM sees enough work to amortize its overhead.
+inline int64_t select_block_m(int64_t M) {
+  if (M <= 48) {
+    return M;
+  }
+  if (M < 64) {
+    return 32;
+  }
+  if (M < 96) {
+    return 64;
+  }
+  return 128;
+}
+
+// Immutable view of the pointers and dimensions shared by every block of a
+// single _da8w4_linear_impl call. Bundling them keeps the per-block worker's
+// signature (and the top-level function) readable.
+template<typename out_dtype>
+struct Da8w4LinearArgs {
+  using Tin = uint8_t;  // activation pointer is always byte-addressed below
+  const Tin* a_ptr;
+  const float* a_scales_ptr;
+  const int32_t* a_qzeros_ptr;
+  const uint8_t* b_ptr;
+  const float* b_scales_ptr;
+  const int8_t* b_qzeros_ptr;
+  const int32_t* compensation_ptr;
+  out_dtype* c_ptr;
+  const float* bias_ptr;
+  int64_t K;
+  int64_t N;
+  int64_t Kc;
+  int64_t block_k;
+  int64_t block_m;
+  int64_t block_per_group;
+  int64_t num_groups;
+};
+
+// Compute one output block: the `block_m` rows starting at row-block `mci` for
+// the `block_n` columns of column-block `nc`. This holds the accumulation loop
+// that used to be nested three levels deep inside the parallel_for lambda.
+template<typename out_dtype, bool cpublas_can_pack, bool sym_quant_a>
+inline void _da8w4_linear_block(
+    const Da8w4LinearArgs<out_dtype>& a,
+    int64_t M,
+    int64_t mci,
+    int64_t nc) {
+  constexpr int64_t block_n = BLOCK_N;
+  int64_t row_start = mci * a.block_m;
+  bool is_tail_block = row_start + a.block_m > M;
+  int64_t m_size = is_tail_block ? M - row_start : a.block_m;
+
+  alignas(64) float y_buf[m_size][block_n];
+
+  // Seed the accumulator with bias (or zeros when there is no bias).
+  const float* bias_data = a.bias_ptr ? a.bias_ptr + nc * block_n : nullptr;
+  copy_bias<block_n>(bias_data, y_buf[0], m_size);
+
+  for (int kci = 0; kci < a.Kc; ++kci) {
+    int64_t group = kci / a.block_per_group;
+    _dequant_gemm_accum<cpublas_can_pack, block_n, block_n / 2, sym_quant_a>(
+      y_buf[0] /*C*/,
+      a.a_ptr + row_start * a.K + kci * a.block_k /*A*/,
+      a.a_scales_ptr + row_start /*scales_a*/,
+      a.a_qzeros_ptr + row_start /*qzeros_a*/,
+      a.b_ptr + (nc * a.Kc + kci) * block_n * a.block_k / 2 /*B*/,
+      a.b_scales_ptr + nc * block_n * a.num_groups + group * block_n /*scales_b*/,
+      a.b_qzeros_ptr + nc * block_n * a.num_groups + group * block_n /*qzeros_b*/,
+      a.compensation_ptr + nc * block_n * a.Kc + kci * block_n /*compensation*/,
+      m_size /*M*/,
+      a.block_k /*K*/,
+      a.K /*lda*/,
+      block_n /*ldc*/);
+  }
+
+  // store y_buf to output with dtype conversion
+  store_out<out_dtype, block_n>(
+    y_buf[0],
+    a.c_ptr + row_start * a.N + nc * block_n,
+    m_size,
+    a.N /*lda*/);
+}
+
 template<typename out_dtype, bool cpublas_can_pack, bool sym_quant_a>
 void _da8w4_linear_impl(
     const at::Tensor& input,
@@ -690,17 +775,7 @@ void _da8w4_linear_impl(
   TORCH_CHECK(weight.size(3) * 2 == block_n, "DA8W4: unexpected weight shape");
   int64_t N = Nc * block_n;
   TORCH_CHECK(K == Kc * block_k, "DA8W4: weight and input shapes mismatch");
-  int64_t block_m = [&]() -> long {
-    if (M <= 48) {
-      return M;
-    } else if (M < 64) {
-      return 32;
-    } else if (M < 96) {
-      return 64;
-    } else {
-      return 128;
-    }
-  }();
+  int64_t block_m = select_block_m(M);
   int64_t Mc = (M + block_m - 1) / block_m;
   bool parallel_on_M = M > 128;
   int64_t num_blocks = parallel_on_M ? Mc * Nc : Nc;
@@ -714,48 +789,36 @@ void _da8w4_linear_impl(
 
   using Tin = typename ActDtype<sym_quant_a>::type;
   const Tin* a_ptr = input_view.data_ptr<Tin>();
-  const float* a_scales_ptr = input_scales.data_ptr<float>();
-  const int32_t* a_qzeros_ptr = sym_quant_a ? nullptr : input_qzeros.data_ptr<int32_t>();
-  const uint8_t* b_ptr = weight.data_ptr<uint8_t>();
-  const float* b_scales_ptr = weight_scales.data_ptr<float>();
-  const int8_t* b_qzeros_ptr = weight_qzeros.data_ptr<int8_t>();
-  const int32_t* compensation_ptr = sym_quant_a ? nullptr : compensation.data_ptr<int32_t>();
-  out_dtype* c_ptr = output.data_ptr<out_dtype>();
-  const float* bias_ptr = bias.has_value() ? bias.value().data_ptr<float>() : nullptr;
+  const Da8w4LinearArgs<out_dtype> args{
+    reinterpret_cast<const uint8_t*>(a_ptr),
+    input_scales.data_ptr<float>(),
+    sym_quant_a ? nullptr : input_qzeros.data_ptr<int32_t>(),
+    weight.data_ptr<uint8_t>(),
+    weight_scales.data_ptr<float>(),
+    weight_qzeros.data_ptr<int8_t>(),
+    sym_quant_a ? nullptr : compensation.data_ptr<int32_t>(),
+    output.data_ptr<out_dtype>(),
+    bias.has_value() ? bias.value().data_ptr<float>() : nullptr,
+    K,
+    N,
+    Kc,
+    block_k,
+    block_m,
+    block_per_group,
+    num_groups,
+  };
 
   at::parallel_for(0, num_blocks, 1, [&](int64_t begin, int64_t end) {
     for (const auto i : c10::irange(begin, end)) {
-      int64_t mc = parallel_on_M ? i / Nc : 0;
+      // When parallelizing over M, each task owns one (mc, nc) block; otherwise
+      // each task owns a full column-block nc and sweeps every row-block below.
+      int64_t mc_begin = parallel_on_M ? i / Nc : 0;
       int64_t nc = parallel_on_M ? i % Nc : i;
-      int64_t mc_end = parallel_on_M ? mc + 1 : Mc;
+      int64_t mc_end = parallel_on_M ? mc_begin + 1 : Mc;
 
-      for (int mci = mc; mci < mc_end; ++mci) {
-        int64_t m_size = mci * block_m + block_m > M ? M - mci * block_m : block_m;
-        alignas(64) float y_buf[m_size][block_n];
-        // copy bias to y_buf if bias is not None
-        auto bias_data = bias_ptr ? bias_ptr + nc * block_n : nullptr;
-        copy_bias<block_n>(bias_data, y_buf[0], m_size);
-        for (int kci = 0; kci < Kc; ++kci) {
-          _dequant_gemm_accum<cpublas_can_pack, block_n, block_n / 2, sym_quant_a>(
-            y_buf[0] /*C*/,
-            (uint8_t*)a_ptr + mci * block_m * K + kci * block_k /*A*/,
-            a_scales_ptr + mci * block_m /*scales_a*/,
-            a_qzeros_ptr + mci * block_m /*qzeros_a*/,
-            b_ptr + (nc * Kc + kci) * block_n * block_k / 2 /*B*/,
-            b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n /*scales_b*/,
-            b_qzeros_ptr + nc * block_n * num_groups + kci / block_per_group * block_n /*qzeros_b*/,
-            compensation_ptr + nc * block_n * Kc + kci * block_n /*compensation*/,
-            m_size /*M*/,
-            block_k /*K*/,
-            K /*lda*/,
-            block_n /*ldc*/);
-        }
-        // store y_buf to output with dtype conversion
-        store_out<out_dtype, block_n>(
-          y_buf[0],
-          c_ptr + mci * block_m * N + nc * block_n,
-          m_size,
-          N /*lda*/);
+      for (int64_t mci = mc_begin; mci < mc_end; ++mci) {
+        _da8w4_linear_block<out_dtype, cpublas_can_pack, sym_quant_a>(
+            args, M, mci, nc);
       }
     }
     if constexpr (cpublas_can_pack) {
