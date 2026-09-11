@@ -209,22 +209,32 @@ def _resolve_min_max_and_dtypes(
     return min_val, max_val, scale_dtype, zero_point_dtype, eps
 
 
+@dataclass
+class _QParamsWorkspace:
+    """Derived inputs shared by ``_symmetric_qparams``/``_asymmetric_qparams``.
+
+    Bundles the reduced min/max tensors and the resolved quant bounds/eps so the
+    per-mapping helpers can take a single workspace argument alongside the config.
+    """
+
+    min_val_neg: torch.Tensor
+    max_val_pos: torch.Tensor
+    quant_min: int
+    quant_max: int
+    eps: float
+
+
 def _symmetric_qparams(
-    mapping_type: str,
-    min_val_neg: torch.Tensor,
-    max_val_pos: torch.Tensor,
-    quant_min: int,
-    quant_max: int,
-    eps: float,
-    preserve_zero: bool,
-    zero_point_domain: Optional[str],
+    ws: _QParamsWorkspace,
+    config: _AffineQParamsConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute scale/zero_point for the symmetric mapping types."""
-    if mapping_type == MappingType.SYMMETRIC.name:
-        max_val_pos = torch.max(-min_val_neg, max_val_pos)
+    quant_min, quant_max = ws.quant_min, ws.quant_max
+    if config.mapping_type == MappingType.SYMMETRIC.name:
+        max_val_pos = torch.max(-ws.min_val_neg, ws.max_val_pos)
         scale = max_val_pos / (float(quant_max - quant_min) / 2)
     else:
-        assert mapping_type == MappingType.SYMMETRIC_NO_CLIPPING_ERR.name
+        assert config.mapping_type == MappingType.SYMMETRIC_NO_CLIPPING_ERR.name
         # calculate smin and smax individually and choose the larger one. For example, if quant_min = -8 and
         # quant_max = 7.
         # - If smin is bigger: There would be coverage on negative values down to -8, and less rounding
@@ -232,49 +242,46 @@ def _symmetric_qparams(
         # - If smax is bigger: it covers the positive values up to 7. The round
         # error may be bigger than the existing SYMMETRIC case. Either way, there's no out-of-range fp values after
         # quantization.
-        smin = min_val_neg / float(quant_min)
-        smax = max_val_pos / float(quant_max)
+        smin = ws.min_val_neg / float(quant_min)
+        smax = ws.max_val_pos / float(quant_max)
         mask = smin > smax
         scale = torch.where(mask, smin, smax)
 
-    if not preserve_zero:
+    if not config.preserve_zero:
         raise ValueError(
             "preserve_zero == False is not supported for symmetric quantization"
         )
+    zero_point_domain = config.zero_point_domain
     if zero_point_domain is not None and zero_point_domain != ZeroPointDomain.INT.name:
         raise ValueError(
             "zero_point_domain != ZeroPointDomain.INT is not supported for symmetric quantization"
         )
-    scale = torch.clamp(scale, min=eps)
+    scale = torch.clamp(scale, min=ws.eps)
     zero_point = torch.full_like(scale, int((quant_max + quant_min + 1) / 2))
     return scale, zero_point
 
 
 def _asymmetric_qparams(
-    min_val_neg: torch.Tensor,
-    max_val_pos: torch.Tensor,
-    quant_min: int,
-    quant_max: int,
-    eps: float,
-    preserve_zero: bool,
-    zero_point_domain: Optional[str],
+    ws: _QParamsWorkspace,
+    config: _AffineQParamsConfig,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Compute scale/zero_point for the asymmetric mapping type."""
-    scale = (max_val_pos - min_val_neg) / float(quant_max - quant_min)
-    scale = torch.clamp(scale, min=eps)
+    quant_min, quant_max = ws.quant_min, ws.quant_max
+    scale = (ws.max_val_pos - ws.min_val_neg) / float(quant_max - quant_min)
+    scale = torch.clamp(scale, min=ws.eps)
 
-    if zero_point_domain == ZeroPointDomain.NONE.name:
+    if config.zero_point_domain == ZeroPointDomain.NONE.name:
         return scale, None
-    if preserve_zero:
-        zero_point = quant_min - torch.round(min_val_neg / scale)
+    if config.preserve_zero:
+        zero_point = quant_min - torch.round(ws.min_val_neg / scale)
         zero_point = torch.clamp(zero_point, quant_min, quant_max)
         return scale, zero_point
 
-    assert zero_point_domain == ZeroPointDomain.FLOAT.name, (
+    assert config.zero_point_domain == ZeroPointDomain.FLOAT.name, (
         "if not preserve_zero, zero_point must be in FLOAT domain"
     )
     mid_point = (quant_max + quant_min + 1) / 2
-    zero_point = min_val_neg + scale * mid_point
+    zero_point = ws.min_val_neg + scale * mid_point
     return scale, zero_point
 
 
@@ -293,7 +300,6 @@ def _choose_qparams_affine(
     mapping_type = config.mapping_type
     target_dtype = config.target_dtype
     preserve_zero = config.preserve_zero
-    zero_point_domain = config.zero_point_domain
 
     quant_min, quant_max = _get_and_check_qmin_qmax(
         target_dtype, config.quant_min, config.quant_max
@@ -319,32 +325,22 @@ def _choose_qparams_affine(
         min_val_neg = min_val
         max_val_pos = max_val
 
+    workspace = _QParamsWorkspace(
+        min_val_neg=min_val_neg,
+        max_val_pos=max_val_pos,
+        quant_min=quant_min,
+        quant_max=quant_max,
+        eps=eps,
+    )
     is_symmetric = mapping_type in (
         MappingType.SYMMETRIC.name,
         MappingType.SYMMETRIC_NO_CLIPPING_ERR.name,
     )
     if is_symmetric:
-        scale, zero_point = _symmetric_qparams(
-            mapping_type,
-            min_val_neg,
-            max_val_pos,
-            quant_min,
-            quant_max,
-            eps,
-            preserve_zero,
-            zero_point_domain,
-        )
+        scale, zero_point = _symmetric_qparams(workspace, config)
     else:
         assert mapping_type == MappingType.ASYMMETRIC.name
-        scale, zero_point = _asymmetric_qparams(
-            min_val_neg,
-            max_val_pos,
-            quant_min,
-            quant_max,
-            eps,
-            preserve_zero,
-            zero_point_domain,
-        )
+        scale, zero_point = _asymmetric_qparams(workspace, config)
 
     if zero_point is not None:
         zero_point = zero_point.to(dtype=zero_point_dtype)
