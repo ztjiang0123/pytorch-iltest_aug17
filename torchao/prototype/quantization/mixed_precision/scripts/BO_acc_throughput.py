@@ -130,6 +130,36 @@ def generate(
     return seq
 
 
+def _make_interactive_callback(tokenizer):
+    """Build a streaming callback that prints decoded tokens as they are generated."""
+    buffer = []
+    period_id = tokenizer.encode(".")[0]
+    done_generating = False
+
+    def callback(x):
+        nonlocal done_generating
+        if done_generating:
+            return
+        buffer.append(tokenizer.decode([period_id] + x.tolist())[1:])
+        if x.item() == tokenizer.eos_id():
+            done_generating = True
+        if len(buffer) == 4 or done_generating:
+            print("".join(buffer), end="", flush=True)
+            buffer.clear()
+
+    return callback
+
+
+def _make_profiler_context(is_last_sample: bool, profile: Optional[Path]):
+    """Return a profiler context for the final sample, else a no-op context."""
+    import contextlib
+
+    if not (is_last_sample and profile):
+        return contextlib.nullcontext()
+    torch.profiler._utils._init_for_cuda_graphs()
+    return torch.profiler.profile()
+
+
 def cal_throughput(
     model,
     tokenizer,
@@ -183,38 +213,19 @@ def cal_throughput(
         if i == 0:
             torch.cuda.reset_peak_memory_stats()
         device_sync(device=device)  # MKG
-        if i >= 0 and interactive:
+
+        interactive_sample = interactive and i >= 0
+        if interactive_sample:
             prompt = input("What is your prompt? ")
             if is_chat:
                 prompt = f"{B_INST} {prompt.strip()} {E_INST}"
             encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
-
-        if interactive and i >= 0:
-            buffer = []
-            period_id = tokenizer.encode(".")[0]
-            done_generating = False
-
-            def callback(x):
-                nonlocal done_generating
-                if done_generating:
-                    return
-                buffer.append(tokenizer.decode([period_id] + x.tolist())[1:])
-                if x.item() == tokenizer.eos_id():
-                    done_generating = True
-                if len(buffer) == 4 or done_generating:
-                    print("".join(buffer), end="", flush=True)
-                    buffer.clear()
-                # print(, end='', flush=True)
+            callback = _make_interactive_callback(tokenizer)
         else:
             callback = lambda x: x
-        t0 = time.perf_counter()
-        import contextlib
 
-        if i != num_samples - 1 or not profile:
-            prof = contextlib.nullcontext()
-        else:
-            torch.profiler._utils._init_for_cuda_graphs()
-            prof = torch.profiler.profile()
+        t0 = time.perf_counter()
+        prof = _make_profiler_context(i == num_samples - 1, profile)
         with prof:
             y = generate(
                 model,

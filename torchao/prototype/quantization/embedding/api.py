@@ -299,6 +299,67 @@ class TiedEmbeddingQuantizer:
         self.granularity = granularity
         self.mapping_type = mapping_type
 
+    @staticmethod
+    def _detect_embedding_to_unembedding(
+        embedding_fqns: List[str],
+        linear_fqns: List[str],
+        state_dict: Mapping[str, torch.Tensor],
+    ) -> dict:
+        """Auto-detect embeddings that share weights with a linear (unembedding)."""
+        embedding_to_unembedding = {}
+        for embedding_fqn in embedding_fqns:
+            embedding_w = state_dict[embedding_fqn + ".weight"]
+            for linear_fqn in linear_fqns:
+                linear_w = state_dict[linear_fqn + ".weight"]
+                shares_weights = embedding_w.shape == linear_w.shape and torch.allclose(
+                    embedding_w, linear_w
+                )
+                if not shares_weights:
+                    continue
+                print(
+                    f"Found shared embedding {embedding_fqn} and unembedding {linear_fqn}"
+                )
+                if embedding_fqn in embedding_to_unembedding:
+                    raise ValueError(
+                        f"Found multiple candidate unembeddings ({embedding_to_unembedding[embedding_fqn]}, {linear_fqn}) for embedding {embedding_fqn}.  This is not supported yet.  Please explicitly define the input embedding_to_unembedding."
+                    )
+                embedding_to_unembedding[embedding_fqn] = linear_fqn
+        return embedding_to_unembedding
+
+    @staticmethod
+    def _reverse_mapping(embedding_to_unembedding: Mapping[str, str]) -> dict:
+        """Invert embedding->unembedding, rejecting many-to-one collisions."""
+        unembedding_to_embedding = {}
+        for embedding_fqn, unembedding_fqn in embedding_to_unembedding.items():
+            if unembedding_fqn in unembedding_to_embedding:
+                raise ValueError(
+                    f"Found multiple candidate embeddings ({unembedding_to_embedding[unembedding_fqn]}, {embedding_fqn}) for unembedding {unembedding_fqn}.  This is not supported yet."
+                )
+            unembedding_to_embedding[unembedding_fqn] = embedding_fqn
+        return unembedding_to_embedding
+
+    @staticmethod
+    def _validate_mapping(
+        embedding_to_unembedding: Mapping[str, str],
+        embedding_fqns: List[str],
+        linear_fqns: List[str],
+        state_dict: Mapping[str, torch.Tensor],
+    ) -> None:
+        """Check embeddings/unembeddings exist and actually share weights."""
+        for embedding_fqn, unembedding_fqn in embedding_to_unembedding.items():
+            assert embedding_fqn in embedding_fqns, (
+                f"Embedding {embedding_fqn} is not found in model"
+            )
+            assert unembedding_fqn in linear_fqns, (
+                f"Unembedding {unembedding_fqn} is not found in model"
+            )
+            assert torch.allclose(
+                state_dict[embedding_fqn + ".weight"],
+                state_dict[unembedding_fqn + ".weight"],
+            ), (
+                f"Embedding {embedding_fqn} does not share weights with unembedding {unembedding_fqn}"
+            )
+
     def quantize(
         self,
         model: nn.Module,
@@ -314,48 +375,17 @@ class TiedEmbeddingQuantizer:
 
         # If embedding_to_unembedding is not provided, automatically detect shared embeddings and unembeddings
         if embedding_to_unembedding is None:
-            embedding_to_unembedding = {}
-            for embedding_fqn in embedding_fqns:
-                embedding_w = state_dict[embedding_fqn + ".weight"]
-                for linear_fqn in linear_fqns:
-                    linear_w = state_dict[linear_fqn + ".weight"]
-                    if embedding_w.shape == linear_w.shape and torch.allclose(
-                        embedding_w, linear_w
-                    ):
-                        print(
-                            f"Found shared embedding {embedding_fqn} and unembedding {linear_fqn}"
-                        )
-                        if embedding_fqn not in embedding_to_unembedding:
-                            embedding_to_unembedding[embedding_fqn] = linear_fqn
-                        else:
-                            raise ValueError(
-                                f"Found multiple candidate unembeddings ({embedding_to_unembedding[embedding_fqn]}, {linear_fqn}) for embedding {embedding_fqn}.  This is not supported yet.  Please explicitly define the input embedding_to_unembedding."
-                            )
+            embedding_to_unembedding = self._detect_embedding_to_unembedding(
+                embedding_fqns, linear_fqns, state_dict
+            )
 
         # Construct reverse mapping
-        unembedding_to_embedding = {}
-        for v, k in embedding_to_unembedding.items():
-            if k not in unembedding_to_embedding:
-                unembedding_to_embedding[k] = v
-            else:
-                raise ValueError(
-                    f"Found multiple candidate embeddings ({unembedding_to_embedding[k]}, {v}) for unembedding {k}.  This is not supported yet."
-                )
+        unembedding_to_embedding = self._reverse_mapping(embedding_to_unembedding)
 
         # Check that embeddings are shared, embeddings are embeddings, and unembeddings are linear ops
-        for embedding_fqn, unembedding_fqn in embedding_to_unembedding.items():
-            assert embedding_fqn in embedding_fqns, (
-                f"Embedding {embedding_fqn} is not found in model"
-            )
-            assert unembedding_fqn in linear_fqns, (
-                f"Unembedding {unembedding_fqn} is not found in model"
-            )
-            assert torch.allclose(
-                state_dict[embedding_fqn + ".weight"],
-                state_dict[unembedding_fqn + ".weight"],
-            ), (
-                f"Embedding {embedding_fqn} does not share weights with unembedding {unembedding_fqn}"
-            )
+        self._validate_mapping(
+            embedding_to_unembedding, embedding_fqns, linear_fqns, state_dict
+        )
 
         # Quantize unembeddings
         quantize_(

@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from torch.utils._python_dispatch import return_and_correct_aliasing
@@ -330,6 +330,130 @@ implements_torch_function([torch.matmul, torch.mm])(_float8_mm_dispatch)
 implements(aten.addmm_.default)(_float8_addmm__dispatch)
 
 
+def _select_addmm_kernel(weight_tensor: PrototypeFloat8Tensor) -> str:
+    """Resolve which gemm kernel ("mslk" or "torch") to use for the weight tensor."""
+    kernel_preference = weight_tensor.kernel_preference
+
+    if kernel_preference == KernelPreference.MSLK:
+        return "mslk"
+
+    if kernel_preference == KernelPreference.TORCH:
+        return "torch"
+
+    assert kernel_preference == KernelPreference.AUTO, (
+        f"{weight_tensor.kernel_preference=} not handled"
+    )
+    mslk_usable = (
+        _is_mslk_available()
+        and is_sm_at_least_90()
+        and not _is_128_128_scaled(weight_tensor)
+        and not _is_tensorwise_scaled(weight_tensor)
+    )
+    return "mslk" if mslk_usable else "torch"
+
+
+def _float8_addmm_mslk(
+    input_tensor: PrototypeFloat8Tensor,
+    weight_tensor: PrototypeFloat8Tensor,
+    out_shape: Tuple[int, ...],
+    bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Run the MSLK gemm path (rowwise-scaled only)."""
+    assert _is_mslk_available(), "Expected mslk package to be installed"
+    assert is_sm_at_least_90(), "Expected SM90+ for mslk"
+    mm_config = weight_tensor.mm_config
+    assert mm_config is not None
+    assert not _is_128_128_scaled(weight_tensor), "unimplemented"
+
+    if not _is_rowwise_scaled(weight_tensor.t()):
+        assert _is_tensorwise_scaled(weight_tensor)
+        assert _is_tensorwise_scaled(input_tensor)
+        raise NotImplementedError(
+            "torch.ops.mslk.f8f8bf16 (tensorwise-scaled MSLK gemm) is no "
+            "longer supported. Please use KernelPreference.TORCH instead."
+        )
+
+    assert _is_rowwise_scaled(input_tensor), "Input tensor must be rowwise block size"
+    xq = input_tensor.qdata.reshape(-1, input_tensor.qdata.shape[-1])
+    return torch.ops.mslk.f8f8bf16_rowwise(
+        xq,
+        weight_tensor.qdata.t(),
+        input_tensor.scale,
+        weight_tensor.scale.t(),
+        bias=bias,
+        use_fast_accum=mm_config.use_fast_accum,
+    ).reshape(out_shape)
+
+
+def _float8_addmm_torch(
+    input_tensor: PrototypeFloat8Tensor,
+    weight_tensor: PrototypeFloat8Tensor,
+    out_shape: Tuple[int, ...],
+    bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Run the torch._scaled_mm / blockwise gemm path."""
+    scaled_mm_config = weight_tensor.mm_config
+    assert scaled_mm_config is not None
+
+    # Extract tensor data and scales
+    inpt_data = input_tensor.qdata.reshape(-1, input_tensor.qdata.shape[-1])
+    w_data = weight_tensor.qdata
+    input_scale = input_tensor.scale
+    w_scale = weight_tensor.scale
+
+    if _is_rowwise_scaled(weight_tensor):
+        assert _is_rowwise_scaled(input_tensor), (
+            "Input tensor must be rowwise block size"
+        )
+    elif _is_128_128_scaled(weight_tensor):
+        assert _is_1_128_scaled(input_tensor), "input_tensor must be 1x128 scaled"
+
+    input_scale = preprocess_scale(input_scale, input_tensor.shape)
+    inpt_data, w_data = preprocess_data(inpt_data, w_data, scaled_mm_config)
+
+    if _is_128_128_scaled(weight_tensor):
+        # TODO(future PR): add testing for torch._scaled_mm with
+        # blockwise scaling on CUDA 12.9
+        # TODO(future PR): add mslk path if available
+        # TODO(future PR): proper out_dtype handling
+        assert _is_1_128_scaled(input_tensor), "unsupported"
+        res = blockwise_fp8_gemm(
+            inpt_data,
+            input_scale,
+            w_data.t(),
+            w_scale.t(),
+            block_size=128,
+        )
+        if bias is not None:
+            res = res + bias
+    else:
+        res = addmm_float8_unwrapped_inference(
+            inpt_data,
+            input_scale,
+            w_data,
+            w_scale,
+            output_dtype=input_tensor.dtype,
+            bias=bias,
+            use_fast_accum=scaled_mm_config.use_fast_accum,
+        )
+    return res.reshape(out_shape)
+
+
+def _float8_addmm_weight_only(
+    input_tensor: torch.Tensor,
+    weight_tensor: PrototypeFloat8Tensor,
+    bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Weight-only path: input is unquantized, dequantize the weight and matmul."""
+    assert not isinstance(input_tensor, TorchAOBaseTensor), (
+        "Expecting input_tensor to be unquantized"
+    )
+    res = torch.matmul(input_tensor, weight_tensor.dequantize())
+    if bias is not None:
+        res = res + bias
+    return res
+
+
 def _float8_addmm_impl(
     input_tensor: PrototypeFloat8Tensor,
     weight_tensor: PrototypeFloat8Tensor,
@@ -357,110 +481,16 @@ def _float8_addmm_impl(
     out_shape = (*input_tensor.shape[:-1], weight_tensor.shape[1])
 
     if isinstance(input_tensor, PrototypeFloat8Tensor):
-        kernel_choice = None
-
-        if weight_tensor.kernel_preference == KernelPreference.AUTO:
-            kernel_choice = "torch"
-            if (
-                _is_mslk_available()
-                and is_sm_at_least_90()
-                and (not _is_128_128_scaled(weight_tensor))
-                and not _is_tensorwise_scaled(weight_tensor)
-            ):
-                kernel_choice = "mslk"
-        elif weight_tensor.kernel_preference == KernelPreference.MSLK:
-            kernel_choice = "mslk"
-        else:
-            assert weight_tensor.kernel_preference == KernelPreference.TORCH, (
-                f"{weight_tensor.kernel_preference=} not handled"
-            )
-            kernel_choice = "torch"
-
+        kernel_choice = _select_addmm_kernel(weight_tensor)
         if kernel_choice == "mslk":
-            assert _is_mslk_available(), "Expected mslk package to be installed"
-            assert is_sm_at_least_90(), "Expected SM90+ for mslk"
-            mm_config = weight_tensor.mm_config
-            assert mm_config is not None
-            assert not _is_128_128_scaled(weight_tensor), "unimplemented"
-
-            xq = input_tensor.qdata.reshape(-1, input_tensor.qdata.shape[-1])
-            if _is_rowwise_scaled(weight_tensor.t()):
-                assert _is_rowwise_scaled(input_tensor), (
-                    "Input tensor must be rowwise block size"
-                )
-                res = torch.ops.mslk.f8f8bf16_rowwise(
-                    xq,
-                    weight_tensor.qdata.t(),
-                    input_tensor.scale,
-                    weight_tensor.scale.t(),
-                    bias=bias,
-                    use_fast_accum=mm_config.use_fast_accum,
-                ).reshape(out_shape)
-            else:
-                assert _is_tensorwise_scaled(weight_tensor)
-                assert _is_tensorwise_scaled(input_tensor)
-                raise NotImplementedError(
-                    "torch.ops.mslk.f8f8bf16 (tensorwise-scaled MSLK gemm) is no "
-                    "longer supported. Please use KernelPreference.TORCH instead."
-                )
+            res = _float8_addmm_mslk(input_tensor, weight_tensor, out_shape, bias)
         else:
             assert kernel_choice == "torch"
-            scaled_mm_config = weight_tensor.mm_config
-            assert scaled_mm_config is not None
-
-            # Extract tensor data and scales
-            inpt_data = input_tensor.qdata.reshape(-1, input_tensor.qdata.shape[-1])
-            w_data = weight_tensor.qdata
-            input_scale = input_tensor.scale
-            w_scale = weight_tensor.scale
-
-            if _is_rowwise_scaled(weight_tensor):
-                assert _is_rowwise_scaled(input_tensor), (
-                    "Input tensor must be rowwise block size"
-                )
-            elif _is_128_128_scaled(weight_tensor):
-                assert _is_1_128_scaled(input_tensor), (
-                    "input_tensor must be 1x128 scaled"
-                )
-
-            input_scale = preprocess_scale(input_scale, input_tensor.shape)
-            inpt_data, w_data = preprocess_data(inpt_data, w_data, scaled_mm_config)
-
-            if _is_128_128_scaled(weight_tensor):
-                # TODO(future PR): add testing for torch._scaled_mm with
-                # blockwise scaling on CUDA 12.9
-                # TODO(future PR): add mslk path if available
-                # TODO(future PR): proper out_dtype handling
-                assert _is_1_128_scaled(input_tensor), "unsupported"
-                res = blockwise_fp8_gemm(
-                    inpt_data,
-                    input_scale,
-                    w_data.t(),
-                    w_scale.t(),
-                    block_size=128,
-                )
-                if bias is not None:
-                    res = res + bias
-            else:
-                res = addmm_float8_unwrapped_inference(
-                    inpt_data,
-                    input_scale,
-                    w_data,
-                    w_scale,
-                    output_dtype=input_tensor.dtype,
-                    bias=bias,
-                    use_fast_accum=scaled_mm_config.use_fast_accum,
-                )
-            res = res.reshape(out_shape)
+            res = _float8_addmm_torch(input_tensor, weight_tensor, out_shape, bias)
     else:
-        assert not isinstance(input_tensor, TorchAOBaseTensor), (
-            "Expecting input_tensor to be unquantized"
-        )
         # when input is not `PrototypeFloat8Tensor`, we expect that it is not quantized
         # so this is float8 weight only quantization
-        res = torch.matmul(input_tensor, weight_tensor.dequantize())
-        if bias is not None:
-            res = res + bias
+        res = _float8_addmm_weight_only(input_tensor, weight_tensor, bias)
 
     # Handle output quantization if output_act_quant_kwargs is set
     output_act_quant_kwargs = weight_tensor.output_act_quant_kwargs
