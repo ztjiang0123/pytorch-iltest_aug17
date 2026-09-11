@@ -6,6 +6,7 @@ from typing import Any, Dict
 import torch
 
 import torchao
+from torchao.core.config import _is_serialized_config
 from torchao.prototype.mx_formats.config import ScaleCalculationMode
 from torchao.prototype.mx_formats.mx_tensor import MXTensor, QuantizeTensorToMXKwargs
 from torchao.prototype.mx_formats.nvfp4_tensor import (
@@ -158,19 +159,14 @@ class TensorSubclassAttributeJSONEncoder(json.JSONEncoder):
         return value
 
 
-def _is_serialized_object(value: Any) -> bool:
-    """Return True if ``value`` is a dict encoding a serialized object."""
-    return isinstance(value, dict) and "_type" in value and "_data" in value
-
-
 def _decode_if_serialized(value: Any) -> Any:
     """Recursively decode ``value`` when it encodes a serialized object."""
-    return object_from_dict(value) if _is_serialized_object(value) else value
+    return object_from_dict(value) if _is_serialized_config(value) else value
 
 
 def _decode_field(value: Any) -> Any:
     """Decode a single field value from ``_data``, recursing into containers."""
-    if _is_serialized_object(value):
+    if _is_serialized_config(value):
         # Recursively handle nested configs
         return object_from_dict(value)
     if isinstance(value, list):

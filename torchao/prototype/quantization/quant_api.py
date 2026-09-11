@@ -476,6 +476,10 @@ class Float8QuantizedSoftmax(torch.nn.Module):
         )
 
 
+def _float8_resolve_granularity(config: Float8StaticActivationFloat8WeightConfig):
+    return config.granularity if config.granularity is not None else PerTensor()
+
+
 def _float8_make_output_quant_kwargs(
     config: Float8StaticActivationFloat8WeightConfig, granularity
 ) -> QuantizeTensorToFloat8Kwargs:
@@ -511,7 +515,6 @@ def _float8_make_activation_observer(
 def _float8_build_quantized_weight(
     module: torch.nn.Module,
     config: Float8StaticActivationFloat8WeightConfig,
-    granularity,
     act_quant_scale,
     output_act_quant_scale,
     output_kwargs,
@@ -520,6 +523,7 @@ def _float8_build_quantized_weight(
         PrototypeFloat8Tensor,
     )
 
+    granularity = _float8_resolve_granularity(config)
     return PrototypeFloat8Tensor.from_hp(
         module.weight,
         float8_dtype=config.weight_dtype,
@@ -603,7 +607,6 @@ def _float8_convert_observed_linear(
     quantized_tensor = _float8_build_quantized_weight(
         module,
         config,
-        granularity,
         act_quant_scale,
         output_act_quant_scale,
         output_act_quant_kwargs,
@@ -671,7 +674,6 @@ def _float8_handle_direct_quantization(
     quantized_tensor = _float8_build_quantized_weight(
         module,
         config,
-        granularity,
         act_quant_scale,
         output_act_quant_scale,
         output_act_quant_kwargs,
@@ -699,7 +701,7 @@ def _float8_static_activation_float8_weight_transform(
     - torch.nn.Softmax: Output quantization simulation (quantize-and-dequantize)
     """
     step = config.step
-    granularity = config.granularity if config.granularity is not None else PerTensor()
+    granularity = _float8_resolve_granularity(config)
 
     is_prepare = step == QuantizationStep.PREPARE or step == "prepare"
     is_convert = step == QuantizationStep.CONVERT or step == "convert"
