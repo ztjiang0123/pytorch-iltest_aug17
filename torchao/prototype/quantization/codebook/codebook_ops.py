@@ -244,6 +244,84 @@ def _kmeans_greedy_init(data: torch.Tensor, k: int) -> torch.Tensor:
 
 
 @torch.jit.script
+def _assign_nearest_clusters(
+    data: List[torch.Tensor],
+    clusters: List[torch.Tensor],
+    nearest_indices: List[torch.Tensor],
+    shard_size: int,
+    block_size: int,
+) -> None:
+    """Assign every data point (per shard/device) to its nearest cluster, in place.
+
+    The formula computed equals ``-0.5 || data[:, None, :] - clusters[None, :, :] || ^ 2``
+    plus a per-cluster constant, so ``argmax`` selects the nearest cluster.
+    """
+    for block_start in range(0, shard_size, block_size):
+        for gi in range(len(data)):
+            nearest_indices[gi][block_start : block_start + block_size] = torch.addmm(
+                torch.bmm(clusters[gi][:, None, :], clusters[gi][:, :, None]).flatten(),
+                data[gi][block_start : block_start + block_size],
+                clusters[gi].T,
+                beta=-0.5,
+            ).argmax(1)
+
+
+@torch.jit.script
+def _update_clusters_single_device(
+    data: List[torch.Tensor],
+    clusters: List[torch.Tensor],
+    nearest_indices: List[torch.Tensor],
+) -> List[torch.Tensor]:
+    """Recompute cluster centroids as the mean of assigned points (single device)."""
+    return [
+        clusters[0]
+        .clone()
+        .index_reduce_(
+            dim=0,
+            index=nearest_indices[0],
+            source=data[0],
+            reduce="mean",
+            include_self=False,
+        )
+    ]
+
+
+@torch.jit.script
+def _update_clusters_multi_device(
+    data: List[torch.Tensor],
+    clusters: List[torch.Tensor],
+    nearest_indices: List[torch.Tensor],
+    devices: List[torch.device],
+    k: int,
+) -> List[torch.Tensor]:
+    """Recompute cluster centroids across shards on multiple devices.
+
+    Empty clusters keep their previous centroid.
+    """
+    cluster_sums = [
+        torch.zeros_like(clusters[gi])
+        .index_add(dim=0, index=nearest_indices[gi], source=data[gi])
+        .to(devices[0], non_blocking=True)
+        for gi in range(len(devices))
+    ]
+    cluster_counts = [
+        torch.bincount(nearest_indices[gi], minlength=k).to(
+            devices[0], non_blocking=True
+        )
+        for gi in range(len(devices))
+    ]
+    for gi in range(1, len(devices)):
+        cluster_sums[0] += cluster_sums[gi]
+        cluster_counts[0] += cluster_counts[gi]
+
+    new_clusters = [cluster_sums[0] / cluster_counts[0].unsqueeze(1).clamp_min(1)]
+    new_clusters[0] += (cluster_counts[0].unsqueeze(1) == 0) * clusters[0]
+    for gi in range(1, len(devices)):
+        new_clusters.append(new_clusters[0].to(devices[gi], non_blocking=True))
+    return new_clusters
+
+
+@torch.jit.script
 def fit_kmeans(
     data: torch.Tensor,
     k: int,
@@ -287,69 +365,29 @@ def fit_kmeans(
     ]
     clusters = [clusters.to(device, non_blocking=True) for device in devices]
 
+    single_device = len(devices) == 1
     for i in range(max_iter):
-        for block_start in range(0, shard_size, block_size):
-            for gi in range(len(devices)):
-                nearest_indices[gi][block_start : block_start + block_size] = (
-                    torch.addmm(
-                        torch.bmm(
-                            clusters[gi][:, None, :], clusters[gi][:, :, None]
-                        ).flatten(),
-                        data[gi][block_start : block_start + block_size],
-                        clusters[gi].T,
-                        beta=-0.5,
-                    ).argmax(1)
-                )
-            # note: the above formula equals to - 0.5 || data[:, None, :] - clusters[None, :, :] || ^ 2 + const
+        _assign_nearest_clusters(
+            data, clusters, nearest_indices, shard_size, block_size
+        )
 
-        if len(devices) == 1:
-            new_clusters = [
-                clusters[0]
-                .clone()
-                .index_reduce_(
-                    dim=0,
-                    index=nearest_indices[0],
-                    source=data[0],
-                    reduce="mean",
-                    include_self=False,
-                )
-            ]
+        if single_device:
+            new_clusters = _update_clusters_single_device(
+                data, clusters, nearest_indices
+            )
         else:
-            cluster_sums = [
-                torch.zeros_like(clusters[gi])
-                .index_add(dim=0, index=nearest_indices[gi], source=data[gi])
-                .to(devices[0], non_blocking=True)
-                for gi in range(len(devices))
-            ]
-            cluster_counts = [
-                torch.bincount(nearest_indices[gi], minlength=k).to(
-                    devices[0], non_blocking=True
-                )
-                for gi in range(len(devices))
-            ]
-            for gi in range(1, len(devices)):
-                cluster_sums[0] += cluster_sums[gi]
-                cluster_counts[0] += cluster_counts[gi]
+            new_clusters = _update_clusters_multi_device(
+                data, clusters, nearest_indices, devices, k
+            )
 
-            new_clusters = [
-                cluster_sums[0] / cluster_counts[0].unsqueeze(1).clamp_min(1)
-            ]
-            new_clusters[0] += (cluster_counts[0].unsqueeze(1) == 0) * clusters[0]
-            for gi in range(1, len(devices)):
-                new_clusters.append(new_clusters[0].to(devices[gi], non_blocking=True))
-
-        if i % check_every == 0:
-            if torch.allclose(new_clusters[0], clusters[0], rtol=rtol, atol=atol):
-                break
+        converged = i % check_every == 0 and torch.allclose(
+            new_clusters[0], clusters[0], rtol=rtol, atol=atol
+        )
+        if converged:
+            break
         clusters = new_clusters
-    for block_start in range(0, shard_size, block_size):
-        for gi in range(len(devices)):
-            nearest_indices[gi][block_start : block_start + block_size] = torch.addmm(
-                torch.bmm(clusters[gi][:, None, :], clusters[gi][:, :, None]).flatten(),
-                data[gi][block_start : block_start + block_size],
-                clusters[gi].T,
-                beta=-0.5,
-            ).argmax(1)
+
+    _assign_nearest_clusters(data, clusters, nearest_indices, shard_size, block_size)
 
     clusters = clusters[0]
     nearest_indices = torch.cat(

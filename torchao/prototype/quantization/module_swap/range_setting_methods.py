@@ -59,6 +59,62 @@ def get_batched_output(
     return torch.vstack(output_data)
 
 
+def _get_module_input_data_for_range_setting(
+    model: nn.Module,
+    name: str,
+    module: nn.Module,
+    data: torch.Tensor,
+    batch_size: int,
+    data_getter: Optional[DataGetter],
+) -> torch.Tensor:
+    """Fetch input data for a module, from the data_getter if provided else from data."""
+    if data_getter is not None:
+        return data_getter.pop(model, name)
+    return get_module_input_data(model, data, module, batch_size)
+
+
+def _set_weight_range_for_module(
+    model: nn.Module,
+    name: str,
+    module: QuantizedLinear,
+    data: torch.Tensor,
+    batch_size: int,
+    num_points: int,
+    progressive: bool,
+    data_getter: Optional[DataGetter],
+    data_getter_progressive: Optional[DataGetter],
+) -> None:
+    """Run range setting (weight-scale search) for a single QuantizedLinear module."""
+    logger.info(f"Range setting for {name}")
+    model.apply(all_quantizers_off)
+    # TODO: Some form of smart subsampling from all this sequential data
+    input_data = _get_module_input_data_for_range_setting(
+        model, name, module, data, batch_size, data_getter
+    )
+    output_data = get_batched_output(module, input_data, batch_size)
+
+    if progressive:
+        model.apply(all_weight_quantizers_on)
+        input_data = _get_module_input_data_for_range_setting(
+            model, name, module, data, batch_size, data_getter_progressive
+        )
+
+    input_data = input_data.to(module.weight.device).to(module.weight.dtype)
+    output_data = output_data.to(module.weight.device).to(module.weight.dtype)
+
+    module.weight_quantization = True
+    dim = tuple(range(input_data.dim() - 1))  # all but last
+
+    # TODO: batched loss getting
+    loss_fn = lambda m: torch.mean(
+        torch.pow(m(input_data) - output_data, 2),
+        dim=dim,
+    )
+
+    best_scale = find_optimal_scales_with_loss(module, loss_fn, num_points)
+    module.weight_scale.data = best_scale
+
+
 def set_weight_range_activation_loss(
     model: nn.Module,
     data: torch.Tensor,
@@ -85,40 +141,17 @@ def set_weight_range_activation_loss(
     with torch.no_grad():
         for name, module in model.named_modules():
             if isinstance(module, QuantizedLinear):
-                logger.info(f"Range setting for {name}")
-                model.apply(all_quantizers_off)
-                # TODO: Some form of smart subsampling from all this sequential data
-                if data_getter is not None:
-                    input_data = data_getter.pop(model, name)
-                else:
-                    input_data = get_module_input_data(model, data, module, batch_size)
-                output_data = get_batched_output(module, input_data, batch_size)
-
-                if progressive:
-                    model.apply(all_weight_quantizers_on)
-                    if data_getter_progressive is not None:
-                        input_data = data_getter_progressive.pop(model, name)
-                    else:
-                        input_data = get_module_input_data(
-                            model, data, module, batch_size
-                        )
-
-                input_data = input_data.to(module.weight.device).to(module.weight.dtype)
-                output_data = output_data.to(module.weight.device).to(
-                    module.weight.dtype
+                _set_weight_range_for_module(
+                    model,
+                    name,
+                    module,
+                    data,
+                    batch_size,
+                    num_points,
+                    progressive,
+                    data_getter,
+                    data_getter_progressive,
                 )
-
-                module.weight_quantization = True
-                dim = tuple(range(input_data.dim() - 1))  # all but last
-
-                # TODO: batched loss getting
-                loss_fn = lambda m: torch.mean(
-                    torch.pow(m(input_data) - output_data, 2),
-                    dim=dim,
-                )
-
-                best_scale = find_optimal_scales_with_loss(module, loss_fn, num_points)
-                module.weight_scale.data = best_scale
 
     # reset quantization settings to original values
     for name, module in model.named_modules():
