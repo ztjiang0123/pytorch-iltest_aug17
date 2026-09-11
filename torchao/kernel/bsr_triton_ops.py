@@ -164,21 +164,6 @@ class _AddmmMetaQuery(NamedTuple):
     sparsity: float
     version: int
 
-    @classmethod
-    def build(cls, M, K, N, Ms, Ks, beta, alpha, sparsity, dtype, out_dtype, _version):
-        key = (M, K, N, Ms, Ks, beta == 0, beta == 1, alpha == 1)
-        version_dtype = dtype if dtype is out_dtype else (dtype, out_dtype)
-        return cls(
-            N=N,
-            key=key,
-            device_name=torch.cuda.get_device_name(),
-            version_dtype=version_dtype,
-            dtype=dtype,
-            out_dtype=out_dtype,
-            sparsity=sparsity,
-            version=_version,
-        )
-
 
 def _lookup_tuned_addmm_meta(q: "_AddmmMetaQuery"):
     """Look up pre-tuned bsr_dense_addmm kernel parameters, or None if untuned.
@@ -270,8 +255,15 @@ def bsr_dense_addmm_meta(
     if sparsity is None:
         sparsity = 0.5
     if {SPLIT_N, num_warps, num_stages, GROUP_SIZE_ROW} == {None}:
-        query = _AddmmMetaQuery.build(
-            M, K, N, Ms, Ks, beta, alpha, sparsity, dtype, out_dtype, _version
+        query = _AddmmMetaQuery(
+            N=N,
+            key=(M, K, N, Ms, Ks, beta == 0, beta == 1, alpha == 1),
+            device_name=torch.cuda.get_device_name(),
+            version_dtype=dtype if dtype is out_dtype else (dtype, out_dtype),
+            dtype=dtype,
+            out_dtype=out_dtype,
+            sparsity=sparsity,
+            version=_version,
         )
         meta = _lookup_tuned_addmm_meta(query)
         if meta is not None:
