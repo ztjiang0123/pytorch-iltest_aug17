@@ -204,6 +204,9 @@ def _approximate_addmm_meta(
             version=(_version, dtype, 0.5),
         )
 
+    # Iterate all candidates in sorted order and keep the last qualifying one
+    # (largest n), matching the original fall-through-without-break behavior.
+    meta = None
     for mkey in sorted(matching_meta or {}):
         meta_ = matching_meta[mkey]
         n = mkey[2]
@@ -211,9 +214,8 @@ def _approximate_addmm_meta(
         if N % c == 0 and n <= N:
             meta = dict(meta_)
             meta["SPLIT_N"] = N // c
-            return meta
 
-    return None
+    return meta
 
 
 def bsr_dense_addmm_meta(
