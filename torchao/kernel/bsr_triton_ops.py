@@ -152,6 +152,70 @@ def tune_bsr_dense_addmm(
     return meta
 
 
+def _lookup_tuned_addmm_meta(
+    M, K, N, Ms, Ks, beta, alpha, sparsity, dtype, out_dtype, _version
+):
+    """Look up pre-tuned bsr_dense_addmm kernel parameters, or None if untuned.
+
+    Tries the exact (dtype, sparsity) entry first, then progressively relaxes to
+    the 0.5-sparsity and input-dtype fallbacks, and finally to an approximate
+    entry whose SPLIT_N can be rescaled to divide N evenly.
+    """
+    device_name = torch.cuda.get_device_name()
+    key = (M, K, N, Ms, Ks, beta == 0, beta == 1, alpha == 1)
+    version_dtype = dtype if dtype is out_dtype else (dtype, out_dtype)
+
+    # Exact match, then progressively relaxed fallbacks.
+    meta = get_meta(
+        "bsr_dense_addmm", key, device_name, version=(_version, version_dtype, sparsity)
+    )
+    if meta is None and sparsity != 0.5:
+        meta = get_meta(
+            "bsr_dense_addmm", key, device_name, version=(_version, version_dtype, 0.5)
+        )
+    if meta is None and dtype is not out_dtype:
+        meta = get_meta(
+            "bsr_dense_addmm", key, device_name, version=(_version, dtype, 0.5)
+        )
+    if meta is not None:
+        return meta
+
+    return _approximate_addmm_meta(
+        key, N, device_name, version_dtype, dtype, out_dtype, _version
+    )
+
+
+def _approximate_addmm_meta(
+    key, N, device_name, version_dtype, dtype, out_dtype, _version
+):
+    """Find a tuned entry for any N whose SPLIT_N rescales so that N % SPLIT_N == 0."""
+    wildcard_key = (*key[:2], "*", *key[3:])
+    matching_meta = get_meta(
+        "bsr_dense_addmm",
+        wildcard_key,
+        device_name,
+        version=(_version, version_dtype, 0.5),
+    )
+    if matching_meta is None and dtype is not out_dtype:
+        matching_meta = get_meta(
+            "bsr_dense_addmm",
+            wildcard_key,
+            device_name,
+            version=(_version, dtype, 0.5),
+        )
+
+    for mkey in sorted(matching_meta or {}):
+        meta_ = matching_meta[mkey]
+        n = mkey[2]
+        c = n // meta_["SPLIT_N"]
+        if N % c == 0 and n <= N:
+            meta = dict(meta_)
+            meta["SPLIT_N"] = N // c
+            return meta
+
+    return None
+
+
 def bsr_dense_addmm_meta(
     M,
     K,
@@ -180,61 +244,17 @@ def bsr_dense_addmm_meta(
     if sparsity is None:
         sparsity = 0.5
     if {SPLIT_N, num_warps, num_stages, GROUP_SIZE_ROW} == {None}:
-        device_name = torch.cuda.get_device_name()
-        key = (M, K, N, Ms, Ks, beta == 0, beta == 1, alpha == 1)
-        if dtype is out_dtype:
-            version_dtype = dtype
-        else:
-            version_dtype = dtype, out_dtype
-        meta = get_meta(
-            "bsr_dense_addmm",
-            key,
-            device_name,
-            version=(_version, version_dtype, sparsity),
+        meta = _lookup_tuned_addmm_meta(
+            M, K, N, Ms, Ks, beta, alpha, sparsity, dtype, out_dtype, _version
         )
-        if meta is None and sparsity != 0.5:
-            meta = get_meta(
-                "bsr_dense_addmm",
-                key,
-                device_name,
-                version=(_version, version_dtype, 0.5),
-            )
-        if meta is None and dtype is not out_dtype:
-            meta = get_meta(
-                "bsr_dense_addmm", key, device_name, version=(_version, dtype, 0.5)
-            )
-        if meta is None:
-            # find approximate meta such that N % SPLIT_N == 0.
-            matching_meta = get_meta(
-                "bsr_dense_addmm",
-                (*key[:2], "*", *key[3:]),
-                device_name,
-                version=(_version, version_dtype, 0.5),
-            )
-            if matching_meta is None and dtype is not out_dtype:
-                matching_meta = get_meta(
-                    "bsr_dense_addmm",
-                    (*key[:2], "*", *key[3:]),
-                    device_name,
-                    version=(_version, dtype, 0.5),
-                )
-            for mkey in sorted(matching_meta or {}):
-                meta_ = matching_meta[mkey]
-                n = mkey[2]
-                split_n = meta_["SPLIT_N"]
-                c = n // split_n
-                if N % c == 0 and n <= N:
-                    meta = dict(meta_)
-                    meta["SPLIT_N"] = N // c
         if meta is not None:
             meta.update(**extra)
             return meta
-        else:
-            warn_once(
-                "bsr_dense_addmm uses non-optimal triton kernel parameters"
-                f" for {M=} {K=} {N=} {Ms=}, {Ks=} {beta=} {alpha=} {dtype=} {out_dtype=}. "
-                "To find optimal triton kernel parameters, run with BSR_AUTOTUNE=1"
-            )
+        warn_once(
+            "bsr_dense_addmm uses non-optimal triton kernel parameters"
+            f" for {M=} {K=} {N=} {Ms=}, {Ks=} {beta=} {alpha=} {dtype=} {out_dtype=}. "
+            "To find optimal triton kernel parameters, run with BSR_AUTOTUNE=1"
+        )
 
     SPLIT_N = SPLIT_N or max(N // Ms, 1)
     GROUP_SIZE_ROW = GROUP_SIZE_ROW or 4
