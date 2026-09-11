@@ -6,7 +6,7 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
 import os
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 from torch._dynamo.utils import warn_once
@@ -152,56 +152,80 @@ def tune_bsr_dense_addmm(
     return meta
 
 
-def _lookup_tuned_addmm_meta(
-    M, K, N, Ms, Ks, beta, alpha, sparsity, dtype, out_dtype, _version
-):
+class _AddmmMetaQuery(NamedTuple):
+    """Precomputed inputs for looking up tuned bsr_dense_addmm parameters."""
+
+    N: int
+    key: tuple
+    device_name: str
+    version_dtype: object  # dtype, or (dtype, out_dtype)
+    dtype: object
+    out_dtype: object
+    sparsity: float
+    version: int
+
+    @classmethod
+    def build(cls, M, K, N, Ms, Ks, beta, alpha, sparsity, dtype, out_dtype, _version):
+        key = (M, K, N, Ms, Ks, beta == 0, beta == 1, alpha == 1)
+        version_dtype = dtype if dtype is out_dtype else (dtype, out_dtype)
+        return cls(
+            N=N,
+            key=key,
+            device_name=torch.cuda.get_device_name(),
+            version_dtype=version_dtype,
+            dtype=dtype,
+            out_dtype=out_dtype,
+            sparsity=sparsity,
+            version=_version,
+        )
+
+
+def _lookup_tuned_addmm_meta(q: "_AddmmMetaQuery"):
     """Look up pre-tuned bsr_dense_addmm kernel parameters, or None if untuned.
 
     Tries the exact (dtype, sparsity) entry first, then progressively relaxes to
     the 0.5-sparsity and input-dtype fallbacks, and finally to an approximate
     entry whose SPLIT_N can be rescaled to divide N evenly.
     """
-    device_name = torch.cuda.get_device_name()
-    key = (M, K, N, Ms, Ks, beta == 0, beta == 1, alpha == 1)
-    version_dtype = dtype if dtype is out_dtype else (dtype, out_dtype)
-
     # Exact match, then progressively relaxed fallbacks.
     meta = get_meta(
-        "bsr_dense_addmm", key, device_name, version=(_version, version_dtype, sparsity)
+        "bsr_dense_addmm",
+        q.key,
+        q.device_name,
+        version=(q.version, q.version_dtype, q.sparsity),
     )
-    if meta is None and sparsity != 0.5:
+    if meta is None and q.sparsity != 0.5:
         meta = get_meta(
-            "bsr_dense_addmm", key, device_name, version=(_version, version_dtype, 0.5)
+            "bsr_dense_addmm",
+            q.key,
+            q.device_name,
+            version=(q.version, q.version_dtype, 0.5),
         )
-    if meta is None and dtype is not out_dtype:
+    if meta is None and q.dtype is not q.out_dtype:
         meta = get_meta(
-            "bsr_dense_addmm", key, device_name, version=(_version, dtype, 0.5)
+            "bsr_dense_addmm", q.key, q.device_name, version=(q.version, q.dtype, 0.5)
         )
     if meta is not None:
         return meta
 
-    return _approximate_addmm_meta(
-        key, N, device_name, version_dtype, dtype, out_dtype, _version
-    )
+    return _approximate_addmm_meta(q)
 
 
-def _approximate_addmm_meta(
-    key, N, device_name, version_dtype, dtype, out_dtype, _version
-):
+def _approximate_addmm_meta(q: "_AddmmMetaQuery"):
     """Find a tuned entry for any N whose SPLIT_N rescales so that N % SPLIT_N == 0."""
-    wildcard_key = (*key[:2], "*", *key[3:])
+    wildcard_key = (*q.key[:2], "*", *q.key[3:])
     matching_meta = get_meta(
         "bsr_dense_addmm",
         wildcard_key,
-        device_name,
-        version=(_version, version_dtype, 0.5),
+        q.device_name,
+        version=(q.version, q.version_dtype, 0.5),
     )
-    if matching_meta is None and dtype is not out_dtype:
+    if matching_meta is None and q.dtype is not q.out_dtype:
         matching_meta = get_meta(
             "bsr_dense_addmm",
             wildcard_key,
-            device_name,
-            version=(_version, dtype, 0.5),
+            q.device_name,
+            version=(q.version, q.dtype, 0.5),
         )
 
     # Iterate all candidates in sorted order and keep the last qualifying one
@@ -211,9 +235,9 @@ def _approximate_addmm_meta(
         meta_ = matching_meta[mkey]
         n = mkey[2]
         c = n // meta_["SPLIT_N"]
-        if N % c == 0 and n <= N:
+        if q.N % c == 0 and n <= q.N:
             meta = dict(meta_)
-            meta["SPLIT_N"] = N // c
+            meta["SPLIT_N"] = q.N // c
 
     return meta
 
@@ -246,9 +270,10 @@ def bsr_dense_addmm_meta(
     if sparsity is None:
         sparsity = 0.5
     if {SPLIT_N, num_warps, num_stages, GROUP_SIZE_ROW} == {None}:
-        meta = _lookup_tuned_addmm_meta(
+        query = _AddmmMetaQuery.build(
             M, K, N, Ms, Ks, beta, alpha, sparsity, dtype, out_dtype, _version
         )
+        meta = _lookup_tuned_addmm_meta(query)
         if meta is not None:
             meta.update(**extra)
             return meta

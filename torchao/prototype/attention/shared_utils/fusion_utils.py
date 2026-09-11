@@ -987,63 +987,76 @@ def _replace_with_fused_op(
 # Main Fusion Pass
 
 
-def _finalize_fusion(
-    graph: Graph,
-    sdpa_node: Node,
-    pattern_name: str,
-    pre_rope_q: Node,
-    pre_rope_k: Node,
-    v_input: Optional[Node],
-    q_rope: "RoPEMatch",
-    params: "_FP8SDPAParams",
-    enable_gqa: bool,
-    rope_sdpa_op,
-) -> bool:
-    """Reshape cos/sin and replace ``sdpa_node`` with the fused op.
+@dataclass
+class _FusionContext:
+    """Per-SDPA-node invariants shared by all fusion attempts."""
+
+    graph: Graph
+    sdpa_node: Node
+    params: "_FP8SDPAParams"
+    rope_sdpa_op: object
+
+
+@dataclass
+class _FusionPlan:
+    """Resolved operands for a matched RoPE pattern, ready to fuse."""
+
+    pattern_name: str
+    pre_rope_q: Node
+    pre_rope_k: Node
+    v_input: Optional[Node]
+    q_rope: "RoPEMatch"
+    enable_gqa: bool
+
+
+def _finalize_fusion(ctx: "_FusionContext", plan: "_FusionPlan") -> bool:
+    """Reshape cos/sin and replace ``ctx.sdpa_node`` with the fused op.
 
     Returns True when the fusion was applied, False when it was skipped
     because V had no transpose or cos/sin had an incompatible shape.
     """
-    if v_input is None:
-        logger.debug("%s: V has no transpose, skipping: %s", pattern_name, sdpa_node.name)
+    sdpa_node = ctx.sdpa_node
+    if plan.v_input is None:
+        logger.debug(
+            "%s: V has no transpose, skipping: %s", plan.pattern_name, sdpa_node.name
+        )
         return False
 
-    cos_sin = _reshape_cos_sin_to_2d(graph, q_rope.cos_node, q_rope.sin_node, sdpa_node)
+    cos_sin = _reshape_cos_sin_to_2d(
+        ctx.graph, plan.q_rope.cos_node, plan.q_rope.sin_node, sdpa_node
+    )
     if cos_sin is None:
         logger.debug(
             "%s: cos/sin shape incompatible, skipping: %s",
-            pattern_name,
+            plan.pattern_name,
             sdpa_node.name,
         )
         return False
     cos_2d, sin_2d = cos_sin
 
     _replace_with_fused_op(
-        graph=graph,
+        graph=ctx.graph,
         sdpa_node=sdpa_node,
-        pre_rope_q=pre_rope_q,
-        pre_rope_k=pre_rope_k,
-        v_input=v_input,
+        pre_rope_q=plan.pre_rope_q,
+        pre_rope_k=plan.pre_rope_k,
+        v_input=plan.v_input,
         cos_node=cos_2d,
         sin_node=sin_2d,
-        is_causal=params.is_causal,
-        scale=params.scale,
-        enable_gqa=enable_gqa,
-        rope_interleaved=q_rope.rope_interleaved,
-        hadamard=params.hadamard,
-        rope_sdpa_op=rope_sdpa_op,
+        is_causal=ctx.params.is_causal,
+        scale=ctx.params.scale,
+        enable_gqa=plan.enable_gqa,
+        rope_interleaved=plan.q_rope.rope_interleaved,
+        hadamard=ctx.params.hadamard,
+        rope_sdpa_op=ctx.rope_sdpa_op,
     )
     return True
 
 
 def _try_fuse_pattern_a(
-    graph: Graph,
-    sdpa_node: Node,
+    ctx: "_FusionContext",
     q_node: Node,
     k_node: Node,
     v_pre_transpose: Optional[Node],
-    params: "_FP8SDPAParams",
-    rope_sdpa_op,
 ) -> Optional[bool]:
     """Pattern A: RoPE -> transpose -> FP8 SDPA (FLUX-style).
 
@@ -1062,16 +1075,15 @@ def _try_fuse_pattern_a(
         return None
 
     return _finalize_fusion(
-        graph=graph,
-        sdpa_node=sdpa_node,
-        pattern_name="Pattern A",
-        pre_rope_q=_trace_through_views(q_rope.pre_rope_input),
-        pre_rope_k=_trace_through_views(k_rope.pre_rope_input),
-        v_input=v_pre_transpose,
-        q_rope=q_rope,
-        params=params,
-        enable_gqa=params.enable_gqa,
-        rope_sdpa_op=rope_sdpa_op,
+        ctx,
+        _FusionPlan(
+            pattern_name="Pattern A",
+            pre_rope_q=_trace_through_views(q_rope.pre_rope_input),
+            pre_rope_k=_trace_through_views(k_rope.pre_rope_input),
+            v_input=v_pre_transpose,
+            q_rope=q_rope,
+            enable_gqa=ctx.params.enable_gqa,
+        ),
     )
 
 
@@ -1093,13 +1105,10 @@ def _detect_pattern_b_kv_rope(k_node: Node) -> Tuple[Optional["RoPEMatch"], bool
 
 
 def _try_fuse_pattern_b(
-    graph: Graph,
-    sdpa_node: Node,
+    ctx: "_FusionContext",
     q_node: Node,
     k_node: Node,
     v_node: Node,
-    params: "_FP8SDPAParams",
-    rope_sdpa_op,
 ) -> bool:
     """Pattern B: transpose -> RoPE -> FP8 SDPA (HuggingFace-style).
 
@@ -1122,16 +1131,15 @@ def _try_fuse_pattern_b(
             v_for_fusion = v_pre_repeat
 
     return _finalize_fusion(
-        graph=graph,
-        sdpa_node=sdpa_node,
-        pattern_name="Pattern B",
-        pre_rope_q=q_bshd,
-        pre_rope_k=k_bshd,
-        v_input=_unwrap_transpose(v_for_fusion),
-        q_rope=q_rope,
-        params=params,
-        enable_gqa=True if gqa_unwrapped else params.enable_gqa,
-        rope_sdpa_op=rope_sdpa_op,
+        ctx,
+        _FusionPlan(
+            pattern_name="Pattern B",
+            pre_rope_q=q_bshd,
+            pre_rope_k=k_bshd,
+            v_input=_unwrap_transpose(v_for_fusion),
+            q_rope=q_rope,
+            enable_gqa=True if gqa_unwrapped else ctx.params.enable_gqa,
+        ),
     )
 
 
@@ -1144,26 +1152,26 @@ def _try_fuse_sdpa_node(
 
     Tries each supported pattern in turn and returns True once one fuses.
     """
-    params = _get_fp8_sdpa_params(sdpa_node)
-
     qkv = _get_fp8_sdpa_qkv(sdpa_node)
     if qkv is None:
         return False
     q_node, k_node, v_node = qkv
 
+    ctx = _FusionContext(
+        graph=graph,
+        sdpa_node=sdpa_node,
+        params=_get_fp8_sdpa_params(sdpa_node),
+        rope_sdpa_op=rope_sdpa_op,
+    )
     v_pre_transpose = _unwrap_transpose(v_node)
 
     # Pattern A takes priority: if its RoPE pattern matches we commit to it and
     # do not fall through to Pattern B, even when fusion is ultimately skipped.
-    pattern_a = _try_fuse_pattern_a(
-        graph, sdpa_node, q_node, k_node, v_pre_transpose, params, rope_sdpa_op
-    )
+    pattern_a = _try_fuse_pattern_a(ctx, q_node, k_node, v_pre_transpose)
     if pattern_a is not None:
         return pattern_a
 
-    return _try_fuse_pattern_b(
-        graph, sdpa_node, q_node, k_node, v_node, params, rope_sdpa_op
-    )
+    return _try_fuse_pattern_b(ctx, q_node, k_node, v_node)
 
 
 def rope_sdpa_fusion_pass(

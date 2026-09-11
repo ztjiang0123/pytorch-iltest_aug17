@@ -425,20 +425,26 @@ inline float _exp_reduce_sum_slice(
   return vec_tmp_sum.reduce_add();
 }
 
+// Vectorized constants for the scale/round/clamp quantization step. Bundled so
+// per-slice quant is a single small-signature call.
+struct QuantSliceParams {
+  at::vec::Vectorized<float> sum_scale;
+  at::vec::Vectorized<float> beta1;
+  at::vec::Vectorized<float> min_val;
+  at::vec::Vectorized<float> max_val;
+};
+
 // Scale, round, add zp and clamp one kv slice into the uint8 output buffer.
 template <typename scalar_t>
 inline void _scale_quant_slice(
     const float* tmp_in,
     scalar_t* tmp_out,
     int64_t kvBlockSize,
-    const at::vec::Vectorized<float>& vec_sum_scale,
-    const at::vec::Vectorized<float>& vec_beta1,
-    const at::vec::Vectorized<float>& vec_min_val,
-    const at::vec::Vectorized<float>& vec_max_val) {
+    const QuantSliceParams& qp) {
   const int32_t vec_size = at::vec::Vectorized<float>::size();
   auto quant = [&](const at::vec::Vectorized<float>& tmp0) {
-    auto tmp2 = (tmp0 * vec_sum_scale).round() + vec_beta1;
-    return at::vec::clamp(tmp2, vec_min_val, vec_max_val);
+    auto tmp2 = (tmp0 * qp.sum_scale).round() + qp.beta1;
+    return at::vec::clamp(tmp2, qp.min_val, qp.max_val);
   };
   long col = 0;
   for (; col < vec_size * (kvBlockSize / vec_size); col += vec_size) {
@@ -499,16 +505,17 @@ inline void _sub_exp_sum_div_quant_fusion_kernel(
           qk_block_data + l * ldi, local + n, kvBlockSize, vec_max);
     }
     // div sum, sum for attention
-    auto vec_sum_scale =
-        at::vec::Vectorized<float>(1 / sfm_sum_ptr[row] / alpha);
+    QuantSliceParams qp{
+        at::vec::Vectorized<float>(1 / sfm_sum_ptr[row] / alpha),
+        vec_beta1,
+        vec_min_val,
+        vec_max_val};
     scalar_t* qk_reduced_block_data = out + row * av_gemm_K;
     for (int64_t l = 0; l < NSlice; l++) {
       int64_t n = l * N_step;
       int64_t kvBlockSize = std::min(N_step, kvSize - n);
       scalar_t* tmp_out = qk_reduced_block_data + l * ldo;
-      _scale_quant_slice(
-          local + n, tmp_out, kvBlockSize, vec_sum_scale, vec_beta1,
-          vec_min_val, vec_max_val);
+      _scale_quant_slice(local + n, tmp_out, kvBlockSize, qp);
       _zero_fill_tail(tmp_out, kvBlockSize, av_gemm_K, vec_zero);
     }
   }
