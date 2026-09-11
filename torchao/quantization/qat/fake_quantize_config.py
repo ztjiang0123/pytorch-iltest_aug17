@@ -370,120 +370,178 @@ def _infer_fake_quantize_configs(
         IntxWeightOnlyConfig,
     )
 
+    inferrer = _select_fake_quantize_config_inferrer(
+        base_config,
+        Int4WeightOnlyConfig,
+        Float8DynamicActivationFloat8WeightConfig,
+        Float8DynamicActivationInt4WeightConfig,
+        NVFP4DynamicActivationNVFP4WeightConfig,
+        NVFP4FakeQuantizeConfig,
+        MXDynamicActivationMXWeightConfig,
+        MXFakeQuantizeConfig,
+        Int8DynamicActivationIntxWeightConfig,
+        IntxWeightOnlyConfig,
+    )
+    return inferrer(base_config)
+
+
+def _select_fake_quantize_config_inferrer(
+    base_config: AOBaseConfig,
+    Int4WeightOnlyConfig,
+    Float8DynamicActivationFloat8WeightConfig,
+    Float8DynamicActivationInt4WeightConfig,
+    NVFP4DynamicActivationNVFP4WeightConfig,
+    NVFP4FakeQuantizeConfig,
+    MXDynamicActivationMXWeightConfig,
+    MXFakeQuantizeConfig,
+    Int8DynamicActivationIntxWeightConfig,
+    IntxWeightOnlyConfig,
+):
+    """Return the per-config-type inferrer for ``base_config``.
+
+    The config classes are passed in from the caller so that the imports stay
+    local to ``_infer_fake_quantize_configs`` (avoiding circular imports).
+    """
     if isinstance(base_config, Int4WeightOnlyConfig):
-        act_config = None
-        if base_config.version == 2:
-            supported_packing_formats = [
-                Int4PackingFormat.PLAIN,
-                Int4PackingFormat.PRESHUFFLED,
-            ]
-            if base_config.int4_packing_format not in supported_packing_formats:
-                raise ValueError(
-                    f"Packing format must be one of {supported_packing_formats}"
-                )
-            weight_config = Int4WeightFakeQuantizeConfig(
-                group_size=128,
-                activation_dtype=torch.bfloat16,
-            )
-        else:
-            raise ValueError(f"Unknown version on base config {type(base_config)}")
-    elif isinstance(base_config, Float8DynamicActivationFloat8WeightConfig):
-        if base_config.version != 2:
-            raise ValueError(f"Only version 2 of {type(base_config)} is supported")
-        (act_granularity, weight_granularity) = _normalize_granularity(
-            base_config.granularity
-        )
-        act_config = Float8FakeQuantizeConfig(
-            dtype=base_config.activation_dtype,
-            granularity=act_granularity,
-            hp_value_lb=base_config.activation_value_lb,
-            hp_value_ub=base_config.activation_value_ub,
-        )
-        weight_config = Float8FakeQuantizeConfig(
-            dtype=base_config.weight_dtype,
-            granularity=weight_granularity,
-        )
-    elif isinstance(base_config, Float8DynamicActivationInt4WeightConfig):
-        act_config = Float8FakeQuantizeConfig(
-            dtype=e4m3_dtype,
-            granularity=PerRow(),
-        )
-        weight_config = Int4WeightFakeQuantizeConfig(
-            group_size=128,
-            activation_dtype=e4m3_dtype,
-        )
-    elif isinstance(base_config, NVFP4DynamicActivationNVFP4WeightConfig):
-        act_config = NVFP4FakeQuantizeConfig(
-            use_per_tensor_scale=base_config.use_dynamic_per_tensor_scale,
-            use_swizzled_scales=False,
-            use_triton_kernel=False,
-        )
-        weight_config = NVFP4FakeQuantizeConfig(
-            use_per_tensor_scale=base_config.use_dynamic_per_tensor_scale,
-            use_swizzled_scales=True,
-            use_triton_kernel=base_config.use_triton_kernel,
-        )
-    elif isinstance(base_config, MXDynamicActivationMXWeightConfig):
-        act_config = MXFakeQuantizeConfig(
-            dtype=base_config.activation_dtype,
-            block_size=base_config.block_size,
-            scaling_mode=base_config.scaling_mode,
-            kernel_preference=base_config.kernel_preference,
-        )
-        weight_config = MXFakeQuantizeConfig(
-            dtype=base_config.weight_dtype,
-            block_size=base_config.block_size,
-            scaling_mode=base_config.scaling_mode,
-            kernel_preference=base_config.kernel_preference,
-        )
-    elif isinstance(base_config, Int8DynamicActivationIntxWeightConfig):
-        assert base_config.version >= 2, "Only version 2+ is supported"
-        assert base_config.intx_packing_format == "unpacked_to_int8", (
-            "Only unpacked_to_int8 is supported"
-        )
-        assert base_config.weight_dtype != torch.int1, "Only int2+ is supported"
-        assert base_config.act_mapping_type == MappingType.ASYMMETRIC, (
-            "Only asymmetric activation mapping is supported"
-        )
-        assert base_config.weight_mapping_type == MappingType.SYMMETRIC, (
-            "Only symmetric weight mapping is supported"
-        )
-        assert base_config.weight_scale_dtype is None, (
-            "Specifying weight_scale_dtype is not supported"
-        )
+        return _infer_int4_weight_only
+    if isinstance(base_config, Float8DynamicActivationFloat8WeightConfig):
+        return _infer_float8_dynamic_act_float8_weight
+    if isinstance(base_config, Float8DynamicActivationInt4WeightConfig):
+        return _infer_float8_dynamic_act_int4_weight
+    if isinstance(base_config, NVFP4DynamicActivationNVFP4WeightConfig):
+        return lambda cfg: _infer_nvfp4(cfg, NVFP4FakeQuantizeConfig)
+    if isinstance(base_config, MXDynamicActivationMXWeightConfig):
+        return lambda cfg: _infer_mx(cfg, MXFakeQuantizeConfig)
+    if isinstance(base_config, Int8DynamicActivationIntxWeightConfig):
+        return _infer_int8_dynamic_act_intx_weight
+    if isinstance(base_config, IntxWeightOnlyConfig):
+        return _infer_intx_weight_only
+    raise ValueError("Unexpected base config: %s" % base_config)
 
-        act_config = IntxFakeQuantizeConfig(
-            torch.int8,
-            "per_token",
-            is_symmetric=False,
-            scale_precision=base_config.weight_scale_dtype,
-        )
-        weight_config = IntxFakeQuantizeConfig(
-            dtype=base_config.weight_dtype,
-            granularity=base_config.weight_granularity,
-            mapping_type=base_config.weight_mapping_type,
-            scale_precision=base_config.weight_scale_dtype,
-        )
-    elif isinstance(base_config, IntxWeightOnlyConfig):
-        assert base_config.version >= 2, "Only version 2+ is supported"
-        assert base_config.intx_packing_format == "unpacked_to_int8", (
-            "Only unpacked_to_int8 is supported"
-        )
-        assert base_config.mapping_type == MappingType.SYMMETRIC, (
-            "Only symmetric mapping is supported"
-        )
-        assert base_config.weight_dtype != torch.int1, "Only int2+ is supported"
-        assert base_config.scale_dtype is None, (
-            "Specifying scale_dtype is not supported"
-        )
 
-        act_config = None
-        weight_config = IntxFakeQuantizeConfig(
-            dtype=base_config.weight_dtype,
-            granularity=base_config.granularity,
-            mapping_type=base_config.mapping_type,
-            scale_precision=base_config.scale_dtype,
-        )
-    else:
-        raise ValueError("Unexpected base config: %s" % base_config)
+def _infer_int4_weight_only(base_config):
+    if base_config.version != 2:
+        raise ValueError(f"Unknown version on base config {type(base_config)}")
+    supported_packing_formats = [
+        Int4PackingFormat.PLAIN,
+        Int4PackingFormat.PRESHUFFLED,
+    ]
+    if base_config.int4_packing_format not in supported_packing_formats:
+        raise ValueError(f"Packing format must be one of {supported_packing_formats}")
+    weight_config = Int4WeightFakeQuantizeConfig(
+        group_size=128,
+        activation_dtype=torch.bfloat16,
+    )
+    return (None, weight_config)
+
+
+def _infer_float8_dynamic_act_float8_weight(base_config):
+    if base_config.version != 2:
+        raise ValueError(f"Only version 2 of {type(base_config)} is supported")
+    (act_granularity, weight_granularity) = _normalize_granularity(
+        base_config.granularity
+    )
+    act_config = Float8FakeQuantizeConfig(
+        dtype=base_config.activation_dtype,
+        granularity=act_granularity,
+        hp_value_lb=base_config.activation_value_lb,
+        hp_value_ub=base_config.activation_value_ub,
+    )
+    weight_config = Float8FakeQuantizeConfig(
+        dtype=base_config.weight_dtype,
+        granularity=weight_granularity,
+    )
     return (act_config, weight_config)
+
+
+def _infer_float8_dynamic_act_int4_weight(base_config):
+    act_config = Float8FakeQuantizeConfig(
+        dtype=e4m3_dtype,
+        granularity=PerRow(),
+    )
+    weight_config = Int4WeightFakeQuantizeConfig(
+        group_size=128,
+        activation_dtype=e4m3_dtype,
+    )
+    return (act_config, weight_config)
+
+
+def _infer_nvfp4(base_config, NVFP4FakeQuantizeConfig):
+    act_config = NVFP4FakeQuantizeConfig(
+        use_per_tensor_scale=base_config.use_dynamic_per_tensor_scale,
+        use_swizzled_scales=False,
+        use_triton_kernel=False,
+    )
+    weight_config = NVFP4FakeQuantizeConfig(
+        use_per_tensor_scale=base_config.use_dynamic_per_tensor_scale,
+        use_swizzled_scales=True,
+        use_triton_kernel=base_config.use_triton_kernel,
+    )
+    return (act_config, weight_config)
+
+
+def _infer_mx(base_config, MXFakeQuantizeConfig):
+    act_config = MXFakeQuantizeConfig(
+        dtype=base_config.activation_dtype,
+        block_size=base_config.block_size,
+        scaling_mode=base_config.scaling_mode,
+        kernel_preference=base_config.kernel_preference,
+    )
+    weight_config = MXFakeQuantizeConfig(
+        dtype=base_config.weight_dtype,
+        block_size=base_config.block_size,
+        scaling_mode=base_config.scaling_mode,
+        kernel_preference=base_config.kernel_preference,
+    )
+    return (act_config, weight_config)
+
+
+def _infer_int8_dynamic_act_intx_weight(base_config):
+    assert base_config.version >= 2, "Only version 2+ is supported"
+    assert base_config.intx_packing_format == "unpacked_to_int8", (
+        "Only unpacked_to_int8 is supported"
+    )
+    assert base_config.weight_dtype != torch.int1, "Only int2+ is supported"
+    assert base_config.act_mapping_type == MappingType.ASYMMETRIC, (
+        "Only asymmetric activation mapping is supported"
+    )
+    assert base_config.weight_mapping_type == MappingType.SYMMETRIC, (
+        "Only symmetric weight mapping is supported"
+    )
+    assert base_config.weight_scale_dtype is None, (
+        "Specifying weight_scale_dtype is not supported"
+    )
+
+    act_config = IntxFakeQuantizeConfig(
+        torch.int8,
+        "per_token",
+        is_symmetric=False,
+        scale_precision=base_config.weight_scale_dtype,
+    )
+    weight_config = IntxFakeQuantizeConfig(
+        dtype=base_config.weight_dtype,
+        granularity=base_config.weight_granularity,
+        mapping_type=base_config.weight_mapping_type,
+        scale_precision=base_config.weight_scale_dtype,
+    )
+    return (act_config, weight_config)
+
+
+def _infer_intx_weight_only(base_config):
+    assert base_config.version >= 2, "Only version 2+ is supported"
+    assert base_config.intx_packing_format == "unpacked_to_int8", (
+        "Only unpacked_to_int8 is supported"
+    )
+    assert base_config.mapping_type == MappingType.SYMMETRIC, (
+        "Only symmetric mapping is supported"
+    )
+    assert base_config.weight_dtype != torch.int1, "Only int2+ is supported"
+    assert base_config.scale_dtype is None, "Specifying scale_dtype is not supported"
+
+    weight_config = IntxFakeQuantizeConfig(
+        dtype=base_config.weight_dtype,
+        granularity=base_config.granularity,
+        mapping_type=base_config.mapping_type,
+        scale_precision=base_config.scale_dtype,
+    )
+    return (None, weight_config)

@@ -1525,6 +1525,85 @@ class X86InductorQuantizer(Quantizer):
                 _is_output_of_quantized_pattern=True,
             )
 
+    def _unpack_linear_binary_unary_nodes(self, fused_partition, has_unary):
+        """Return ``(linear_node, binary_node, unary_node)`` for a fused partition.
+
+        ``unary_node`` is ``None`` when the pattern has no trailing unary op.
+        """
+        if has_unary:
+            linear_partition, binary_partition, unary_partition = fused_partition
+            return self._get_output_nodes_of_partitions(
+                [linear_partition, binary_partition, unary_partition]
+            )
+        linear_partition, binary_partition = fused_partition
+        linear_node, binary_node = self._get_output_nodes_of_partitions(
+            [linear_partition, binary_partition]
+        )
+        return linear_node, binary_node, None
+
+    def _is_fusible_linear_binary_node(self, linear_node, binary_node):
+        """Whether ``linear_node`` feeds ``binary_node`` in a fusible linear+binary."""
+        if len(linear_node.users) != 1:
+            # Linear Node should only has 1 user node
+            return False
+        linear_node_idx, extra_input_node_idx = self._get_input_idx_for_binary_node(
+            linear_node, binary_node
+        )
+        if (linear_node_idx is None) or (extra_input_node_idx is None):
+            return False
+        if linear_node != binary_node.args[linear_node_idx]:
+            raise ValueError(f"{linear_node} doesn't match input of binary node")
+        assert isinstance(linear_node, Node)
+        # No linear node found to be fused with add
+        return (
+            linear_node.op == "call_function"
+            and linear_node.target == torch.ops.aten.linear.default
+        )
+
+    def _annotate_linear_binary_unary_partition(
+        self,
+        fused_partition,
+        has_unary,
+        quantization_config: Optional[QuantizationConfig],
+        filter_fn: Optional[FilterFn],
+    ) -> None:
+        if any(len(partition.output_nodes) > 1 for partition in fused_partition):
+            # Fusion patterns assume each module has a single call site. A
+            # reused module (e.g. called inside an unrolled loop) yields a
+            # partition with multiple output nodes; skip fusion and let
+            # `_annotate_linear` annotate its call sites instead.
+            return
+        linear_node, binary_node, unary_node = self._unpack_linear_binary_unary_nodes(
+            fused_partition, has_unary
+        )
+        if not self._is_fusible_linear_binary_node(linear_node, binary_node):
+            return
+
+        node_list = (
+            [binary_node, linear_node]
+            if unary_node is None
+            else [unary_node, binary_node, linear_node]
+        )
+        if _skip_annotate(node_list, filter_fn):
+            return
+
+        if quantization_config is None:
+            _annotate_nodes_not_quantize(node_list)
+            return
+
+        self._annotate_linear_node_helper(linear_node, False, quantization_config)
+        # We don't insert q-dq before the binary input node due to accuracy issues
+        binary_node.meta[QUANT_ANNOTATION_KEY] = _X86InductorQuantizationAnnotation(
+            input_qspec_map={},
+            _annotated=True,
+            _is_output_of_quantized_pattern=(not has_unary),
+        )
+        if unary_node is not None:
+            unary_node.meta[QUANT_ANNOTATION_KEY] = _X86InductorQuantizationAnnotation(
+                _annotated=True,
+                _is_output_of_quantized_pattern=True,
+            )
+
     def _annotate_linear_binary_unary(
         self,
         gm: torch.fx.GraphModule,
@@ -1542,84 +1621,9 @@ class X86InductorQuantizer(Quantizer):
                 seq_partition.append(unary_op)
             fused_partitions = find_sequential_partitions(gm, seq_partition)
             for fused_partition in fused_partitions:
-                if any(
-                    len(partition.output_nodes) > 1 for partition in fused_partition
-                ):
-                    # Fusion patterns assume each module has a single call
-                    # site. A reused module (e.g. called inside an unrolled
-                    # loop) yields a partition with multiple output nodes; skip
-                    # fusion and let `_annotate_linear` annotate its call sites
-                    # instead.
-                    continue
-                unary_partition, unary_node = None, None
-                if has_unary:
-                    (
-                        linear_partition,
-                        binary_partition,
-                        unary_partition,
-                    ) = fused_partition
-                    (
-                        linear_node,
-                        binary_node,
-                        unary_node,
-                    ) = self._get_output_nodes_of_partitions(
-                        [linear_partition, binary_partition, unary_partition]
-                    )
-                else:
-                    linear_partition, binary_partition = fused_partition
-                    linear_node, binary_node = self._get_output_nodes_of_partitions(
-                        [linear_partition, binary_partition]
-                    )
-                if len(linear_node.users) != 1:
-                    # Linear Node should only has 1 user node
-                    continue
-                (
-                    linear_node_idx,
-                    extra_input_node_idx,
-                ) = self._get_input_idx_for_binary_node(linear_node, binary_node)
-                if (linear_node_idx is None) or (extra_input_node_idx is None):
-                    continue
-                if linear_node != binary_node.args[linear_node_idx]:
-                    raise ValueError(
-                        f"{linear_node} doesn't match input of binary node"
-                    )
-                assert isinstance(linear_node, Node)
-                if (
-                    linear_node.op != "call_function"
-                    or linear_node.target != torch.ops.aten.linear.default
-                ):
-                    # No linear node found to be fused with add
-                    continue
-                node_list = (
-                    [binary_node, linear_node]
-                    if unary_node is None
-                    else [unary_node, binary_node, linear_node]
+                self._annotate_linear_binary_unary_partition(
+                    fused_partition, has_unary, quantization_config, filter_fn
                 )
-                if _skip_annotate(node_list, filter_fn):
-                    continue
-
-                if quantization_config is None:
-                    _annotate_nodes_not_quantize(node_list)
-                    continue
-
-                self._annotate_linear_node_helper(
-                    linear_node, False, quantization_config
-                )
-                # We don't insert q-dq before the binary input node due to accuracy issues
-                binary_node.meta[QUANT_ANNOTATION_KEY] = (
-                    _X86InductorQuantizationAnnotation(
-                        input_qspec_map={},
-                        _annotated=True,
-                        _is_output_of_quantized_pattern=(not has_unary),
-                    )
-                )
-                if unary_node is not None:
-                    unary_node.meta[QUANT_ANNOTATION_KEY] = (
-                        _X86InductorQuantizationAnnotation(
-                            _annotated=True,
-                            _is_output_of_quantized_pattern=True,
-                        )
-                    )
 
     def _annotate_mul_tensor(
         self,
