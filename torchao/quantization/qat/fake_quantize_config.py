@@ -352,15 +352,17 @@ def _infer_fake_quantize_configs(
 
     Return a 2-tuple of (activation_config, weight_config) for fake quantization.
     """
+    inferrer = _select_fake_quantize_config_inferrer(base_config)
+    return inferrer(base_config)
+
+
+def _select_fake_quantize_config_inferrer(base_config: AOBaseConfig):
+    """Return the per-config-type inferrer function for ``base_config``."""
     # TODO: rewrite using registration API so we don't need to import here
     # avoid circular imports
     from torchao.prototype.mx_formats import (
         MXDynamicActivationMXWeightConfig,
         NVFP4DynamicActivationNVFP4WeightConfig,
-    )
-    from torchao.prototype.qat import (
-        MXFakeQuantizeConfig,
-        NVFP4FakeQuantizeConfig,
     )
     from torchao.quantization import (
         Float8DynamicActivationFloat8WeightConfig,
@@ -370,38 +372,6 @@ def _infer_fake_quantize_configs(
         IntxWeightOnlyConfig,
     )
 
-    inferrer = _select_fake_quantize_config_inferrer(
-        base_config,
-        Int4WeightOnlyConfig,
-        Float8DynamicActivationFloat8WeightConfig,
-        Float8DynamicActivationInt4WeightConfig,
-        NVFP4DynamicActivationNVFP4WeightConfig,
-        NVFP4FakeQuantizeConfig,
-        MXDynamicActivationMXWeightConfig,
-        MXFakeQuantizeConfig,
-        Int8DynamicActivationIntxWeightConfig,
-        IntxWeightOnlyConfig,
-    )
-    return inferrer(base_config)
-
-
-def _select_fake_quantize_config_inferrer(
-    base_config: AOBaseConfig,
-    Int4WeightOnlyConfig,
-    Float8DynamicActivationFloat8WeightConfig,
-    Float8DynamicActivationInt4WeightConfig,
-    NVFP4DynamicActivationNVFP4WeightConfig,
-    NVFP4FakeQuantizeConfig,
-    MXDynamicActivationMXWeightConfig,
-    MXFakeQuantizeConfig,
-    Int8DynamicActivationIntxWeightConfig,
-    IntxWeightOnlyConfig,
-):
-    """Return the per-config-type inferrer for ``base_config``.
-
-    The config classes are passed in from the caller so that the imports stay
-    local to ``_infer_fake_quantize_configs`` (avoiding circular imports).
-    """
     if isinstance(base_config, Int4WeightOnlyConfig):
         return _infer_int4_weight_only
     if isinstance(base_config, Float8DynamicActivationFloat8WeightConfig):
@@ -409,9 +379,9 @@ def _select_fake_quantize_config_inferrer(
     if isinstance(base_config, Float8DynamicActivationInt4WeightConfig):
         return _infer_float8_dynamic_act_int4_weight
     if isinstance(base_config, NVFP4DynamicActivationNVFP4WeightConfig):
-        return lambda cfg: _infer_nvfp4(cfg, NVFP4FakeQuantizeConfig)
+        return _infer_nvfp4
     if isinstance(base_config, MXDynamicActivationMXWeightConfig):
-        return lambda cfg: _infer_mx(cfg, MXFakeQuantizeConfig)
+        return _infer_mx
     if isinstance(base_config, Int8DynamicActivationIntxWeightConfig):
         return _infer_int8_dynamic_act_intx_weight
     if isinstance(base_config, IntxWeightOnlyConfig):
@@ -466,7 +436,9 @@ def _infer_float8_dynamic_act_int4_weight(base_config):
     return (act_config, weight_config)
 
 
-def _infer_nvfp4(base_config, NVFP4FakeQuantizeConfig):
+def _infer_nvfp4(base_config):
+    from torchao.prototype.qat import NVFP4FakeQuantizeConfig
+
     act_config = NVFP4FakeQuantizeConfig(
         use_per_tensor_scale=base_config.use_dynamic_per_tensor_scale,
         use_swizzled_scales=False,
@@ -480,7 +452,9 @@ def _infer_nvfp4(base_config, NVFP4FakeQuantizeConfig):
     return (act_config, weight_config)
 
 
-def _infer_mx(base_config, MXFakeQuantizeConfig):
+def _infer_mx(base_config):
+    from torchao.prototype.qat import MXFakeQuantizeConfig
+
     act_config = MXFakeQuantizeConfig(
         dtype=base_config.activation_dtype,
         block_size=base_config.block_size,
