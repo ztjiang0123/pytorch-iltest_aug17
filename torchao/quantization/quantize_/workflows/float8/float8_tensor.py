@@ -404,9 +404,13 @@ def _(func, types, args, kwargs):
     )
 
 
-def _select_float8_kernel_choice(weight_tensor: Float8Tensor) -> str:
+def _select_float8_kernel_choice(weight_tensor) -> str:
     """Resolve which gemm kernel ("mslk" or "torch") to use for a quantized
     activation @ float8 weight, based on the weight's kernel preference.
+
+    Shared by the stable ``Float8Tensor`` and the prototype
+    ``PrototypeFloat8Tensor`` addmm paths (they only differ in the impl the
+    chosen kernel dispatches to).
     """
     kernel_preference = weight_tensor.kernel_preference
 

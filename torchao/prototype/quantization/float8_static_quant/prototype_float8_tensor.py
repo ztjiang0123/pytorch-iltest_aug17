@@ -45,6 +45,7 @@ from torchao.quantization.quantize_.workflows.float8.float8_tensor import (
     _float8_linear_dispatch,
     _float8_mm_dispatch,
     _float8_quantization_type,
+    _select_float8_kernel_choice,
 )
 from torchao.quantization.utils import get_block_size
 from torchao.utils import (
@@ -330,28 +331,6 @@ implements_torch_function([torch.matmul, torch.mm])(_float8_mm_dispatch)
 implements(aten.addmm_.default)(_float8_addmm__dispatch)
 
 
-def _select_addmm_kernel(weight_tensor: PrototypeFloat8Tensor) -> str:
-    """Resolve which gemm kernel ("mslk" or "torch") to use for the weight tensor."""
-    kernel_preference = weight_tensor.kernel_preference
-
-    if kernel_preference == KernelPreference.MSLK:
-        return "mslk"
-
-    if kernel_preference == KernelPreference.TORCH:
-        return "torch"
-
-    assert kernel_preference == KernelPreference.AUTO, (
-        f"{weight_tensor.kernel_preference=} not handled"
-    )
-    mslk_usable = (
-        _is_mslk_available()
-        and is_sm_at_least_90()
-        and not _is_128_128_scaled(weight_tensor)
-        and not _is_tensorwise_scaled(weight_tensor)
-    )
-    return "mslk" if mslk_usable else "torch"
-
-
 def _float8_addmm_mslk(
     input_tensor: PrototypeFloat8Tensor,
     weight_tensor: PrototypeFloat8Tensor,
@@ -481,7 +460,7 @@ def _float8_addmm_impl(
     out_shape = (*input_tensor.shape[:-1], weight_tensor.shape[1])
 
     if isinstance(input_tensor, PrototypeFloat8Tensor):
-        kernel_choice = _select_addmm_kernel(weight_tensor)
+        kernel_choice = _select_float8_kernel_choice(weight_tensor)
         if kernel_choice == "mslk":
             res = _float8_addmm_mslk(input_tensor, weight_tensor, out_shape, bias)
         else:
