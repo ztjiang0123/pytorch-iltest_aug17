@@ -68,6 +68,15 @@ class _SizeTotals:
         self.unfactored_size += contribution.unfactored_size
 
 
+def _scale_group_zeros(zero_elts, grouper, prox_kwargs):
+    """Scale a per-group zero count up to element count for group-based pruning."""
+    if not prox_kwargs["is_svd_grouper"] and not prox_kwargs.get(
+        "zero_elts_are_counts", False
+    ):
+        zero_elts *= grouper.group_size()
+    return zero_elts
+
+
 class PruneOptimizer(BaseWrappedOptimizer):
     """Wraps a base optimizer to apply proximal updates that induce sparsity
     or low-rank structure during training.
@@ -329,31 +338,11 @@ class PruneOptimizer(BaseWrappedOptimizer):
         return zero_elts, group_norm
 
     @staticmethod
-    def _apply_prox_vmap(
-        grouper,
-        prox_map,
-        p,
-        gamma,
-        gamma_in_dims,
-        tau_reweight,
-        tau_reweight_in_dims,
-        use_dtensor,
-    ):
-        """Apply `prox_map` per group via vmap (or the DTensor equivalent)."""
-        if use_dtensor:
-            return PruneOptimizer._apply_prox_dtensor(
-                grouper,
-                prox_map,
-                p,
-                gamma,
-                gamma_in_dims,
-                tau_reweight,
-                tau_reweight_in_dims,
-            )
-        # torch.Tensor branch - use standard vmap
+    def _apply_prox_tensor_vmap(grouper, prox_map, in_dims, gamma, tau_reweight):
+        """Apply `prox_map` per group over a plain torch.Tensor via vmap."""
         zero_elts_per_group, group_norm = torch.vmap(
             prox_map.apply_,
-            in_dims=(grouper.in_dims, gamma_in_dims, tau_reweight_in_dims),
+            in_dims=in_dims,
             out_dims=(0, 0),
         )(grouper.p, gamma, tau_reweight)
         return zero_elts_per_group.sum().item(), group_norm
@@ -405,9 +394,8 @@ class PruneOptimizer(BaseWrappedOptimizer):
                     grouper, prox_map, gamma, tau_reweight
                 )
                 zeros_are_summed = zero_elts.dim() == 0
-            else:
-                use_dtensor = not is_svd_grouper and _is_dtensor(p)
-                zero_elts, group_norm = PruneOptimizer._apply_prox_vmap(
+            elif not is_svd_grouper and _is_dtensor(p):
+                zero_elts, group_norm = PruneOptimizer._apply_prox_dtensor(
                     grouper,
                     prox_map,
                     p,
@@ -415,15 +403,17 @@ class PruneOptimizer(BaseWrappedOptimizer):
                     gamma_in_dims,
                     tau_reweight,
                     tau_reweight_in_dims,
-                    use_dtensor,
                 )
                 zeros_are_summed = True
-
-                # Adjust for group-based pruning
-                if not is_svd_grouper and not prox_kwargs.get(
-                    "zero_elts_are_counts", False
-                ):
-                    zero_elts *= grouper.group_size()
+                zero_elts = _scale_group_zeros(zero_elts, grouper, prox_kwargs)
+            else:
+                # torch.Tensor branch - use standard vmap
+                in_dims = (grouper.in_dims, gamma_in_dims, tau_reweight_in_dims)
+                zero_elts, group_norm = PruneOptimizer._apply_prox_tensor_vmap(
+                    grouper, prox_map, in_dims, gamma, tau_reweight
+                )
+                zeros_are_summed = True
+                zero_elts = _scale_group_zeros(zero_elts, grouper, prox_kwargs)
 
             if is_svd_grouper:
                 PruneOptimizer._record_sv_count(grouper, p, sv_count)

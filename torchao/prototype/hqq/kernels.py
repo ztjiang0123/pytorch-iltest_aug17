@@ -164,42 +164,26 @@ def _reshape_dq_b(
 
 
 @triton.jit
-def _load_ab(
-    A,
-    B,
-    rak,
-    rbk,
-    k,
-    K,
-    BLOCK_K: tl.constexpr,
-    SPLIT_K: tl.constexpr,
-    EVEN_K: tl.constexpr,
-    TRANSPOSED: tl.constexpr,
-    dtype: tl.constexpr,
-):
-    """Load one A / B block, masking the K tail when K is not block-aligned."""
+def _masked_load_row(ptr, r, k_remaining, EVEN_K: tl.constexpr, dtype: tl.constexpr):
+    """Load a K-row tile, masking the K tail unless the block evenly divides K."""
     if EVEN_K:
-        return tl.load(A), tl.load(B)
-    k_remaining_a = K - k * (BLOCK_K * SPLIT_K)
-    k_remaining_b = _remaining_b(k, K, BLOCK_K, SPLIT_K, TRANSPOSED)
+        return tl.load(ptr)
     _0 = tl.zeros((1, 1), dtype=dtype)
-    a = tl.load(A, mask=rak[None, :] < k_remaining_a, other=_0)
-    qb = tl.load(B, mask=rbk[:, None] < k_remaining_b, other=_0)
-    return a, qb
+    return tl.load(ptr, mask=r[None, :] < k_remaining, other=_0)
 
 
 @triton.jit
-def _dequant_b(
-    qb,
-    scales,
-    zeros,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    IS_BFLOAT16: tl.constexpr,
-    TRANSPOSED: tl.constexpr,
-    dtype: tl.constexpr,
-):
-    """Unpack the 2x-int4 B block, upcast, scale, and orient for the matmul."""
+def _masked_load_col(ptr, r, k_remaining, EVEN_K: tl.constexpr, dtype: tl.constexpr):
+    """Load a K-column tile, masking the K tail unless the block evenly divides K."""
+    if EVEN_K:
+        return tl.load(ptr)
+    _0 = tl.zeros((1, 1), dtype=dtype)
+    return tl.load(ptr, mask=r[:, None] < k_remaining, other=_0)
+
+
+@triton.jit
+def _upcast_qb(qb, IS_BFLOAT16: tl.constexpr, dtype: tl.constexpr):
+    """Unpack the 2x-int4 B tile and upcast the two nibbles to ``dtype``."""
     # Unpack qweights -- h/t jlebar!
     _4_i8 = tl.full((1,), 4, dtype=tl.int8)
     qb_lo = (qb << _4_i8) >> _4_i8
@@ -208,24 +192,14 @@ def _dequant_b(
     # Upcast to fp16. bfloat16 needs an intermediate fp16 hop (direct int8 ->
     # bfloat16 conversion triggers a compilation error).
     if IS_BFLOAT16:
-        dq_b = tl.join(
+        return tl.join(
             qb_lo.to(tl.float16).to(dtype),
             qb_hi.to(tl.float16).to(dtype),
         ).permute(0, 2, 1)
-    else:
-        dq_b = tl.join(
-            qb_lo.to(dtype),
-            qb_hi.to(dtype),
-        ).permute(0, 2, 1)
-    dq_b = _reshape_dq_b(dq_b, BLOCK_N, BLOCK_K, TRANSPOSED)
-
-    # Scale upcasted weights, broadcasting scales / zeros across the block
-    # (all scales fall within a single QGROUP -- statically checked above).
-    dq_b = (dq_b - zeros[None, :]) * scales[None, :]
-
-    if TRANSPOSED:
-        dq_b = tl.trans(dq_b)
-    return dq_b
+    return tl.join(
+        qb_lo.to(dtype),
+        qb_hi.to(dtype),
+    ).permute(0, 2, 1)
 
 
 @triton.jit
@@ -362,19 +336,10 @@ def _mixed_mm_kernel(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_dtype)
     for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
-        a, qb = _load_ab(
-            A,
-            B,
-            rak,
-            rbk,
-            k,
-            K,
-            BLOCK_K,
-            SPLIT_K,
-            EVEN_K,
-            TRANSPOSED,
-            C.dtype.element_ty,
-        )
+        k_remaining_a = K - k * (BLOCK_K * SPLIT_K)
+        k_remaining_b = _remaining_b(k, K, BLOCK_K, SPLIT_K, TRANSPOSED)
+        a = _masked_load_row(A, rak, k_remaining_a, EVEN_K, C.dtype.element_ty)
+        qb = _masked_load_col(B, rbk, k_remaining_b, EVEN_K, C.dtype.element_ty)
 
         if not TRANSPOSED:
             scale_offset_k = k * BLOCK_K * SPLIT_K * stride_scale_k // QGROUP_SIZE
@@ -386,16 +351,13 @@ def _mixed_mm_kernel(
         scales = tl.load(scales_ptr + offsets_scale_n + scale_offset_k)
         zeros = tl.load(zeros_ptr + offsets_scale_n + scale_offset_k)
 
-        dq_b = _dequant_b(
-            qb,
-            scales,
-            zeros,
-            BLOCK_N,
-            BLOCK_K,
-            IS_BFLOAT16,
-            TRANSPOSED,
-            A.dtype.element_ty,
-        )
+        # Unpack + upcast, orient to (K, N) [or (N, K)], then scale.
+        dq_b = _upcast_qb(qb, IS_BFLOAT16, A.dtype.element_ty)
+        dq_b = _reshape_dq_b(dq_b, BLOCK_N, BLOCK_K, TRANSPOSED)
+        # Broadcast scales / zeros across the block (all within one QGROUP).
+        dq_b = (dq_b - zeros[None, :]) * scales[None, :]
+        if TRANSPOSED:
+            dq_b = tl.trans(dq_b)
 
         if fp8_fast_accum:
             acc = tl.dot(

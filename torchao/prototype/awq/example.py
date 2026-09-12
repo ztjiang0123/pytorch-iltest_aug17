@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 import argparse
 import time
+from dataclasses import dataclass
 
 import lm_eval
 import torch
@@ -193,15 +194,16 @@ def _int4wo_base_config(group_size: int, device: str, allow_xpu: bool = True):
     raise AssertionError("Unsupported device: {}".format(device))
 
 
-def _quantize_awq_int4wo(
-    model,
-    tokenizer,
-    quant: str,
-    tasks: list[str],
-    max_seq_length: int,
-    calibration_limit: int,
-    device: str,
-):
+@dataclass
+class _CalibrationSettings:
+    """Settings for the AWQ calibration pass over the evaluation harness."""
+
+    tasks: list[str]
+    max_seq_length: int
+    calibration_limit: int
+
+
+def _quantize_awq_int4wo(model, tokenizer, quant, device, settings):
     """Run the AWQ int4 weight-only prepare/calibrate/convert flow in place."""
     group_size = int(quant.split("-")[2])
     print(f"running {quant} quantization with group size {group_size}")
@@ -216,11 +218,11 @@ def _quantize_awq_int4wo(
     TransformerEvalWrapper(
         model=model.to(device),
         tokenizer=tokenizer,
-        max_seq_length=max_seq_length,
+        max_seq_length=settings.max_seq_length,
         device=device,
     ).run_eval(
-        tasks=tasks,
-        limit=calibration_limit,
+        tasks=settings.tasks,
+        limit=settings.calibration_limit,
     )
 
     print(f"time for prepare and calibration: {time.time() - t0:.02f} seconds")
@@ -268,15 +270,12 @@ def quantize_and_eval(
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
     if quant.startswith("awq-int4wo"):
-        _quantize_awq_int4wo(
-            model,
-            tokenizer,
-            quant,
-            tasks,
-            max_seq_length,
-            calibration_limit,
-            device,
+        settings = _CalibrationSettings(
+            tasks=tasks,
+            max_seq_length=max_seq_length,
+            calibration_limit=calibration_limit,
         )
+        _quantize_awq_int4wo(model, tokenizer, quant, device, settings)
     elif quant.startswith("int4wo"):
         _quantize_int4wo(model, quant, device)
 
