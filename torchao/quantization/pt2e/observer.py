@@ -811,6 +811,17 @@ class PerChannelMinMaxObserver(UniformQuantizationObserverBase):
     def extra_repr(self):
         return f"min_val={self.min_val}, max_val={self.max_val}"
 
+    def _resolve_min_max_buffer(
+        self, name: str, expected_min_name: str, expected_max_name: str
+    ) -> Optional[torch.Tensor]:
+        """Return the buffer (``min_val`` or ``max_val``) that ``name`` refers
+        to, or ``None`` if the name is unexpected."""
+        if name == expected_min_name:
+            return self.min_val
+        if name == expected_max_name:
+            return self.max_val
+        return None
+
     def _load_from_state_dict(
         self,
         state_dict: dict[str, Any],
@@ -832,33 +843,32 @@ class PerChannelMinMaxObserver(UniformQuantizationObserverBase):
             expected_max_name = "max_val"
         for name in local_state:
             key = prefix + name
-            if key in state_dict:
-                val = state_dict[key]
-                # Custom handling to allow loading min_val or max_val
-                # of size N into uninitialized buffers of size 0. The
-                # buffers are resized here, and the values are copied in
-                # the default state_dict loading code of the parent.
-                if name == expected_min_name:
-                    self.min_val.resize_(val.shape)
-                elif name == expected_max_name:
-                    self.max_val.resize_(val.shape)
-                else:
-                    warnings.warn(
-                        f"Observer load_from_state_dict got unexpected name {name}"
-                    )
-                # For torchscript module we need to update the attributes here since we do not
-                # call the `_load_from_state_dict` function defined module.py
-                if torch.jit.is_scripting():
-                    if name == expected_min_name:
-                        self.min_val.copy_(val)
-                    elif name == expected_max_name:
-                        self.max_val.copy_(val)
-                    else:
-                        warnings.warn(
-                            f"Observer load_from_state_dict got unexpected name {name}"
-                        )
-            elif strict:
-                missing_keys.append(key)
+            if key not in state_dict:
+                if strict:
+                    missing_keys.append(key)
+                continue
+
+            val = state_dict[key]
+            # Resolve which buffer this state entry targets once, so the
+            # resize and (torchscript) copy below share the same decision.
+            target = self._resolve_min_max_buffer(
+                name, expected_min_name, expected_max_name
+            )
+            if target is None:
+                warnings.warn(
+                    f"Observer load_from_state_dict got unexpected name {name}"
+                )
+                continue
+
+            # Custom handling to allow loading min_val or max_val
+            # of size N into uninitialized buffers of size 0. The
+            # buffers are resized here, and the values are copied in
+            # the default state_dict loading code of the parent.
+            target.resize_(val.shape)
+            # For torchscript module we need to update the attributes here since we do not
+            # call the `_load_from_state_dict` function defined module.py
+            if torch.jit.is_scripting():
+                target.copy_(val)
 
         if not torch.jit.is_scripting():
             super()._load_from_state_dict(

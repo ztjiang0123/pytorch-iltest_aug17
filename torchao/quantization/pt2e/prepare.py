@@ -269,6 +269,71 @@ def _union_input_edge_with(
         _union(edge_or_node, input_edge, shared_with_map, edge_or_node_to_qspec)
 
 
+def _share_input_edge_implicitly(
+    input_edge, input_edge_root_qspec, shared_with_map, edge_or_node_to_qspec
+):
+    """Apply implicit sharing for an input edge whose producer node allows it.
+
+    NOTE: the order is important here, we first share with other users and then share with previous
+    output because the reverse order could cause circular dependency
+    e.g node1 -> node2
+             \\ -> node3
+    when processing (node1, node2), if we first point (node1, node2) to node1
+    Step 1. shared_map = {(node1, node2): node1}
+    Step 2. after that, we point the (node1, node2) to its other user (node1, node3) ,
+    which means shared_map = {(node1, node2): node1, node1: (node1, node3)}
+    because we will point the root of (node1, node2) (in this case node1) to the root of (node1, node3)
+    Step 3. and when we process (node1, node3), it can try to point to node1 as well, then we'll
+    have a circular dependency
+    """
+    arg, n = input_edge
+    if not isinstance(arg, Node) or not isinstance(n, Node):
+        raise Exception(
+            f"Expected input_edge to have type Tuple[Node, Node], but got: {arg, n}"
+        )
+
+    # sharing with other users of the producer node: (arg, user)
+    for user in arg.users:
+        if user is n:
+            continue
+        arg_to_user_edge = (arg, user)
+        _union_input_edge_with(
+            input_edge,
+            input_edge_root_qspec,
+            arg_to_user_edge,
+            edge_or_node_to_qspec,
+            shared_with_map,
+        )
+
+    # sharing with output of producer node
+    _union_input_edge_with(
+        input_edge,
+        input_edge_root_qspec,
+        arg,
+        edge_or_node_to_qspec,
+        shared_with_map,
+    )
+
+
+def _process_input_edge_sharing(
+    input_edge, qspec, shared_with_map, edge_or_node_to_qspec
+):
+    """Update ``shared_with_map`` for a single input edge, applying implicit
+    sharing first when the producer node opts in."""
+    input_edge_root_qspec = _unwrap_shared_qspec(
+        qspec, edge_or_node_to_qspec, shared_with_map
+    )
+
+    assert isinstance(input_edge, tuple)
+    _, n = input_edge
+    if n.meta[Q_ANNOTATION_KEY].allow_implicit_sharing:
+        _share_input_edge_implicitly(
+            input_edge, input_edge_root_qspec, shared_with_map, edge_or_node_to_qspec
+        )
+
+    _update_shared_with(input_edge, qspec, shared_with_map, edge_or_node_to_qspec)
+
+
 def _get_edge_or_node_to_group_id(
     edge_or_node_to_qspec: dict[EdgeOrNode, QuantizationSpecBase],
 ) -> dict[EdgeOrNode, int]:
@@ -332,55 +397,8 @@ def _get_edge_or_node_to_group_id(
                 output_node, qspec, shared_with_map, edge_or_node_to_qspec
             )
         else:
-            input_edge = edge_or_node
-            input_edge_root_qspec = _unwrap_shared_qspec(
-                qspec, edge_or_node_to_qspec, shared_with_map
-            )
-
-            assert isinstance(input_edge, tuple)
-            arg, n = input_edge
-            if n.meta[Q_ANNOTATION_KEY].allow_implicit_sharing:
-                # NOTE: the order is important here, we first share with other users and then share with previous
-                # output because the reverse order could cause circular dependency
-                # e.g node1 -> node2
-                #          \ -> node3
-                # when processing (node1, node2), if we first point (node1, node2) to node1
-                # Step 1. shared_map = {(node1, node2): node1}
-                # Step 2. after that, we point the (node1, node2) to its other user (node1, node3) ,
-                # which means shared_map = {(node1, node2): node1, node1: (node1, node3)}
-                # because we will point the root of (node1, node2) (in this case node1) to the root of (node1, node3)
-                # Step 3. and when we process (node1, node3), it can try to point to node1 as well, then we'll
-                # have a circular dependency
-
-                # sharing with other users of the producer node
-                # (arg, user)
-                if not isinstance(arg, Node) or not isinstance(n, Node):
-                    raise Exception(
-                        f"Expected input_edge to have type Tuple[Node, Node], but got: {arg, n}"
-                    )
-                for user in arg.users:
-                    if user is n:
-                        continue
-                    arg_to_user_edge = (arg, user)
-                    _union_input_edge_with(
-                        input_edge,
-                        input_edge_root_qspec,
-                        arg_to_user_edge,
-                        edge_or_node_to_qspec,
-                        shared_with_map,
-                    )
-
-                # sharing with output of producer node
-                _union_input_edge_with(
-                    input_edge,
-                    input_edge_root_qspec,
-                    arg,
-                    edge_or_node_to_qspec,
-                    shared_with_map,
-                )
-
-            _update_shared_with(
-                input_edge, qspec, shared_with_map, edge_or_node_to_qspec
+            _process_input_edge_sharing(
+                edge_or_node, qspec, shared_with_map, edge_or_node_to_qspec
             )
 
     # now that we get the sharing relations between all edges and nodes, we can assingn group ids

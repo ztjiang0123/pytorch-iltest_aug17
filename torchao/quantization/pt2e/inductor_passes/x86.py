@@ -2796,6 +2796,94 @@ def _register_qconv_unary_fusion():
             )
 
 
+_SWAP_BINARY_INPUTS_LIST = [False, True]
+
+
+def _build_qconv_binary_int8_out_patterns(
+    x_scale_zp_are_tensors, int8_mixed_bf16_with_inplace_add
+):
+    """Priority 1: QConv2d Binary or Binary-Unary pattern with int8 output."""
+    binary_replace_patterns = {}
+    for swap_inputs, is_fp8 in itertools.product(
+        _SWAP_BINARY_INPUTS_LIST, [False, True]
+    ):
+        binary_replace_patterns.update(
+            {
+                PostOpAttr(
+                    "sum", 1.0, "none", [], ""
+                ): generate_pattern_with_output_quant(
+                    generate_pattern_with_binary(
+                        aten.add.Tensor,
+                        get_qconv_pt2e_pattern(x_scale_zp_are_tensors, 1),
+                        dequantize_accum_pattern,
+                        int8_mixed_bf16_with_inplace_add,
+                        swap_inputs=swap_inputs,
+                    ),
+                    is_fp8=is_fp8,
+                ),
+                PostOpAttr(
+                    "sum", 1.0, "relu", [], ""
+                ): generate_pattern_with_output_quant(
+                    generate_pattern_with_unary(
+                        generate_pattern_with_binary(
+                            aten.add.Tensor,
+                            get_qconv_pt2e_pattern(x_scale_zp_are_tensors, 1),
+                            dequantize_accum_pattern,
+                            int8_mixed_bf16_with_inplace_add,
+                            swap_inputs=swap_inputs,
+                        ),
+                        aten.relu.default,
+                    ),
+                    is_fp8=is_fp8,
+                ),
+            }
+        )
+    return binary_replace_patterns
+
+
+def _build_qconv_binary_unary_float_out_patterns(
+    x_scale_zp_are_tensors, int8_mixed_bf16_with_inplace_add
+):
+    """Priority 2: QConv2d Binary-Unary pattern with fp32/bfloat16 output."""
+    binary_replace_float_out_patterns = {}
+    for swap_inputs in _SWAP_BINARY_INPUTS_LIST:
+        binary_replace_float_out_patterns.update(
+            {
+                PostOpAttr("sum", 1.0, "relu", [], ""): generate_pattern_with_unary(
+                    generate_pattern_with_binary(
+                        aten.add.Tensor,
+                        get_qconv_pt2e_pattern(x_scale_zp_are_tensors, 1),
+                        KeywordArg("accum_after_dequant"),
+                        int8_mixed_bf16_with_inplace_add,
+                        swap_inputs=swap_inputs,
+                    ),
+                    aten.relu.default,
+                )
+            }
+        )
+    return binary_replace_float_out_patterns
+
+
+def _build_qconv_binary_float_out_patterns(
+    x_scale_zp_are_tensors, int8_mixed_bf16_with_inplace_add
+):
+    """Priority 3: QConv2d Binary pattern with fp32/bfloat16 output."""
+    binary_replace_float_out_patterns = {}
+    for swap_inputs in _SWAP_BINARY_INPUTS_LIST:
+        binary_replace_float_out_patterns.update(
+            {
+                PostOpAttr("sum", 1.0, "none", [], ""): generate_pattern_with_binary(
+                    aten.add.Tensor,
+                    get_qconv_pt2e_pattern(x_scale_zp_are_tensors, 1),
+                    KeywordArg("accum_after_dequant"),
+                    int8_mixed_bf16_with_inplace_add,
+                    swap_inputs=swap_inputs,
+                ),
+            }
+        )
+    return binary_replace_float_out_patterns
+
+
 def _register_qconv_binary_fusion():
     for int8_mixed_bf16_with_inplace_add, x_scale_zp_are_tensors in itertools.product(
         [False, True], [False, True]
@@ -2805,45 +2893,12 @@ def _register_qconv_binary_fusion():
             if x_scale_zp_are_tensors
             else torch.ops.onednn.qconv2d_pointwise.binary
         )
-        # Priority 1 to match: QConv2d Binary or Binary-Unary pattern with int8 output
-        swap_binary_inputs_list = [False, True]
-        binary_replace_patterns = {}
-        for swap_inputs, is_fp8 in itertools.product(
-            swap_binary_inputs_list, [False, True]
-        ):
-            binary_replace_patterns.update(
-                {
-                    PostOpAttr(
-                        "sum", 1.0, "none", [], ""
-                    ): generate_pattern_with_output_quant(
-                        generate_pattern_with_binary(
-                            aten.add.Tensor,
-                            get_qconv_pt2e_pattern(x_scale_zp_are_tensors, 1),
-                            dequantize_accum_pattern,
-                            int8_mixed_bf16_with_inplace_add,
-                            swap_inputs=swap_inputs,
-                        ),
-                        is_fp8=is_fp8,
-                    ),
-                    PostOpAttr(
-                        "sum", 1.0, "relu", [], ""
-                    ): generate_pattern_with_output_quant(
-                        generate_pattern_with_unary(
-                            generate_pattern_with_binary(
-                                aten.add.Tensor,
-                                get_qconv_pt2e_pattern(x_scale_zp_are_tensors, 1),
-                                dequantize_accum_pattern,
-                                int8_mixed_bf16_with_inplace_add,
-                                swap_inputs=swap_inputs,
-                            ),
-                            aten.relu.default,
-                        ),
-                        is_fp8=is_fp8,
-                    ),
-                }
-            )
 
-        for binary_unary_attr, patterns in binary_replace_patterns.items():
+        # Priority 1 to match: QConv2d Binary or Binary-Unary pattern with int8 output
+        int8_out_patterns = _build_qconv_binary_int8_out_patterns(
+            x_scale_zp_are_tensors, int8_mixed_bf16_with_inplace_add
+        )
+        for binary_unary_attr, patterns in int8_out_patterns.items():
             _register_qconv_post_op_fusion_pass(
                 patterns,
                 3,  # pass_number
@@ -2852,66 +2907,27 @@ def _register_qconv_binary_fusion():
             )
 
         # Priority 2 to match: QConv2d Binary-Unary pattern with fp32/bfloat16 output
-        binary_replace_float_out_patterns = {}
-        for swap_inputs in swap_binary_inputs_list:
-            binary_replace_float_out_patterns.update(
-                {
-                    PostOpAttr("sum", 1.0, "relu", [], ""): generate_pattern_with_unary(
-                        generate_pattern_with_binary(
-                            aten.add.Tensor,
-                            get_qconv_pt2e_pattern(x_scale_zp_are_tensors, 1),
-                            KeywordArg("accum_after_dequant"),
-                            int8_mixed_bf16_with_inplace_add,
-                            swap_inputs=swap_inputs,
-                        ),
-                        aten.relu.default,
-                    )
-                }
-            )
-
-        for (
-            binary_unary_attr,
-            patterns,
-        ) in binary_replace_float_out_patterns.items():
-            if int8_mixed_bf16_with_inplace_add:
-                _register_qconv_post_op_fusion_pass(
-                    patterns,
-                    3,  # pass_number
-                    qconv_binary_op,  # computation_op
-                    binary_unary_attr,  # binary_unary_attr
-                )
-            else:
-                _register_qconv_post_op_fusion_pass(
-                    patterns,
-                    4,  # pass_number
-                    qconv_binary_op,  # computation_op
-                    binary_unary_attr,  # binary_unary_attr
-                )
-
-        # Priority 3: QConv2d Binary pattern with fp32/bfloat16 output
-        binary_replace_float_out_patterns = {}
-        for swap_inputs in swap_binary_inputs_list:
-            binary_replace_float_out_patterns.update(
-                {
-                    PostOpAttr(
-                        "sum", 1.0, "none", [], ""
-                    ): generate_pattern_with_binary(
-                        aten.add.Tensor,
-                        get_qconv_pt2e_pattern(x_scale_zp_are_tensors, 1),
-                        KeywordArg("accum_after_dequant"),
-                        int8_mixed_bf16_with_inplace_add,
-                        swap_inputs=swap_inputs,
-                    ),
-                }
-            )
-
-        for (
-            binary_unary_attr,
-            patterns,
-        ) in binary_replace_float_out_patterns.items():
+        binary_unary_float_out_pass = 3 if int8_mixed_bf16_with_inplace_add else 4
+        binary_unary_float_out_patterns = _build_qconv_binary_unary_float_out_patterns(
+            x_scale_zp_are_tensors, int8_mixed_bf16_with_inplace_add
+        )
+        for binary_unary_attr, patterns in binary_unary_float_out_patterns.items():
             _register_qconv_post_op_fusion_pass(
                 patterns,
-                4 if int8_mixed_bf16_with_inplace_add else 5,  # pass_number
+                binary_unary_float_out_pass,  # pass_number
+                qconv_binary_op,  # computation_op
+                binary_unary_attr,  # binary_unary_attr
+            )
+
+        # Priority 3: QConv2d Binary pattern with fp32/bfloat16 output
+        binary_float_out_pass = 4 if int8_mixed_bf16_with_inplace_add else 5
+        binary_float_out_patterns = _build_qconv_binary_float_out_patterns(
+            x_scale_zp_are_tensors, int8_mixed_bf16_with_inplace_add
+        )
+        for binary_unary_attr, patterns in binary_float_out_patterns.items():
+            _register_qconv_post_op_fusion_pass(
+                patterns,
+                binary_float_out_pass,  # pass_number
                 qconv_binary_op,  # computation_op
                 binary_unary_attr,  # binary_unary_attr
             )
@@ -3792,74 +3808,87 @@ class QuantLiftUp(CustomGraphPass):
     It produces a DQ->LINEAR->Q pattern which can be fused by backend.
     """
 
-    def __call__(self, module_graph: torch.fx.graph.Graph) -> None:
-        def is_view_op(node):
+    @staticmethod
+    def _is_view_op(node) -> bool:
+        return (node.op == "call_function" and node.target in _VIEW_FUNCTION_OPS) or (
+            node.op == "call_method" and node.target in _VIEW_METHOD_OPS
+        )
+
+    @staticmethod
+    def _quant_input_check(node) -> bool:
+        if len(node.all_input_nodes) == 1:
+            return True
+        if (
+            node.target
+            == torch.ops.torchao.quantize_affine_float8_non_decomposed.default
+        ):
+            # check if scale created by torch.tensor
             return (
-                node.op == "call_function" and node.target in _VIEW_FUNCTION_OPS
-            ) or (node.op == "call_method" and node.target in _VIEW_METHOD_OPS)
+                len(node.all_input_nodes) == 2
+                and node.all_input_nodes[1].target == torch.tensor
+            )
+        return False
 
-        def quant_input_check(node):
-            if len(node.all_input_nodes) == 1:
-                return True
-            elif (
-                node.target
-                == torch.ops.torchao.quantize_affine_float8_non_decomposed.default
-            ):
-                # check if scale created by torch.tensor
-                return (
-                    len(node.all_input_nodes) == 2
-                    and node.all_input_nodes[1].target == torch.tensor
-                )
-            return False
+    def _is_liftable_quant_node(self, node) -> bool:
+        # <TODO> Leslie: Here we verify that the quant node has exactly
+        # one input FX node, with constant scalar value for scale and zero point.
+        # For the case input of quant node has more than one input FX nodes,
+        # extend the implementation to lift up all the connected nodes
+        # before the view nodes to keep the topological order.
+        return (
+            node.op == "call_function"
+            and node.target in _PER_TENSOR_QUANTIZE_OPS
+            and self._quant_input_check(node)
+            and self._is_view_op(node.all_input_nodes[0])
+        )
 
+    def _find_lift_up_insertion_node(self, quant_node):
+        """Walk the view-op chain above ``quant_node`` to find where to insert
+        the lifted quant node. Returns the insertion node and its input, or
+        ``None`` if any node along the path has more than one user."""
+        current_node = quant_node
+        input_node = current_node.all_input_nodes[0]
+        while self._is_view_op(input_node):
+            if len(input_node.users) != 1:
+                return None
+            current_node = input_node
+            input_node = current_node.all_input_nodes[0]
+
+        # Further check the input node of the first view node has only 1 user node
+        if len(input_node.users) != 1:
+            return None
+        return current_node, input_node
+
+    def _lift_up_quant_node(self, module_graph, quant_node, insertion_node, input_node):
+        input_node_of_quant = quant_node.all_input_nodes[0]
+        # Replace dequant's input from quant to quant's input
+        quant_node.replace_all_uses_with(input_node_of_quant)
+        # Insert the new quant node
+        with module_graph.inserting_before(insertion_node):
+            new_quant_node = module_graph.node_copy(quant_node)
+            input_node.replace_all_uses_with(new_quant_node)
+
+            # Update inputs of new_quant_node
+            def maybe_replace_node(n: torch.fx.Node) -> torch.fx.Node:
+                return input_node if n == input_node_of_quant else n
+
+            new_quant_node.args = map_arg(new_quant_node.args, maybe_replace_node)  # type: ignore[assignment]
+            new_quant_node.kwargs = map_arg(new_quant_node.kwargs, maybe_replace_node)  # type: ignore[assignment]
+            module_graph.erase_node(quant_node)
+
+    def __call__(self, module_graph: torch.fx.graph.Graph) -> None:
         for node in module_graph.nodes:
-            # <TODO> Leslie: Here we verify that the quant node has exactly
-            # one input FX node, with constant scalar value for scale and zero point.
-            # For the case input of quant node has more than one input FX nodes,
-            # extend the implementation to lift up all the connected nodes
-            # before the view nodes to keep the topological order.
-            if (
-                node.op == "call_function"
-                and node.target in _PER_TENSOR_QUANTIZE_OPS
-                and quant_input_check(node)
-                and is_view_op(node.all_input_nodes[0])
-            ):
-                quant_node = node
-                input_node_of_quant = quant_node.all_input_nodes[0]
+            if not self._is_liftable_quant_node(node):
+                continue
 
-                # Check the nodes along lift up path has only 1 user node
-                # Propagate view like node to find where to insert the new quant node
-                could_lift_up = True
-                current_node = quant_node
-                input_node = current_node.all_input_nodes[0]
-                while is_view_op(input_node):
-                    if len(input_node.users) != 1:
-                        could_lift_up = False
-                        break
-                    current_node = input_node
-                    input_node = current_node.all_input_nodes[0]
+            # Check the nodes along lift up path has only 1 user node
+            # Propagate view like node to find where to insert the new quant node
+            insertion = self._find_lift_up_insertion_node(node)
+            if insertion is None:
+                continue
 
-                # Further check the input node of the first view node has only 1 user node
-                if could_lift_up and len(input_node.users) == 1:
-                    # Replace dequant's input from quant to quant's input
-                    quant_node.replace_all_uses_with(input_node_of_quant)
-                    # Insert the new quant node
-                    with module_graph.inserting_before(current_node):
-                        new_quant_node = module_graph.node_copy(quant_node)
-                        input_node.replace_all_uses_with(new_quant_node)
-
-                        # Update inputs of new_quant_node
-                        def maybe_replace_node(n: torch.fx.Node) -> torch.fx.Node:
-                            if n == input_node_of_quant:
-                                return input_node
-                            else:
-                                return n
-
-                        new_args = map_arg(new_quant_node.args, maybe_replace_node)
-                        new_kwargs = map_arg(new_quant_node.kwargs, maybe_replace_node)
-                        new_quant_node.args = new_args  # type: ignore[assignment]
-                        new_quant_node.kwargs = new_kwargs  # type: ignore[assignment]
-                        module_graph.erase_node(quant_node)
+            insertion_node, input_node = insertion
+            self._lift_up_quant_node(module_graph, node, insertion_node, input_node)
 
     def uuid(self) -> bytes:
         return get_hash_for_files((__file__,))
