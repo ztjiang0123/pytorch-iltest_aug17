@@ -12,7 +12,7 @@ import functools
 import logging
 import operator
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -385,7 +385,14 @@ def detect_causal_mask(
     return all(all_causal)
 
 
-def _get_fp8_sdpa_params(node: Node) -> Tuple[bool, float, bool, str]:
+class _FP8SDPAParams(NamedTuple):
+    is_causal: bool
+    scale: float
+    enable_gqa: bool
+    hadamard: str
+
+
+def _get_fp8_sdpa_params(node: Node) -> _FP8SDPAParams:
     """Extract is_causal, scale, enable_gqa, and hadamard from an FP8 SDPA custom op node.
 
     Custom op signature: (q, k, v, is_causal=False, scale=0.0, enable_gqa=False, hadamard="NONE")
@@ -399,7 +406,7 @@ def _get_fp8_sdpa_params(node: Node) -> Tuple[bool, float, bool, str]:
     enable_gqa = args[5] if len(args) > 5 else kwargs.get("enable_gqa", False)
     hadamard = args[6] if len(args) > 6 else kwargs.get("hadamard", "NONE")
 
-    return is_causal, scale, enable_gqa, hadamard
+    return _FP8SDPAParams(is_causal, scale, enable_gqa, hadamard)
 
 
 def _get_fp8_sdpa_qkv(node: Node) -> Optional[Tuple[Node, Node, Node]]:
@@ -464,64 +471,61 @@ def _detect_rotate_half(cat_node: Node) -> Optional[Node]:
     return _match_rotate_half_slices(neg_input, pos_part)
 
 
+def _match_aten_slice_halves(neg_input: Node, pos_part: Node) -> Optional[Node]:
+    """Match the ATen ``slice.Tensor`` form of rotate_half's two halves."""
+    slice_neg_source = neg_input.args[0]
+    if slice_neg_source is not pos_part.args[0]:
+        return None
+
+    slice_neg_dim = neg_input.args[1] if len(neg_input.args) > 1 else 0
+    slice_pos_dim = pos_part.args[1] if len(pos_part.args) > 1 else 0
+    if slice_neg_dim not in (-1, 3) or slice_pos_dim not in (-1, 3):
+        return None
+
+    pos_start = pos_part.args[2] if len(pos_part.args) > 2 else None
+    pos_end = pos_part.args[3] if len(pos_part.args) > 3 else None
+    neg_start = neg_input.args[2] if len(neg_input.args) > 2 else None
+
+    # The positive half starts at 0 and the negative half starts where it ends.
+    halves_are_adjacent = (
+        pos_start == 0
+        and neg_start is not None
+        and pos_end is not None
+        and neg_start == pos_end
+    )
+    return slice_neg_source if halves_are_adjacent else None
+
+
+def _match_getitem_slice_halves(neg_input: Node, pos_part: Node) -> Optional[Node]:
+    """Match the Dynamo ``getitem`` form of rotate_half's two halves."""
+    slice_neg_source = neg_input.args[0]
+    if slice_neg_source is not pos_part.args[0]:
+        return None
+
+    neg_slice = _extract_last_dim_slice(neg_input.args[1])
+    pos_slice = _extract_last_dim_slice(pos_part.args[1])
+    if neg_slice is None or pos_slice is None:
+        return None
+
+    # The positive half starts at 0/None and the negative half starts at its stop.
+    halves_are_adjacent = (
+        pos_slice.start in (0, None)
+        and pos_slice.stop is not None
+        and neg_slice.start is not None
+        and neg_slice.start == pos_slice.stop
+    )
+    return slice_neg_source if halves_are_adjacent else None
+
+
 def _match_rotate_half_slices(neg_input: Node, pos_part: Node) -> Optional[Node]:
     """Match the slice patterns in rotate_half. Returns the source tensor x, or None."""
-    # ATen slice pattern
     if _is_op(neg_input, torch.ops.aten.slice.Tensor) and _is_op(
         pos_part, torch.ops.aten.slice.Tensor
     ):
-        slice_neg_source = neg_input.args[0]
-        slice_pos_source = pos_part.args[0]
+        return _match_aten_slice_halves(neg_input, pos_part)
 
-        if slice_neg_source is not slice_pos_source:
-            return None
-
-        slice_neg_dim = neg_input.args[1] if len(neg_input.args) > 1 else 0
-        slice_pos_dim = pos_part.args[1] if len(pos_part.args) > 1 else 0
-
-        if slice_neg_dim not in (-1, 3) or slice_pos_dim not in (-1, 3):
-            return None
-
-        pos_start = pos_part.args[2] if len(pos_part.args) > 2 else None
-        pos_end = pos_part.args[3] if len(pos_part.args) > 3 else None
-        neg_start = neg_input.args[2] if len(neg_input.args) > 2 else None
-
-        if pos_start != 0:
-            return None
-        if neg_start is None or pos_end is None:
-            return None
-        if neg_start != pos_end:
-            return None
-
-        return slice_neg_source
-
-    # Dynamo getitem pattern
     if _is_op(neg_input, operator.getitem) and _is_op(pos_part, operator.getitem):
-        slice_neg_source = neg_input.args[0]
-        slice_pos_source = pos_part.args[0]
-
-        if slice_neg_source is not slice_pos_source:
-            return None
-
-        neg_idx = neg_input.args[1]
-        pos_idx = pos_part.args[1]
-
-        neg_slice = _extract_last_dim_slice(neg_idx)
-        pos_slice = _extract_last_dim_slice(pos_idx)
-
-        if neg_slice is None or pos_slice is None:
-            return None
-
-        if pos_slice.start not in (0, None):
-            return None
-        if pos_slice.stop is None:
-            return None
-        if neg_slice.start is None:
-            return None
-        if neg_slice.start != pos_slice.stop:
-            return None
-
-        return slice_neg_source
+        return _match_getitem_slice_halves(neg_input, pos_part)
 
     return None
 
@@ -983,6 +987,193 @@ def _replace_with_fused_op(
 # Main Fusion Pass
 
 
+@dataclass
+class _FusionContext:
+    """Per-SDPA-node invariants shared by all fusion attempts."""
+
+    graph: Graph
+    sdpa_node: Node
+    params: "_FP8SDPAParams"
+    rope_sdpa_op: object
+
+
+@dataclass
+class _FusionPlan:
+    """Resolved operands for a matched RoPE pattern, ready to fuse."""
+
+    pattern_name: str
+    pre_rope_q: Node
+    pre_rope_k: Node
+    v_input: Optional[Node]
+    q_rope: "RoPEMatch"
+    enable_gqa: bool
+
+
+def _finalize_fusion(ctx: "_FusionContext", plan: "_FusionPlan") -> bool:
+    """Reshape cos/sin and replace ``ctx.sdpa_node`` with the fused op.
+
+    Returns True when the fusion was applied, False when it was skipped
+    because V had no transpose or cos/sin had an incompatible shape.
+    """
+    sdpa_node = ctx.sdpa_node
+    if plan.v_input is None:
+        logger.debug(
+            "%s: V has no transpose, skipping: %s", plan.pattern_name, sdpa_node.name
+        )
+        return False
+
+    cos_sin = _reshape_cos_sin_to_2d(
+        ctx.graph, plan.q_rope.cos_node, plan.q_rope.sin_node, sdpa_node
+    )
+    if cos_sin is None:
+        logger.debug(
+            "%s: cos/sin shape incompatible, skipping: %s",
+            plan.pattern_name,
+            sdpa_node.name,
+        )
+        return False
+    cos_2d, sin_2d = cos_sin
+
+    _replace_with_fused_op(
+        graph=ctx.graph,
+        sdpa_node=sdpa_node,
+        pre_rope_q=plan.pre_rope_q,
+        pre_rope_k=plan.pre_rope_k,
+        v_input=plan.v_input,
+        cos_node=cos_2d,
+        sin_node=sin_2d,
+        is_causal=ctx.params.is_causal,
+        scale=ctx.params.scale,
+        enable_gqa=plan.enable_gqa,
+        rope_interleaved=plan.q_rope.rope_interleaved,
+        hadamard=ctx.params.hadamard,
+        rope_sdpa_op=ctx.rope_sdpa_op,
+    )
+    return True
+
+
+def _try_fuse_pattern_a(
+    ctx: "_FusionContext",
+    q_node: Node,
+    k_node: Node,
+    v_pre_transpose: Optional[Node],
+) -> Optional[bool]:
+    """Pattern A: RoPE -> transpose -> FP8 SDPA (FLUX-style).
+
+    Returns None when the pattern does not match (caller should try the next
+    pattern), True when fused, or False when the pattern matched but fusion was
+    skipped (V/cos-sin incompatible) — in which case the node is left as-is.
+    """
+    q_pre_transpose = _unwrap_transpose(q_node)
+    k_pre_transpose = _unwrap_transpose(k_node)
+    if q_pre_transpose is None or k_pre_transpose is None:
+        return None
+
+    q_rope = _detect_rope(_trace_through_views(q_pre_transpose))
+    k_rope = _detect_rope(_trace_through_views(k_pre_transpose))
+    if q_rope is None or k_rope is None:
+        return None
+
+    return _finalize_fusion(
+        ctx,
+        _FusionPlan(
+            pattern_name="Pattern A",
+            pre_rope_q=_trace_through_views(q_rope.pre_rope_input),
+            pre_rope_k=_trace_through_views(k_rope.pre_rope_input),
+            v_input=v_pre_transpose,
+            q_rope=q_rope,
+            enable_gqa=ctx.params.enable_gqa,
+        ),
+    )
+
+
+def _detect_pattern_b_kv_rope(k_node: Node) -> Tuple[Optional["RoPEMatch"], bool]:
+    """Detect K-side RoPE for Pattern B, unwrapping repeat_kv for GQA.
+
+    Returns (k_rope, gqa_unwrapped).
+    """
+    k_rope = _detect_rope(_trace_through_views(k_node))
+    if k_rope is not None:
+        return k_rope, False
+
+    k_pre_repeat = _unwrap_repeat_kv(k_node)
+    if k_pre_repeat is None:
+        return None, False
+
+    k_rope = _detect_rope(_trace_through_views(k_pre_repeat))
+    return k_rope, k_rope is not None
+
+
+def _try_fuse_pattern_b(
+    ctx: "_FusionContext",
+    q_node: Node,
+    k_node: Node,
+    v_node: Node,
+) -> bool:
+    """Pattern B: transpose -> RoPE -> FP8 SDPA (HuggingFace-style).
+
+    For GQA, K may go through repeat_kv after RoPE.
+    """
+    q_rope = _detect_rope(_trace_through_views(q_node))
+    k_rope, gqa_unwrapped = _detect_pattern_b_kv_rope(k_node)
+    if q_rope is None or k_rope is None:
+        return False
+
+    q_bshd = _unwrap_transpose(_trace_through_views(q_rope.pre_rope_input))
+    k_bshd = _unwrap_transpose(_trace_through_views(k_rope.pre_rope_input))
+    if q_bshd is None or k_bshd is None:
+        return False
+
+    v_for_fusion = v_node
+    if gqa_unwrapped:
+        v_pre_repeat = _unwrap_repeat_kv(v_node)
+        if v_pre_repeat is not None:
+            v_for_fusion = v_pre_repeat
+
+    return _finalize_fusion(
+        ctx,
+        _FusionPlan(
+            pattern_name="Pattern B",
+            pre_rope_q=q_bshd,
+            pre_rope_k=k_bshd,
+            v_input=_unwrap_transpose(v_for_fusion),
+            q_rope=q_rope,
+            enable_gqa=True if gqa_unwrapped else ctx.params.enable_gqa,
+        ),
+    )
+
+
+def _try_fuse_sdpa_node(
+    graph: Graph,
+    sdpa_node: Node,
+    rope_sdpa_op,
+) -> bool:
+    """Attempt to fuse a single FP8 SDPA node with a preceding RoPE.
+
+    Tries each supported pattern in turn and returns True once one fuses.
+    """
+    qkv = _get_fp8_sdpa_qkv(sdpa_node)
+    if qkv is None:
+        return False
+    q_node, k_node, v_node = qkv
+
+    ctx = _FusionContext(
+        graph=graph,
+        sdpa_node=sdpa_node,
+        params=_get_fp8_sdpa_params(sdpa_node),
+        rope_sdpa_op=rope_sdpa_op,
+    )
+    v_pre_transpose = _unwrap_transpose(v_node)
+
+    # Pattern A takes priority: if its RoPE pattern matches we commit to it and
+    # do not fall through to Pattern B, even when fusion is ultimately skipped.
+    pattern_a = _try_fuse_pattern_a(ctx, q_node, k_node, v_pre_transpose)
+    if pattern_a is not None:
+        return pattern_a
+
+    return _try_fuse_pattern_b(ctx, q_node, k_node, v_node)
+
+
 def rope_sdpa_fusion_pass(
     graph: Graph,
     rope_sdpa_op,
@@ -1014,137 +1205,10 @@ def rope_sdpa_fusion_pass(
         )
         return
 
-    fused_count = 0
-
-    for sdpa_node in fp8_sdpa_nodes:
-        is_causal, scale, enable_gqa, hadamard = _get_fp8_sdpa_params(sdpa_node)
-
-        qkv = _get_fp8_sdpa_qkv(sdpa_node)
-        if qkv is None:
-            continue
-        q_node, k_node, v_node = qkv
-
-        v_pre_transpose = _unwrap_transpose(v_node)
-
-        # Pattern A: RoPE -> transpose -> FP8 SDPA (FLUX-style)
-        q_pre_transpose = _unwrap_transpose(q_node)
-        k_pre_transpose = _unwrap_transpose(k_node)
-
-        if q_pre_transpose is not None and k_pre_transpose is not None:
-            q_pre_cast = _trace_through_views(q_pre_transpose)
-            k_pre_cast = _trace_through_views(k_pre_transpose)
-
-            q_rope = _detect_rope(q_pre_cast)
-            k_rope = _detect_rope(k_pre_cast)
-
-            if q_rope is not None and k_rope is not None:
-                pre_rope_q = _trace_through_views(q_rope.pre_rope_input)
-                pre_rope_k = _trace_through_views(k_rope.pre_rope_input)
-
-                if v_pre_transpose is None:
-                    logger.debug(
-                        "Pattern A: V has no transpose, skipping: %s",
-                        sdpa_node.name,
-                    )
-                    continue
-
-                cos_sin = _reshape_cos_sin_to_2d(
-                    graph,
-                    q_rope.cos_node,
-                    q_rope.sin_node,
-                    sdpa_node,
-                )
-                if cos_sin is None:
-                    logger.debug(
-                        "Pattern A: cos/sin shape incompatible, skipping: %s",
-                        sdpa_node.name,
-                    )
-                    continue
-                cos_2d, sin_2d = cos_sin
-
-                _replace_with_fused_op(
-                    graph=graph,
-                    sdpa_node=sdpa_node,
-                    pre_rope_q=pre_rope_q,
-                    pre_rope_k=pre_rope_k,
-                    v_input=v_pre_transpose,
-                    cos_node=cos_2d,
-                    sin_node=sin_2d,
-                    is_causal=is_causal,
-                    scale=scale,
-                    enable_gqa=enable_gqa,
-                    rope_interleaved=q_rope.rope_interleaved,
-                    hadamard=hadamard,
-                    rope_sdpa_op=rope_sdpa_op,
-                )
-                fused_count += 1
-                continue
-
-        # Pattern B: transpose -> RoPE -> FP8 SDPA (HuggingFace-style)
-        # For GQA, K may go through repeat_kv after RoPE.
-        q_rope = _detect_rope(_trace_through_views(q_node))
-
-        k_rope = _detect_rope(_trace_through_views(k_node))
-        gqa_unwrapped = False
-        if k_rope is None:
-            k_pre_repeat = _unwrap_repeat_kv(k_node)
-            if k_pre_repeat is not None:
-                k_rope = _detect_rope(_trace_through_views(k_pre_repeat))
-                if k_rope is not None:
-                    gqa_unwrapped = True
-
-        if q_rope is not None and k_rope is not None:
-            q_bshd = _unwrap_transpose(_trace_through_views(q_rope.pre_rope_input))
-            k_bshd = _unwrap_transpose(_trace_through_views(k_rope.pre_rope_input))
-
-            if q_bshd is not None and k_bshd is not None:
-                v_for_fusion = v_node
-                if gqa_unwrapped:
-                    v_pre_repeat = _unwrap_repeat_kv(v_node)
-                    if v_pre_repeat is not None:
-                        v_for_fusion = v_pre_repeat
-
-                v_bshd = _unwrap_transpose(v_for_fusion)
-                if v_bshd is None:
-                    logger.debug(
-                        "Pattern B: V has no transpose, skipping: %s",
-                        sdpa_node.name,
-                    )
-                    continue
-
-                cos_sin = _reshape_cos_sin_to_2d(
-                    graph,
-                    q_rope.cos_node,
-                    q_rope.sin_node,
-                    sdpa_node,
-                )
-                if cos_sin is None:
-                    logger.debug(
-                        "Pattern B: cos/sin shape incompatible, skipping: %s",
-                        sdpa_node.name,
-                    )
-                    continue
-                cos_2d, sin_2d = cos_sin
-
-                fused_enable_gqa = True if gqa_unwrapped else enable_gqa
-
-                _replace_with_fused_op(
-                    graph=graph,
-                    sdpa_node=sdpa_node,
-                    pre_rope_q=q_bshd,
-                    pre_rope_k=k_bshd,
-                    v_input=v_bshd,
-                    cos_node=cos_2d,
-                    sin_node=sin_2d,
-                    is_causal=is_causal,
-                    scale=scale,
-                    enable_gqa=fused_enable_gqa,
-                    rope_interleaved=q_rope.rope_interleaved,
-                    hadamard=hadamard,
-                    rope_sdpa_op=rope_sdpa_op,
-                )
-                fused_count += 1
-                continue
+    fused_count = sum(
+        _try_fuse_sdpa_node(graph, sdpa_node, rope_sdpa_op)
+        for sdpa_node in fp8_sdpa_nodes
+    )
 
     print(
         f"[low_precision_attention] RoPE fusion pass ({backend_name}): "
