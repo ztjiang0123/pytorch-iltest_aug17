@@ -291,9 +291,7 @@ def _insert_choose_qparams_decomposed(graph, node, activation_post_process, dtyp
         }
 
 
-def _replace_observer_dynamic_decomposed(
-    graph, node, activation_post_process, dtype
-):
+def _replace_observer_dynamic_decomposed(graph, node, activation_post_process, dtype):
     """uint8/int8/fp16 dynamic quantization branch."""
     quantize_op = torch.ops.quantized_decomposed.quantize_per_tensor.tensor
     qparams = _insert_choose_qparams_decomposed(
@@ -429,6 +427,101 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
     # activation_post_process is supported
 
 
+class _QuantizeOpSpec(NamedTuple):
+    """The quantize op and its inputs derived from an activation_post_process.
+
+    Bundles the three values (node type, quantize op, qparams) that every
+    branch of ``_replace_observer_with_quantize_dequantize_node`` produces and
+    that ``_insert_quantize_dequantize_nodes`` consumes.
+    """
+
+    node_type: str
+    quantize_op: Union[Callable, str]
+    qparams: dict[str, Any]
+
+
+def _static_quantize_op_spec(
+    activation_post_process: torch.nn.Module,
+    dtype: torch.dtype,
+) -> _QuantizeOpSpec:
+    """Build the quantize op spec for static int/fp8 quant."""
+    scale, zero_point = activation_post_process.calculate_qparams()  # type: ignore[attr-defined, operator]
+    if is_per_channel(activation_post_process.qscheme):  # type: ignore[attr-defined]
+        ch_axis = int(activation_post_process.ch_axis)  # type: ignore[attr-defined, arg-type]
+        qparams = {
+            "_scale_": scale,
+            "_zero_point_": zero_point,
+            "_axis_": ch_axis,
+            "_dtype_": dtype,
+        }
+        quantize_op: Callable = torch.quantize_per_channel
+    else:
+        qparams = {
+            "_scale_": float(scale),
+            "_zero_point_": int(zero_point),
+            "_dtype_": dtype,
+        }
+        quantize_op = torch.quantize_per_tensor
+    return _QuantizeOpSpec("call_function", quantize_op, qparams)
+
+
+def _dynamic_quantize_op_spec(dtype: torch.dtype) -> _QuantizeOpSpec:
+    """Build the quantize op spec for dynamic quant."""
+    # TODO: get reduce range from observer
+    # reduce_range = activation_post_process.reduce_range
+    reduce_range = torch.backends.quantized.engine in ("fbgemm", "x86")
+    qparams = {"_dtype_": dtype, "_reduce_range_": reduce_range}
+    return _QuantizeOpSpec("call_function", torch.quantize_per_tensor_dynamic, qparams)
+
+
+def _fp16_quantize_op_spec(dtype: torch.dtype) -> _QuantizeOpSpec:
+    """Build the quantize op spec for fp16 quant."""
+    return _QuantizeOpSpec("call_method", "to", {"_dtype_": dtype})
+
+
+def _insert_quantize_dequantize_nodes(
+    model: torch.fx.GraphModule,
+    node: Node,
+    spec: _QuantizeOpSpec,
+    qparam_attr_prefix: str,
+    model_device: Optional[torch.device],
+) -> None:
+    """Replace ``node`` with a quantize op followed by a dequantize call.
+
+    ``_scale_``/``_zero_point_`` qparams are registered as buffers on the root
+    module via ``create_getattr_from_value``; all other qparams are inlined as
+    literal graph inputs.
+    """
+    graph = model.graph
+    with graph.inserting_before(node):
+        input_node = node.args[0]
+        quantize_op_inputs = [input_node]
+        for key, value_or_node in spec.qparams.items():
+            # TODO: we can add the information of whether a value needs to
+            # be registered as an attribute in qparams dict itself
+            if key in ["_scale_", "_zero_point_"]:
+                # For scale and zero_point values we register them as buffers in the root module.
+                # TODO: maybe need more complex attr name here
+                qparam_node = create_getattr_from_value(
+                    model,
+                    graph,
+                    qparam_attr_prefix + key,
+                    value_or_node,
+                    model_device,
+                )
+                quantize_op_inputs.append(qparam_node)
+            else:
+                # for qparams that are not scale/zero_point (like axis, dtype) we store them as literals in the graph.
+                quantize_op_inputs.append(value_or_node)
+
+        quantized_node = graph.create_node(
+            spec.node_type, spec.quantize_op, tuple(quantize_op_inputs), {}
+        )
+        dequantized_node = graph.call_method("dequantize", args=(quantized_node,))
+        node.replace_all_uses_with(dequantized_node)
+        graph.erase_node(node)
+
+
 def _replace_observer_with_quantize_dequantize_node(
     model: torch.fx.GraphModule,
     node: Node,
@@ -473,109 +566,34 @@ def _replace_observer_with_quantize_dequantize_node(
     if hasattr(activation_post_process, "is_dynamic"):
         is_dynamic = activation_post_process.is_dynamic  # type: ignore[attr-defined, assignment]
 
-    if dtype in [
-        torch.quint8,
-        torch.qint8,
-        torch.qint32,
-        torch.float8_e5m2,
-        torch.float8_e4m3fn,
-    ] and (not is_dynamic):
-        # TODO: probably should cleanup this condition check, it's hard
-        # to reason about this if and the following elif
+    is_static_int = (
+        dtype
+        in [
+            torch.quint8,
+            torch.qint8,
+            torch.qint32,
+            torch.float8_e5m2,
+            torch.float8_e4m3fn,
+        ]
+        and not is_dynamic
+    )
 
-        # uint8/int8/int32 static quantization branch
-
-        # 1. extract the information from activation_post_process module for generating
-        # the quantize and dequantize operator
-        node_type = "call_function"
-        quantize_op: Optional[Callable] = None
-        scale, zero_point = activation_post_process.calculate_qparams()  # type: ignore[attr-defined, operator]
-        if is_per_channel(activation_post_process.qscheme):  # type: ignore[attr-defined]
-            ch_axis = int(activation_post_process.ch_axis)  # type: ignore[attr-defined, arg-type]
-            qparams = {
-                "_scale_": scale,
-                "_zero_point_": zero_point,
-                "_axis_": ch_axis,
-                "_dtype_": dtype,
-            }
-            quantize_op = torch.quantize_per_channel
-        else:
-            scale = float(scale)
-            zero_point = int(zero_point)
-            qparams = {"_scale_": scale, "_zero_point_": zero_point, "_dtype_": dtype}
-            quantize_op = torch.quantize_per_tensor
-
-        # 2. replace activation_post_process node with quantize and dequantize
-        with graph.inserting_before(node):
-            input_node = node.args[0]
-            quantize_op_inputs = [input_node]
-            for key, value_or_node in qparams.items():
-                # TODO: we can add the information of whether a value needs to
-                # be registered as an attribute in qparams dict itself
-                if key in ["_scale_", "_zero_point_"]:
-                    # For scale and zero_point values we register them as buffers in the root module.
-                    # TODO: maybe need more complex attr name here
-                    qparam_node = create_getattr_from_value(
-                        model,
-                        graph,
-                        module_path + prefix + key,
-                        value_or_node,
-                        model_device,
-                    )
-                    quantize_op_inputs.append(qparam_node)
-                else:
-                    # for qparams that are not scale/zero_point (like axis, dtype) we store them as literals in the graph.
-                    quantize_op_inputs.append(value_or_node)
-
-            quantized_node = graph.create_node(
-                node_type, quantize_op, tuple(quantize_op_inputs), {}
-            )
-            dequantized_node = graph.call_method("dequantize", args=(quantized_node,))
-            node.replace_all_uses_with(dequantized_node)
-            graph.erase_node(node)
+    # Each branch determines the quantize op, its node type, and the qparams that
+    # feed it. The graph rewrite that follows is identical for all of them.
+    if is_static_int:
+        spec = _static_quantize_op_spec(activation_post_process, dtype)
     elif is_dynamic:
-        # uint8/int8/fp16 dynamic quantization branch
-
-        node_type = "call_function"
-        quantize_op = torch.quantize_per_tensor_dynamic
-        # TODO: get reduce range from observer
-        # reduce_range = activation_post_process.reduce_range
-        reduce_range = torch.backends.quantized.engine in ("fbgemm", "x86")
-        qparams = {"_dtype_": dtype, "_reduce_range_": reduce_range}
-
-        with graph.inserting_before(node):
-            input_node = node.args[0]
-            quantize_op_inputs = [input_node]
-            for key, value in qparams.items():
-                quantize_op_inputs.append(value)
-
-            quantized_node = graph.create_node(
-                node_type, quantize_op, tuple(quantize_op_inputs), {}
-            )
-            dequantized_node = graph.call_method("dequantize", args=(quantized_node,))
-            node.replace_all_uses_with(dequantized_node)
-            graph.erase_node(node)
+        spec = _dynamic_quantize_op_spec(dtype)
     elif dtype == torch.float16:
-        node_type = "call_method"
-        quantize_op = "to"  # type: ignore[assignment]
-        qparams = {"_dtype_": dtype}
-        with graph.inserting_before(node):
-            input_node = node.args[0]
-            quantize_op_inputs = [input_node]
-            for key, value in qparams.items():
-                # TODO: we can add the information of whether a value needs to
-                # be registered as an attribute in qparams dict itself
-                quantize_op_inputs.append(value)
+        spec = _fp16_quantize_op_spec(dtype)
+    else:
+        # should not reach since we have checks in the beginning to make sure the
+        # activation_post_process is supported
+        return
 
-            quantized_node = graph.create_node(
-                node_type, quantize_op, tuple(quantize_op_inputs), {}
-            )
-            dequantized_node = graph.call_method("dequantize", args=(quantized_node,))
-            node.replace_all_uses_with(dequantized_node)
-            graph.erase_node(node)
-
-    # should not reach since we have checks in the beginning to make sure the
-    # activation_post_process is supported
+    _insert_quantize_dequantize_nodes(
+        model, node, spec, module_path + prefix, model_device
+    )
 
 
 # this is a temporary hack for custom module, we may want to implement
@@ -810,6 +828,156 @@ def convert_standalone_module(
     modules[str(node.target)] = quantized_standalone_module
 
 
+class _WeightConvertOptions(NamedTuple):
+    """The convert-mode flags that steer weight qparam computation."""
+
+    is_decomposed: bool
+    is_reference: bool
+    model_device: Optional[torch.device]
+
+
+class _WeightModuleLookups(NamedTuple):
+    """The convert-wide lookups needed to decide if a weighted module converts."""
+
+    observed_node_names: set[str]
+    node_name_to_qconfig: dict[str, QConfigAny]
+    backend_config: BackendConfig
+
+
+def _should_convert_weighted_module(
+    node: Node,
+    original_module: torch.nn.Module,
+    qconfig: QConfigAny,
+    lookups: _WeightModuleLookups,
+) -> bool:
+    """Decide whether ``node`` should be swapped to a reference quantized module.
+
+    Collects the guard conditions (qconfig defined, node observed, qconfig
+    supported by the dtype configs, weights quantized) that otherwise appear as
+    a chain of early returns.
+    """
+    is_observed = node.name in lookups.observed_node_names
+    # If a qconfig is not defined for this node, then skip converting to a reference module
+    if (
+        qconfig is None
+        or _has_none_qconfig(node, lookups.node_name_to_qconfig)
+        or not is_observed
+    ):
+        return False
+
+    # skip converting to reference quantized module if the qconfig is not supported
+    pattern_to_dtype_configs = get_pattern_to_dtype_configs(lookups.backend_config)
+    dtype_configs = pattern_to_dtype_configs.get(type(original_module), [])
+    if not _is_qconfig_supported_by_dtype_configs(qconfig, dtype_configs):
+        return False
+
+    # the condition for swapping the module to reference quantized module is:
+    # weights need to be quantized
+    # TODO: rename weight_is_statically_quantized to weight_is_int8_quantized
+    return weight_is_quantized(qconfig)
+
+
+def _lstm_gru_weight_qparams(
+    float_module: torch.nn.Module,
+    qconfig: QConfigAny,
+) -> dict[str, Any]:
+    """Per-layer flattened weight qparams for LSTM/GRU modules."""
+    # format for the returned dict (flattened attributes):
+    # {"weight_ih_l0_scale": ..., "weight_ih_l0_qscheme": ..., ...}
+    result: dict[str, Any] = {}
+    for wn in float_module._flat_weights_names:
+        if not (hasattr(float_module, wn) and wn.startswith("weight")):
+            continue
+        weight = getattr(float_module, wn)
+        weight_post_process = qconfig.weight()  # type: ignore[union-attr, operator]
+        if weight_post_process.dtype == torch.qint8:  # type: ignore[union-attr]
+            weight_post_process(weight)  # type: ignore[operator, misc]
+        result[wn] = get_qparam_dict(weight_post_process)
+    return result
+
+
+def _compute_weight_qparams(
+    float_module: torch.nn.Module,
+    qconfig: QConfigAny,
+    weight_post_process: Optional[torch.nn.Module],
+    opts: _WeightConvertOptions,
+) -> dict[str, Any]:
+    """Compute the weight qparams dict for a weighted module.
+
+    Handles the three module shapes separately: RNN cells (ih/hh weights),
+    LSTM/GRU (flattened per-layer weights), and the generic single-weight case.
+    """
+    wq_or_wq_dict: dict[str, Any] = {"is_decomposed": opts.is_decomposed}
+    if isinstance(float_module, torch.nn.RNNCellBase):
+        weight_post_process_ih = qconfig.weight()  # type: ignore[union-attr, operator]
+        weight_post_process_hh = qconfig.weight()  # type: ignore[union-attr, operator]
+        weight_post_process_ih(float_module.weight_ih)
+        weight_post_process_hh(float_module.weight_hh)
+        wq_or_wq_dict.update(
+            {
+                "weight_ih": get_qparam_dict(weight_post_process_ih),
+                "weight_hh": get_qparam_dict(weight_post_process_hh),
+            }
+        )
+    elif isinstance(float_module, (torch.nn.LSTM, torch.nn.GRU)):
+        wq_or_wq_dict.update(_lstm_gru_weight_qparams(float_module, qconfig))
+    else:
+        weight_post_process = _prepared_weight_post_process(
+            float_module, qconfig, weight_post_process, opts
+        )
+        wq_or_wq_dict.update(get_qparam_dict(weight_post_process))
+    return wq_or_wq_dict
+
+
+def _prepared_weight_post_process(
+    float_module: torch.nn.Module,
+    qconfig: QConfigAny,
+    weight_post_process: Optional[torch.nn.Module],
+    opts: _WeightConvertOptions,
+) -> torch.nn.Module:
+    """Return the weight observer/fake_quant for the generic single-weight case.
+
+    For PTQ (``weight_post_process is None``) a fresh observer is built from the
+    qconfig and moved to the module's device. The observer is then run once on
+    the weight unless we are in the PT2 QAT case where the shapes are already
+    established.
+    """
+    # weight_post_process is None means the original module is not a QAT module
+    # we need to get weight_post_process from qconfig in this case
+    is_ptq = weight_post_process is None
+    if is_ptq:
+        weight_post_process = qconfig.weight()  # type: ignore[union-attr, operator]
+        if opts.model_device is not None:
+            device = opts.model_device
+        else:
+            device = _assert_and_get_unique_device(float_module)
+        if device:
+            weight_post_process.to(device)
+
+    # Call weight observer/fake_quant at least once to ensure the scales and zero points
+    # have the right shapes. Note: there are two cases where we don't have to do this:
+    #
+    # (1) QAT: The model's forward method already calls the weight observer/fake_quant,
+    #     and this typically happens during training, so we don't need to do it here.
+    #
+    # (2) Non-reference (lowered) case: The quantized module's from_float method already
+    #     calls the weight observer/fake_quant, so we don't have to do it here.
+    #
+    # Currently we ignore both cases and call the weight observer/fake_quant here
+    # regardless, which is technically incorrect. For (1), this is mainly to preserve BC
+    # in test code, which may not always train before convert. In the future, we should
+    # break BC for these two cases. See https://github.com/pytorch/pytorch/issues/73941.
+    #
+    # For PT2, however, we don't need to preserve BC here, so we can skip this hack
+    # for QAT. We identify this case as (is_decomposed + is_reference + is_qat).
+    # Note that we still need it for PTQ in the PT2 flow since the model's forward
+    # method doesn't call the weight observer.
+    is_qat = not is_ptq
+    if not (opts.is_decomposed and opts.is_reference and is_qat):
+        weight_post_process(float_module.weight)  # type: ignore[operator]
+    return weight_post_process
+
+
 def convert_weighted_module(
     node: Node,
     modules: dict[str, torch.nn.Module],
@@ -845,27 +1013,10 @@ def convert_weighted_module(
         parent_name, name = _parent_name(node.target)
         setattr(modules[parent_name], name, original_module)
 
-    is_observed = node.name in observed_node_names
-    # If a qconfig is not defined for this node, then skip converting to a reference module
-    if (
-        qconfig is None
-        or _has_none_qconfig(node, node_name_to_qconfig)
-        or not is_observed
-    ):
-        return
-
-    # skip converting to reference quantized module if the qconfig is not supported
-    pattern_to_dtype_configs = get_pattern_to_dtype_configs(backend_config)
-    dtype_configs = pattern_to_dtype_configs.get(type(original_module), [])
-    if not _is_qconfig_supported_by_dtype_configs(qconfig, dtype_configs):
-        return
-
-    # TODO: rename weight_is_statically_quantized to weight_is_int8_quantized
-    is_weight_quantized = weight_is_quantized(qconfig)
-
-    # the condition for swapping the module to reference quantized module is:
-    # weights need to be quantized
-    if not is_weight_quantized:
+    lookups = _WeightModuleLookups(
+        observed_node_names, node_name_to_qconfig, backend_config
+    )
+    if not _should_convert_weighted_module(node, original_module, qconfig, lookups):
         return
 
     fused_module = None
@@ -877,66 +1028,10 @@ def convert_weighted_module(
 
     # TODO: move this to the reference quantized module
     # weight_qparams or weight_qparams dict
-    wq_or_wq_dict = {"is_decomposed": is_decomposed}
-    if isinstance(float_module, torch.nn.RNNCellBase):
-        weight_post_process_ih = qconfig.weight()  # type: ignore[union-attr, operator]
-        weight_post_process_hh = qconfig.weight()  # type: ignore[union-attr, operator]
-        weight_post_process_ih(float_module.weight_ih)
-        weight_post_process_hh(float_module.weight_hh)
-        weight_qparams_ih = get_qparam_dict(weight_post_process_ih)
-        weight_qparams_hh = get_qparam_dict(weight_post_process_hh)
-        wq_or_wq_dict.update(
-            {
-                "weight_ih": weight_qparams_ih,
-                "weight_hh": weight_qparams_hh,
-            }
-        )
-    elif isinstance(float_module, (torch.nn.LSTM, torch.nn.GRU)):
-        # format for wq_or_wq_dict (flattened attributes):
-        # {"weight_ih_l0_scale": ..., "weight_ih_l0_qscheme": ..., ...}
-        for wn in float_module._flat_weights_names:
-            if hasattr(float_module, wn) and wn.startswith("weight"):
-                weight = getattr(float_module, wn)
-                weight_post_process = qconfig.weight()  # type: ignore[union-attr, operator]
-                if weight_post_process.dtype == torch.qint8:  # type: ignore[union-attr]
-                    weight_post_process(weight)  # type: ignore[operator, misc]
-                wq_or_wq_dict[wn] = get_qparam_dict(weight_post_process)
-    else:
-        # weight_post_process is None means the original module is not a QAT module
-        # we need to get weight_post_process from qconfig in this case
-        is_ptq = weight_post_process is None
-        if is_ptq:
-            weight_post_process = qconfig.weight()  # type: ignore[union-attr, operator]
-            if model_device is not None:
-                device = model_device
-            else:
-                device = _assert_and_get_unique_device(float_module)
-            if device:
-                weight_post_process.to(device)
-
-        # Call weight observer/fake_quant at least once to ensure the scales and zero points
-        # have the right shapes. Note: there are two cases where we don't have to do this:
-        #
-        # (1) QAT: The model's forward method already calls the weight observer/fake_quant,
-        #     and this typically happens during training, so we don't need to do it here.
-        #
-        # (2) Non-reference (lowered) case: The quantized module's from_float method already
-        #     calls the weight observer/fake_quant, so we don't have to do it here.
-        #
-        # Currently we ignore both cases and call the weight observer/fake_quant here
-        # regardless, which is technically incorrect. For (1), this is mainly to preserve BC
-        # in test code, which may not always train before convert. In the future, we should
-        # break BC for these two cases. See https://github.com/pytorch/pytorch/issues/73941.
-        #
-        # For PT2, however, we don't need to preserve BC here, so we can skip this hack
-        # for QAT. We identify this case as (is_decomposed + is_reference + is_qat).
-        # Note that we still need it for PTQ in the PT2 flow since the model's forward
-        # method doesn't call the weight observer.
-        is_qat = not is_ptq
-        if not (is_decomposed and is_reference and is_qat):
-            weight_post_process(float_module.weight)  # type: ignore[operator]
-
-        wq_or_wq_dict.update(get_qparam_dict(weight_post_process))
+    opts = _WeightConvertOptions(is_decomposed, is_reference, model_device)
+    wq_or_wq_dict = _compute_weight_qparams(
+        float_module, qconfig, weight_post_process, opts
+    )
 
     # We use the same reference module for all modes of quantization: static, dynamic, weight_only
     # root_module_to_quantized_reference_module: module mapping from root (floating point) module class
@@ -1111,6 +1206,51 @@ def _convert_call_module_node(node: Node, ctx: _ConvertContext) -> None:
         )
 
 
+def _reconcile_convert_qconfig_mapping(
+    model: GraphModule,
+    modules: dict[str, torch.nn.Module],
+    qconfig_mapping: QConfigMapping,
+    observed_graph_module_attrs: Any,
+    backend_config: BackendConfig,
+) -> dict[str, QConfigAny]:
+    """Regenerate and validate ``node_name_to_qconfig`` from a convert-time mapping.
+
+    Applies the QAT/fusion updates to ``qconfig_mapping``, regenerates the
+    per-node qconfig, and asserts each regenerated value either matches the
+    prepare-time value or was reset to ``None``. The prepare-time mapping,
+    ``node_name_to_scope`` and ``node_name_to_qconfig`` are read from
+    ``observed_graph_module_attrs``.
+    """
+    prepare_qconfig_mapping: QConfigMapping = (
+        observed_graph_module_attrs.qconfig_mapping
+    )  # type: ignore[assignment]
+    node_name_to_scope = observed_graph_module_attrs.node_name_to_scope
+    node_name_to_qconfig = observed_graph_module_attrs.node_name_to_qconfig
+    modules_copy = copy.deepcopy(modules)
+
+    if observed_graph_module_attrs.is_qat:
+        _update_qconfig_for_qat(qconfig_mapping, backend_config)
+    _update_qconfig_for_fusion(model, qconfig_mapping)
+
+    _compare_prepare_convert_qconfig_mappings(prepare_qconfig_mapping, qconfig_mapping)  # type: ignore[arg-type]
+    convert_node_name_to_qconfig = _generate_node_name_to_qconfig(
+        model, modules_copy, model.graph, qconfig_mapping, node_name_to_scope
+    )
+    # check the convert_node_name_to_qconfig generated and ensure that
+    # all the values either match what was set in prepare node_name_to_qconfig
+    # or are set to None in the convert_node_name_to_qconfig.
+    for k, v in node_name_to_qconfig.items():
+        assert k in convert_node_name_to_qconfig, (
+            f"Expected key {k} in convert node_name_to_qconfig"
+        )
+        if convert_node_name_to_qconfig[k] is not None:
+            assert qconfig_equals(v, convert_node_name_to_qconfig[k]), (
+                f"Expected k {k} to have the same value in prepare and convert QConfigMappings, "
+                f"but {v} was updated to {convert_node_name_to_qconfig[k]}"
+            )
+    return convert_node_name_to_qconfig
+
+
 def convert(
     model: GraphModule,
     is_reference: bool = False,
@@ -1180,34 +1320,13 @@ def convert(
     # TODO refactor this code once we update the prepare logic to have additional information on
     # which graph nodes have been observed and share that with convert to decide which observers to ignore.
     if qconfig_mapping:
-        prepare_qconfig_mapping: QConfigMapping = (
-            observed_graph_module_attrs.qconfig_mapping
-        )  # type: ignore[assignment]
-        modules_copy = copy.deepcopy(modules)
-
-        if observed_graph_module_attrs.is_qat:
-            _update_qconfig_for_qat(qconfig_mapping, backend_config)
-        _update_qconfig_for_fusion(model, qconfig_mapping)
-
-        _compare_prepare_convert_qconfig_mappings(
-            prepare_qconfig_mapping, qconfig_mapping
-        )  # type: ignore[arg-type]
-        convert_node_name_to_qconfig = _generate_node_name_to_qconfig(
-            model, modules_copy, model.graph, qconfig_mapping, node_name_to_scope
+        node_name_to_qconfig = _reconcile_convert_qconfig_mapping(
+            model,
+            modules,
+            qconfig_mapping,
+            observed_graph_module_attrs,
+            backend_config,
         )
-        # check the convert_node_name_to_qconfig generated and ensure that
-        # all the values either match what was set in prepare node_name_to_qconfig
-        # or are set to None in the convert_node_name_to_qconfig.
-        for k, v in node_name_to_qconfig.items():
-            assert k in convert_node_name_to_qconfig, (
-                f"Expected key {k} in convert node_name_to_qconfig"
-            )
-            if convert_node_name_to_qconfig[k] is not None:
-                assert qconfig_equals(v, convert_node_name_to_qconfig[k]), (
-                    f"Expected k {k} to have the same value in prepare and convert QConfigMappings, "
-                    f"but {v} was updated to {convert_node_name_to_qconfig[k]}"
-                )
-        node_name_to_qconfig = convert_node_name_to_qconfig
 
     if observed_graph_module_attrs.equalization_node_name_to_qconfig is not None:
         # If we want to do equalization then do the following:
