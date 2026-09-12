@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD 3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
+
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
@@ -31,40 +37,68 @@ class QuantConfig:
             object.__setattr__(self, "quantizer", q)
 
 
+def _build_initial_param_groups(quant_configs_and_filter_fns):
+    """Create one param group per quant config, plus a trailing no-quant group.
+
+    The no-quant group is kept last so that a quantized config's index in
+    ``quant_configs_and_filter_fns`` matches its index in ``param_groups``.
+    """
+    param_groups = []
+    for config, _ in quant_configs_and_filter_fns:
+        param_group = {"params": [], "quant_bits": config.bitwidth}
+        if config.group_size is not None:
+            param_group["quant_block_size"] = config.group_size
+        param_group["_quantizer"] = config.quantizer
+        param_groups.append(param_group)
+
+    param_groups.append({"params": [], "weight_decay": 0.0})
+    return param_groups
+
+
+def _assign_param_to_group(
+    param, param_name, owning_module, quant_configs_and_filter_fns, param_groups
+):
+    """Append ``param`` to the single group whose filter matches it.
+
+    Falls back to the trailing no-quant group when nothing matches, and raises
+    if more than one config matches the same parameter.
+    """
+    matching_config = None
+    for idx, (config, filter_fn) in enumerate(quant_configs_and_filter_fns):
+        if not filter_fn(owning_module, param_name):
+            continue
+        param_groups[idx]["params"].append(param)
+        if matching_config is not None:
+            raise ValueError(
+                f"Found multiple matching configs for {param_name}. "
+                f"Previous match={matching_config}, new match={config}."
+            )
+        matching_config = config
+        print(f"{config.bitwidth},{config.group_size}")
+
+    if matching_config is None:
+        print("NONE")
+        param_groups[-1]["params"].append(param)
+
+
 def create_param_groups_and_group_quantizer_map(
     model: torch.nn.Module,
     quant_configs_and_filter_fns: List[
         Tuple[QuantConfig, Callable[[torch.nn.Module, str], bool]]
     ],
 ):
-    param_groups = []
-    group_quantizer_map = {}
-    for idx, (config, _) in enumerate(quant_configs_and_filter_fns):
-        params_quant = []
-        param_group = {
-            "params": params_quant,
-            "quant_bits": config.bitwidth,
-        }
-        if config.group_size is not None:
-            param_group["quant_block_size"] = config.group_size
-        param_group["_quantizer"] = config.quantizer
-        param_groups.append(param_group)
-
-    # Non-quantized group at end so that index in param_groups
-    # is the index in the subset of quantized param groups, which is
-    # used in defining group_quantizer_map
-    params_no_quant = []
-    param_groups.append({"params": params_no_quant, "weight_decay": 0.0})
+    param_groups = _build_initial_param_groups(quant_configs_and_filter_fns)
 
     seen_data_ptrs = {}
     for param_name, param in model.named_parameters():
-        module_name, _, param_basename = param_name.rpartition(".")
+        module_name, _, _ = param_name.rpartition(".")
         owning_module = model.get_submodule(module_name) if module_name else model
 
         data_ptr = param.data_ptr()
         if data_ptr in seen_data_ptrs:
             print(
-                f"Not considering {param} because it shares a data_ptr with {seen_data_ptrs[data_ptr]}, which was previously considered"
+                f"Not considering {param} because it shares a data_ptr with "
+                f"{seen_data_ptrs[data_ptr]}, which was previously considered"
             )
             continue
         seen_data_ptrs[data_ptr] = param_name
@@ -77,22 +111,13 @@ def create_param_groups_and_group_quantizer_map(
             "matching_config:",
             end="",
         )
-        matching_config = None
-        for idx, (config, filter_fn) in enumerate(quant_configs_and_filter_fns):
-            if filter_fn(owning_module, param_name):
-                param_groups[idx]["params"].append(param)
-                if matching_config is None:
-                    matching_config = config
-                    print(f"{config.bitwidth},{config.group_size}")
-                else:
-                    raise ValueError(
-                        f"Found multiple matching configs for {param_name}. Previous match={matching_config}, new match={config}."
-                    )
-
-        # If no match, add to no-quant group at last idx
-        if matching_config is None:
-            print("NONE")
-            param_groups[-1]["params"].append(param)
+        _assign_param_to_group(
+            param,
+            param_name,
+            owning_module,
+            quant_configs_and_filter_fns,
+            param_groups,
+        )
 
     # Filter out empty param groups
     param_groups = [pg for pg in param_groups if len(pg["params"]) > 0]

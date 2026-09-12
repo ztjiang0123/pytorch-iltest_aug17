@@ -131,6 +131,131 @@ MIXED_MM_HEURISTICS = {
 
 
 @triton.jit
+def _apply_contiguity_hint(r, n, block, DEBUG: tl.constexpr):
+    """Hint contiguity/alignment to the compiler unless debugging."""
+    if not DEBUG:
+        return tl.max_contiguous(tl.multiple_of(r % n, block), block)
+    return r
+
+
+@triton.jit
+def _remaining_b(
+    k, K, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr, TRANSPOSED: tl.constexpr
+):
+    """Remaining valid K rows of B for the current mainloop iteration.
+
+    In the non-transposed layout B is packed 2x along K, so the offset advances
+    by half the block size (hence the division by 2). The transposed layout is
+    unpacked along this axis and matches A's remaining count.
+    """
+    if not TRANSPOSED:
+        return K - k * (BLOCK_K * SPLIT_K) // 2
+    return K - k * (BLOCK_K * SPLIT_K)
+
+
+@triton.jit
+def _reshape_dq_b(
+    dq_b, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, TRANSPOSED: tl.constexpr
+):
+    """Reshape the dequantized B block to (K, N), or (N, K) when transposed."""
+    if not TRANSPOSED:
+        return dq_b.reshape(BLOCK_K, BLOCK_N)
+    return dq_b.reshape(BLOCK_N, BLOCK_K)
+
+
+@triton.jit
+def _load_ab(
+    A,
+    B,
+    rak,
+    rbk,
+    k,
+    K,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    TRANSPOSED: tl.constexpr,
+    dtype: tl.constexpr,
+):
+    """Load one A / B block, masking the K tail when K is not block-aligned."""
+    if EVEN_K:
+        return tl.load(A), tl.load(B)
+    k_remaining_a = K - k * (BLOCK_K * SPLIT_K)
+    k_remaining_b = _remaining_b(k, K, BLOCK_K, SPLIT_K, TRANSPOSED)
+    _0 = tl.zeros((1, 1), dtype=dtype)
+    a = tl.load(A, mask=rak[None, :] < k_remaining_a, other=_0)
+    qb = tl.load(B, mask=rbk[:, None] < k_remaining_b, other=_0)
+    return a, qb
+
+
+@triton.jit
+def _dequant_b(
+    qb,
+    scales,
+    zeros,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    IS_BFLOAT16: tl.constexpr,
+    TRANSPOSED: tl.constexpr,
+    dtype: tl.constexpr,
+):
+    """Unpack the 2x-int4 B block, upcast, scale, and orient for the matmul."""
+    # Unpack qweights -- h/t jlebar!
+    _4_i8 = tl.full((1,), 4, dtype=tl.int8)
+    qb_lo = (qb << _4_i8) >> _4_i8
+    qb_hi = qb >> _4_i8
+
+    # Upcast to fp16. bfloat16 needs an intermediate fp16 hop (direct int8 ->
+    # bfloat16 conversion triggers a compilation error).
+    if IS_BFLOAT16:
+        dq_b = tl.join(
+            qb_lo.to(tl.float16).to(dtype),
+            qb_hi.to(tl.float16).to(dtype),
+        ).permute(0, 2, 1)
+    else:
+        dq_b = tl.join(
+            qb_lo.to(dtype),
+            qb_hi.to(dtype),
+        ).permute(0, 2, 1)
+    dq_b = _reshape_dq_b(dq_b, BLOCK_N, BLOCK_K, TRANSPOSED)
+
+    # Scale upcasted weights, broadcasting scales / zeros across the block
+    # (all scales fall within a single QGROUP -- statically checked above).
+    dq_b = (dq_b - zeros[None, :]) * scales[None, :]
+
+    if TRANSPOSED:
+        dq_b = tl.trans(dq_b)
+    return dq_b
+
+
+@triton.jit
+def _b_advance(
+    stride_bk,
+    stride_bn,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    TRANSPOSED: tl.constexpr,
+):
+    """Pointer delta to advance B by one mainloop block along K."""
+    if not TRANSPOSED:
+        return BLOCK_K * SPLIT_K * stride_bk // 2
+    # iterating across a row of B (non-packing dim, hence no need for div 2)
+    return BLOCK_K * SPLIT_K * stride_bn
+
+
+@triton.jit
+def _store_c(C, acc, mask, SPLIT_K: tl.constexpr):
+    """Store (or atomically accumulate) the C block."""
+    if SPLIT_K == 1:
+        tl.store(C, acc, mask=mask)
+    elif tl.constexpr(torch.version.hip is not None):
+        # AMD GPUs need relaxed semantics for better performance
+        tl.atomic_add(C, acc, mask=mask, sem="relaxed")
+    else:
+        tl.atomic_add(C, acc, mask=mask)
+
+
+@triton.jit
 def _mixed_mm_kernel(
     # Operands: A, B, scales, zeros, C
     A,
@@ -203,26 +328,17 @@ def _mixed_mm_kernel(
     pid_n = (pid % width) // group_size
 
     rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-    if not DEBUG:
-        ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
-    else:
-        ram = rm
+    ram = _apply_contiguity_hint(rm, M, BLOCK_M, DEBUG)
     rak = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
 
     # BLOCK_K for b is effectively BLOCK_K // 2
     if not TRANSPOSED:
         rn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
-        if not DEBUG:
-            rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
-        else:
-            rbn = rn
+        rbn = _apply_contiguity_hint(rn, N, BLOCK_N, DEBUG)
         rbk = pid_z * BLOCK_K // 2 + tl.arange(0, BLOCK_K // 2)
     else:
         rn = (pid_n * BLOCK_N // 2 + tl.arange(0, BLOCK_N // 2)) % N
-        if not DEBUG:
-            rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N // 2), BLOCK_N // 2)
-        else:
-            rbn = rn
+        rbn = _apply_contiguity_hint(rn, N, BLOCK_N // 2, DEBUG)
         rbk = rak
 
     A = A + (ram[:, None] * stride_am + rak[None, :] * stride_ak)
@@ -246,21 +362,19 @@ def _mixed_mm_kernel(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_dtype)
     for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
-        if EVEN_K:
-            a = tl.load(A)
-            qb = tl.load(B)
-        else:
-            k_remaining_a = K - k * (BLOCK_K * SPLIT_K)
-            if not TRANSPOSED:
-                k_remaining_b = (
-                    K - k * (BLOCK_K * SPLIT_K) // 2
-                )  # Note the division by 2
-            else:
-                k_remaining_b = K - k * (BLOCK_K * SPLIT_K)  # = k_remaining_a
-
-            _0 = tl.zeros((1, 1), dtype=C.dtype.element_ty)
-            a = tl.load(A, mask=rak[None, :] < k_remaining_a, other=_0)
-            qb = tl.load(B, mask=rbk[:, None] < k_remaining_b, other=_0)
+        a, qb = _load_ab(
+            A,
+            B,
+            rak,
+            rbk,
+            k,
+            K,
+            BLOCK_K,
+            SPLIT_K,
+            EVEN_K,
+            TRANSPOSED,
+            C.dtype.element_ty,
+        )
 
         if not TRANSPOSED:
             scale_offset_k = k * BLOCK_K * SPLIT_K * stride_scale_k // QGROUP_SIZE
@@ -272,34 +386,16 @@ def _mixed_mm_kernel(
         scales = tl.load(scales_ptr + offsets_scale_n + scale_offset_k)
         zeros = tl.load(zeros_ptr + offsets_scale_n + scale_offset_k)
 
-        # Unpack qweights -- h/t jlebar!
-        _4_i8 = tl.full((1,), 4, dtype=tl.int8)
-        qb_lo = (qb << _4_i8) >> _4_i8
-        qb_hi = qb >> _4_i8
-
-        # Upcast to fp16. bfloat16 needs an intermediate fp16 hop (direct int8 ->
-        # bfloat16 conversion triggers a compilation error).
-        if IS_BFLOAT16:
-            dq_b = tl.join(
-                qb_lo.to(tl.float16).to(A.dtype.element_ty),
-                qb_hi.to(tl.float16).to(A.dtype.element_ty),
-            ).permute(0, 2, 1)
-        else:
-            dq_b = tl.join(
-                qb_lo.to(A.dtype.element_ty),
-                qb_hi.to(A.dtype.element_ty),
-            ).permute(0, 2, 1)
-        if not TRANSPOSED:
-            dq_b = dq_b.reshape(BLOCK_K, BLOCK_N)
-        else:
-            dq_b = dq_b.reshape(BLOCK_N, BLOCK_K)
-
-        # Scale upcasted weights, broadcasting scales / zeros across the block
-        # (all scales fall within a single QGROUP -- statically checked above).
-        dq_b = (dq_b - zeros[None, :]) * scales[None, :]
-
-        if TRANSPOSED:
-            dq_b = tl.trans(dq_b)
+        dq_b = _dequant_b(
+            qb,
+            scales,
+            zeros,
+            BLOCK_N,
+            BLOCK_K,
+            IS_BFLOAT16,
+            TRANSPOSED,
+            A.dtype.element_ty,
+        )
 
         if fp8_fast_accum:
             acc = tl.dot(
@@ -309,12 +405,9 @@ def _mixed_mm_kernel(
             acc += tl.dot(a, dq_b, out_dtype=acc_dtype, input_precision=input_precision)
         A += BLOCK_K * SPLIT_K * stride_ak
 
-        # Advance by half the block size, since each block is unpacked and upcasted into two fp16 values
-        if not TRANSPOSED:
-            B += BLOCK_K * SPLIT_K * stride_bk // 2
-        else:
-            # we iterating across a row of B (non-packing dim, hence no need for div 2)
-            B += BLOCK_K * SPLIT_K * stride_bn
+        # Advance by half the block size (non-packing dim needs no div 2), since each
+        # block is unpacked and upcasted into two fp16 values.
+        B += _b_advance(stride_bk, stride_bn, BLOCK_K, SPLIT_K, TRANSPOSED)
     acc = acc.to(C.dtype.element_ty)
 
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -322,14 +415,7 @@ def _mixed_mm_kernel(
     C = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
-    if SPLIT_K == 1:
-        tl.store(C, acc, mask=mask)
-    else:
-        # AMD GPUs need relaxed semantics for better performance
-        if tl.constexpr(torch.version.hip is not None):
-            tl.atomic_add(C, acc, mask=mask, sem="relaxed")
-        else:
-            tl.atomic_add(C, acc, mask=mask)
+    _store_c(C, acc, mask, SPLIT_K)
 
 
 _mixed_mm = triton.heuristics(MIXED_MM_HEURISTICS)(_mixed_mm_kernel)

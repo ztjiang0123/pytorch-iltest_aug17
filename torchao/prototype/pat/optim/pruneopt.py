@@ -301,6 +301,74 @@ class PruneOptimizer(BaseWrappedOptimizer):
         return zero_elts_per_group.full_tensor().sum().item(), group_norm
 
     @staticmethod
+    def _apply_prox_whole_tensor(grouper, prox_map, gamma, tau_reweight):
+        """Apply `prox_map` once over the full grouped view (no vmap).
+
+        Element-, layer-, or whole-tensor pruning bypasses vmap. whole_tensor
+        prox maps treat p.size(0) as n_groups, so transpose when the grouper
+        iterates dim 1 (e.g. Dim1Grouper).
+        """
+        transpose = getattr(grouper, "in_dims", 0) == 1 and grouper.p.dim() == 2
+        if _is_dtensor(grouper.p):
+            # Prox maps that mutate via index_put_ (e.g. MinSparsityConstraint)
+            # have no DTensor sharding rule and the whole-tensor variants need a
+            # global view to compute correct top-k. Gather, mutate, scatter back.
+            full = grouper.p.full_tensor()
+            view = full.transpose(0, 1) if transpose else full
+            zero_elts, group_norm = prox_map.apply_(view, gamma, tau_reweight)
+            grouper.p.copy_(
+                distribute_tensor(
+                    full,
+                    device_mesh=grouper.p.device_mesh,
+                    placements=grouper.p.placements,
+                )
+            )
+        else:
+            view = grouper.p.transpose(0, 1) if transpose else grouper.p
+            zero_elts, group_norm = prox_map.apply_(view, gamma, tau_reweight)
+        return zero_elts, group_norm
+
+    @staticmethod
+    def _apply_prox_vmap(
+        grouper,
+        prox_map,
+        p,
+        gamma,
+        gamma_in_dims,
+        tau_reweight,
+        tau_reweight_in_dims,
+        use_dtensor,
+    ):
+        """Apply `prox_map` per group via vmap (or the DTensor equivalent)."""
+        if use_dtensor:
+            return PruneOptimizer._apply_prox_dtensor(
+                grouper,
+                prox_map,
+                p,
+                gamma,
+                gamma_in_dims,
+                tau_reweight,
+                tau_reweight_in_dims,
+            )
+        # torch.Tensor branch - use standard vmap
+        zero_elts_per_group, group_norm = torch.vmap(
+            prox_map.apply_,
+            in_dims=(grouper.in_dims, gamma_in_dims, tau_reweight_in_dims),
+            out_dims=(0, 0),
+        )(grouper.p, gamma, tau_reweight)
+        return zero_elts_per_group.sum().item(), group_norm
+
+    @staticmethod
+    def _record_sv_count(grouper, p, sv_count):
+        """Record per-group nonzero counts for SVD reconstruction and logging."""
+        dim = 0 if sv_count.dim() > 1 else None
+        sv_count.copy_(
+            (grouper.p != 0).to(torch.uint8).sum(dim=dim)
+            if _is_dtensor(p)
+            else torch.count_nonzero(grouper.p, dim=dim)
+        )
+
+    @staticmethod
     def _apply_prox(
         grouper, prox_map, p, tau_reweight=1.0, sv_count=None, **prox_kwargs
     ) -> tuple[Tensor, Tensor, bool]:
@@ -316,12 +384,12 @@ class PruneOptimizer(BaseWrappedOptimizer):
             zeros_are_summed: whether zero_elts is already globally summed
         """
         gamma = prox_kwargs["gamma"]
-        zeros_are_summed = False
+        is_svd_grouper = prox_kwargs["is_svd_grouper"]
         with grouper:
+            tau_reweight_in_dims = (
+                0 if torch.is_tensor(tau_reweight) and tau_reweight.dim() > 0 else None
+            )
             gamma_in_dims = None
-            tau_reweight_in_dims = None
-            if torch.is_tensor(tau_reweight) and tau_reweight.dim() > 0:
-                tau_reweight_in_dims = 0
             if prox_kwargs["gamma_index_slope"] > 0:
                 # y = slope(2x - 1) + 1
                 gamma = gamma * get_index_linspace(
@@ -331,70 +399,34 @@ class PruneOptimizer(BaseWrappedOptimizer):
                 )
                 gamma_in_dims = 0
 
-            if prox_kwargs["disable_vmap"] or prox_map.whole_tensor:
-                # Element-, layer-, or whole-tensor pruning: bypass vmap and
-                # call apply_ once on the full grouped view. whole_tensor prox
-                # maps treat p.size(0) as n_groups, so transpose when the
-                # grouper iterates dim 1 (e.g. Dim1Grouper).
-                transpose = getattr(grouper, "in_dims", 0) == 1 and grouper.p.dim() == 2
-                if _is_dtensor(grouper.p):
-                    # Prox maps that mutate via index_put_ (e.g.
-                    # MinSparsityConstraint) have no DTensor sharding rule and
-                    # the whole-tensor variants need a global view to compute
-                    # correct top-k. Gather, mutate, then scatter back.
-                    full = grouper.p.full_tensor()
-                    view = full.transpose(0, 1) if transpose else full
-                    zero_elts, group_norm = prox_map.apply_(view, gamma, tau_reweight)
-                    grouper.p.copy_(
-                        distribute_tensor(
-                            full,
-                            device_mesh=grouper.p.device_mesh,
-                            placements=grouper.p.placements,
-                        )
-                    )
-                else:
-                    view = grouper.p.transpose(0, 1) if transpose else grouper.p
-                    zero_elts, group_norm = prox_map.apply_(view, gamma, tau_reweight)
+            use_whole_tensor = prox_kwargs["disable_vmap"] or prox_map.whole_tensor
+            if use_whole_tensor:
+                zero_elts, group_norm = PruneOptimizer._apply_prox_whole_tensor(
+                    grouper, prox_map, gamma, tau_reweight
+                )
                 zeros_are_summed = zero_elts.dim() == 0
             else:
-                if not prox_kwargs["is_svd_grouper"] and _is_dtensor(p):
-                    zero_elts, group_norm = PruneOptimizer._apply_prox_dtensor(
-                        grouper,
-                        prox_map,
-                        p,
-                        gamma,
-                        gamma_in_dims,
-                        tau_reweight,
-                        tau_reweight_in_dims,
-                    )
-                else:
-                    # torch.Tensor branch - use standard vmap
-                    zero_elts_per_group, group_norm = torch.vmap(
-                        prox_map.apply_,
-                        in_dims=(
-                            grouper.in_dims,
-                            gamma_in_dims,
-                            tau_reweight_in_dims,
-                        ),
-                        out_dims=(0, 0),
-                    )(grouper.p, gamma, tau_reweight)
-                    zero_elts = zero_elts_per_group.sum().item()
+                use_dtensor = not is_svd_grouper and _is_dtensor(p)
+                zero_elts, group_norm = PruneOptimizer._apply_prox_vmap(
+                    grouper,
+                    prox_map,
+                    p,
+                    gamma,
+                    gamma_in_dims,
+                    tau_reweight,
+                    tau_reweight_in_dims,
+                    use_dtensor,
+                )
                 zeros_are_summed = True
 
                 # Adjust for group-based pruning
-                if not prox_kwargs["is_svd_grouper"] and not prox_kwargs.get(
+                if not is_svd_grouper and not prox_kwargs.get(
                     "zero_elts_are_counts", False
                 ):
                     zero_elts *= grouper.group_size()
 
-            # Record for reconstruction and logging
-            if prox_kwargs["is_svd_grouper"]:
-                dim = 0 if sv_count.dim() > 1 else None
-                sv_count.copy_(
-                    (grouper.p != 0).to(torch.uint8).sum(dim=dim)
-                    if _is_dtensor(p)
-                    else torch.count_nonzero(grouper.p, dim=dim)
-                )
+            if is_svd_grouper:
+                PruneOptimizer._record_sv_count(grouper, p, sv_count)
 
             return zero_elts, group_norm, zeros_are_summed
 
