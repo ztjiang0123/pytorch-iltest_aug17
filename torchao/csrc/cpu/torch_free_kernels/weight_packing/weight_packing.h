@@ -285,6 +285,95 @@ inline void pack_column_block(
   }
 }
 
+// ---- Unpack side ----
+//
+// Mirrors the pack helpers above: each step of unpack_weights_at_n_idx is a
+// small named free function operating on an UnpackCursor, so the top-level
+// unpack loop reads as a flat sequence of steps.
+
+// Read position plus the fixed geometry shared by every unpack step. Bundling
+// these lets each step below keep a small (<=5 arg) signature and read as a
+// flat sequence of decisions.
+struct UnpackCursor {
+  const char* cursor; // advances as values are consumed
+  int n_idx; // first column of this nr-block
+  int n; // total columns (columns past n are padding)
+  int groups_per_k;
+
+  // Column (n_idx + j) is inside the real matrix (not zero padding).
+  bool column_in_range(int j) const {
+    return n_idx + j < n;
+  }
+
+  // Read one little-endian scalar and advance the cursor.
+  template <typename T>
+  T read_scalar() {
+    T value = *reinterpret_cast<const T*>(cursor);
+    cursor += sizeof(T);
+    return value;
+  }
+};
+
+// Unpack one group's qvals for the next nr columns into weight_qvals.
+template <int weight_nbit, int nr, int kr, int sr>
+inline void unpack_group_qvals(
+    UnpackCursor& uc, int8_t* weight_qvals, int k, int k_idx, int group_size) {
+  constexpr int packed_buffer_bytes = weight_nbit * nr * kr / 8;
+  std::array<int8_t, nr * kr> buffer;
+  int8_t packed_values[nr * kr];
+
+  for (int idx_in_group = 0; idx_in_group < group_size; idx_in_group += kr) {
+    impl::unpack_buffer<weight_nbit, kr, nr>(packed_values, uc.cursor);
+    uc.cursor += packed_buffer_bytes;
+    torchao::weight_packing::unpack_values(
+        buffer.data(), packed_values, nr, kr, sr);
+
+    for (int j = 0; j < nr; j++) {
+      if (uc.column_in_range(j)) {
+        std::memcpy(
+            weight_qvals + j * k + (k_idx + idx_in_group),
+            buffer.data() + kr * j,
+            kr);
+      }
+    }
+  }
+}
+
+// Read this group's per-column scales into weight_scales.
+template <int nr>
+inline void unpack_group_scales(
+    UnpackCursor& uc, float* weight_scales, int group_idx) {
+  for (int j = 0; j < nr; j++) {
+    float scale = uc.read_scalar<float>();
+    if (uc.column_in_range(j)) {
+      weight_scales[j * uc.groups_per_k + group_idx] = scale;
+    }
+  }
+}
+
+// Read this group's per-column zero points into weight_zeros (may be nullptr).
+template <int nr>
+inline void unpack_group_zeros(
+    UnpackCursor& uc, int8_t* weight_zeros, int group_idx) {
+  for (int j = 0; j < nr; j++) {
+    int32_t zero = uc.read_scalar<int32_t>();
+    if (uc.column_in_range(j) && weight_zeros != nullptr) {
+      weight_zeros[j * uc.groups_per_k + group_idx] = static_cast<int8_t>(zero);
+    }
+  }
+}
+
+// Read the per-column bias values into bias (may be nullptr).
+template <int nr>
+inline void unpack_bias(UnpackCursor& uc, float* bias) {
+  for (int j = 0; j < nr; j++) {
+    float bias_ = uc.read_scalar<float>();
+    if (uc.column_in_range(j) && bias != nullptr) {
+      bias[j] = bias_;
+    }
+  }
+}
+
 } // namespace detail
 
 // Pack weights into architecture-portable format
@@ -350,74 +439,35 @@ void unpack_weights_at_n_idx(
   assert(group_size % kr == 0);
   assert(n_idx % nr == 0);
 
+  assert(nr * kr % 8 == 0);
   int groups_per_k = k / group_size;
 
-  std::array<int8_t, nr * kr> buffer;
-  int8_t packed_values[nr * kr];
-
-  assert(nr * kr % 8 == 0);
-  constexpr int packed_buffer_bytes = weight_nbit * nr * kr / 8;
-
-  auto packed_weights_byte_ptr =
+  // All per-group/per-column work lives in the detail:: free functions above,
+  // so this function is just a flat loop over the groups plus the optional bias.
+  detail::UnpackCursor uc{
       reinterpret_cast<const char*>(packed_weights) +
-      n_idx *
-          torchao::weight_packing::packed_weights_size_per_n(
-              k, group_size, weight_nbit, has_weight_zeros, has_bias);
+          n_idx *
+              torchao::weight_packing::packed_weights_size_per_n(
+                  k, group_size, weight_nbit, has_weight_zeros, has_bias),
+      n_idx,
+      n,
+      groups_per_k};
 
   for (int group_idx = 0; group_idx < groups_per_k; group_idx++) {
-    int k_idx = group_idx * group_size;
-    for (int idx_in_group = 0; idx_in_group < group_size;
-         idx_in_group += kr) {
-      impl::unpack_buffer<weight_nbit, kr, nr>(
-          packed_values, packed_weights_byte_ptr);
-      packed_weights_byte_ptr += packed_buffer_bytes;
-      torchao::weight_packing::unpack_values(
-          buffer.data(), packed_values, nr, kr, sr);
-
-      for (int j = 0; j < nr; j++) {
-        if (n_idx + j < n) {
-          std::memcpy(
-              weight_qvals + j * k + (k_idx + idx_in_group),
-              buffer.data() + kr * j,
-              kr);
-        }
-      }
-    }
-
-    for (int j = 0; j < nr; j++) {
-      float scale =
-          *reinterpret_cast<const float*>(packed_weights_byte_ptr);
-      packed_weights_byte_ptr += sizeof(float);
-      if (n_idx + j < n) {
-        weight_scales[j * groups_per_k + group_idx] = scale;
-      }
-    }
+    detail::unpack_group_qvals<weight_nbit, nr, kr, sr>(
+        uc, weight_qvals, k, group_idx * group_size, group_size);
+    detail::unpack_group_scales<nr>(uc, weight_scales, group_idx);
 
     // Skip over weight qval sums
-    packed_weights_byte_ptr += nr * sizeof(int32_t);
+    uc.cursor += nr * sizeof(int32_t);
 
     if (has_weight_zeros) {
-      for (int j = 0; j < nr; j++) {
-        int32_t zero =
-            *reinterpret_cast<const int32_t*>(packed_weights_byte_ptr);
-        packed_weights_byte_ptr += sizeof(int32_t);
-        if (n_idx + j < n && weight_zeros != nullptr) {
-          weight_zeros[j * groups_per_k + group_idx] =
-              static_cast<int8_t>(zero);
-        }
-      }
+      detail::unpack_group_zeros<nr>(uc, weight_zeros, group_idx);
     }
   }
 
   if (has_bias) {
-    for (int j = 0; j < nr; j++) {
-      float bias_ =
-          *reinterpret_cast<const float*>(packed_weights_byte_ptr);
-      packed_weights_byte_ptr += sizeof(float);
-      if (n_idx + j < n && bias != nullptr) {
-        bias[j] = bias_;
-      }
-    }
+    detail::unpack_bias<nr>(uc, bias);
   }
 }
 
