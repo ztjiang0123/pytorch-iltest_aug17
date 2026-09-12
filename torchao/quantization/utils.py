@@ -692,6 +692,28 @@ def recommended_inductor_config_setter():
     torch.set_float32_matmul_precision("high")
 
 
+def _get_per_block_block_size(
+    input_shape: Tuple[int, ...], granularity: PerBlock
+) -> Tuple[int, ...]:
+    """Resolve the block size for ``PerBlock`` granularity against ``input_shape``."""
+    block_size = tuple(granularity.block_size)
+
+    # pad the start of `block_size` with 1s, to make 2d block_size
+    # handle tensors of rank 3+
+    if len(block_size) < len(input_shape):
+        padding = (1,) * (len(input_shape) - len(block_size))
+        block_size = padding + block_size
+
+    assert len(block_size) == len(input_shape), (
+        f"Block size {block_size} must have the same number of dimensions as input shape {input_shape}"
+    )
+    for shape_dim, block_dim in zip(input_shape, block_size):
+        assert shape_dim % block_dim == 0, (
+            f"Not all shapes in input shape {input_shape} are divisible by block size {block_size}"
+        )
+    return block_size
+
+
 def get_block_size(
     input_shape: Tuple[int, ...], granularity: Granularity
 ) -> Tuple[int, ...]:
@@ -702,36 +724,19 @@ def get_block_size(
     """
     if isinstance(granularity, PerTensor):
         return input_shape
-    elif isinstance(granularity, PerAxis):
+    if isinstance(granularity, PerAxis):
         block_size = list(input_shape)
         block_size[granularity.axis] = 1
         return tuple(block_size)
-    elif isinstance(granularity, PerBlock):
-        block_size = granularity.block_size
-
-        # pad the start of `block_size` with 1s, to make 2d block_size
-        # handle tensors of rank 3+
-        if len(block_size) < len(input_shape):
-            block_size_list = list(block_size)
-            while len(block_size_list) < len(input_shape):
-                block_size_list.insert(0, 1)
-            block_size = tuple(block_size_list)
-
-        assert len(block_size) == len(input_shape), (
-            f"Block size {block_size} must have the same number of dimensions as input shape {input_shape}"
-        )
-        for i in range(len(block_size)):
-            assert input_shape[i] % block_size[i] == 0, (
-                f"Not all shapes in input shape {input_shape} are divisible by block size {block_size}"
-            )
-        return block_size
-    elif isinstance(granularity, PerToken):
+    if isinstance(granularity, PerBlock):
+        return _get_per_block_block_size(input_shape, granularity)
+    if isinstance(granularity, PerToken):
         return (1,) * (len(input_shape) - 1) + (input_shape[-1],)
-    elif isinstance(granularity, PerRow):
+    if isinstance(granularity, PerRow):
         block_size = [1] * len(input_shape)
         block_size[granularity.dim] = input_shape[granularity.dim]
         return tuple(block_size)
-    elif isinstance(granularity, PerGroup):
+    if isinstance(granularity, PerGroup):
         assert input_shape[-1] % granularity.group_size == 0, (
             f"Last dimension of input {input_shape[-1]} is not divisible by group size {granularity.group_size}"
         )

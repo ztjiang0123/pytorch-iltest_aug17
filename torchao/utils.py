@@ -485,6 +485,78 @@ def _implements_torch_function(cls, torch_fns):
     return _implements_dispatch(cls, "_TORCH_FN_TABLE", torch_fns)
 
 
+def _tensors_shape_match(self, src, names) -> bool:
+    """Return True if the named tensor attributes have matching shapes on both."""
+    return all(getattr(self, name).shape == getattr(src, name).shape for name in names)
+
+
+def _optional_tensors_shape_match(self, src) -> bool:
+    """Return True if optional tensor attributes agree: either both None, or both
+    present with matching shape.
+    """
+    if not hasattr(self, "optional_tensor_data_names"):
+        return True
+    return all(
+        (
+            getattr(self, name).shape == getattr(src, name).shape
+            if getattr(self, name) is not None
+            else getattr(src, name) is None
+        )
+        for name in self.optional_tensor_data_names
+    )
+
+
+def _attrs_match(self, src, names) -> bool:
+    """Return True if the named (non-tensor) attributes are equal on both."""
+    return all(getattr(self, name) == getattr(src, name) for name in names)
+
+
+def _optional_attrs_match(self, src) -> bool:
+    """Return True if optional (non-tensor) attributes are equal on both."""
+    if not hasattr(self, "optional_tensor_attribute_names"):
+        return True
+    return _attrs_match(self, src, self.optional_tensor_attribute_names)
+
+
+def _move_attrs_to_device(self, names, device):
+    """Return attribute values, substituting ``device`` for the ``"device"`` attr."""
+    return [
+        device if attr_name == "device" else getattr(self, attr_name)
+        for attr_name in names
+    ]
+
+
+def _to_copy_reconstruct(self, device, non_blocking):
+    """Rebuild a tensor subclass instance with all its (optional) tensor data moved
+    to ``device`` and its ``"device"`` attribute updated.
+    """
+    tensors = [
+        getattr(self, name).to(device, non_blocking=non_blocking)
+        for name in self.tensor_data_names
+    ]
+
+    optional_tensors = []
+    for name in getattr(self, "optional_tensor_data_names", []):
+        maybe_tensor = getattr(self, name)
+        optional_tensors.append(
+            maybe_tensor.to(device, non_blocking=non_blocking)
+            if maybe_tensor is not None
+            else None
+        )
+
+    tensor_attributes = _move_attrs_to_device(self, self.tensor_attribute_names, device)
+    optional_tensor_attributes = _move_attrs_to_device(
+        self, getattr(self, "optional_tensor_attribute_names", []), device
+    )
+
+    return self.__class__(
+        *tensors,
+        *tensor_attributes,
+        *optional_tensors,
+        *optional_tensor_attributes,
+    )
+
+
 def _implements_common_tensor_ops(cls):
     implements = cls.implements
     implements_torch_function = cls.implements_torch_function
@@ -545,41 +617,13 @@ def _implements_common_tensor_ops(cls):
         )
 
     def _same_metadata(self: TorchAOBaseTensor, src: TorchAOBaseTensor) -> bool:
-        _tensor_shape_match = all(
-            getattr(self, t_name).shape == getattr(src, t_name).shape
-            for t_name in self.tensor_data_names
-        )
-        _optional_tensor_shape_match = True
-        if hasattr(self, "optional_tensor_data_names"):
-            # either both are None or both are not Tensors and the shape match
-            _optional_tensor_shape_match = all(
-                (
-                    getattr(self, t_name).shape == getattr(src, t_name).shape
-                    if getattr(self, t_name) is not None
-                    else getattr(src, t_name) is None
-                )
-                for t_name in self.optional_tensor_data_names
-            )
-
-        _attr_match = all(
-            getattr(self, a_name) == getattr(src, a_name)
-            for a_name in self.tensor_attribute_names
-        )
-
-        _optional_attr_match = True
-        if hasattr(self, "optional_tensor_attribute_names"):
-            _optional_attr_match = all(
-                getattr(self, a_name) == getattr(src, a_name)
-                for a_name in self.optional_tensor_attribute_names
-            )
-
         return (
             type(self) == type(src)
             and self.shape == src.shape
-            and _tensor_shape_match
-            and _optional_tensor_shape_match
-            and _attr_match
-            and _optional_attr_match
+            and _tensors_shape_match(self, src, self.tensor_data_names)
+            and _optional_tensors_shape_match(self, src)
+            and _attrs_match(self, src, self.tensor_attribute_names)
+            and _optional_attrs_match(self, src)
         )
 
     @implements(aten.copy_.default)
@@ -598,50 +642,19 @@ def _implements_common_tensor_ops(cls):
     @implements(aten._to_copy.default)
     def _(func, types, args, kwargs):
         self = args[0]
-        if hasattr(self, "tensor_data_names") and hasattr(
-            self, "tensor_attribute_names"
+        if not (
+            hasattr(self, "tensor_data_names")
+            and hasattr(self, "tensor_attribute_names")
         ):
-            kwargs = self._get_to_kwargs(*args[1:], **kwargs)
-            device = kwargs.pop("device")
-            non_blocking = kwargs.pop("non_blocking", False)
-            tensors = [
-                getattr(self, name).to(device, non_blocking=non_blocking)
-                for name in self.tensor_data_names
-            ]
-            optional_tensors = []
-            if hasattr(self, "optional_tensor_data_names"):
-                for tensor_data_name in self.optional_tensor_data_names:
-                    maybe_tensor = getattr(self, tensor_data_name)
-                    if maybe_tensor is not None:
-                        optional_tensors.append(
-                            maybe_tensor.to(device, non_blocking=non_blocking)
-                        )
-                    else:
-                        optional_tensors.append(None)
-
-            # change device
-            tensor_attributes = [
-                getattr(self, attr_name) if attr_name != "device" else device
-                for attr_name in self.tensor_attribute_names
-            ]
-            optional_tensor_attributes = []
-            if hasattr(self, "optional_tensor_attribute_names"):
-                optional_tensor_attributes = [
-                    getattr(self, attr_name) if attr_name != "device" else device
-                    for attr_name in self.optional_tensor_attribute_names
-                ]
-
-            t = self.__class__(
-                *tensors,
-                *tensor_attributes,
-                *optional_tensors,
-                *optional_tensor_attributes,
+            raise NotImplementedError(
+                "Subclasses must implement `aten._to_copy.default` or specify `tensor_data_names` and `tensor_attribute_names` for tensor class or tensor instance before using it"
             )
-            return return_and_correct_aliasing(func, args, kwargs, t)
 
-        raise NotImplementedError(
-            "Subclasses must implement `aten._to_copy.default` or specify `tensor_data_names` and `tensor_attribute_names` for tensor class or tensor instance before using it"
-        )
+        kwargs = self._get_to_kwargs(*args[1:], **kwargs)
+        device = kwargs.pop("device")
+        non_blocking = kwargs.pop("non_blocking", False)
+        t = _to_copy_reconstruct(self, device, non_blocking)
+        return return_and_correct_aliasing(func, args, kwargs, t)
 
 
 def _torchao_base_tensor__setstate__(self, state):
