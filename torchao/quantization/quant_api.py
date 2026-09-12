@@ -244,9 +244,9 @@ def swap_conv2d_1x1_to_linear(model, filter_fn=None):
         return PermuteSandwich(lin)
 
     if filter_fn is None:
-        filter_fn = lambda mod, *args: isinstance(
-            mod, torch.nn.Conv2d
-        ) and mod.kernel_size == (1, 1)
+        filter_fn = lambda mod, *args: (
+            isinstance(mod, torch.nn.Conv2d) and mod.kernel_size == (1, 1)
+        )
 
     _replace_with_custom_fn_if_matches_filter(
         model, replace_conv2d_1x1, filter_fn=filter_fn
@@ -275,6 +275,46 @@ def _get_linear_subclass_inserter(
         return lin
 
     return insert_subclass
+
+
+def _module_matches_fqn_config(
+    module: torch.nn.Module,
+    module_fqn: str,
+    config: "FqnToConfig",
+) -> bool:
+    """Return True if ``module`` should be quantized under ``config``."""
+    return (
+        fqn_matches_fqn_config(module_fqn, config)
+        or _module_param_matches_fqn_config(module, module_fqn, config)
+        or ("_default" in config.fqn_to_config and _is_linear(module))
+    )
+
+
+def _maybe_apply_fqn_config(
+    named_modules: dict,
+    module_fqn: str,
+    module: torch.nn.Module,
+    config: "FqnToConfig",
+    device: Optional[torch.types.Device],
+):
+    """Apply ``config`` to a single module (identified by ``module_fqn``) if it
+    matches, swapping the replacement into its parent when the handler returns a
+    new module.
+    """
+    if not _module_matches_fqn_config(module, module_fqn, config):
+        return
+
+    replacement = _fqn_to_config_handler(module, module_fqn, config)
+    if device is not None:
+        replacement = replacement.to(device=device)
+
+    # handle module swap
+    if replacement is module or module_fqn == "":
+        return
+    child_name = module_fqn.split(".")[-1]
+    parent_fqn = module_fqn.removesuffix(child_name).removesuffix(".")
+    parent_module = named_modules[parent_fqn]
+    setattr(parent_module, child_name, replacement)
 
 
 def quantize_(
@@ -321,20 +361,7 @@ def quantize_(
             )
         named_modules = dict(model.named_modules())
         for module_fqn, module in named_modules.items():
-            if (
-                fqn_matches_fqn_config(module_fqn, config)
-                or _module_param_matches_fqn_config(module, module_fqn, config)
-                or ("_default" in config.fqn_to_config and _is_linear(module))
-            ):
-                replacement = _fqn_to_config_handler(module, module_fqn, config)
-                if device is not None:
-                    replacement = replacement.to(device=device)
-                # handle module swap
-                if replacement is not module and module_fqn != "":
-                    child_name = module_fqn.split(".")[-1]
-                    parent_fqn = module_fqn.removesuffix(child_name).removesuffix(".")
-                    parent_module = named_modules[parent_fqn]
-                    setattr(parent_module, child_name, replacement)
+            _maybe_apply_fqn_config(named_modules, module_fqn, module, config, device)
     elif isinstance(config, AOBaseConfig):
         filter_fn = _is_linear if filter_fn is None else filter_fn
         handler = _QUANTIZE_CONFIG_HANDLER[type(config)]
@@ -372,9 +399,7 @@ def _validate_intx_weight_config(
         f"{granularity_field_name} must be PerAxis or PerGroup, but got {granularity}"
     )
     if isinstance(granularity, PerAxis):
-        assert granularity.axis == 0, (
-            f"axis must be 0, but got {granularity.axis}"
-        )
+        assert granularity.axis == 0, f"axis must be 0, but got {granularity.axis}"
     assert mapping_type in [
         MappingType.ASYMMETRIC,
         MappingType.SYMMETRIC,
@@ -1611,6 +1636,81 @@ def _apply_param_config(
     return handler(module, c, parameter_name=parameter_name)
 
 
+def _apply_module_config(module: torch.nn.Module, c: Optional[AOBaseConfig]):
+    """Apply a whole-module config, returning the (possibly replaced) module.
+
+    A ``None`` config means "explicitly skip", so the module is returned
+    unchanged.
+    """
+    if c is None:
+        return module
+    handler = _QUANTIZE_CONFIG_HANDLER[type(c)]
+    return handler(module, c)
+
+
+def _collect_top_level_params(module: torch.nn.Module, fqn: str):
+    """Return the ``(index, name, param, param_fqn)`` tuples for parameters that
+    are direct attributes of ``module``.
+    """
+    top_level_params = []
+    for i, (parameter_name, param) in enumerate(list(module.named_parameters())):
+        if parameter_name in dir(module):
+            parameter_fqn = (
+                f"{fqn}.{parameter_name}" if len(fqn) > 0 else parameter_name
+            )
+            top_level_params.append((i, parameter_name, param, parameter_fqn))
+    return top_level_params
+
+
+def _apply_exact_param_configs(module, config, top_level_params):
+    """Apply configs whose key exactly matches a parameter fqn.
+
+    Returns ``(module, config_found)``. Parameters mapped to ``None`` are
+    removed from ``top_level_params`` in place so they are skipped by the
+    later regex pass.
+    """
+    config_found = False
+    for i, parameter_name, param, parameter_fqn in list(top_level_params):
+        if parameter_fqn not in config.fqn_to_config:
+            continue
+        config_found = True
+        c = config.fqn_to_config[parameter_fqn]
+        # if None, remove from subsequent regex check
+        if c is None:
+            top_level_params.pop(i)
+        else:
+            module = _apply_param_config(module, c, parameter_name)
+    return module, config_found
+
+
+def _apply_regex_param_configs(module, config, top_level_params):
+    """Apply configs whose ``re:`` pattern matches a parameter fqn.
+
+    Returns ``(module, config_found)``.
+    """
+    config_found = False
+    for i, parameter_name, param, parameter_fqn in top_level_params:
+        for pattern in config.fqn_to_config:
+            if not (
+                pattern.startswith("re:") and re.fullmatch(pattern[3:], parameter_fqn)
+            ):
+                continue
+            config_found = True
+            c = config.fqn_to_config[pattern]
+            if c is not None:
+                module = _apply_param_config(module, c, parameter_name)
+    return module, config_found
+
+
+def _find_regex_module_config(config, fqn):
+    """Return ``(matched, config)`` for the first ``re:`` pattern matching ``fqn``."""
+    for pattern in config.fqn_to_config:
+        # we'll apply the config for first fully matched pattern
+        if pattern.startswith("re:") and re.fullmatch(pattern[3:], fqn):
+            return True, config.fqn_to_config[pattern]
+    return False, None
+
+
 def _fqn_to_config_handler(
     module: torch.nn.Module,
     fqn: str,
@@ -1630,65 +1730,33 @@ def _fqn_to_config_handler(
     Raises:
         NotImplementedError: If the quantization configuration is not yet supported for parameter quantization.
     """
-    parameter_config_found = False
-    top_level_params = []
-    for i, (parameter_name, param) in enumerate(list(module.named_parameters())):
-        if parameter_name in dir(module):
-            parameter_fqn = (
-                f"{fqn}.{parameter_name}" if len(fqn) > 0 else parameter_name
-            )
-            top_level_params.append((i, parameter_name, param, parameter_fqn))
+    top_level_params = _collect_top_level_params(module, fqn)
 
     # First we see if any parameter fqn matches with FqnToConfig, if so, we apply the appropriate transform
-    for i, parameter_name, param, parameter_fqn in list(top_level_params):
-        if parameter_fqn in config.fqn_to_config:
-            parameter_config_found = True
-            c = config.fqn_to_config[parameter_fqn]
-            # if None, remove from subsequent regex check
-            if c is None:
-                top_level_params.pop(i)
-            else:
-                module = _apply_param_config(module, c, parameter_name)
+    module, parameter_config_found = _apply_exact_param_configs(
+        module, config, top_level_params
+    )
 
     # then we see if we match module_fqn exactly
     if not parameter_config_found and fqn in config.fqn_to_config:
-        c = config.fqn_to_config[fqn]
-        if c is not None:
-            handler = _QUANTIZE_CONFIG_HANDLER[type(c)]
-            return handler(module, c)
-        else:
-            return module
+        return _apply_module_config(module, config.fqn_to_config[fqn])
 
     # Next try to match parameters on regex patterns
-    for i, parameter_name, param, parameter_fqn in top_level_params:
-        for pattern in config.fqn_to_config:
-            if pattern.startswith("re:") and re.fullmatch(pattern[3:], parameter_fqn):
-                parameter_config_found = True
-                c = config.fqn_to_config[pattern]
-                if c is not None:
-                    module = _apply_param_config(module, c, parameter_name)
+    module, regex_param_found = _apply_regex_param_configs(
+        module, config, top_level_params
+    )
+    parameter_config_found = parameter_config_found or regex_param_found
+    if parameter_config_found:
+        return module
 
     # try to match regex on module fqn
-    if not parameter_config_found:
-        for pattern in config.fqn_to_config:
-            # we'll apply the config for first fully matched pattern
-            if pattern.startswith("re:") and re.fullmatch(pattern[3:], fqn):
-                c = config.fqn_to_config[pattern]
-                if c is not None:
-                    handler = _QUANTIZE_CONFIG_HANDLER[type(c)]
-                    return handler(module, c)
-                else:
-                    return module
+    regex_module_matched, regex_module_config = _find_regex_module_config(config, fqn)
+    if regex_module_matched:
+        return _apply_module_config(module, regex_module_config)
 
     # If no module_fqn or parameter_fqn matches, then we apply _default
-    if not parameter_config_found:
-        c = config.fqn_to_config.get("_default", None)
-        if c is not None:
-            handler = _QUANTIZE_CONFIG_HANDLER[type(c)]
-            # safe to return here as at most only one module will match
-            return handler(module, c)
-
-    return module
+    # safe to return here as at most only one module will match
+    return _apply_module_config(module, config.fqn_to_config.get("_default", None))
 
 
 def fqn_matches_fqn_config(
