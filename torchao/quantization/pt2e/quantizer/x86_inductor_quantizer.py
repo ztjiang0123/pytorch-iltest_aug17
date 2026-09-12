@@ -1317,72 +1317,69 @@ class X86InductorQuantizer(Quantizer):
                 node, quantization_config, filter_fn
             )
 
+    @staticmethod
+    def _all_inputs_connected_to_quantized_op(input_nodes) -> bool:
+        # Ensure all the inputs connect to fusion pattern or quantized node
+        return all(_is_quantized_op_pt2e(input_node) for input_node in input_nodes)
+
+    def _annotate_maxpool2d_propagation(self, node: Node, quantization_config) -> None:
+        # Recipe of maxpool2d: check input arg[0] of maxpool2d is quantized or not
+        if not self._all_inputs_connected_to_quantized_op([node.all_input_nodes[0]]):
+            warnings.warn(
+                f"The input of maxpool2d is not quantized, skip annotate maxpool2d with config {quantization_config}."
+            )
+            return
+        self._annotate_maxpool2d(node, quantization_config)
+
+    def _annotate_cat_propagation(self, node: Node, quantization_config) -> None:
+        if not self._all_inputs_connected_to_quantized_op(node.all_input_nodes):
+            return
+        self._annotate_cat(node, quantization_config)
+
+    def _annotate_default_propagation(self, node: Node, quantization_config) -> None:
+        input_node = node.all_input_nodes[0]
+        if not self._all_inputs_connected_to_quantized_op([input_node]):
+            return
+        input_qspec_map = {input_node: get_input_act_qspec(quantization_config)}
+        node.meta[QUANT_ANNOTATION_KEY] = _X86InductorQuantizationAnnotation(
+            input_qspec_map=input_qspec_map,
+            _annotated=True,
+            _is_output_of_quantized_pattern=True,
+        )
+
+    @staticmethod
+    def _is_flatten_without_quantizable_users(node: Node) -> bool:
+        # Recipe of flatten: check if any users of flatten node are quantizable ops or not
+        return (
+            node.target is torch.ops.aten.flatten.using_ints
+            and len(node.users) > 0
+            and not any(user.target in quantizable_ops for user in node.users.keys())
+        )
+
     def _annotate_propagation_quantizable_pattern(
         self, node: Node, quantization_config, filter_fn
     ) -> None:
         # Propagate annotation to quantizable patterns.
-        if (
+        is_propagation_candidate = (
             (node.target in propagation_quantizable_ops)
             and (not _is_any_annotated([node]))
             and (node.op == "call_function")
-        ):
+        )
+        if not is_propagation_candidate or _skip_annotate([node], filter_fn):
+            return
 
-            def is_all_inputs_connected_to_quantized_op(input_nodes):
-                # Ensure all the inputs connect to fusion pattern or quantized node
-                for input_node in input_nodes:
-                    if not _is_quantized_op_pt2e(input_node):
-                        return False
-                return True
+        if quantization_config is None:
+            _annotate_nodes_not_quantize(node)
+            return
 
-            if _skip_annotate([node], filter_fn):
-                return
-
-            if quantization_config is None:
-                _annotate_nodes_not_quantize(node)
-                return
-
-            if node.target is torch.ops.aten.max_pool2d.default:
-                # Recipe of maxpool2d: check input arg[0] of maxpool2d is quantized or not
-                input_nodes_to_check = [node.all_input_nodes[0]]
-                if not is_all_inputs_connected_to_quantized_op(input_nodes_to_check):
-                    if quantization_config is not None:
-                        warnings.warn(
-                            f"The input of maxpool2d is not quantized, skip annotate maxpool2d with config {quantization_config}."
-                        )
-                    return
-
-                self._annotate_maxpool2d(node, quantization_config)
-                return
-            elif node.target is torch.ops.aten.cat.default:
-                input_nodes_to_check = node.all_input_nodes
-                if not is_all_inputs_connected_to_quantized_op(input_nodes_to_check):
-                    return
-                self._annotate_cat(node, quantization_config)
-            elif (
-                node.target is torch.ops.aten.flatten.using_ints
-                and len(node.users) > 0
-                and not any(
-                    user.target in quantizable_ops for user in node.users.keys()
-                )
-            ):
-                # Recipe of flatten: check if any users of flatten node are quantizable ops or not
-                return
-            else:
-                input_node = node.all_input_nodes[0]
-                if not is_all_inputs_connected_to_quantized_op(
-                    [
-                        input_node,
-                    ]
-                ):
-                    return
-                input_qspec_map = {}
-                input_qspec_map[input_node] = get_input_act_qspec(quantization_config)
-                node.meta[QUANT_ANNOTATION_KEY] = _X86InductorQuantizationAnnotation(
-                    input_qspec_map=input_qspec_map,
-                    _annotated=True,
-                    _is_output_of_quantized_pattern=True,
-                )
-        return
+        if node.target is torch.ops.aten.max_pool2d.default:
+            self._annotate_maxpool2d_propagation(node, quantization_config)
+        elif node.target is torch.ops.aten.cat.default:
+            self._annotate_cat_propagation(node, quantization_config)
+        elif self._is_flatten_without_quantizable_users(node):
+            return
+        else:
+            self._annotate_default_propagation(node, quantization_config)
 
     def _annotate_output_share_observer_as_input(
         self, input_node: Node, source_node: Node
