@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 import argparse
 import time
+from dataclasses import dataclass
 
 import lm_eval
 import torch
@@ -180,6 +181,71 @@ def _eval_mmlu(run_single_task, np):
     return np.mean(k)
 
 
+def _int4wo_base_config(group_size: int, device: str, allow_xpu: bool = True):
+    """Select the int4 weight-only base config appropriate for ``device``."""
+    if device == "cuda":
+        return Int4WeightOnlyConfig(group_size=group_size)
+    if device == "xpu" and allow_xpu:
+        return Int4WeightOnlyConfig(
+            group_size=group_size, int4_packing_format="plain_int32"
+        )
+    if device == "cpu":
+        return PrototypeInt4WeightOnlyConfig(group_size=group_size)
+    raise AssertionError("Unsupported device: {}".format(device))
+
+
+@dataclass
+class _CalibrationSettings:
+    """Settings for the AWQ calibration pass over the evaluation harness."""
+
+    tasks: list[str]
+    max_seq_length: int
+    calibration_limit: int
+
+
+def _quantize_awq_int4wo(model, tokenizer, quant, device, settings):
+    """Run the AWQ int4 weight-only prepare/calibrate/convert flow in place."""
+    group_size = int(quant.split("-")[2])
+    print(f"running {quant} quantization with group size {group_size}")
+    base_config = _int4wo_base_config(group_size, device)
+
+    print(f"running {quant} prepare and calibrate")
+    t0 = time.time()
+    quantize_(model, AWQConfig(base_config, step="prepare"))
+
+    from torchao._models._eval import TransformerEvalWrapper
+
+    TransformerEvalWrapper(
+        model=model.to(device),
+        tokenizer=tokenizer,
+        max_seq_length=settings.max_seq_length,
+        device=device,
+    ).run_eval(
+        tasks=settings.tasks,
+        limit=settings.calibration_limit,
+    )
+
+    print(f"time for prepare and calibration: {time.time() - t0:.02f} seconds")
+    print(f"running {quant} convert")
+    t0 = time.time()
+    quantize_(model, AWQConfig(base_config, step="convert"))
+    print(f"time for convert: {time.time() - t0:.02f} seconds")
+
+    quant_config = AWQConfig(base_config, step="prepare_for_loading")
+    model.config.quantization_config = TorchAoConfig(quant_config)
+
+
+def _quantize_int4wo(model, quant: str, device: str):
+    """Run plain int4 weight-only quantization in place."""
+    group_size = int(quant.split("-")[1])
+    print(f"running {quant} quantization with group size {group_size}")
+    # TODO: enable after migration: https://github.com/pytorch/ao/issues/2752
+    # use_hqq = "hqq" in quant
+    # xpu is not currently supported for the plain int4wo path.
+    base_config = _int4wo_base_config(group_size, device, allow_xpu=False)
+    quantize_(model, base_config)
+
+
 def quantize_and_eval(
     repo_id: str,
     quant: str,
@@ -202,61 +268,16 @@ def quantize_and_eval(
         AutoModelForCausalLM.from_pretrained(repo_id, dtype=precision).eval().to(device)
     )
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
+
     if quant.startswith("awq-int4wo"):
-        group_size = int(quant.split("-")[2])
-        print(f"running {quant} quantization with group size {group_size}")
-
-        if device == "cuda":
-            base_config = Int4WeightOnlyConfig(group_size=group_size)
-        elif device == "xpu":
-            base_config = Int4WeightOnlyConfig(
-                group_size=group_size, int4_packing_format="plain_int32"
-            )
-        elif device == "cpu":
-            base_config = PrototypeInt4WeightOnlyConfig(group_size=group_size)
-        else:
-            assert False, "Unsupported device: {}".format(device)
-        print(f"running {quant} prepare and calibrate")
-        t0 = time.time()
-        quant_config = AWQConfig(base_config, step="prepare")
-
-        quantize_(
-            model,
-            quant_config,
-        )
-        from torchao._models._eval import TransformerEvalWrapper
-
-        TransformerEvalWrapper(
-            model=model.to(device),
-            tokenizer=tokenizer,
-            max_seq_length=max_seq_length,
-            device=device,
-        ).run_eval(
+        settings = _CalibrationSettings(
             tasks=tasks,
-            limit=calibration_limit,
+            max_seq_length=max_seq_length,
+            calibration_limit=calibration_limit,
         )
-
-        print(f"time for prepare and calibration: {time.time() - t0:.02f} seconds")
-        print(f"running {quant} convert")
-        t0 = time.time()
-        quant_config = AWQConfig(base_config, step="convert")
-        quantize_(model, quant_config)
-        print(f"time for convert: {time.time() - t0:.02f} seconds")
-        quant_config = AWQConfig(base_config, step="prepare_for_loading")
-        model.config.quantization_config = TorchAoConfig(quant_config)
-
+        _quantize_awq_int4wo(model, tokenizer, quant, device, settings)
     elif quant.startswith("int4wo"):
-        group_size = int(quant.split("-")[1])
-        print(f"running {quant} quantization with group size {group_size}")
-        # TODO: enable after migration: https://github.com/pytorch/ao/issues/2752
-        # use_hqq = "hqq" in quant
-        if device == "cuda":
-            base_config = Int4WeightOnlyConfig(group_size=group_size)
-        elif device == "cpu":
-            base_config = PrototypeInt4WeightOnlyConfig(group_size=group_size)
-        else:
-            assert False, "Unsupported device: {}".format(device)
-        quantize_(model, base_config)
+        _quantize_int4wo(model, quant, device)
 
     if model_save_path is not None:
         print(f"Saving model to {model_save_path}")
