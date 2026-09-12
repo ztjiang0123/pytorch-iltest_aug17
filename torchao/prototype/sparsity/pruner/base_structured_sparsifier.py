@@ -193,6 +193,28 @@ def _get_default_structured_pruning_patterns() -> Dict[
     return patterns
 
 
+def _first_module_is_prunable(modules, node) -> bool:
+    """Return True if the pattern's first module exists and carries the
+    FakeStructuredSparsity parametrization we need to convert."""
+    first_module = modules.get(node.target)
+    return (
+        first_module is not None
+        and parametrize.is_parametrized(first_module)
+        and module_contains_param(first_module, FakeStructuredSparsity)
+    )
+
+
+def _build_convert_block(modules, matched):
+    """Resolve a matched node sequence into the arguments for a convert function."""
+    convert_block = []
+    for node in matched:
+        if node.op == "call_module":
+            convert_block.append(modules.get(node.target))
+        elif node.op == "call_function":
+            convert_block.append(node.target)
+    return convert_block
+
+
 class BaseStructuredSparsifier(BaseSparsifier):
     r"""Base class for structured pruning.
 
@@ -274,20 +296,11 @@ class BaseStructuredSparsifier(BaseSparsifier):
                 if matched is None:
                     continue
 
-                first_module = modules.get(node.target)
-                # check if first module exists and has appropriate parameterization, otherwise skip
-                if (
-                    first_module is not None
-                    and parametrize.is_parametrized(first_module)
-                    and module_contains_param(first_module, FakeStructuredSparsity)
-                ):
-                    convert_block = []
-                    for node in matched:
-                        if node.op == "call_module":
-                            convert_block.append(modules.get(node.target))
-                        elif node.op == "call_function":
-                            convert_block.append(node.target)
-                    convert_fn(*convert_block)
+                if not _first_module_is_prunable(modules, node):
+                    continue
+
+                convert_block = _build_convert_block(modules, matched)
+                convert_fn(*convert_block)
 
         for module in self.traced.modules():
             if module_contains_param(module, FakeStructuredSparsity):

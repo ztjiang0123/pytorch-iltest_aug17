@@ -69,49 +69,76 @@ def unflatten_tensor_state_dict(
     result = {}
     leftover_state_dict = tensors_data_dict.copy()
     for tensor_name in tensor_names:
-        processed_tensors = []
+        reconstructed, processed_tensors = _reconstruct_tensor(
+            tensor_name, combined_data, tensors_data_dict, metadata
+        )
 
-        module_fqn, weight_name = tensor_name.rsplit(".", 1)
+        # If the tensor's data has not fully arrived yet, wait for a future call.
+        if reconstructed is _INCOMPLETE:
+            continue
 
-        prefix = f"{module_fqn}._{weight_name}_"
-        tensor_tensors = {}
-
-        for key, value in combined_data.items():
-            if key.startswith(prefix):
-                # Remove the prefix
-                tensor_tensors[key[len(prefix) :]] = value
-
-        tensor_metadata = json.loads(metadata.get(tensor_name))
-        tensor_type = tensor_metadata.get("_type")
-        complete_tensor_data_names = tensor_metadata.get("_tensor_data_names")
-
-        if tensor_type in ALLOWED_TENSORS_SUBCLASSES:
-            # if not all tensor data is present (ie missing qdata) we wait for it
-            # to be loaded in from a future call
-            if not len(tensor_tensors) is len(complete_tensor_data_names):
-                continue
-            tensor_metadata["_data"].update(tensor_tensors)
-            result[tensor_name] = object_from_dict(tensor_metadata)
-
-            for suffix in complete_tensor_data_names:
-                processed_tensors.append(prefix + suffix)
-        elif tensor_type == torch.Tensor.__name__:
-            # we allow the option of loading in state_dict info for a single tensor
-            # if tensor state dict info is not loaded in yet, we wait for it to be provided
-            # in a future call
-            if tensor_name not in tensors_data_dict.keys():
-                continue
-            result[tensor_name] = tensors_data_dict[tensor_name]
-            processed_tensors.append(
-                tensor_name
-            )  # add here because key for torch.Tensor has no prefix
-        else:
-            raise ValueError(f"Unsupported tensor type: {tensor_type}")
-
-        for tensor_name in processed_tensors:
-            del leftover_state_dict[tensor_name]
+        result[tensor_name] = reconstructed
+        for processed_name in processed_tensors:
+            del leftover_state_dict[processed_name]
 
     return result, leftover_state_dict
+
+
+# Sentinel returned when a tensor's data is not yet fully available and its
+# reconstruction should be deferred to a future call.
+_INCOMPLETE = object()
+
+
+def _reconstruct_subclass_tensor(prefix, tensor_tensors, tensor_metadata):
+    """Rebuild a tensor subclass instance once all its data tensors are present."""
+    complete_tensor_data_names = tensor_metadata.get("_tensor_data_names")
+
+    # if not all tensor data is present (ie missing qdata) we wait for it
+    # to be loaded in from a future call
+    if len(tensor_tensors) != len(complete_tensor_data_names):
+        return _INCOMPLETE, []
+
+    tensor_metadata["_data"].update(tensor_tensors)
+    processed_tensors = [prefix + suffix for suffix in complete_tensor_data_names]
+    return object_from_dict(tensor_metadata), processed_tensors
+
+
+def _reconstruct_plain_tensor(tensor_name, tensors_data_dict):
+    """Return a plain torch.Tensor entry once its data has been loaded in."""
+    # we allow the option of loading in state_dict info for a single tensor
+    # if tensor state dict info is not loaded in yet, we wait for it to be provided
+    # in a future call
+    if tensor_name not in tensors_data_dict:
+        return _INCOMPLETE, []
+
+    # key for torch.Tensor has no prefix, so the processed name is the tensor name
+    return tensors_data_dict[tensor_name], [tensor_name]
+
+
+def _reconstruct_tensor(tensor_name, combined_data, tensors_data_dict, metadata):
+    """Reconstruct a single tensor entry from the flattened data and metadata.
+
+    Returns a ``(value, processed_tensors)`` tuple. ``value`` is ``_INCOMPLETE``
+    when the tensor's data has not fully arrived yet.
+    """
+    module_fqn, weight_name = tensor_name.rsplit(".", 1)
+    prefix = f"{module_fqn}._{weight_name}_"
+
+    tensor_tensors = {
+        key[len(prefix) :]: value
+        for key, value in combined_data.items()
+        if key.startswith(prefix)
+    }
+
+    tensor_metadata = json.loads(metadata.get(tensor_name))
+    tensor_type = tensor_metadata.get("_type")
+
+    if tensor_type in ALLOWED_TENSORS_SUBCLASSES:
+        return _reconstruct_subclass_tensor(prefix, tensor_tensors, tensor_metadata)
+    if tensor_type == torch.Tensor.__name__:
+        return _reconstruct_plain_tensor(tensor_name, tensors_data_dict)
+
+    raise ValueError(f"Unsupported tensor type: {tensor_type}")
 
 
 def flatten_tensor_state_dict(

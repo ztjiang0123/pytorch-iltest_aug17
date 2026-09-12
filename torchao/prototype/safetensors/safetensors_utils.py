@@ -6,6 +6,7 @@ from typing import Any, Dict
 import torch
 
 import torchao
+from torchao.core.config import _is_serialized_config
 from torchao.prototype.mx_formats.config import ScaleCalculationMode
 from torchao.prototype.mx_formats.mx_tensor import MXTensor, QuantizeTensorToMXKwargs
 from torchao.prototype.mx_formats.nvfp4_tensor import (
@@ -158,6 +159,42 @@ class TensorSubclassAttributeJSONEncoder(json.JSONEncoder):
         return value
 
 
+def _decode_if_serialized(value: Any) -> Any:
+    """Recursively decode ``value`` when it encodes a serialized object."""
+    return object_from_dict(value) if _is_serialized_config(value) else value
+
+
+def _decode_field(value: Any) -> Any:
+    """Decode a single field value from ``_data``, recursing into containers."""
+    if _is_serialized_config(value):
+        # Recursively handle nested configs
+        return object_from_dict(value)
+    if isinstance(value, list):
+        # Handle lists of possible configs
+        return [_decode_if_serialized(item) for item in value]
+    if isinstance(value, tuple):
+        raise NotImplementedError(
+            "Tuples will be serialized as List in JSON, so we recommend to use "
+            f"Lists instead to avoid surprises. got: {value}"
+        )
+    if isinstance(value, dict):
+        # Handle dicts of possible configs
+        return {k: _decode_if_serialized(v) for k, v in value.items()}
+    return value
+
+
+def _instantiate_scalar(cls, obj_data: Any) -> Any:
+    """Build an instance from a non-dict payload (enum member or primitive)."""
+    if issubclass(cls, enum.Enum):
+        # For enums, convert string to enum value
+        return getattr(cls, obj_data)
+    # For other primitive types, create an instance with the value
+    try:
+        return cls(obj_data)
+    except:
+        return obj_data
+
+
 def object_from_dict(data: Dict[str, Any]):
     if not isinstance(data, dict):
         raise TypeError(f"Expected dictionary, got {type(data)}")
@@ -182,45 +219,9 @@ def object_from_dict(data: Dict[str, Any]):
 
     # Handle the case where obj_data is not a dictionary
     if not isinstance(obj_data, dict):
-        if issubclass(cls, enum.Enum):
-            # For enums, convert string to enum value
-            return getattr(cls, obj_data)
-        else:
-            # For other primitive types, create an instance with the value
-            try:
-                return cls(obj_data)
-            except:
-                return obj_data
+        return _instantiate_scalar(cls, obj_data)
 
-    processed_data = {}
-
-    for key, value in obj_data.items():
-        if isinstance(value, dict) and "_type" in value and "_data" in value:
-            # Recursively handle nested configs
-            processed_data[key] = object_from_dict(value)
-        elif isinstance(value, list):
-            # Handle lists or tuples of possible configs
-            processed_data[key] = [
-                object_from_dict(item)
-                if isinstance(item, dict) and "_type" in item and "_data" in item
-                else item
-                for item in value
-            ]
-        elif isinstance(value, tuple):
-            raise NotImplementedError(
-                "Tuples will be serialized as List in JSON, so we recommend to use "
-                f"Lists instead to avoid surprises. got: {value}"
-            )
-        elif isinstance(value, dict):
-            # Handle dicts of possible configs
-            processed_data[key] = {
-                k: object_from_dict(v)
-                if isinstance(v, dict) and "_type" in v and "_data" in v
-                else v
-                for k, v in value.items()
-            }
-        else:
-            processed_data[key] = value
+    processed_data = {key: _decode_field(value) for key, value in obj_data.items()}
 
     # Create and return the instance
     try:
