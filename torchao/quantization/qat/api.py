@@ -184,6 +184,125 @@ class QATConfig(AOBaseConfig):
             )
 
 
+def _qat_prepare_transform(
+    module: torch.nn.Module,
+    config: QATConfig,
+) -> torch.nn.Module:
+    """Prepare step: swap ``nn.Linear``/``nn.Embedding`` for their fake quantized
+    counterparts, deriving the fake quantize configs from the base config if given.
+    """
+    # TODO: rewrite this using a registration API so
+    # specific quantization schemes do not leak here
+    from torchao.prototype.qat import (
+        MXFakeQuantizeConfig,
+        MXFakeQuantizedLinear,
+        NVFP4FakeQuantizeConfig,
+        NVFP4FakeQuantizedLinear,
+    )
+
+    base_config = config.base_config
+    if base_config is not None:
+        (act_config, weight_config) = _infer_fake_quantize_configs(base_config)
+    else:
+        act_config = config.activation_config
+        weight_config = config.weight_config
+
+    if isinstance(module, torch.nn.Linear):
+        if isinstance(weight_config, NVFP4FakeQuantizeConfig):
+            assert act_config is None or isinstance(act_config, NVFP4FakeQuantizeConfig)
+            return NVFP4FakeQuantizedLinear.from_linear(
+                module, act_config, weight_config
+            )
+        if isinstance(weight_config, MXFakeQuantizeConfig):
+            assert act_config is None or isinstance(act_config, MXFakeQuantizeConfig)
+            return MXFakeQuantizedLinear.from_linear(module, act_config, weight_config)
+        return FakeQuantizedLinear.from_linear(module, act_config, weight_config)
+
+    if isinstance(module, torch.nn.Embedding):
+        if act_config is not None:
+            raise ValueError(
+                "Activation fake quantization is not supported for embedding"
+            )
+        return FakeQuantizedEmbedding.from_embedding(module, weight_config)
+
+    raise ValueError("Module of type '%s' does not have QAT support" % type(module))
+
+
+def _revert_fake_quantized_module(module: torch.nn.Module) -> torch.nn.Module:
+    """Swap a fake quantized module back to its built-in ``torch.nn.Module``."""
+    from torchao.prototype.qat import (
+        MXFakeQuantizedLinear,
+        NVFP4FakeQuantizedLinear,
+    )
+
+    if isinstance(
+        module,
+        (FakeQuantizedLinear, MXFakeQuantizedLinear, NVFP4FakeQuantizedLinear),
+    ):
+        return module.to_linear()
+    if isinstance(module, FakeQuantizedEmbedding):
+        return module.to_embedding()
+    raise ValueError(f"Encountered unexpected module {module}, should never happen")
+
+
+def _qat_convert_transform(
+    module: torch.nn.Module,
+    config: QATConfig,
+) -> torch.nn.Module:
+    """Convert step: revert fake quantized modules to built-in modules, then apply
+    the base config directly to quantize them.
+    """
+    from torchao.prototype.qat import (
+        MXFakeQuantizedLinear,
+        NVFP4FakeQuantizedLinear,
+    )
+
+    base_config = config.base_config
+    assert config.activation_config is None, "unexpected `activation_config`"
+    assert config.weight_config is None, "unexpected `weight_config`"
+
+    # Ignore unrelated modules
+    if not isinstance(
+        module,
+        (
+            FakeQuantizedLinear,
+            FakeQuantizedEmbedding,
+            MXFakeQuantizedLinear,
+            NVFP4FakeQuantizedLinear,
+        ),
+    ):
+        return module
+
+    # Optionally pass custom scales and zero points to base config handler
+    # This is only for range learning and only applies to weights
+    kwargs = {}
+    has_custom_scale_and_zero_point = False
+    if (
+        hasattr(module, "weight_fake_quantizer")
+        and isinstance(module.weight_fake_quantizer.config, IntxFakeQuantizeConfig)
+        and module.weight_fake_quantizer.config.range_learning
+    ):
+        kwargs["custom_scale"] = module.weight_fake_quantizer.scale
+        kwargs["custom_zero_point"] = module.weight_fake_quantizer.zero_point
+        has_custom_scale_and_zero_point = True
+
+    # Swap FakeQuantizedLinear -> nn.Linear / FakeQuantizedEmbedding -> nn.Embedding,
+    # then apply the base config's transform function to quantize the model. If there
+    # is no base config, then simply perform the module swap.
+    module = _revert_fake_quantized_module(module)
+    if base_config is None:
+        return module
+
+    # If passing custom scales and zero points, we need to disable the choose_qparam_algorithm on the config
+    if has_custom_scale_and_zero_point and hasattr(
+        base_config, "intx_choose_qparams_algorithm"
+    ):
+        logging.debug("Disabling intx_choose_qparams_algorithm")
+        base_config = copy.deepcopy(base_config)
+        base_config.intx_choose_qparams_algorithm = None
+    return _QUANTIZE_CONFIG_HANDLER[type(base_config)](module, base_config, **kwargs)
+
+
 @register_quantize_module_handler(QATConfig)
 def _qat_config_transform(
     module: torch.nn.Module,
@@ -197,114 +316,11 @@ def _qat_config_transform(
     modules to the corresponding built-in `torch.nn.Module`s, then apply the
     base config directly to quantize the module.
     """
-    # TODO: rewrite this using a registration API so
-    # specific quantization schemes do not leak here
-    from torchao.prototype.qat import (
-        MXFakeQuantizeConfig,
-        MXFakeQuantizedLinear,
-        NVFP4FakeQuantizeConfig,
-        NVFP4FakeQuantizedLinear,
-    )
-
-    # Prepare step
-    # Swap nn.Linear -> FakeQuantizedLinear
-    # Swap nn.Embedding -> FakeQuantizedEmbedding
-    base_config = config.base_config
     step = config.step
     if step == QATStep.PREPARE:
-        if base_config is not None:
-            (act_config, weight_config) = _infer_fake_quantize_configs(base_config)
-        else:
-            act_config = config.activation_config
-            weight_config = config.weight_config
-        if isinstance(module, torch.nn.Linear):
-            if isinstance(weight_config, NVFP4FakeQuantizeConfig):
-                assert act_config is None or isinstance(
-                    act_config, NVFP4FakeQuantizeConfig
-                )
-                return NVFP4FakeQuantizedLinear.from_linear(
-                    module, act_config, weight_config
-                )
-            elif isinstance(weight_config, MXFakeQuantizeConfig):
-                assert act_config is None or isinstance(
-                    act_config, MXFakeQuantizeConfig
-                )
-                return MXFakeQuantizedLinear.from_linear(
-                    module, act_config, weight_config
-                )
-            else:
-                return FakeQuantizedLinear.from_linear(
-                    module, act_config, weight_config
-                )
-        elif isinstance(module, torch.nn.Embedding):
-            if act_config is not None:
-                raise ValueError(
-                    "Activation fake quantization is not supported for embedding"
-                )
-            return FakeQuantizedEmbedding.from_embedding(module, weight_config)
-        else:
-            raise ValueError(
-                "Module of type '%s' does not have QAT support" % type(module)
-            )
-    else:
-        # Convert step
-        assert step == QATStep.CONVERT, "unexpected step '%s' in QATConfig" % step
-        assert config.activation_config is None, "unexpected `activation_config`"
-        assert config.weight_config is None, "unexpected `weight_config`"
-
-        # Ignore unrelated modules
-        if not isinstance(
-            module,
-            (
-                FakeQuantizedLinear,
-                FakeQuantizedEmbedding,
-                MXFakeQuantizedLinear,
-                NVFP4FakeQuantizedLinear,
-            ),
-        ):
-            return module
-
-        # Optionally pass custom scales and zero points to base config handler
-        # This is only for range learning and only applies to weights
-        kwargs = {}
-        has_custom_scale_and_zero_point = False
-        if (
-            hasattr(module, "weight_fake_quantizer")
-            and isinstance(module.weight_fake_quantizer.config, IntxFakeQuantizeConfig)
-            and module.weight_fake_quantizer.config.range_learning
-        ):
-            kwargs["custom_scale"] = module.weight_fake_quantizer.scale
-            kwargs["custom_zero_point"] = module.weight_fake_quantizer.zero_point
-            has_custom_scale_and_zero_point = True
-
-        # Swap FakeQuantizedLinear -> nn.Linear
-        # Swap FakeQuantizedEmbedding -> nn.Embedding
-        # Then apply the base config's transform function to quantize the model
-        # If there is no base config, then simply perform the module swap
-        if isinstance(
-            module,
-            (FakeQuantizedLinear, MXFakeQuantizedLinear, NVFP4FakeQuantizedLinear),
-        ):
-            module = module.to_linear()
-        elif isinstance(module, FakeQuantizedEmbedding):
-            module = module.to_embedding()
-        else:
-            raise ValueError(
-                f"Encountered unexpected module {module}, should never happen"
-            )
-        if base_config is not None:
-            # If passing custom scales and zero points, we need to disable the choose_qparam_algorithm on the config
-            if has_custom_scale_and_zero_point and hasattr(
-                base_config, "intx_choose_qparams_algorithm"
-            ):
-                logging.debug("Disabling intx_choose_qparams_algorithm")
-                base_config = copy.deepcopy(base_config)
-                base_config.intx_choose_qparams_algorithm = None
-            return _QUANTIZE_CONFIG_HANDLER[type(base_config)](
-                module, base_config, **kwargs
-            )
-        else:
-            return module
+        return _qat_prepare_transform(module, config)
+    assert step == QATStep.CONVERT, "unexpected step '%s' in QATConfig" % step
+    return _qat_convert_transform(module, config)
 
 
 @dataclass

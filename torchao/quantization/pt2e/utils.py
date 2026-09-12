@@ -193,6 +193,54 @@ def check_min_max_valid(min_val: torch.Tensor, max_val: torch.Tensor) -> bool:
     return True
 
 
+def _validate_customized_qrange(
+    quant_min: int,
+    quant_max: int,
+    dtype: torch.dtype,
+) -> None:
+    """Assert that a caller-supplied quantization range fits within ``dtype``."""
+    # This initialization here is to be resolve TorchScript compilation issues and allow
+    # using of refinement to decouple initial_qmin and initial_qmax from quantization range.
+    # The actual values of initial_qmin and initial_qmax will be reset below.
+    if dtype in [torch.qint32, torch.int32]:
+        initial_quant_min, initial_quant_max = 0, 2**32 - 1
+    else:
+        initial_quant_min, initial_quant_max = 0, 255
+    # The following assignment of self.qmin and self.qmax to the local variables and the if check refine the
+    # attribute from Optional valid integers for use, based on TorchScript's requirements.
+    custom_quant_min, custom_quant_max = quant_min, quant_max
+    if custom_quant_min is not None and custom_quant_max is not None:
+        initial_quant_min, initial_quant_max = (
+            custom_quant_min,
+            custom_quant_max,
+        )
+
+    qrange_len = initial_quant_max - initial_quant_min + 1
+    if dtype in [torch.qint8, torch.int8]:
+        assert 0 < qrange_len <= 256, (
+            "quantization range should be positive and not exceed the maximum bit range (=256)."
+        )
+    elif dtype in [torch.qint32, torch.int32]:
+        assert 0 < qrange_len <= 2**32, (
+            "quantization range should be positive and not exceed the maximum bit range (=4294967296)."
+        )
+
+
+def _default_qmin_qmax(dtype: torch.dtype, reduce_range: bool) -> tuple[int, int]:
+    """Return the built-in 8-bit (or wider) qmin/qmax when no custom range is set."""
+    if dtype in [torch.qint8, torch.int8]:
+        return (-64, 63) if reduce_range else (-128, 127)
+    if dtype in [torch.quint8, torch.uint8]:
+        return (0, 127) if reduce_range else (0, 255)
+    if dtype in [torch.qint32, torch.int32]:
+        return -1 * (2**31), (2**31) - 1
+    if dtype in [torch.uint16]:
+        return 0, 2**16 - 1
+    if dtype in [torch.int16]:
+        return -(2**15), 2**15 - 1
+    return 0, 15
+
+
 def calculate_qmin_qmax(
     quant_min: int,
     quant_max: int,
@@ -204,54 +252,13 @@ def calculate_qmin_qmax(
     observer datatype and if range is reduced.
     """
     # TODO(jerryzh): Figure out why custom quant_min/quant_max are still adjusted.
-    if has_customized_qrange:
-        # This initialization here is to be resolve TorchScript compilation issues and allow
-        # using of refinement to decouple initial_qmin and initial_qmax from quantization range.
-        # The actual values of initial_qmin and initial_qmax will be reset below.
-        if dtype in [torch.qint32, torch.int32]:
-            initial_quant_min, initial_quant_max = 0, 2**32 - 1
-        else:
-            initial_quant_min, initial_quant_max = 0, 255
-        # The following assignment of self.qmin and self.qmax to the local variables and the if check refine the
-        # attribute from Optional valid integers for use, based on TorchScript's requirements.
-        custom_quant_min, custom_quant_max = quant_min, quant_max
-        if custom_quant_min is not None and custom_quant_max is not None:
-            initial_quant_min, initial_quant_max = (
-                custom_quant_min,
-                custom_quant_max,
-            )
-
-        qrange_len = initial_quant_max - initial_quant_min + 1
-        if dtype in [torch.qint8, torch.int8]:
-            assert 0 < qrange_len <= 256, (
-                "quantization range should be positive and not exceed the maximum bit range (=256)."
-            )
-        elif dtype in [torch.qint32, torch.int32]:
-            assert 0 < qrange_len <= 2**32, (
-                "quantization range should be positive and not exceed the maximum bit range (=4294967296)."
-            )
-        if reduce_range:
-            quant_min, quant_max = quant_min // 2, quant_max // 2
-    else:
+    if not has_customized_qrange:
         # Fallback onto default 8-bit qmin and qmax calculation if dynamic range is not used.
-        if dtype in [torch.qint8, torch.int8]:
-            if reduce_range:
-                quant_min, quant_max = -64, 63
-            else:
-                quant_min, quant_max = -128, 127
-        elif dtype in [torch.quint8, torch.uint8]:
-            if reduce_range:
-                quant_min, quant_max = 0, 127
-            else:
-                quant_min, quant_max = 0, 255
-        elif dtype in [torch.qint32, torch.int32]:
-            quant_min, quant_max = -1 * (2**31), (2**31) - 1
-        elif dtype in [torch.uint16]:
-            quant_min, quant_max = 0, 2**16 - 1
-        elif dtype in [torch.int16]:
-            quant_min, quant_max = -(2**15), 2**15 - 1
-        else:
-            quant_min, quant_max = 0, 15
+        return _default_qmin_qmax(dtype, reduce_range)
+
+    _validate_customized_qrange(quant_min, quant_max, dtype)
+    if reduce_range:
+        quant_min, quant_max = quant_min // 2, quant_max // 2
     return quant_min, quant_max
 
 
@@ -1193,42 +1200,65 @@ def _replace_literals_with_new_placeholders(
         return x - new_ph
 
     """
-    last_ph = None
-    cnt = 0
-    literal_to_ph: dict[Union[float, bool, int, torch.dtype], Node] = {}
     if exclude_literals is None:
         exclude_literals = []
 
     in_spec = gm._in_spec
     args_spec = in_spec.children_specs[0]
+
+    # Mutable state shared across nodes: the running placeholder count, the last
+    # placeholder we can insert after, and (when merging) a literal -> placeholder map.
+    state = _PlaceholderReplacementState(
+        gm=gm,
+        args_spec=args_spec,
+        merge_dup=merge_dup,
+        exclude_literals=exclude_literals,
+    )
+
     for node in gm.graph.nodes:
         if node.op == "placeholder":
-            last_ph = node
-            cnt += 1
+            state.on_placeholder(node)
             continue
-        with gm.graph.inserting_after(last_ph):
-            new_args = []
-            for arg in node.args:
-                if _is_literal(arg) and arg not in exclude_literals:
-                    if merge_dup and arg in literal_to_ph:
-                        new_args.append(literal_to_ph[arg])
-                    else:
-                        ph_node = gm.graph.placeholder("arg" + str(cnt))
-                        new_args.append(ph_node)
-                        args_spec.children_specs.append(treespec_leaf())
-                        cnt += 1
-                        if merge_dup:
-                            literal_to_ph[arg] = ph_node
-                else:
-                    new_args.append(arg)
-            new_args = tuple(new_args)
-
-        node.args = new_args
+        with gm.graph.inserting_after(state.last_ph):
+            node.args = tuple(state.replace_arg(arg) for arg in node.args)
 
     # Update `num_nodes`, `num_leaves`, `num_children`.
     args_spec.__post_init__()
     in_spec.__post_init__()
     return gm
+
+
+class _PlaceholderReplacementState:
+    """Tracks placeholder creation while rewriting literal args into placeholders."""
+
+    def __init__(self, gm, args_spec, merge_dup, exclude_literals):
+        self._gm = gm
+        self._args_spec = args_spec
+        self._merge_dup = merge_dup
+        self._exclude_literals = exclude_literals
+        self.last_ph: Optional[Node] = None
+        self._cnt = 0
+        self._literal_to_ph: dict[Union[float, bool, int, torch.dtype], Node] = {}
+
+    def on_placeholder(self, node: Node) -> None:
+        self.last_ph = node
+        self._cnt += 1
+
+    def replace_arg(self, arg):
+        """Return ``arg`` unchanged, or a placeholder node standing in for a literal."""
+        if not (_is_literal(arg) and arg not in self._exclude_literals):
+            return arg
+        if self._merge_dup and arg in self._literal_to_ph:
+            return self._literal_to_ph[arg]
+        return self._new_placeholder(arg)
+
+    def _new_placeholder(self, arg) -> Node:
+        ph_node = self._gm.graph.placeholder("arg" + str(self._cnt))
+        self._args_spec.children_specs.append(treespec_leaf())
+        self._cnt += 1
+        if self._merge_dup:
+            self._literal_to_ph[arg] = ph_node
+        return ph_node
 
 
 def _replace_literals_with_existing_placeholders(
