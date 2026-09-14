@@ -37,7 +37,6 @@ from torchao.quantization.pt2e.quantizer.utils import _create_global_config_filt
 
 from .x86_inductor_quantizer import (
     X86InductorQuantizer,
-    _config_checker,
     _create_module_name_filter,
     _create_operator_type_filter,
 )
@@ -169,22 +168,9 @@ class ArmInductorQuantizer(X86InductorQuantizer):
             )
         return self.global_config
 
-    @_config_checker
-    def set_module_type_qconfig(
-        self,
-        module_type: torch.nn.Module,
-        quantization_config: Optional[QuantizationConfig],
-    ) -> "ArmInductorQuantizer":
-        if module_type in ArmInductorQuantizer.module_function_to_aten_operator_type:
-            self._set_aten_operator_qconfig(
-                ArmInductorQuantizer.module_function_to_aten_operator_type[module_type],
-                quantization_config,
-            )
-        else:
-            warnings.warn(
-                f"Module: Unable to customize quantization config for {module_type} by ArmInductorQuantizer."
-            )
-        return self
+    # set_module_type_qconfig is inherited unchanged from X86InductorQuantizer;
+    # it resolves ``module_function_to_aten_operator_type`` against ``type(self)``,
+    # so this subclass's override of that attribute is picked up automatically.
 
     # set_module_name_qconfig is inherited unchanged from X86InductorQuantizer.
 

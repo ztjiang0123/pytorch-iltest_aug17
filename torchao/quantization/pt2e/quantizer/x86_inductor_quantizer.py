@@ -517,14 +517,18 @@ class X86InductorQuantizer(Quantizer):
         module_type: torch.nn.Module,
         quantization_config: Optional[QuantizationConfig],
     ) -> "X86InductorQuantizer":
-        if module_type in X86InductorQuantizer.module_function_to_aten_operator_type:
+        # Resolve against the concrete class so subclasses (e.g.
+        # ``ArmInductorQuantizer``) that override
+        # ``module_function_to_aten_operator_type`` reuse this implementation.
+        cls = type(self)
+        if module_type in cls.module_function_to_aten_operator_type:
             self._set_aten_operator_qconfig(
-                X86InductorQuantizer.module_function_to_aten_operator_type[module_type],
+                cls.module_function_to_aten_operator_type[module_type],
                 quantization_config,
             )
         else:
             warnings.warn(
-                f"Module: Unable to customize quantization config for {module_type} by X86InductorQuantizer."
+                f"Module: Unable to customize quantization config for {module_type} by {cls.__name__}."
             )
         return self
 
